@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/style.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aperture</title>
+  </head>
+  <body>
+    <div id="app">
+      <nav id="navbar">
+        <div id="navbar-title"></div>
+        <div id="navbar-views">
+          <button class="navbar__view-btn navbar__view-btn--active" data-view="terminal">Terminal</button>
+          <button class="navbar__view-btn" data-view="objectives">Objectives</button>
+        </div>
+        <div id="navbar-actions">
+          <button class="navbar__btn" data-panel="chat">Chat</button>
+          <button class="navbar__btn" data-panel="warroom">War Room</button>
+          <button class="navbar__btn" data-panel="messages">Messages</button>
+          <button class="navbar__btn" data-panel="beads">BEADS</button>
+          <button class="navbar__btn" data-panel="spiders">Spiders</button>
+        </div>
+      </nav>
+      <div id="content">
+        <aside id="sidebar">
+          <div id="sidebar-agents"></div>
+          <div id="sidebar-sessions"></div>
+          <div id="sidebar-active-agent"></div>
+        </aside>
+        <main id="terminal-container"></main>
+        <div id="objectives-container" class="hidden"></div>
+        <div id="resize-handle" class="hidden"></div>
+        <aside id="right-panel" class="hidden">
+          <div id="panel-chat" class="panel-view hidden"></div>
+          <div id="panel-warroom" class="panel-view hidden"></div>
+          <div id="panel-messages" class="panel-view hidden"></div>
+          <div id="panel-beads" class="panel-view hidden"></div>
+          <div id="panel-spiders" class="panel-view hidden"></div>
+        </aside>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
