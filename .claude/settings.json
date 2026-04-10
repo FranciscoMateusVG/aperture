@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "aperture-bus": {
+      "command": "/Users/ronaldo-caetano/Desktop/personal-projects/aperture/mcp-server/start.sh"
+    }
+  },
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "bd prime",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "bd prime",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  }
+}
