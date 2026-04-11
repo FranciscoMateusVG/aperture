@@ -28,7 +28,35 @@ export function createAgentList(container: HTMLElement) {
       // Only rebuild DOM if something actually changed
       if (hash !== lastAgentHash) {
         lastAgentHash = hash;
-        wrapper.innerHTML = '<h3 class="section-title">Agents</h3>';
+        wrapper.innerHTML = "";
+
+        const allRunning = agents.every(a => a.status === "running");
+
+        const header = document.createElement("div");
+        header.className = "agent-list__header";
+        header.innerHTML = `<h3 class="section-title">Agents</h3>`;
+
+        const toggleAll = document.createElement("button");
+        toggleAll.className = `agent-list__toggle-all ${allRunning ? "agent-list__toggle-all--stop" : "agent-list__toggle-all--play"}`;
+        toggleAll.title = allRunning ? "Stop all" : "Start all";
+        toggleAll.textContent = allRunning ? "■ All" : "▶ All";
+        toggleAll.addEventListener("click", async () => {
+          for (const agent of agents) {
+            try {
+              if (allRunning) {
+                await commands.stopAgent(agent.name);
+              } else if (agent.status !== "running") {
+                await commands.startAgent(agent.name);
+              }
+            } catch (e) {
+              console.error(`Failed to toggle ${agent.name}:`, e);
+            }
+          }
+          refresh();
+        });
+        header.appendChild(toggleAll);
+        wrapper.appendChild(header);
+
         agents.forEach((agent) => {
           wrapper.appendChild(createAgentCard(agent, modal, refresh));
         });
