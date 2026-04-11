@@ -198,6 +198,22 @@ html, body {
   opacity: 0.8;
 }
 
+.agent-list__toggle-all--loading {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  cursor: default;
+}
+
+.agent-list__spinner {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
 .agent-mini {
   --agent-color: var(--accent-orange);
   display: flex;
