@@ -163,6 +163,63 @@ html, body {
   gap: 4px;
 }
 
+.agent-list__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.agent-list__header .section-title {
+  margin-bottom: 0;
+}
+
+.agent-list__toggle-all {
+  font-size: 10px;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: monospace;
+  font-weight: 600;
+}
+
+.agent-list__toggle-all--play {
+  color: var(--accent-green);
+  background: rgba(46, 204, 113, 0.15);
+}
+
+.agent-list__toggle-all--stop {
+  color: var(--accent-red);
+  background: rgba(231, 76, 60, 0.15);
+}
+
+.agent-list__toggle-all:hover {
+  opacity: 0.8;
+}
+
+.agent-list__toggle-all--loading {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  cursor: default;
+}
+
+.agent-list__spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
 .agent-mini {
   --agent-color: var(--accent-orange);
   display: flex;
