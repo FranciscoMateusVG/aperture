@@ -206,7 +206,13 @@ html, body {
 
 .agent-list__spinner {
   display: inline-block;
-  animation: spin 1s linear infinite;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
 }
 
 @keyframes spin {

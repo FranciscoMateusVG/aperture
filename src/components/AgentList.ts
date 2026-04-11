@@ -42,7 +42,7 @@ export function createAgentList(container: HTMLElement) {
         toggleAll.textContent = allRunning ? "■ All" : "▶ All";
         toggleAll.addEventListener("click", async () => {
           toggleAll.disabled = true;
-          toggleAll.innerHTML = `<span class="agent-list__spinner">⟳</span> All`;
+          toggleAll.innerHTML = `<span class="agent-list__spinner"></span> All`;
           toggleAll.className = "agent-list__toggle-all agent-list__toggle-all--loading";
           for (const agent of agents) {
             try {
