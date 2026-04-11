@@ -134,14 +134,7 @@ async function init() {
   const agentList = createAgentList(sidebarAgents);
 
   // Active agent indicator (lower-left sidebar)
-  const activeAgentEl = document.getElementById("sidebar-active-agent")!;
-  window.addEventListener("agent-focused", (e) => {
-    const { name, color } = (e as CustomEvent).detail;
-    activeAgentEl.innerHTML = `
-      <span class="sidebar-active-agent__label">viewing</span>
-      <span class="sidebar-active-agent__badge" style="background:${color}">${name}</span>
-    `;
-  });
+  const activeAgentEl = document.getElementById("sidebar-active-agent")!
 
   // Right panels
   createChatPanel(panelChat);
@@ -151,8 +144,17 @@ async function init() {
   createSpiderlingsPanel(panelSpiders);
 
   // Main area views
-  await createTerminal(terminalEl, SESSION_NAME);
+  const terminalInstance = await createTerminal(terminalEl, SESSION_NAME);
   createObjectivesKanban(objectivesEl);
+
+  window.addEventListener("agent-focused", (e) => {
+    const { name, color } = (e as CustomEvent).detail;
+    activeAgentEl.innerHTML = `
+      <span class="sidebar-active-agent__label">viewing</span>
+      <span class="sidebar-active-agent__badge" style="background:${color}">${name}</span>
+    `;
+    terminalInstance.focus();
+  });
 
   setInterval(() => agentList.refresh(), 3000);
 }

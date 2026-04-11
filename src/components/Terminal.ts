@@ -77,6 +77,9 @@ export async function createTerminal(container: HTMLElement, sessionName: string
 
   return {
     terminal: term,
+    focus() {
+      term.focus();
+    },
     destroy() {
       unlisten();
       resizeObserver.disconnect();
