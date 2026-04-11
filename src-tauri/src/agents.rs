@@ -47,23 +47,74 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         }
     });
 
-    let config_path = format!("/tmp/aperture-mcp-{}.json", name);
-    fs::write(
-        &config_path,
-        serde_json::to_string_pretty(&mcp_config).unwrap(),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Write a launcher script that reads the prompt from file
     let launcher_path = format!("/tmp/aperture-launch-{}.sh", name);
-    let launcher_script = format!(
-        r#"#!/bin/bash
+    let launcher_script = if agent.model.starts_with("codex/") {
+        let bare_model = agent.model.trim_start_matches("codex/");
+        let codex_home = format!("/tmp/aperture-codex-{}", name);
+        let config_toml_path = format!("{}/config.toml", codex_home);
+
+        let beads_dir = format!("{}/.aperture/.beads", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+        fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
+
+        // Copy prompt into codex_home so the path is always correct.
+        let prompt_content = fs::read_to_string(&agent.prompt_file)
+            .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
+        let prompt_dest = format!("{}/prompt.md", codex_home);
+        fs::write(&prompt_dest, &prompt_content).map_err(|e| e.to_string())?;
+
+        let config_toml = format!(
+            r#"model = "{bare_model}"
+model_instructions_file = "{prompt_dest}"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[projects."{project_dir}"]
+trust_level = "trusted"
+
+[mcp_servers.aperture-bus]
+command = "node"
+args = ["{mcp_server_path}"]
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
+"#,
+            bare_model = bare_model,
+            prompt_dest = prompt_dest,
+            project_dir = app_state.project_dir,
+            mcp_server_path = app_state.mcp_server_path,
+            name = name,
+            role = agent.role,
+            model = agent.model,
+            mailbox_dir = mailbox_dir,
+            beads_dir = beads_dir,
+        );
+        fs::write(&config_toml_path, &config_toml).map_err(|e| e.to_string())?;
+
+        format!(
+            r#"#!/bin/bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH"
+export CODEX_HOME="{codex_home}"
+exec codex --yolo
+"#,
+            codex_home = codex_home,
+        )
+    } else {
+        let config_path = format!("/tmp/aperture-mcp-{}.json", name);
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&mcp_config).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        format!(
+            r#"#!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 PROMPT=$(cat "{}")
 exec claude --dangerously-skip-permissions --model {} --system-prompt "$PROMPT" --mcp-config {} --name {}
 "#,
-        agent.prompt_file, agent.model, config_path, name
-    );
+            agent.prompt_file, agent.model, config_path, name
+        )
+    };
     fs::write(&launcher_path, &launcher_script).map_err(|e| e.to_string())?;
 
     std::process::Command::new("chmod")
@@ -125,7 +176,9 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
     if let Ok(windows) = tmux::tmux_list_windows(app_state.tmux_session.clone()) {
         for window in &windows {
             if let Some(agent) = app_state.agents.get_mut(&window.name) {
-                if window.command == "claude" || window.command.contains("claude") {
+                if window.command == "claude" || window.command.contains("claude")
+                    || window.command == "codex" || window.command.contains("codex")
+                    || window.command == "node" {
                     if agent.status != "running" {
                         agent.status = "running".into();
                         agent.tmux_window_id = Some(window.window_id.clone());
@@ -293,9 +346,9 @@ pub fn update_agent_model(
     model: String,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    const VALID_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
-    if !VALID_MODELS.contains(&model.as_str()) {
-        return Err(format!("Invalid model '{}'. Must be one of: opus, sonnet, haiku", model));
+    let valid = matches!(model.as_str(), "opus" | "sonnet" | "haiku") || model.starts_with("codex/");
+    if !valid {
+        return Err(format!("Invalid model '{}'. Must be opus/sonnet/haiku or codex/<model>", model));
     }
 
     let mut app_state = state.lock().map_err(|e| e.to_string())?;

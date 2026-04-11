@@ -112,8 +112,8 @@ html, body {
 
 /* ── Left Sidebar ── */
 #sidebar {
-  width: 220px;
-  min-width: 220px;
+  width: 260px;
+  min-width: 260px;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   position: relative;

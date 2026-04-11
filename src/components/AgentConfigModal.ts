@@ -1,7 +1,9 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
 
-const MODELS = ["opus", "sonnet", "haiku"] as const;
+const CLAUDE_MODELS = ["opus", "sonnet", "haiku"] as const;
+const CODEX_MODELS = ["codex/gpt-5.4", "codex/gpt-5.4-mini", "codex/gpt-5.3-codex"] as const;
+const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS] as const;
 
 export interface AgentConfigModal {
   open: (agent: AgentDef) => void;
@@ -31,7 +33,12 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
         <div class="agent-config-modal__row">
           <span class="agent-config-modal__label">Model</span>
           <select class="agent-config-modal__select">
-            ${MODELS.map(m => `<option value="${m}">${m}</option>`).join("")}
+            <optgroup label="Claude">
+              ${CLAUDE_MODELS.map(m => `<option value="${m}">${m}</option>`).join("")}
+            </optgroup>
+            <optgroup label="Codex">
+              ${CODEX_MODELS.map(m => `<option value="${m}">${m}</option>`).join("")}
+            </optgroup>
           </select>
         </div>
       </div>
@@ -61,7 +68,7 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
     currentAgent = agent;
     nameEl.textContent = agent.name;
     roleEl.textContent = agent.role;
-    select.value = MODELS.includes(agent.model as any) ? agent.model : "sonnet";
+    select.value = (ALL_MODELS as readonly string[]).includes(agent.model) ? agent.model : "sonnet";
     statusEl.textContent = "";
     saveBtn.disabled = false;
     overlay.classList.add("agent-config-modal--visible");

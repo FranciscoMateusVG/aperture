@@ -180,7 +180,11 @@ fn load_spiderlings(home: &str) -> HashMap<String, SpiderlingDef> {
 
 pub fn default_state() -> AppState {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let project_dir = format!("{}/projects/aperture", home);
+    // CARGO_MANIFEST_DIR is src-tauri/, so parent is the project root
+    let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}/projects/aperture", home));
     let mut agents = default_agents(&project_dir);
 
     // Apply persisted model overrides

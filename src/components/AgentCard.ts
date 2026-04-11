@@ -63,7 +63,9 @@ export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpda
         }
         onUpdate();
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         console.error(`Failed to toggle agent ${agent.name}:`, err);
+        alert(`Failed to ${isRunning ? "stop" : "start"} ${agent.name}:\n${msg}`);
       }
     });
   }

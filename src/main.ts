@@ -8,7 +8,6 @@ import { createWarRoom } from "./components/WarRoom";
 import { createBeadsPanel } from "./components/BeadsPanel";
 import { createSpiderlingsPanel } from "./components/SpiderlingsPanel";
 import { createObjectivesKanban } from "./components/ObjectivesKanban";
-import { createTmuxControls } from "./components/TmuxControls";
 import { createTerminal } from "./components/Terminal";
 import { commands } from "./services/tauri-commands";
 
@@ -25,7 +24,6 @@ async function init() {
   const panelBeads = document.getElementById("panel-beads")!;
   const panelSpiders = document.getElementById("panel-spiders")!;
   const sidebarAgents = document.getElementById("sidebar-agents")!;
-  const sidebarSessions = document.getElementById("sidebar-sessions")!;
   const terminalEl = document.getElementById("terminal-container")!;
   const objectivesEl = document.getElementById("objectives-container")!;
 
@@ -134,7 +132,6 @@ async function init() {
 
   // Sidebar
   const agentList = createAgentList(sidebarAgents);
-  createTmuxControls(sidebarSessions, SESSION_NAME);
 
   // Active agent indicator (lower-left sidebar)
   const activeAgentEl = document.getElementById("sidebar-active-agent")!;
