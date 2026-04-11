@@ -44,7 +44,9 @@ export function createAgentList(container: HTMLElement) {
           toggleAll.disabled = true;
           toggleAll.innerHTML = `<span class="agent-list__spinner"></span> All`;
           toggleAll.className = "agent-list__toggle-all agent-list__toggle-all--loading";
-          for (const agent of agents) {
+          // Yield to let the browser paint the spinner before kicking off Tauri calls
+          await new Promise(r => requestAnimationFrame(r));
+          await Promise.all(agents.map(async (agent) => {
             try {
               if (allRunning) {
                 await commands.stopAgent(agent.name);
@@ -54,7 +56,7 @@ export function createAgentList(container: HTMLElement) {
             } catch (e) {
               console.error(`Failed to toggle ${agent.name}:`, e);
             }
-          }
+          }));
           refresh();
         });
         header.appendChild(toggleAll);
