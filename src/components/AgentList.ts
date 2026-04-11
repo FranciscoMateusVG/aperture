@@ -9,10 +9,12 @@ export function createAgentList(container: HTMLElement) {
 
   // Track previous state to avoid unnecessary DOM rebuilds
   let lastAgentHash = "";
+  let isBulkToggling = false;
 
   const modal = createAgentConfigModal(() => refresh());
 
   async function refresh() {
+    if (isBulkToggling) return;
     try {
       const agents = await commands.listAgents();
       const order = ["planner", "glados", "wheatley", "peppy", "izzy"];
@@ -41,12 +43,13 @@ export function createAgentList(container: HTMLElement) {
         toggleAll.title = allRunning ? "Stop all" : "Start all";
         toggleAll.textContent = allRunning ? "■ All" : "▶ All";
         toggleAll.addEventListener("click", async () => {
+          isBulkToggling = true;
           toggleAll.disabled = true;
           toggleAll.innerHTML = `<span class="agent-list__spinner"></span> All`;
           toggleAll.className = "agent-list__toggle-all agent-list__toggle-all--loading";
           // Yield to let the browser paint the spinner before kicking off Tauri calls
           await new Promise(r => requestAnimationFrame(r));
-          await Promise.all(agents.map(async (agent) => {
+          for (const agent of agents) {
             try {
               if (allRunning) {
                 await commands.stopAgent(agent.name);
@@ -56,7 +59,9 @@ export function createAgentList(container: HTMLElement) {
             } catch (e) {
               console.error(`Failed to toggle ${agent.name}:`, e);
             }
-          }));
+          }
+          isBulkToggling = false;
+          lastAgentHash = "";
           refresh();
         });
         header.appendChild(toggleAll);
