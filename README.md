@@ -75,6 +75,18 @@ No sockets. No queues. The mailbox is a directory you can `ls`. Fully debuggable
 
 ---
 
+## Supported Agent Types
+
+Aperture supports both **Claude Code agents** and **Codex agents**.
+
+- **Claude Code agents** call MCP tools directly through `aperture-bus`.
+- **Codex agents** do not call MCP tools directly. They emit `@@BEADS@@` command blocks instead.
+- The **Tauri harness** intercepts those `@@BEADS@@` blocks and executes the corresponding BEADS operations on the agent's behalf.
+- The `codex-comms` skill defines the Codex-side communication protocol.
+- Model names starting with `codex/` are treated as Codex agents by the harness.
+
+---
+
 ## Key Concepts
 
 ### War Rooms
