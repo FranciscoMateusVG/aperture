@@ -233,16 +233,25 @@ The poller already handles per-agent BEADS delivery. It could be extended to han
 
 ---
 
-## 8. Extensibility
+## 8. Extensibility: Adding New Non-MCP Models
 
-This pattern generalises to any non-MCP model. To onboard a new model type:
+This pattern **generalises to any non-MCP model type** (OpenAI GPT, Anthropic legacy models, etc.).
 
-1. Add a model prefix check (e.g., `model.starts_with("gpt/")`)
-2. Route to the same harness with the appropriate API client
-3. The `@@BEADS@@` syntax, parser, and executor are unchanged
-4. Update the system prompt template for the new model's instruction-following style
+**The non-MCP harness pattern is model-agnostic:**
+- **Parser** — reusable without modification; `@@BEADS@@` syntax is identical across all models
+- **Executor** — reusable without modification; BEADS CLI calls are identical across all models
+- **What changes** — model launcher (API client), output monitoring (tmux vs. API response), configuration format, skill/prompt style
 
-The harness is model-agnostic. Only the API call itself changes.
+**To onboard a new model type, follow:** `docs/extending-non-mcp-agents.md` — 5-step checklist with a complete example (GPT-4o).
+
+**Summary of changes per new model:**
+1. Add model prefix check in `src-tauri/src/agents.rs` line 400 (validation)
+2. Create `src-tauri/src/<model>_harness.rs` — copy codex harness, adapt paths & output monitoring
+3. Wire harness into `agents.rs` `start_agent()` (model-specific launcher & harness startup)
+4. Add module export in `src-tauri/src/lib.rs`
+5. Create agent skill: `.claude/skills/<model>-comms/SKILL.md` — document model-specific instruction style
+
+**Key insight:** The framework is solved. Adding model #2 is ~30 minutes; model #3 is ~20 minutes.
 
 ---
 
