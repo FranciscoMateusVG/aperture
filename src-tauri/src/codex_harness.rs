@@ -19,6 +19,7 @@ use crate::beads_parser::{parse_beads_blocks, BeadsCommand};
 use crate::tmux;
 use std::collections::HashSet;
 use std::fs;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,10 +152,38 @@ pub fn buffer_pending_message(agent_name: &str, formatted: &str) {
 ///
 /// The thread exits cleanly when the tmux window disappears (agent stopped).
 pub fn start_output_monitor(window_id: String, agent_name: String) {
+    ensure_output_monitor(window_id, agent_name);
+}
+
+/// Ensure exactly one output monitor is running for the given
+/// `(agent_name, window_id)` pair.
+///
+/// This matters for externally started/restarted Codex agents: the normal
+/// `start_agent()` path spawns the monitor, but agents discovered later by the
+/// poller or UI need the same monitor started lazily.
+pub fn ensure_output_monitor(window_id: String, agent_name: String) {
+    static ACTIVE_MONITORS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let active = ACTIVE_MONITORS.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = format!("{}:{}", agent_name, window_id);
+
+    {
+        let mut guards = active.lock().expect("active monitor mutex poisoned");
+        if guards.contains(&key) {
+            return;
+        }
+        guards.insert(key.clone());
+    }
+
     std::thread::spawn(move || {
         // Give Codex time to fully boot before we start scraping output
         std::thread::sleep(Duration::from_secs(8));
-        monitor_loop(window_id, agent_name);
+        monitor_loop(window_id.clone(), agent_name.clone());
+
+        if let Some(active) = ACTIVE_MONITORS.get() {
+            if let Ok(mut guards) = active.lock() {
+                guards.remove(&key);
+            }
+        }
     });
 }
 

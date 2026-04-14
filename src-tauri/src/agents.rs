@@ -225,27 +225,20 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
 
     // Cross-reference with actual tmux windows to detect agents started outside the UI
     if let Ok(windows) = tmux::tmux_list_windows(app_state.tmux_session.clone()) {
-        for window in &windows {
-            if let Some(agent) = app_state.agents.get_mut(&window.name) {
-                if window.command == "claude" || window.command.contains("claude")
-                    || window.command == "codex" || window.command.contains("codex")
-                    || window.command == "node" {
-                    if agent.status != "running" {
-                        agent.status = "running".into();
-                        agent.tmux_window_id = Some(window.window_id.clone());
-                    }
-                } else if agent.tmux_window_id.as_deref() == Some(&window.window_id) {
-                    // Window exists but claude isn't running in it
-                    agent.status = "stopped".into();
-                    agent.tmux_window_id = None;
-                }
-            }
-        }
-
-        // Also mark agents as stopped if their window is gone entirely
-        let window_names: Vec<String> = windows.iter().map(|w| w.name.clone()).collect();
         for agent in app_state.agents.values_mut() {
-            if agent.status == "running" && !window_names.contains(&agent.name) {
+            let running_window = windows.iter().find(|window| {
+                window.name == agent.name
+                    && (window.command == "claude"
+                        || window.command.contains("claude")
+                        || window.command == "codex"
+                        || window.command.contains("codex")
+                        || window.command == "node")
+            });
+
+            if let Some(window) = running_window {
+                agent.status = "running".into();
+                agent.tmux_window_id = Some(window.window_id.clone());
+            } else {
                 agent.status = "stopped".into();
                 agent.tmux_window_id = None;
             }

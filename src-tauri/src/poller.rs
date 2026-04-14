@@ -2,7 +2,7 @@ use crate::codex_harness;
 use crate::state::AppState;
 use crate::tmux;
 use crate::warroom;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -285,14 +285,37 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
                 continue;
             };
 
+            // Resolve live permanent-agent windows from tmux every cycle rather
+            // than relying on cached AppState window IDs. This self-heals after
+            // external restarts and ignores stale shell windows left behind by
+            // prior sessions with the same agent name.
+            let running_windows: HashMap<String, String> =
+                match tmux::tmux_list_windows(app_state.tmux_session.clone()) {
+                    Ok(windows) => windows
+                        .into_iter()
+                        .filter(|w| {
+                            w.command == "claude"
+                                || w.command.contains("claude")
+                                || w.command == "codex"
+                                || w.command.contains("codex")
+                                || w.command == "node"
+                        })
+                        .map(|w| (w.name, w.window_id))
+                        .collect(),
+                    Err(_) => HashMap::new(),
+                };
+
             let named: Vec<(String, String, bool)> = app_state
                 .agents
                 .values()
-                .filter(|a| a.status == "running")
                 .filter_map(|a| {
-                    a.tmux_window_id
-                        .as_ref()
-                        .map(|wid| (a.name.clone(), wid.clone(), a.model.starts_with("codex/")))
+                    running_windows.get(&a.name).map(|wid| {
+                        let is_codex = a.model.starts_with("codex/");
+                        if is_codex {
+                            codex_harness::ensure_output_monitor(wid.clone(), a.name.clone());
+                        }
+                        (a.name.clone(), wid.clone(), is_codex)
+                    })
                 })
                 .collect();
 
