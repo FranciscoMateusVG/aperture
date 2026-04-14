@@ -1,5 +1,7 @@
 mod agents;
 mod beads;
+mod beads_parser;
+mod codex_harness;
 mod config;
 mod objectives;
 mod poller;
@@ -38,30 +40,10 @@ pub fn run() {
             .output();
     }
 
-    // Start dolt sql-server if not already running
-    let dolt_test = std::process::Command::new(&bd_bin)
-        .args(["dolt", "test"])
-        .env("BEADS_DIR", &beads_dir)
-        .env("PATH", &path_env)
-        .output();
-
-    let dolt_running = dolt_test.map(|o| o.status.success()).unwrap_or(false);
-    if !dolt_running {
-        let _ = std::process::Command::new("dolt")
-            .args(["sql-server", "--port", "3307", "--host", "127.0.0.1"])
-            .current_dir(&beads_dir)
-            .env("PATH", &path_env)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|_| println!("Started dolt sql-server on port 3307"))
-            .map_err(|e| eprintln!("Failed to start dolt: {}", e));
-
-        // Give it a moment to start
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-
     // Initialize BEADS if not yet done
+    // NOTE: dolt server lifecycle is owned by `bd dolt start` — Tauri no longer
+    // spawns its own dolt sql-server on port 3307. This was removed to avoid
+    // orphaned processes and conflicts with bd's managed server mode.
     {
         let mut cmd = std::process::Command::new(&bd_bin);
         cmd.args(["init", "--quiet"]);

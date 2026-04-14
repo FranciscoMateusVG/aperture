@@ -1,3 +1,4 @@
+use crate::codex_harness;
 use crate::config;
 use crate::state::AppState;
 use crate::tmux;
@@ -70,6 +71,8 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &project_dir);
+        // Prepend any unread BEADS messages so Codex sees them on the first turn
+        let prompt_content = codex_harness::inject_pending_messages(&name, prompt_content);
         let prompt_dest = format!("{}/prompt.md", codex_home);
         fs::write(&prompt_dest, &prompt_content).map_err(|e| e.to_string())?;
 
@@ -134,6 +137,13 @@ exec claude --dangerously-skip-permissions --model {} --system-prompt "$PROMPT" 
         .map_err(|e| e.to_string())?;
 
     tmux::tmux_send_keys(window_id.clone(), launcher_path)?;
+
+    // For Codex agents: start the BEADS output monitor in the background.
+    // The monitor scrapes tmux pane output for @@BEADS@@ command blocks and
+    // executes them on the agent's behalf, closing the outbound BEADS loop.
+    if agent.model.starts_with("codex/") {
+        codex_harness::start_output_monitor(window_id.clone(), name.clone());
+    }
 
     // Auto-confirm the workspace trust prompt — but ONLY when the dialog is
     // actually visible. Sending Enter blindly at fixed intervals would stomp

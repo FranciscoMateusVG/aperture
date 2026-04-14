@@ -156,7 +156,15 @@ Use this for:
 
 ---
 
-## 9. Don't Spam
+## 9. Codex Agents
+
+> **If you are a Codex agent** (your model starts with `codex/`), you cannot call MCP tools directly. Use the `codex-comms` skill instead — it defines the `@@BEADS@@` command block protocol that the Aperture harness intercepts and executes on your behalf.
+>
+> Everything in this skill (sections 1–8) applies to **Claude Code agents only**. The BEADS patterns are the same; only the execution mechanism differs.
+
+---
+
+## 10. Don't Spam
 
 - Don't send the same update twice
 - Don't update BEADS every 5 minutes unless something changed
