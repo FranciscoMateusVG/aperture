@@ -12,6 +12,14 @@ export function createAgentList(container: HTMLElement) {
   let isBulkToggling = false;
 
   const modal = createAgentConfigModal(() => refresh());
+  let focusedAgent: string | null = null;
+
+  window.addEventListener("agent-focused", (e) => {
+    focusedAgent = (e as CustomEvent).detail.name;
+    wrapper.querySelectorAll<HTMLElement>(".agent-mini").forEach(card => {
+      card.classList.toggle("agent-mini--focused", card.dataset.agentName === focusedAgent);
+    });
+  });
 
   async function refresh() {
     if (isBulkToggling) return;
@@ -70,6 +78,13 @@ export function createAgentList(container: HTMLElement) {
         agents.forEach((agent) => {
           wrapper.appendChild(createAgentCard(agent, modal, refresh));
         });
+
+        // Re-apply focused state after DOM rebuild
+        if (focusedAgent) {
+          wrapper.querySelectorAll<HTMLElement>(".agent-mini").forEach(card => {
+            card.classList.toggle("agent-mini--focused", card.dataset.agentName === focusedAgent);
+          });
+        }
       }
     } catch (e) {
       console.error("Failed to list agents:", e);

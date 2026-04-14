@@ -112,8 +112,8 @@ html, body {
 
 /* ── Left Sidebar ── */
 #sidebar {
-  width: 260px;
-  min-width: 260px;
+  width: 300px;
+  min-width: 300px;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   position: relative;
@@ -243,6 +243,16 @@ html, body {
   background: var(--bg-hover);
 }
 
+.agent-mini--focused {
+  background: color-mix(in srgb, var(--agent-color) 12%, var(--bg-card));
+  border-left-color: var(--agent-color);
+  border-color: color-mix(in srgb, var(--agent-color) 35%, var(--border));
+}
+
+.agent-mini--focused .agent-mini__name {
+  color: var(--agent-color);
+}
+
 .agent-mini__icon {
   font-size: 16px;
   width: 22px;
@@ -260,9 +270,13 @@ html, body {
   font-weight: 600;
   font-size: 13px;
   flex: 1;
+  min-width: 0;
   text-transform: capitalize;
   color: var(--text-secondary);
   transition: color 0.15s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .agent-mini--running .agent-mini__name {
@@ -273,6 +287,11 @@ html, body {
   font-size: 10px;
   color: var(--text-secondary);
   font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+  flex-shrink: 0;
 }
 
 .agent-mini__toggle {

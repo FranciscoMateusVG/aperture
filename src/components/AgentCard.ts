@@ -27,7 +27,9 @@ export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpda
 
   function render() {
     const isRunning = agent.status === "running";
-    card.className = `agent-mini ${isRunning ? "agent-mini--running" : ""}`;
+    const isFocused = card.classList.contains("agent-mini--focused");
+    card.className = `agent-mini ${isRunning ? "agent-mini--running" : ""} ${isFocused ? "agent-mini--focused" : ""}`;
+    card.dataset.agentName = agent.name;
     card.style.setProperty("--agent-color", theme.color);
     card.innerHTML = `
       <span class="agent-mini__icon">${theme.icon}</span>
