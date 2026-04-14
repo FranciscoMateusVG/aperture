@@ -161,6 +161,21 @@ pub fn tmux_capture_pane(window_id: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Send just the Enter key to a tmux pane. Used as a follow-up after
+/// `tmux_send_keys` for Codex agents whose interactive loop sometimes
+/// buffers the combined text+Enter and needs a second explicit press.
+pub fn tmux_send_enter(target: &str) -> Result<(), String> {
+    let output = cmd("tmux")
+        .args(["send-keys", "-t", target, "Enter"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
 #[tauri::command]
 pub fn tmux_send_keys(target: String, keys: String) -> Result<(), String> {
     // Special keys like C-c should not be quoted or followed by Enter

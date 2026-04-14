@@ -341,10 +341,16 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
                 log_message(&message_log, &sender, agent_name, &formatted, timestamp);
 
                 if *is_codex {
-                    // Codex agents: buffer to pending file — the codex_harness
-                    // monitor thread flushes it into the session each cycle.
-                    // tmux shell injection is ignored by Codex's interactive loop.
+                    // Codex agents: MCP tools are confirmed working (Failure Mode A).
+                    // The agent calls get_messages() itself to read unread messages.
+                    // Do NOT mark as read here — let the MCP call handle read state
+                    // so the message remains visible when the agent polls BEADS.
+                    //
+                    // We still buffer to pending-msgs.md as a secondary delivery path
+                    // (for the monitor thread's flush prompt), but the primary channel
+                    // is the agent's own MCP get_messages call.
                     codex_harness::buffer_pending_message(agent_name, &formatted);
+                    // Do NOT call mark_message_read — intentionally omitted for Codex.
                 } else {
                     // Claude / spiderling agents: write to temp file and inject via tmux
                     let tmp_path = format!("/tmp/aperture-msg-{}.md", msg.id);
@@ -352,10 +358,9 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
                         let cmd = format!("cat '{}' && rm '{}'", tmp_path, tmp_path);
                         let _ = tmux::tmux_send_keys(window_id.clone(), cmd);
                     }
+                    // Mark as read immediately after tmux delivery
+                    mark_message_read(&msg.id);
                 }
-
-                // Mark as read immediately after delivery
-                mark_message_read(&msg.id);
                 notified.insert(msg.id.clone());
             }
 

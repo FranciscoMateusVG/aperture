@@ -169,11 +169,40 @@ fn monitor_loop(window_id: String, agent_name: String) {
         agent_name, window_id
     );
 
+    // When we flush a pending message, Codex reads the inject file via its
+    // shell tool — the file content (including any @@BEADS examples in the
+    // original message) appears verbatim in the tmux output. If we scan that
+    // output immediately, the monitor would parse @@BEADS blocks from the
+    // *injected message text* rather than from Codex's *response*, then dedup
+    // would block the real response when it arrives.
+    //
+    // Fix: after a flush, skip scanning for one full cycle to let the inject
+    // content settle, then resume scanning only Codex's genuine output.
+    let mut skip_scan_cycles: u8 = 0;
+
     loop {
         std::thread::sleep(Duration::from_secs(2));
 
         // ── Flush pending messages into the live session ──────────────────
-        flush_pending_messages(&window_id, &agent_name);
+        let flushed = flush_pending_messages(&window_id, &agent_name);
+        if flushed {
+            // Advance the baseline past whatever is currently on screen so
+            // we don't scan the inject content on the next cycle.
+            if let Ok(current) = tmux::tmux_capture_pane(&window_id) {
+                last_output_len = current.len();
+            }
+            skip_scan_cycles = 2; // skip 2 cycles (~4s) — enough for Codex to read the file
+            continue;
+        }
+
+        if skip_scan_cycles > 0 {
+            skip_scan_cycles -= 1;
+            // Update baseline so we don't re-scan old output after the skip
+            if let Ok(current) = tmux::tmux_capture_pane(&window_id) {
+                last_output_len = current.len();
+            }
+            continue;
+        }
 
         // ── Poll tmux pane output ─────────────────────────────────────────
         let output = match tmux::tmux_capture_pane(&window_id) {
@@ -226,27 +255,47 @@ fn monitor_loop(window_id: String, agent_name: String) {
 
 /// Flush any buffered pending messages into the Codex session via tmux.
 /// Clears the pending file after injection. Best-effort — never panics.
-fn flush_pending_messages(window_id: &str, agent_name: &str) {
+/// Returns `true` if a flush actually happened, `false` if nothing to flush.
+fn flush_pending_messages(window_id: &str, agent_name: &str) -> bool {
     let path = pending_msgs_path(agent_name);
     let content = match fs::read_to_string(&path) {
         Ok(c) if !c.trim().is_empty() => c,
-        _ => return,
+        _ => return false,
     };
 
-    // Write to a temp file and cat it (avoids quoting issues with arbitrary content)
+    // Send message content as a direct natural-language prompt to Codex.
+    //
+    // Previous approach (shell pipeline via printf/cat) failed because Codex's
+    // interactive loop is not a shell — it ran the pipeline as a tool call,
+    // printed output, then waited without treating the content as a BEADS
+    // message requiring a @@BEADS@@ block response.
+    //
+    // New approach: write the raw message content to a temp file and pass the
+    // path to Codex as a natural-language instruction to read and respond.
+    // This gives Codex clear intent ("you have messages, respond with @@BEADS@@")
+    // rather than a shell command to execute.
     let tmp = format!("/tmp/aperture-codex-{}-inject.md", agent_name);
     if fs::write(&tmp, &content).is_err() {
-        return;
+        return false;
     }
 
-    let cmd = format!(
-        "printf '\\n=== New BEADS Messages ===\\n'; cat '{}'; rm -f '{}'; printf '=== End Messages ===\\n'",
-        tmp, tmp
+    // Instruct Codex to read the file and respond using @@BEADS@@ blocks.
+    // The file path is unambiguous; Codex will use its shell tool to read it.
+    let prompt = format!(
+        "You have new BEADS messages waiting at {}. Read that file now and respond to each message using @@BEADS send_message@@ blocks as defined in your codex-comms skill.",
+        tmp
     );
-    let _ = tmux::tmux_send_keys(window_id.to_string(), cmd);
+    let _ = tmux::tmux_send_keys(window_id.to_string(), prompt);
+
+    // Belt-and-suspenders: send an explicit Enter after a short delay.
+    // Codex's interactive loop sometimes buffers the combined text+Enter
+    // from a single send-keys call and needs a second press to submit.
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = tmux::tmux_send_enter(window_id);
 
     // Clear the pending file so we don't re-inject on the next cycle
     let _ = fs::write(&path, "");
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
