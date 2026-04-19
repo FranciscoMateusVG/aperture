@@ -11,13 +11,21 @@ Quick reference for Dokploy REST API operations on the Aperture server. All call
 
 ## 1. Authentication
 
-Every API call requires the token from the server's Dokploy CLI config:
+There are **two separate Dokploy organizations** on the same server, each with its own API token:
 
+### Xerox Org (BH Escape, Aperture Test, CROSS, FITT)
 ```bash
 TOKEN=$(python3 -c "import json; print(json.load(open('/home/ubuntu/.config/@dokploy/cli/config.json'))['token'])")
 ```
 
-Pass it as: `-H "x-api-key: $TOKEN"`
+### Incluir Org (Main App, Infra, Waha)
+```bash
+TOKEN="lZMOoQglUNzSTzYMtUBtOPHQsRridBcOefVZDjDSEQtZGpBjtkugbjVjJXQqTJBH"
+```
+
+Pass the appropriate token as: `-H "x-api-key: $TOKEN"`
+
+**Use the correct token for the org you're operating on.** The wrong token will return an empty project list.
 
 ---
 
@@ -205,14 +213,23 @@ The app container name matches the service key in `docker-compose.yml`. The DB c
 
 ## 8. Known Environment IDs
 
+### Xerox Org
 | Project | Environment | ID |
 |---------|-------------|-----|
 | Aperture Test | production | `-gnwHYB_Sk1iPP4luBHzS` |
+
+### Incluir Org
+| Project | Environment | ID |
+|---------|-------------|-----|
+| Prod - Main App | production | `env_prod_nk6Ypd57ZscfiaHnQRzES_1757794241.771092` |
+| Infra | production | `env_prod_OFpzQ5wgFC2C2VUscYRNV_1757794241.771092` |
+| waha | production | `OyQcQ0Yk9RCnfLgkTpnhf` |
 
 ---
 
 ## 9. Known Compose IDs
 
+### Xerox Org
 | Service | Compose ID |
 |---------|-----------|
 | Ask Francisco | `dQXVgxC6pchh8rgOdL1dG` |
@@ -220,6 +237,15 @@ The app container name matches the service key in `docker-compose.yml`. The DB c
 | Wanderson - FITT | `4QJKHyMOplCqos2KhXLNd` |
 | Aperture Test App | `HLypwwLCFTj3RE6J4Zbj0` |
 | Pub Quiz Scoreboard | `Lr-Pv8mxeYVD37argTlEJ` |
+| Secretaria Test | `zg6mgJNJlOaYggUXWy95m` |
+
+### Incluir Org
+| Service | Compose ID |
+|---------|-----------|
+| Main Apps (Prod) | `4sHHtg1XwERiDc6o2labm` |
+| Minio | `biqK8MbgAXtrJH24k5zTg` |
+| Unleash | `27vJsrYScdmCcKf1qVh6Y` |
+| Waha | `uIBU4__1Jw3RGp6WSzz6y` |
 
 ---
 

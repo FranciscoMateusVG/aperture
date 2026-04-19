@@ -7,7 +7,7 @@ const MAILBOX_BASE = resolve(
 );
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
-const PERMANENT_NAMES = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "sage", "atlas", "sentinel", "sterling", "operator", "warroom"];
+const PERMANENT_NAMES = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "sage", "atlas", "sentinel", "sterling", "planner", "operator", "warroom"];
 
 export interface SpiderlingInfo {
   name: string;

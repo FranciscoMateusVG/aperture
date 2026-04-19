@@ -23,7 +23,7 @@ const server = new McpServer({
   version: "0.2.0",
 });
 
-const PERMANENT_RECIPIENTS = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "sage", "atlas", "sentinel", "sterling", "operator", "warroom"];
+const PERMANENT_RECIPIENTS = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "sage", "atlas", "sentinel", "sterling", "planner", "operator", "warroom"];
 
 function requireRole(required: string): void {
   if (agentRole !== required) {
@@ -35,8 +35,8 @@ function requireRole(required: string): void {
 
 server.tool(
   "send_message",
-  "Send a message to another agent or the human operator. Valid recipients: glados, wheatley, peppy, izzy, operator, plus any active spiderlings. Use 'operator' to reach the human.",
-  { to: z.string().describe("Recipient: glados, wheatley, peppy, izzy, operator, or a spiderling name"), message: z.string().describe("Message content") },
+  "Send a message to another agent or the human operator. Valid recipients: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, sage, atlas, sentinel, sterling, planner, operator, plus any active spiderlings. Use 'operator' to reach the human.",
+  { to: z.string().describe("Recipient: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, sage, atlas, sentinel, sterling, planner, operator, or a spiderling name"), message: z.string().describe("Message content") },
   async ({ to, message }) => {
     const target = to.toLowerCase().trim();
 
