@@ -173,6 +173,8 @@ pub fn spawn_spiderling(
         prompt = prompt,
     );
 
+    let system_prompt = crate::agents::inject_skills(system_prompt, &repo_dir);
+
     let prompt_path = format!("{}/{}-prompt.txt", launcher_dir, name);
     fs::write(&prompt_path, &system_prompt).map_err(|e| e.to_string())?;
 

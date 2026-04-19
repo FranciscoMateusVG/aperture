@@ -1,5 +1,6 @@
 import { commands } from "../services/tauri-commands";
 import { createAgentCard } from "./AgentCard";
+import { createAgentConfigModal } from "./AgentConfigModal";
 
 export function createAgentList(container: HTMLElement) {
   const wrapper = document.createElement("div");
@@ -8,8 +9,20 @@ export function createAgentList(container: HTMLElement) {
 
   // Track previous state to avoid unnecessary DOM rebuilds
   let lastAgentHash = "";
+  let isBulkToggling = false;
+
+  const modal = createAgentConfigModal(() => refresh());
+  let focusedAgent: string | null = null;
+
+  window.addEventListener("agent-focused", (e) => {
+    focusedAgent = (e as CustomEvent).detail.name;
+    wrapper.querySelectorAll<HTMLElement>(".agent-mini").forEach(card => {
+      card.classList.toggle("agent-mini--focused", card.dataset.agentName === focusedAgent);
+    });
+  });
 
   async function refresh() {
+    if (isBulkToggling) return;
     try {
       const agents = await commands.listAgents();
       const order = ["planner", "glados", "wheatley", "peppy", "izzy"];
@@ -19,16 +32,59 @@ export function createAgentList(container: HTMLElement) {
         return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
       });
 
-      // Build a hash of current state to detect changes
-      const hash = agents.map(a => `${a.name}:${a.status}`).join("|");
+      // Build a hash of current state to detect changes (include model for config updates)
+      const hash = agents.map(a => `${a.name}:${a.status}:${a.model}`).join("|");
 
       // Only rebuild DOM if something actually changed
       if (hash !== lastAgentHash) {
         lastAgentHash = hash;
-        wrapper.innerHTML = '<h3 class="section-title">Agents</h3>';
-        agents.forEach((agent) => {
-          wrapper.appendChild(createAgentCard(agent, refresh));
+        wrapper.innerHTML = "";
+
+        const allRunning = agents.every(a => a.status === "running");
+
+        const header = document.createElement("div");
+        header.className = "agent-list__header";
+        header.innerHTML = `<h3 class="section-title">Agents</h3>`;
+
+        const toggleAll = document.createElement("button");
+        toggleAll.className = `agent-list__toggle-all ${allRunning ? "agent-list__toggle-all--stop" : "agent-list__toggle-all--play"}`;
+        toggleAll.title = allRunning ? "Stop all" : "Start all";
+        toggleAll.textContent = allRunning ? "■ All" : "▶ All";
+        toggleAll.addEventListener("click", async () => {
+          isBulkToggling = true;
+          toggleAll.disabled = true;
+          toggleAll.innerHTML = `<span class="agent-list__spinner"></span> All`;
+          toggleAll.className = "agent-list__toggle-all agent-list__toggle-all--loading";
+          // Yield to let the browser paint the spinner before kicking off Tauri calls
+          await new Promise(r => requestAnimationFrame(r));
+          for (const agent of agents) {
+            try {
+              if (allRunning) {
+                await commands.stopAgent(agent.name);
+              } else if (agent.status !== "running") {
+                await commands.startAgent(agent.name);
+              }
+            } catch (e) {
+              console.error(`Failed to toggle ${agent.name}:`, e);
+            }
+          }
+          isBulkToggling = false;
+          lastAgentHash = "";
+          refresh();
         });
+        header.appendChild(toggleAll);
+        wrapper.appendChild(header);
+
+        agents.forEach((agent) => {
+          wrapper.appendChild(createAgentCard(agent, modal, refresh));
+        });
+
+        // Re-apply focused state after DOM rebuild
+        if (focusedAgent) {
+          wrapper.querySelectorAll<HTMLElement>(".agent-mini").forEach(card => {
+            card.classList.toggle("agent-mini--focused", card.dataset.agentName === focusedAgent);
+          });
+        }
       }
     } catch (e) {
       console.error("Failed to list agents:", e);

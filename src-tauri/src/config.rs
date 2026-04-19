@@ -1,6 +1,24 @@
 use crate::state::{AgentDef, AppState, SpiderlingDef};
 use std::collections::HashMap;
 
+pub fn load_agent_overrides(home: &str) -> HashMap<String, String> {
+    let path = format!("{}/.aperture/agent-config.json", home);
+    match std::fs::read_to_string(&path) {
+        Ok(data) => serde_json::from_str::<HashMap<String, String>>(&data).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+pub fn save_agent_override(home: &str, name: &str, model: &str) {
+    let path = format!("{}/.aperture/agent-config.json", home);
+    let mut overrides = load_agent_overrides(home);
+    overrides.insert(name.to_string(), model.to_string());
+    if let Ok(json) = serde_json::to_string_pretty(&overrides) {
+        let _ = std::fs::create_dir_all(format!("{}/.aperture", home));
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 pub fn default_agents(project_dir: &str) -> HashMap<String, AgentDef> {
     let mut agents = HashMap::new();
     agents.insert(
@@ -162,10 +180,24 @@ fn load_spiderlings(home: &str) -> HashMap<String, SpiderlingDef> {
 
 pub fn default_state() -> AppState {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let project_dir = format!("{}/projects/aperture", home);
+    // CARGO_MANIFEST_DIR is src-tauri/, so parent is the project root
+    let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{}/projects/aperture", home));
+    let mut agents = default_agents(&project_dir);
+
+    // Apply persisted model overrides
+    let overrides = load_agent_overrides(&home);
+    for (name, model) in &overrides {
+        if let Some(agent) = agents.get_mut(name) {
+            agent.model = model.clone();
+        }
+    }
+
     AppState {
         tmux_session: "aperture".into(),
-        agents: default_agents(&project_dir),
+        agents,
         spiderlings: load_spiderlings(&home),
         mcp_server_path: format!("{}/mcp-server/dist/index.js", project_dir),
         db_path: format!("{}/.aperture/messages.db", home),

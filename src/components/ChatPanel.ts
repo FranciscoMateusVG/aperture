@@ -67,15 +67,23 @@ function renderMarkdown(src: string): string {
   return processed;
 }
 
-const AGENTS = ["planner", "glados", "wheatley", "peppy", "izzy"];
-
 const AGENT_COLORS: Record<string, string> = {
-  planner: "#e67e22",
-  glados: "#9b59b6",
+  planner:  "#e67e22",
+  glados:   "#9b59b6",
   wheatley: "#3498db",
-  peppy: "#1abc9c",
-  izzy: "#e91e63",
+  peppy:    "#1abc9c",
+  izzy:     "#e91e63",
+  vance:    "#ff6b9d",
+  rex:      "#e74c3c",
+  scout:    "#27ae60",
+  cipher:   "#7f8c8d",
+  sage:     "#17a589",
+  atlas:    "#8e44ad",
+  sentinel: "#34495e",
+  sterling: "#d4af37",
 };
+
+const AGENTS = ["planner", "glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "sage", "atlas", "sentinel", "sterling"];
 
 export function createChatPanel(container: HTMLElement) {
   let activeAgent = AGENTS[0];

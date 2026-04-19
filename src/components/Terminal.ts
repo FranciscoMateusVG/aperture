@@ -9,7 +9,7 @@ export async function createTerminal(container: HTMLElement, sessionName: string
     cursorBlink: true,
     fontSize: 14,
     scrollback: 10000,
-    fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+    fontFamily: "'MesloLGS NF', monospace",
     theme: {
       background: "#1a1a2e",
       foreground: "#e0e0e0",
@@ -39,12 +39,10 @@ export async function createTerminal(container: HTMLElement, sessionName: string
   }
 
   // Delay initial fit to ensure container has layout dimensions.
-  // Triple-fit strategy: immediate rAF, short delay, and longer delay
-  // to handle production build timing where layout may settle late.
+  // Two-fit strategy: immediate rAF + one safety re-fit for late-settling layouts.
   requestAnimationFrame(() => {
     fitAddon.fit();
-    setTimeout(() => fitAddon.fit(), 100);
-    setTimeout(() => fitAddon.fit(), 500);
+    setTimeout(() => fitAddon.fit(), 200);
   });
 
   // Start PTY and connect
@@ -60,26 +58,32 @@ export async function createTerminal(container: HTMLElement, sessionName: string
     commands.writePty(data);
   });
 
-  // Handle resize
-  const resizeObserver = new ResizeObserver(() => {
-    fitAddon.fit();
-    commands.resizePty(term.rows, term.cols);
-  });
+  // Debounced resize handler — ResizeObserver and window resize both fire here.
+  // Without debouncing, panel drags produce dozens of Tauri IPC calls per second.
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  const handleResize = () => {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      fitAddon.fit();
+      commands.resizePty(term.rows, term.cols);
+    }, 50);
+  };
+
+  const resizeObserver = new ResizeObserver(handleResize);
   resizeObserver.observe(container);
 
   // Also listen to window resize events (triggered by panel toggle/drag)
-  const onWindowResize = () => {
-    fitAddon.fit();
-    commands.resizePty(term.rows, term.cols);
-  };
-  window.addEventListener("resize", onWindowResize);
+  window.addEventListener("resize", handleResize);
 
   return {
     terminal: term,
+    focus() {
+      term.focus();
+    },
     destroy() {
       unlisten();
       resizeObserver.disconnect();
-      window.removeEventListener("resize", onWindowResize);
+      window.removeEventListener("resize", handleResize);
       term.dispose();
     }
   };

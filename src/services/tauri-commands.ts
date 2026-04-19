@@ -14,6 +14,7 @@ export const commands = {
   startAgent: (name: string) => invoke<void>("start_agent", { name }),
   stopAgent: (name: string) => invoke<void>("stop_agent", { name }),
   listAgents: () => invoke<AgentDef[]>("list_agents"),
+  updateAgentModel: (name: string, model: string) => invoke<void>("update_agent_model", { name, model }),
   getRecentMessages: () => invoke<AgentMessage[]>("get_recent_messages"),
   clearMessageHistory: () => invoke<void>("clear_message_history"),
   clearConversationHistory: (agentA: string, agentB: string) => invoke<void>("clear_conversation_history", { agentA, agentB }),

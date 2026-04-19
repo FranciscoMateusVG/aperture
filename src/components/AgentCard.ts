@@ -1,5 +1,6 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
+import type { AgentConfigModal } from "./AgentConfigModal";
 
 const AGENT_THEME: Record<string, { icon: string; color: string }> = {
   planner:   { icon: "📋", color: "#e67e22" },  // orange   — director
@@ -19,19 +20,22 @@ const AGENT_THEME: Record<string, { icon: string; color: string }> = {
 
 const DEFAULT_THEME = { icon: "⚙️", color: "#f39c12" };
 
-export function createAgentCard(agent: AgentDef, onUpdate: () => void): HTMLElement {
+export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpdate: () => void): HTMLElement {
   const card = document.createElement("div");
   const theme = AGENT_THEME[agent.name] ?? DEFAULT_THEME;
   render();
 
   function render() {
     const isRunning = agent.status === "running";
-    card.className = `agent-mini ${isRunning ? "agent-mini--running" : ""}`;
+    const isFocused = card.classList.contains("agent-mini--focused");
+    card.className = `agent-mini ${isRunning ? "agent-mini--running" : ""} ${isFocused ? "agent-mini--focused" : ""}`;
+    card.dataset.agentName = agent.name;
     card.style.setProperty("--agent-color", theme.color);
     card.innerHTML = `
       <span class="agent-mini__icon">${theme.icon}</span>
       <span class="agent-mini__name">${agent.name}</span>
       <span class="agent-mini__model">${agent.model}</span>
+      <button class="agent-mini__config" title="Configure">⚙</button>
       <button class="agent-mini__toggle" title="${isRunning ? "Stop" : "Start"}">
         ${isRunning ? "■" : "▶"}
       </button>
@@ -46,6 +50,11 @@ export function createAgentCard(agent: AgentDef, onUpdate: () => void): HTMLElem
       }
     });
 
+    card.querySelector(".agent-mini__config")!.addEventListener("click", (e) => {
+      e.stopPropagation();
+      modal.open(agent);
+    });
+
     card.querySelector(".agent-mini__toggle")!.addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
@@ -56,7 +65,9 @@ export function createAgentCard(agent: AgentDef, onUpdate: () => void): HTMLElem
         }
         onUpdate();
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         console.error(`Failed to toggle agent ${agent.name}:`, err);
+        alert(`Failed to ${isRunning ? "stop" : "start"} ${agent.name}:\n${msg}`);
       }
     });
   }

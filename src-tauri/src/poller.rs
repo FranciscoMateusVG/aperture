@@ -1,7 +1,8 @@
+use crate::codex_harness;
 use crate::state::AppState;
 use crate::tmux;
 use crate::warroom;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,19 @@ struct BeadsMessage {
 
 fn bd_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{}/.local/bin/bd", home)
+    // Fallback chain: prefer ~/.local/bin/bd (canonical install location),
+    // then ~/go/bin/bd (go install default), then rely on PATH resolution.
+    // This eliminates the manual symlink dependency.
+    let candidates = [
+        format!("{}/.local/bin/bd", home),
+        format!("{}/go/bin/bd", home),
+    ];
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return path.clone();
+        }
+    }
+    "bd".to_string()
 }
 
 fn beads_dir() -> String {
@@ -264,37 +277,64 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
         notified.retain(|f| !f.starts_with(&operator_path) || operator_files.contains(f));
 
         // ── Handle agent-bound messages via BEADS message bus ──
-        let agents: Vec<(String, String)> = {
+        // Each tuple is (agent_name, window_id, is_codex).
+        // Codex agents get messages buffered to a pending file instead of
+        // tmux-injected shell commands (which Codex's loop ignores).
+        let agents: Vec<(String, String, bool)> = {
             let Ok(app_state) = state.lock() else {
                 continue;
             };
 
-            let named: Vec<(String, String)> = app_state
+            // Resolve live permanent-agent windows from tmux every cycle rather
+            // than relying on cached AppState window IDs. This self-heals after
+            // external restarts and ignores stale shell windows left behind by
+            // prior sessions with the same agent name.
+            let running_windows: HashMap<String, String> =
+                match tmux::tmux_list_windows(app_state.tmux_session.clone()) {
+                    Ok(windows) => windows
+                        .into_iter()
+                        .filter(|w| {
+                            w.command == "claude"
+                                || w.command.contains("claude")
+                                || w.command == "codex"
+                                || w.command.contains("codex")
+                                || w.command == "node"
+                        })
+                        .map(|w| (w.name, w.window_id))
+                        .collect(),
+                    Err(_) => HashMap::new(),
+                };
+
+            let named: Vec<(String, String, bool)> = app_state
                 .agents
                 .values()
-                .filter(|a| a.status == "running")
                 .filter_map(|a| {
-                    a.tmux_window_id
-                        .as_ref()
-                        .map(|wid| (a.name.clone(), wid.clone()))
+                    running_windows.get(&a.name).map(|wid| {
+                        let is_codex = a.model.starts_with("codex/");
+                        if is_codex {
+                            codex_harness::ensure_output_monitor(wid.clone(), a.name.clone());
+                        }
+                        (a.name.clone(), wid.clone(), is_codex)
+                    })
                 })
                 .collect();
 
-            let spiderlings: Vec<(String, String)> = app_state
+            // Spiderlings are always Claude — never Codex
+            let spiderlings: Vec<(String, String, bool)> = app_state
                 .spiderlings
                 .values()
                 .filter(|s| s.status == "working")
                 .filter_map(|s| {
                     s.tmux_window_id
                         .as_ref()
-                        .map(|wid| (s.name.clone(), wid.clone()))
+                        .map(|wid| (s.name.clone(), wid.clone(), false))
                 })
                 .collect();
 
             named.into_iter().chain(spiderlings).collect()
         };
 
-        for (agent_name, window_id) in &agents {
+        for (agent_name, window_id, is_codex) in &agents {
             // Query BEADS for unread messages addressed to this agent
             let messages = query_unread_messages(agent_name);
 
@@ -323,15 +363,27 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
                 // Log the message
                 log_message(&message_log, &sender, agent_name, &formatted, timestamp);
 
-                // Write to temp file and inject via tmux (safer than inline content)
-                let tmp_path = format!("/tmp/aperture-msg-{}.md", msg.id);
-                if fs::write(&tmp_path, &formatted).is_ok() {
-                    let cmd = format!("cat '{}' && rm '{}'", tmp_path, tmp_path);
-                    let _ = tmux::tmux_send_keys(window_id.clone(), cmd);
+                if *is_codex {
+                    // Codex agents: MCP tools are confirmed working (Failure Mode A).
+                    // The agent calls get_messages() itself to read unread messages.
+                    // Do NOT mark as read here — let the MCP call handle read state
+                    // so the message remains visible when the agent polls BEADS.
+                    //
+                    // We still buffer to pending-msgs.md as a secondary delivery path
+                    // (for the monitor thread's flush prompt), but the primary channel
+                    // is the agent's own MCP get_messages call.
+                    codex_harness::buffer_pending_message(agent_name, &formatted);
+                    // Do NOT call mark_message_read — intentionally omitted for Codex.
+                } else {
+                    // Claude / spiderling agents: write to temp file and inject via tmux
+                    let tmp_path = format!("/tmp/aperture-msg-{}.md", msg.id);
+                    if fs::write(&tmp_path, &formatted).is_ok() {
+                        let cmd = format!("cat '{}' && rm '{}'", tmp_path, tmp_path);
+                        let _ = tmux::tmux_send_keys(window_id.clone(), cmd);
+                    }
+                    // Mark as read immediately after tmux delivery
+                    mark_message_read(&msg.id);
                 }
-
-                // Mark as read immediately after delivery
-                mark_message_read(&msg.id);
                 notified.insert(msg.id.clone());
             }
 

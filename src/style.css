@@ -112,8 +112,8 @@ html, body {
 
 /* ── Left Sidebar ── */
 #sidebar {
-  width: 220px;
-  min-width: 220px;
+  width: 300px;
+  min-width: 300px;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   position: relative;
@@ -163,6 +163,63 @@ html, body {
   gap: 4px;
 }
 
+.agent-list__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.agent-list__header .section-title {
+  margin-bottom: 0;
+}
+
+.agent-list__toggle-all {
+  font-size: 10px;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: monospace;
+  font-weight: 600;
+}
+
+.agent-list__toggle-all--play {
+  color: var(--accent-green);
+  background: rgba(46, 204, 113, 0.15);
+}
+
+.agent-list__toggle-all--stop {
+  color: var(--accent-red);
+  background: rgba(231, 76, 60, 0.15);
+}
+
+.agent-list__toggle-all:hover {
+  opacity: 0.8;
+}
+
+.agent-list__toggle-all--loading {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  cursor: default;
+}
+
+.agent-list__spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
 .agent-mini {
   --agent-color: var(--accent-orange);
   display: flex;
@@ -186,6 +243,16 @@ html, body {
   background: var(--bg-hover);
 }
 
+.agent-mini--focused {
+  background: color-mix(in srgb, var(--agent-color) 12%, var(--bg-card));
+  border-left-color: var(--agent-color);
+  border-color: color-mix(in srgb, var(--agent-color) 35%, var(--border));
+}
+
+.agent-mini--focused .agent-mini__name {
+  color: var(--agent-color);
+}
+
 .agent-mini__icon {
   font-size: 16px;
   width: 22px;
@@ -203,9 +270,13 @@ html, body {
   font-weight: 600;
   font-size: 13px;
   flex: 1;
+  min-width: 0;
   text-transform: capitalize;
   color: var(--text-secondary);
   transition: color 0.15s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .agent-mini--running .agent-mini__name {
@@ -216,6 +287,11 @@ html, body {
   font-size: 10px;
   color: var(--text-secondary);
   font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+  flex-shrink: 0;
 }
 
 .agent-mini__toggle {
@@ -246,6 +322,173 @@ html, body {
 
 .agent-mini__toggle:hover {
   opacity: 0.8;
+}
+
+.agent-mini__config {
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+  padding: 0;
+  margin-right: 2px;
+}
+
+.agent-mini:hover .agent-mini__config {
+  opacity: 1;
+}
+
+.agent-mini__config:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── Agent Config Modal ── */
+.agent-config-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+}
+
+.agent-config-modal--visible {
+  display: flex;
+}
+
+.agent-config-modal__card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 320px;
+  overflow: hidden;
+}
+
+.agent-config-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-config-modal__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.agent-config-modal__close {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.agent-config-modal__close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.agent-config-modal__body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.agent-config-modal__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.agent-config-modal__label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  width: 48px;
+  flex-shrink: 0;
+}
+
+.agent-config-modal__agent-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: monospace;
+}
+
+.agent-config-modal__agent-role {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.agent-config-modal__select {
+  flex: 1;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: monospace;
+  padding: 5px 8px;
+  cursor: pointer;
+  outline: none;
+}
+
+.agent-config-modal__select:focus {
+  border-color: var(--accent-blue);
+}
+
+.agent-config-modal__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-config-modal__status {
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex: 1;
+}
+
+.agent-config-modal__save {
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 16px;
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: opacity 0.15s;
+}
+
+.agent-config-modal__save:hover {
+  opacity: 0.85;
+}
+
+.agent-config-modal__save:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ── Terminal ── */
@@ -1260,7 +1503,7 @@ html, body {
 }
 
 .spiderling-row__name {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'MesloLGS NF', monospace;
   font-size: 0.85em;
   color: #95a5a6;
   font-weight: 600;
@@ -1269,7 +1512,7 @@ html, body {
 .spiderling-row__task {
   font-size: 0.75em;
   color: var(--text-secondary);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'MesloLGS NF', monospace;
 }
 
 .spiderling-row__status {
@@ -1597,7 +1840,7 @@ html, body {
 .swimlane__card-id {
   font-size: 9px;
   color: var(--text-secondary);
-  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-family: 'MesloLGS NF', monospace;
 }
 
 .swimlane__card-priority {
