@@ -72,6 +72,27 @@ update_task(
 
 You don't need to update every 5 minutes. Update when something changes.
 
+### ⚠️ Gotcha: `update_task(notes: ...)` REPLACES — it does NOT append
+
+Despite the schema description saying "Append notes," the BEADS server overwrites the entire `notes` field on every `update_task` call. Writing a new note silently erases anything that was there before.
+
+**Always read-modify-write** when adding to existing notes:
+
+```
+# 1. Read the current notes
+existing = query_tasks(mode: "show", id: "task-123")[0].notes ?? ""
+
+# 2. Concatenate with your addition
+combined = existing + "\n\n---\n\n## New section\n" + your_new_content
+
+# 3. Write the full blob back
+update_task(id: "task-123", notes: combined)
+```
+
+If you skip the read step, you will silently destroy other agents' work. This bites hardest in collaborative tasks (e.g. Wheatley drafts wave plans, GLaDOS adds a decision, the second writer overwrites the first).
+
+For purely standalone progress notes that don't need to preserve history, replace is fine — but be deliberate about that choice.
+
 ---
 
 ## 5. Storing Artifacts
