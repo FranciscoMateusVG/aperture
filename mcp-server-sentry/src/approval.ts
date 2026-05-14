@@ -160,6 +160,18 @@ async function pollForApproval(
         await markRead(id);
         return { status: "approved", approval_message_id: id };
       }
+      // INTENTIONAL: `(.+?)$` with the `m` flag captures up to end-of-LINE,
+      // not end-of-body. If the operator writes a multi-line reject reason,
+      // only the first line is captured. This is by design (aperture-hyyj,
+      // Cipher's R1-R9 sign-off observation 2026-05-14):
+      //   - The .slice(0, 500) below caps reason length anyway
+      //   - The contract is that reject reasons are SHORT LABELS, not
+      //     discussions ("not allowlisted", "wrong project", etc.)
+      //   - Multi-line capture would let an operator paste a 10KB stack
+      //     trace into a reject and have it land verbatim in the audit
+      //     line, defeating the implicit length-control
+      // If you're tempted to "fix" this into a multi-line regex, file
+      // a follow-up bead first and route through Cipher.
       const rejectMatch = body.match(
         new RegExp(`rejected:\\s*${escapeRegex(requestId)}\\s*:\\s*(.+?)$`, "m"),
       );
