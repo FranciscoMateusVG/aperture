@@ -54,6 +54,7 @@ pub fn default_state() -> AppState {
         tmux_session: "aperture".into(),
         agents,
         mcp_server_path: format!("{}/mcp-server/dist/index.js", project_dir),
+        mcp_sentry_server_path: format!("{}/mcp-server-sentry/dist/index.js", project_dir),
         db_path: format!("{}/.aperture/messages.db", home),
         project_dir,
     }

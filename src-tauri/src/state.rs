@@ -21,6 +21,12 @@ pub struct AppState {
     pub tmux_session: String,
     pub agents: HashMap<String, AgentDef>,
     pub mcp_server_path: String,
+    /// Path to the Sentry MCP wrap server's compiled entrypoint
+    /// (`mcp-server-sentry/dist/index.js`). Wired into each agent's MCP
+    /// config alongside `aperture-bus` so agents see `mcp__sentry__*`
+    /// tools. The wrap layer enforces Cipher's 9 constraints from
+    /// aperture-ttzz (allowlist, audit emission, operator approval).
+    pub mcp_sentry_server_path: String,
     /// Vestigial — kept so we don't have to thread a removal through
     /// `default_state`. Was used by an older message DB; today the message
     /// log is JSONL at `~/.aperture/message-log.jsonl` and BEADS owns the

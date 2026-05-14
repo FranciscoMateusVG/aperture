@@ -1,0 +1,37 @@
+# Sentry MCP allowlist — example file.
+#
+# Deploy by copying to ~/.config/aperture/sentry-mcp-allowlist.yaml on the
+# host where aperture-mcp-server-sentry runs. The wrap layer reads this
+# file at boot and on SIGHUP. Missing / unreadable / empty file → all
+# Sentry MCP tool calls are refused with "Sentry MCP not configured"
+# (R3 fail-closed, see aperture-ttzz).
+
+# Project slugs the wrap layer will allow through to sentry.io.
+# Any tool call whose project / project_id / projects param resolves
+# to a value outside this list is denied with a 403-style MCP error.
+# R4 in aperture-ttzz: applied across 10+ param-name shapes.
+project_allowlist:
+  - incluir
+  - eunenem-v2
+  - fit
+
+# Agents that may call read tools without per-call gating.
+# Approve mutation + attachment tools STILL require operator approval
+# regardless of which tier the caller is in.
+agent_default_on:
+  - cipher
+  - rex
+  - izzy
+  - vance
+  - glados
+  - peppy
+  - wheatley
+
+# Agents that need explicit operator approval per session even for
+# read tools. Add agents here when their lane doesn't include Sentry
+# (Atlas/Sage/Scout/Sterling typically; promote on demand).
+agent_opt_in:
+  - atlas
+  - sage
+  - scout
+  - sterling
