@@ -46,14 +46,20 @@ You are NOT doing the recon hands-on. Your value is dispatching the right scouts
 - Is the target a single component (X), a family (X1, X2, X3, …), or a relationship between components?
 - What's the depth dimension? (See §3 — depth vs breadth.)
 
-**Step 2.** Dispatch 2–4 parallel subagents. Send them in a single tool-call block so they actually run concurrently.
+**Step 2 — Stack-verification gate (if uncertain).** If your dispatch depends on stack knowledge you haven't already verified (framework, ORM, DB engine, auth library, build system, etc.), dispatch a tiny **stack-verification scout FIRST** as a serial step — *before* the parallel architecture-research / library-evaluation subagents go out. Wait for its return. Skip this step ONLY if you already know the stack with high confidence (e.g. you've worked the codebase recently).
+
+Cost: ~30–60s of serial latency. Benefit: every downstream subagent runs on facts, not premises.
+
+**Banked precedent (2026-05-17, surveys recon aperture-izmd):** Architecture and library subagents were dispatched in parallel with a wrong-ORM premise in their prompts ("Drizzle" — actual: Kysely). The codebase-scout subagent caught the error, but only because it ran in parallel by luck. Both downstream reports landed useful but had to be re-read with the correction applied. A serial stack-verification gate would have prevented the muddied analysis at near-zero cost.
+
+**Step 3.** Dispatch 2–4 parallel subagents. Send them in a single tool-call block so they actually run concurrently.
 
 Subagent type choice:
 - **`Explore`** — for "where is X defined / which files reference Y" lookups. Fast, scoped, read-only.
 - **`general-purpose`** — for open-ended recon ("audit all routes that hit /api/foo and report shape + auth + caller").
 - **`Plan`** — when you need an architectural sketch, not just findings. Use sparingly — the goal is recon, not premature design.
 
-**Step 3.** Every subagent brief MUST include:
+**Step 4.** Every subagent brief MUST include:
 - The exact recon question (one sentence)
 - The report-back format (bulleted findings, not prose)
 - A depth instruction: *"Enumerate ALL instances of X before stopping; do NOT stop at the first finding."* (See §3.)
@@ -63,22 +69,22 @@ Subagent type choice:
 
 When subagent reports return:
 
-**Step 4.** Read every report. Don't skim. The findings are why you dispatched.
+**Step 5.** Read every report. Don't skim. The findings are why you dispatched.
 
-**Step 5.** Produce a **findings document** in the recon-parent BEADS task's notes:
+**Step 6.** Produce a **findings document** in the recon-parent BEADS task's notes:
 - What exists today (concrete: files, routes, components, table columns)
 - What's missing or broken
 - Gotchas / non-obvious dependencies
 - Open questions GLaDOS would need to answer to sequence work
 
-**Step 6.** File **exploratory BEADS tasks** for each follow-up direction. These are NOT pre-approved implementation work — they're flagged candidates GLaDOS may or may not dispatch.
+**Step 7.** File **exploratory BEADS tasks** for each follow-up direction. These are NOT pre-approved implementation work — they're flagged candidates GLaDOS may or may not dispatch.
 
 Marking convention (GLaDOS decision, 2026-05-17):
 - Apply the label `recon:in-progress` at creation
 - When GLaDOS converts the exploratory bead into actionable work (or you do, post-approval), the label gets removed and the bead becomes a normal task
 - A bead carrying `recon:in-progress` is a *finding*, not a *commitment*
 
-**Step 7.** Hand off to GLaDOS:
+**Step 8.** Hand off to GLaDOS:
 - Notify her via `send_message` referencing the recon-parent bead ID and the exploratory bead IDs
 - Do NOT wait for a formal review gate (GLaDOS, 2026-05-17: no standing review gate; she'll ask if she wants a second pass)
 - Close the recon-parent task — findings delivered, ball is in her court
@@ -127,6 +133,7 @@ When you close the recon-parent task, GLaDOS gets:
 | Wait for a formal review gate before closing the recon parent | GLaDOS asks for a second pass if she wants one. Default is: file + hand off + close. |
 | Write the findings doc into a repo markdown file | Findings live in BEADS. Long-form → `note` artifact, not `docs/recon-X.md`. |
 | Dispatch one subagent for "the whole investigation" | You collapse parallelism back to serial. Fan out — 2 to 4 subagents minimum. |
+| Dispatch architecture-research subagents on stack assumptions you haven't verified | The subagent's analysis filters through the wrong premise. Verify stack FIRST as a serial gate (§2 Step 2). Banked: 2026-05-17 surveys recon shipped two wrong-ORM premises before the codebase scout caught it. |
 | Use this skill for "write me a spec for X" | That's planning, not recon. Different mode. |
 
 ---
