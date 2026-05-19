@@ -100,6 +100,7 @@ import { parseStatusFilter } from "@/backend/surveys/adminSurveys.helpers";
 - `STATUS_VALUES` / `ROLE_VALUES` / other readonly constant tables
 - Sync zod schemas that the server actions reference (move to a shared schemas module)
 - Type predicates (`isAdminSurvey`, `isActiveStatus`, …)
+- Constant-derived utility functions (e.g. `displayLabelFor(status)`, `colorForRole(role)` — sync mapping lookups that read from a constant table) — same trap shape, same fix
 
 The rule of thumb: **a `"use server"` file is for server actions and only server actions.** Anything that doesn't `await` something or perform a side effect on the server belongs in a sibling `*.helpers.ts` / `*.schema.ts` / `*.types.ts`.
 
