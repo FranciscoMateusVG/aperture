@@ -53,11 +53,13 @@ The intent (don't let a leading space hide a formula) is preserved; the protecte
 
 **Signal phrase for the trap:** the spec proposes a transformation that operates on a set, and the protected set the system already cares about **intersects** with what the transformation removes/modifies.
 
+**Note on this specific story's handoff:** Rex deviated, documented in 3 places, and shipped without pre-flagging the conflict back to Cipher (the spec author). Cipher learned about the deviation by reading PR #296 on her next surveys pass. That's the realistic async-PR-review path for tactical regex-set-style conflicts caught at implementation start — the documentation trail is the handoff. Pre-flag and amend the bead when the conflict is structural enough to need contract-level alignment; document-only when the deviation is a tactical fix that the spec author can validate on their next review.
+
 ### Mode B — Spec's mechanism isn't representable in the type system
 
-**War story (aperture-736g, PR #301, Rex):** Cipher's bead for defence-in-depth read-side re-validation said *"On parse failure, log + return null/empty audience (defensive — better to NOT show a survey than to silently mis-evaluate it)."* The bead offered two options: return null OR return an "empty audience."
+**War story (aperture-736g, PR #301, Rex):** Cipher's bead for defence-in-depth read-side re-validation proposed *"return null/empty audience"* on parse failure (defensive — better to NOT show a survey than to silently mis-evaluate it).
 
-On inspection, **"empty audience" wasn't representable in the system.** `AudienceExpressionSchema` requires AND/OR combinators to have `.min(1)` children, and there's no `{ macro: 'never' }` sentinel. The fan-out + depth caps shipped in PR #298 (`aperture-nnpb`) made the picture even tighter — there's no construction of the schema that means "empty."
+On inspection, **the "empty audience" representation didn't exist in `AudienceExpressionSchema`.** The schema requires AND/OR combinators to have `.min(1)` children, and there's no `{ macro: 'never' }` sentinel — no construction of the schema actually means "empty." The fan-out + depth caps shipped in PR #298 (`aperture-nnpb`) made the picture even tighter.
 
 The deviation: pick the representable option (return null), and choose caller behaviour per method so the spec's INTENT (corrupt audience → survey is invisible) is preserved:
 
@@ -70,7 +72,7 @@ The deviation: pick the representable option (return null), and choose caller be
 
 The spec's intent (don't silently mis-evaluate) is preserved. The mechanism is the one the type system actually admits. **Both intent and invariant satisfied.**
 
-**Signal phrase for the trap:** the spec lists multiple options ("return null OR an empty X"), and one of the options assumes a value shape that the schema/type/contract doesn't admit.
+**Signal phrase for the trap:** the spec proposes a value/return shape — possibly as one of multiple options, possibly as the single prescribed answer — that the schema/type/contract doesn't admit.
 
 ---
 
@@ -98,7 +100,14 @@ When you receive a spec, ask:
 
 You do this pass once, at spec-read time, before you write any code. The cost is 30 seconds to 5 minutes; the cost of skipping it and silently regressing an invariant is hours-to-days to track down later.
 
-If you find a conflict, this is also the moment to **flag it to the spec author** (Cipher, Wheatley, the operator). They may have known about the conflict and there's context you're missing; or they didn't, and your catch becomes a contract amendment. Either way, the deviation gets explicit blessing before you commit.
+If you find a conflict, this is also the moment to **flag it to the spec author** (Cipher, Wheatley, the operator). They may have known about the conflict and there's context you're missing; or they didn't, and your catch becomes a contract amendment.
+
+How explicit the handoff needs to be depends on the review context:
+
+- **Synchronous / blocking-review context** — get explicit blessing from the spec author before you commit. The deviation is part of the contract, and the contract owner should approve it.
+- **Async / fast-shipping context** (the typical Aperture mode) — document the deviation thoroughly in all three places (code comment + commit + PR body) and let the spec author validate on their next review pass. The documentation trail IS the handoff; the spec author will see it when they read the PR or revisit the bead.
+
+Either way the three-place documentation rule still applies. It's the variant that distinguishes "the spec author signed off before merge" from "the spec author will see this when they read the PR" — both are legitimate, neither replaces the documentation discipline.
 
 ---
 
