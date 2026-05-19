@@ -3,3 +3,4 @@ team
 beads
 worktree-discipline
 specialist-delegation
+turbopack-gotchas
