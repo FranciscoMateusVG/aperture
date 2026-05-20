@@ -25,6 +25,18 @@ The failure mode is always:
 
 ---
 
+## The decision rule (call this at coverage-design time)
+
+If a feature crosses an adapter boundary OR has byte-level / encoding / format behaviour that matters:
+
+> **Your E2E must (a) exercise the real prod composition path, and (b) assert at the byte level wherever byte-level behaviour matters.**
+
+If your E2E only exercises a test-app composition or only asserts at the string-equality level, your coverage has a structural gap — and that gap is exactly where this class of bug lives. Unit and integration coverage cannot close it, no matter how deep.
+
+(Forward-friction check below for the longer version. The decision rule is the one-line callable.)
+
+---
+
 ## Two banked modes (3 worked examples)
 
 ### Mode 1 — Composition-root gap
