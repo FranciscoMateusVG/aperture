@@ -43,9 +43,9 @@ If your E2E only exercises a test-app composition or only asserts at the string-
 
 **Shape:** the test app and the prod app have *different wiring*. Unit + integration tests construct a test app that injects fake adapters (`InMemoryBlobStorage`, `surveyRepository`, etc.) directly into the route handlers. The prod composition root (`server.ts`, `index.ts`, the entry point) is supposed to wire the *real* adapters into the *real* route mount. If the entry point forgets to do that, the routes ship but the adapter doesn't — every request hits a catch-all 404 (or a no-op default), and no test below E2E ever exercises the prod composition path.
 
-**Worked example A — `aperture-y57q` (PRs #128/#129, Vance + Rex)**
+**Worked example A — `aperture-y57q` (PR #132, Vance + Rex)**
 
-Blob-storage adapter never wired in `server.ts`. Unit + integration tests passed because they injected `InMemoryBlobStorage` directly into the test app. Only E2E (real Postgres path) surfaced the gap.
+Blob-storage adapter never wired in `server.ts`. Originally shipped under `aperture-47hg` (PRs #128/#129 — backend + frontend halves) with the prod composition root missing the adapter wire-up; the fix re-shipping with prod wire-up + a composition smoke test landed as `aperture-y57q` / PR #132 (*"fix(blob-storage): re-ship MinIO migration with prod wire-up + composition smoke"*). Unit + integration tests on the original PRs passed because they injected `InMemoryBlobStorage` directly into the test app. Only E2E (real Postgres path) surfaced the gap.
 
 **Worked example B — `aperture-3ghh` (PR #303, Rex)**
 
@@ -123,7 +123,7 @@ The cost of this pass is 30 seconds per feature. The cost of skipping it is a cu
 
 | Mode | Bead | PR | Agent | Failure mode |
 |---|---|---|---|---|
-| 1: Composition-root gap | `aperture-y57q` | monorepo-incluir #128/#129 | Vance + Rex | Blob-storage adapter not wired in server.ts |
+| 1: Composition-root gap | `aperture-y57q` | monorepo-incluir #132 (fix; original adapter shipped in #128/#129 under `aperture-47hg`) | Vance + Rex | Blob-storage adapter not wired in server.ts |
 | 1: Composition-root gap | `aperture-3ghh` | monorepo-incluir #303 | Rex | Survey adapters not wired in server.ts |
 | 2: String-string roundtrip | `aperture-tx2k` | monorepo-incluir #306 | Vance | Next.js proxy `.text()` strips BOM via TextDecoder |
 
