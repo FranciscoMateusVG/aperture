@@ -3,3 +3,4 @@ team
 beads
 worktree-discipline
 specialist-delegation
+e2e-catches-what-lower-cant
