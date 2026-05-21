@@ -4,3 +4,4 @@ beads
 deploy-workflow
 worktree-discipline
 specialist-delegation
+hold-the-dependent-merge
