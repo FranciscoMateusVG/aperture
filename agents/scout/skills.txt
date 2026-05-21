@@ -3,3 +3,4 @@ team
 beads
 worktree-discipline
 specialist-delegation
+read-shape-not-line
