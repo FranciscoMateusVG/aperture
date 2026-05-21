@@ -64,6 +64,9 @@ Subagent type choice:
 - The report-back format (bulleted findings, not prose)
 - A depth instruction: *"Enumerate ALL instances of X before stopping; do NOT stop at the first finding."* (See §3.)
 - A "what NOT to do" line: don't propose fixes, don't refactor, don't open PRs. Just report.
+- **If the subagent queries a DB or runs SQL/scripts/CLI commands to produce ground-truth numbers, the brief MUST require the EXACT QUERY VERBATIM in the report — not just the result count.** The synthesis MUST preserve the SQL/script in the bead notes alongside the ground-truth number. A number without its query is unverifiable — framing errors in the filter scope, join shape, or semantic axis cannot be detected by readers and will propagate through every downstream fix.
+
+**Banked precedent (2026-05-21, /presencas recon aperture-qz4b → ftuy).** Subagent C reported "429 realized sessions in semester window" via the `incluir-prod-postgres` skill — no SQL preserved. I banked 429 as ground truth on qz4b. Vance ran his own verify-against-reality SQL the next day and got 298 — the difference was a framing scope (Subagent C counted all check-ins in the broader 2026-02-28→2026-07-04 window; the institutionally-meaningful metric is letivo-only, which is 298). The narrative phrase "in semester window" was the smoking gun but unrecoverable without the actual query. Downstream consequence: Rex's backend fix and Vance's frontend display both needed the canonical 298 number, and the bead notes had to be corrected after the cascade-catch.
 
 ### Phase 2 — Synthesis + exploratory bead filing
 
@@ -134,6 +137,7 @@ When you close the recon-parent task, GLaDOS gets:
 | Write the findings doc into a repo markdown file | Findings live in BEADS. Long-form → `note` artifact, not `docs/recon-X.md`. |
 | Dispatch one subagent for "the whole investigation" | You collapse parallelism back to serial. Fan out — 2 to 4 subagents minimum. |
 | Dispatch architecture-research subagents on stack assumptions you haven't verified | The subagent's analysis filters through the wrong premise. Verify stack FIRST as a serial gate (§2 Step 2). Banked: 2026-05-17 surveys recon shipped two wrong-ORM premises before the codebase scout caught it. |
+| Bank a subagent-reported DB ground-truth number without the SQL preserved in the recon output | Framing errors in the query (filter scope, join shape, semantic axis) cannot be detected by readers and propagate through downstream fix work. A number without its query is unverifiable. Banked: 2026-05-21 qz4b "429 sessions in semester window" → Vance's letivo-only re-query returned 298. |
 | Use this skill for "write me a spec for X" | That's planning, not recon. Different mode. |
 
 ---
@@ -171,5 +175,6 @@ If you find yourself:
 - About to file an exploratory bead with detailed acceptance criteria → STOP. That's spec authoring, file a follow-up planning task instead.
 - About to make a sequencing decision ("we should do X first, THEN Y") → fine to recommend; don't claim authority. GLaDOS owns it.
 - Tempted to "just iterate the spec while I'm here" → STOP. Different mode. Close recon, wait for GLaDOS to dispatch a spec task.
+- About to bank a count/aggregate/ground-truth number a subagent returned without the query attached → STOP. Dispatch a follow-up to extract the SQL/script, or re-run it yourself before the number lands in the recon-parent bead notes. A number without its query is a guess wearing a number's clothes.
 
 The role is sharp on purpose. Stay in lane.
