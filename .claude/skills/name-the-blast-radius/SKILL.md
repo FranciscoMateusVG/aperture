@@ -35,6 +35,7 @@ The list below is the enumerated set of things that DEMAND PR-body disclosure. I
 | **DB contract** | New column with non-trivial semantics, FK change, RLS policy change, schema migration that consumers depend on |
 | **Feature-flag default** | Default value change, new flag introduced, flag retirement (existing-consumer impact) |
 | **External-service contract** | New external API consumed, payload change to existing external call, auth scheme change to a third-party integration |
+| **Observability / audit event taxonomy** | Adding, removing, or renaming a structured Loki event (`coordenador.pii_access`, `users.pii_access`, `surveys.created`, `volunteer_attendance.cross_user_mark`); adding, removing, or renaming an OTel span / attribute name. Downstream LogQL queries depend on these names; Loki retention is calibrated for event volume; the operator's tail-the-logs workflow uses event names directly. Deleting an event breaks log queries silently — same shape as deleting a response field. Adding one expands the audit-trail compliance surface. |
 
 If the change is in any of these categories — name it. If you're unsure whether your change qualifies, name it anyway. The cost of over-disclosure is one extra paragraph; the cost of under-disclosure is the blast-radius examples below.
 
@@ -115,6 +116,7 @@ The cost is 30 seconds to 5 minutes per PR. The cost of skipping it is what the 
 - **NOT** a license to mix unrelated contract changes into one PR because "I'll just list them all." Multiple contract changes in one PR is still bad practice — split them if you can. The disclosure rule applies regardless; smaller PRs make the disclosure both easier and more reviewable.
 - **NOT** a replacement for the diff itself. Reviewers still read the diff. The discipline is that the PR body should let them know *what to look for* in the diff — not let the diff carry the burden of being the only signal.
 - **NOT** about commit messages. Commit messages are a separate discipline. The PR body is the reviewer-facing artifact; that's the surface this skill protects.
+- **NOT** the inverse problem ("PR body promises something the diff doesn't deliver"). That failure mode is less common in the swarm (we tend to under-document, not over-promise), but it exists and deserves separate handling. This skill specifically protects against *under*-disclosure of runtime-contract changes in the diff.
 
 ---
 
@@ -122,7 +124,7 @@ The cost is 30 seconds to 5 minutes per PR. The cost of skipping it is what the 
 
 | Bead | PR | What was disclosed | What was NOT disclosed | Blast radius |
 |---|---|---|---|---|
-| (no dedicated bead — referenced from Cipher's review thread) | monorepo-incluir #315 (Vance) | Audience-flush + nav-overlay scope work | New `user_id:<uuid>` audience matcher (runtime capability) | Would have shipped as silent capability without Cipher's catch + audit-log gap |
+| `aperture-fspg` (Cipher's #315 review → audit-log follow-up; still open in Rex's queue at skill-bank time — catches generate follow-up work, not just immediate corrections) | monorepo-incluir #315 (Vance) | Audience-flush + nav-overlay scope work | New `user_id:<uuid>` audience matcher (runtime capability) | Would have shipped as silent capability without Cipher's catch + audit-log gap |
 | `aperture-n9gn` | monorepo-incluir #310 (Rex) | Auth-gate widening (extensive discussion) | `/api/users` response shape migration camelCase → snake_case | 5 apps × 6+ consumers broken (Cipher's cross-cut sweep); Quarentena "Nunca acessou" is the visible tip |
 
 **Class-diagnosis credit: Cipher.** She flagged both instances during review — first on #315 (caught the user_id macro and demanded the audit-log follow-up), then on #310 (caught the silent shape migration during cross-cut analysis). The pattern she named — "PR adds production-runtime capability without PR-body disclosure" — is the principle this skill banks. GLaDOS dispatched the bank after the second instance.
