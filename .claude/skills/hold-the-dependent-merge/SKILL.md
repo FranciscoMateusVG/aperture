@@ -15,7 +15,7 @@ This skill is the **merge-time companion** to `aperture:specialist-delegation §
 
 > **When PR A depends on PR B (e.g., A's frontend calls a route B's backend adds), hold `gh pr merge --auto` on A until B has merged. `--auto-merge` does NOT respect cross-PR ordering.**
 
-The failure mode: the dependent's faster CI (FE: `vitest` + `drift`) beats the prereq's slower CI (BE: `drift` + `GitGuardian` + `vitest` + Cipher review). The dependent merges first. The frontend hits prod calling a route that doesn't exist yet. Result: a 404 window of length `min(BE CI time + deploy lag)` — minutes to tens of minutes.
+The failure mode: the dependent's faster CI (FE: `vitest` + `drift`) beats the prereq's slower CI (BE: `drift` + `GitGuardian` + `vitest` + Cipher review). The dependent merges first. The frontend hits prod calling a route that doesn't exist yet. Result: a 404 window that **opens the moment the dependent merges and closes the moment the prereq's code is actually running on prod** — deploy rolled, container restarted, not merely merged to main. Window length is typically `min(BE CI time + deploy lag)`, minutes to tens of minutes.
 
 The fix is one rule applied at merge-trigger time: don't `--auto` the dependent. Wait for the prereq to merge first; then trigger the dependent's merge manually (or auto, with the prereq already gone from the race).
 
@@ -31,6 +31,8 @@ Before you commit to a merge strategy on a stacked pair, **verify the dependent'
 The race urgency calibrates against degradation. A race-tolerant pair can afford a couple of minutes of zeros-instead-of-298; a race-intolerant pair cannot afford any window. The discipline test is the precondition for choosing your merge strategy: *how bad is "FE shipped without BE" for THIS pair?*
 
 Apply this before you fire the merge, not after the page 404s and someone files a P1.
+
+**The observability tax of graceful fallback (Cipher's framing):** race-tolerant pairs still have a hidden cost — graceful fallback to empty data means the race window is **invisible to monitoring** unless the operator notices wrong numbers visually. The page shows zeros, nothing crashes, no dashboard alert fires. The Estatísticas-zeros instance lived entirely inside this blind spot until Vance verified the actual numbers manually. Pair the degradation-check with a Loki query (or alert) on the prereq route's 404 rate during the expected race window; that closes the monitoring blind spot without removing the graceful-fallback benefit. The `aperture:surface-fetch-errors` cross-link below is what makes the 404 window NOT silent at the wrapper layer; this monitoring layer protects against the operational-visibility version of the same gap.
 
 ---
 
