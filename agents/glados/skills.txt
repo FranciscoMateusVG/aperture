@@ -6,3 +6,4 @@ subagents
 worktree-discipline
 watch-protocol
 specialist-delegation
+grep-before-spec
