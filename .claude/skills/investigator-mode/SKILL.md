@@ -52,6 +52,14 @@ Cost: ~30–60s of serial latency. Benefit: every downstream subagent runs on fa
 
 **Banked precedent (2026-05-17, surveys recon aperture-izmd):** Architecture and library subagents were dispatched in parallel with a wrong-ORM premise in their prompts ("Drizzle" — actual: Kysely). The codebase-scout subagent caught the error, but only because it ran in parallel by luck. Both downstream reports landed useful but had to be re-read with the correction applied. A serial stack-verification gate would have prevented the muddied analysis at near-zero cost.
 
+**Step 2c — Existing-infra audit subagent (parallel; conditional on the recon proposing new infra).** If your recon will propose adding new infrastructure (clients, adapters, middleware, rate limiters, queues, caches, integrations, schemas, env vars), include an **audit-existing-primitives subagent** in your parallel fan-out. This is NOT a serial gate like Step 2 — it runs alongside the architecture-research subagents, but with a tightly-scoped brief:
+
+> "Exhaustively audit `apps/<service>/src/adapters/` (and the equivalent locations for the proposed infra category). List every existing primitive: file path, exported shape, registration point in server.ts/app.ts, and singleton-vs-DI shape. Specifically check whether the codebase ALREADY HAS: [list of categories the recon will propose — rate-limit, mailer, queue, cache, etc.]. For each found primitive: is it usable for the new need? Report verbatim. Do not propose changes. Do not skip files."
+
+The subagent's verbatim report becomes the **grep-receipt** in the recon synthesis. The grep-receipt is what `aperture:grep-before-spec` requires of any recon doc proposing new infra; this subagent makes the receipt a dispatch-output rather than a manual aside.
+
+**Banked precedent (2026-05-22, AI intake recon aperture-idpx → grep-before-spec):** Architecture sketch for the lz9y epic proposed three pieces of new infrastructure where the codebase already had primitives: (1) in-memory LRU rate limiter — existing: Redis Cipher Lua variant B adapter at `apps/hono-app/src/adapters/rate-limit/` (caught by Cipher in S1 review cea7 A11), (2) "follow mailer pattern for OpenAI DI" — existing: mailer is module singleton, NOT DI; the correct primitive is `AppDependencies` (caught by Rex in fjjk recon #1), (3) implied new rate-limit infra for AI endpoints — sibling of #1 (caught by Rex in fjjk recon #2). All three would have been caught at recon-write time by an audit-existing-primitives subagent in the original fan-out. The discipline shifts the catch from "Cipher/Rex shipping-phase review" to "Wheatley recon-phase dispatch." Cross-link: `aperture:grep-before-spec` (Atlas's PR #24, the shipping-side companion to this step).
+
 **Step 3.** Dispatch 2–4 parallel subagents. Send them in a single tool-call block so they actually run concurrently.
 
 Subagent type choice:
@@ -138,6 +146,7 @@ When you close the recon-parent task, GLaDOS gets:
 | Dispatch one subagent for "the whole investigation" | You collapse parallelism back to serial. Fan out — 2 to 4 subagents minimum. |
 | Dispatch architecture-research subagents on stack assumptions you haven't verified | The subagent's analysis filters through the wrong premise. Verify stack FIRST as a serial gate (§2 Step 2). Banked: 2026-05-17 surveys recon shipped two wrong-ORM premises before the codebase scout caught it. |
 | Bank a subagent-reported DB ground-truth number without the SQL preserved in the recon output | Framing errors in the query (filter scope, join shape, semantic axis) cannot be detected by readers and propagate through downstream fix work. A number without its query is unverifiable. Banked: 2026-05-21 qz4b "429 sessions in semester window" → Vance's letivo-only re-query returned 298. |
+| Propose new infrastructure in a recon doc without dispatching an audit-existing-primitives subagent | Three provenances on a single epic (lz9y, 2026-05-22): in-memory LRU rate-limiter when Redis adapter existed; "follow mailer pattern for DI" when mailer is a singleton; new rate-limit infra implied when adapter exists. All three caught downstream (Cipher S1 + Rex implementation recon) when they should have been caught at dispatch time. See `aperture:grep-before-spec` for the shipping-side companion discipline. |
 | Use this skill for "write me a spec for X" | That's planning, not recon. Different mode. |
 
 ---
@@ -176,5 +185,20 @@ If you find yourself:
 - About to make a sequencing decision ("we should do X first, THEN Y") → fine to recommend; don't claim authority. GLaDOS owns it.
 - Tempted to "just iterate the spec while I'm here" → STOP. Different mode. Close recon, wait for GLaDOS to dispatch a spec task.
 - About to bank a count/aggregate/ground-truth number a subagent returned without the query attached → STOP. Dispatch a follow-up to extract the SQL/script, or re-run it yourself before the number lands in the recon-parent bead notes. A number without its query is a guess wearing a number's clothes.
+- About to propose new infrastructure (client / adapter / middleware / rate limiter / queue / cache / schema / env var) in a recon synthesis → STOP. Did you dispatch an audit-existing-primitives subagent in Step 2c? If no, dispatch one now or grep yourself before the proposal lands. The codebase likely already has the primitive you're about to propose adding — three provenances on lz9y prove it.
 
 The role is sharp on purpose. Stay in lane.
+
+---
+
+## Meta-shape across §2 dispatch-time gates
+
+Steps 2, 4, and 2c share a structural family: **make the subagent dispatch verify against a specific axis that downstream agents will otherwise catch**. Three self-applications banked so far on this skill:
+
+| Gate | Axis verified at dispatch time | Catch averted downstream |
+|---|---|---|
+| Step 2 (stack-verification, gr9g 2026-05-17) | Framework / ORM / DB engine premises | Wrong-stack architecture reports from parallel subagents |
+| Step 4 (SQL-preservation, wjx5 2026-05-21) | DB-query framing (filter scope, join shape) | Numbers banked as ground truth with unverifiable framing |
+| Step 2c (existing-infra audit, fkih 2026-05-22) | Codebase already-has-it for proposed infra | Cipher S1 review + Rex impl recon catching recon-spec-drift |
+
+The unifying frame is **recursive verify-against-reality applied at dispatch-design time**, not synthesis-time. Companion to `aperture:specialist-delegation §6` (verify-against-reality at code-review time) and `aperture:grep-before-spec` (verify-against-reality at recon-doc-write time, shipping-side). When you find a 4th instance of the meta-shape on this skill, bank it here as a 4th row and consider whether the principle deserves a standalone aperture:dispatch-time-verify skill.
