@@ -30,6 +30,8 @@ A subagent is a separate context window with a fresh prompt. It's the right tool
 | **Potentially-blocking external I/O** (ssh, slow log pulls, deploy polls) | Fault-isolation — if it hangs, only the subagent dies (see `aperture:subagents` §11) |
 | **Test-fixture generation / boilerplate scaffolding** | Pattern-driven; doesn't need lane judgment |
 
+> **Sibling liveness skills.** This skill covers when to delegate. For what to do AFTER delegation when state isn't clear: **subagents §11** covers subagent fault-isolation (Agent-tool delegations), and **`aperture:agent-liveness`** covers tmux-pane specialist-agent stuck-vs-working-vs-waiting plus direct intervention via `tmux send-keys`. The orchestrator (GLaDOS) loads both; specialists load whichever applies to their own delegation patterns.
+
 ---
 
 ## 3. WHEN to Stay Hands-On

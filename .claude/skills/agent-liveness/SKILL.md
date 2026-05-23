@@ -21,17 +21,20 @@ Companion to `watch-protocol` (the loop-cadence skill) and `specialist-delegatio
 
 `tmux capture-pane -t <agent> -p | tail -3` is too shallow. It shows you the prompt arrow + the context bar. That's the LEAST informative slice of the pane. The interesting state — what the agent was last doing, whether they typed something at the prompt, whether they hit an API error, what their last message said — lives further up.
 
-**Default to `tail -20` or `-40` when reading any agent that "doesn't look right."**
+**Default to `tail -30` minimum when reading any agent that "doesn't look right." Bump to `-40` or more when in doubt.**
+
+The `-30` floor is calibrated against a real mis-classification — even `tail -10` cuts the thinking indicator on a busy agent (see the Rex row in the table below). `tail -30` reliably catches the indicator + last self-message + input buffer in one read.
 
 Even better — when investigating a specific concern, use a scrollback offset: `tmux capture-pane -t <agent> -p -S -40 | tail -40` reads the last 40 lines of pane history including off-screen content.
 
-Three real failure modes from shallow-peek that deep-peek would have caught:
+Four real failure modes from shallow-peek that deep-peek would have caught:
 
 | Symptom (shallow) | Reality (deep-peek) | Why shallow misses it |
 |---|---|---|
 | "Vance idle" | Vance was mid-tsx-write with "Flummoxing… (3m 45s)" timer + active context burn | The thinking indicator was 15 lines up; tail -3 cut it off |
 | "Atlas frozen at 97%" | Atlas typed `/clear` at the prompt 4 hours ago, awaiting an operator Enter keystroke | The typed-but-unfired slash command was at the actual prompt; tail -3 cut to status bar |
 | "Rex stuck" | Rex's last self-message said "Acked. Still holding for /compact." — deliberate hold | The self-message was 10 lines up; tail -3 cut to UI chrome |
+| "Rex 'idle' (tail -10)" | Rex was actively `✢ Fiddle-faddling… (29m 49s)` on B2 with `pnpm vitest run` + `docker ps` tool calls mid-flight | Thinking indicator + tool calls lived at tail -20–25; even `tail -10` cut to status bar. Banked from a real GLaDOS mis-classification 2026-05-23 — the reason this skill's default is `tail -30` minimum, not `-10` or `-20`. |
 
 ---
 
@@ -197,7 +200,7 @@ You can't `tmux send-keys` them — they don't have a pane. The liveness rules f
 - The runtime is supposed to catch this and notify; if it doesn't, you may have a real silent failure
 - Recovery: `TaskStop` and either re-dispatch fresh OR fall back hands-on
 
-This is covered in more depth in `specialist-delegation §11` (subagents as fault-isolation boundaries). This skill's §1-§6 applies to specialist agents in tmux panes.
+This is covered in more depth in `subagents §11` (subagents as fault-isolation boundaries — the blast-radius framing). This skill's §1-§6 applies to specialist agents in tmux panes. See also `specialist-delegation` for the when-to-delegate-at-all question (vs how to recover the delegation, which is here).
 
 ---
 

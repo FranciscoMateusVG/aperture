@@ -17,7 +17,9 @@ A tick is incomplete without all three. Reading only one of them is what produce
 |---|---|---|
 | **Bead state** | `bd list --status=in_progress -l project:<x>` and `bd list --status=open ...` | What's claimed, by whom, and whether anything moved since last tick |
 | **PR state** | `gh pr list --state=open --json state,mergeStateStatus,statusCheckRollup` | CI health per PR, mergeable vs blocked, what's queued |
-| **Pane activity** | `tmux capture-pane -t <agent> -p \| tail -10` | Whether the agent is actually working (thinking indicator: Forging…, Befuddling…, Crunched, tool call mid-flight) or sitting at an idle prompt |
+| **Pane activity** | `tmux capture-pane -t <agent> -p \| tail -30` | Whether the agent is actually working (thinking indicator: Forging…, Befuddling…, Crunched, tool call mid-flight) or sitting at an idle prompt |
+
+**`tail -30` minimum.** Earlier versions of this skill defaulted to `tail -10` — that was the source of a real GLaDOS mis-classification 2026-05-23 (Rex actively `Fiddle-faddling… (29m 49s)` with tool calls mid-flight read as "idle" because the indicator lived at tail -20–25). For deeper pane-state diagnosis when the tick signal alone doesn't resolve stuck-vs-working-vs-waiting, see **`agent-liveness §1-§4`** — it covers the four signals, classification table, and direct intervention via `tmux send-keys`.
 
 **"tick: nothing to report" is valid ONLY when all three are unchanged AND none indicate trouble.** A bead showing in_progress while the pane shows an idle prompt with no thinking indicator is NOT healthy — it's a stalled agent.
 
