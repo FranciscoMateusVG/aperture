@@ -14,23 +14,27 @@ This skill is the canonical pipeline for that handoff. It also banks the failure
 ## 0. The Pipeline (one diagram)
 
 ```
-                       Prod Postgres                          MinIO              BEADS                Prod Postgres
-                       ─────────────                          ─────              ─────                ─────────────
-user clicks Approve →  user_reports.status='approved'  ←→  attachments  →  create_task  ←→  user_reports.admin_notes
-                                │                                              │                          ↑
-                                │                                              │                          │
-                                └─ (1) query  ─ (2) fetch blobs  ─ (3) file  ─ (4) route  ─ (5) writeback ┘
+              Prod Postgres        MinIO         BEADS         Wheatley         Operator       Specialist        Prod Postgres
+              ─────────────        ─────         ─────         ────────         ────────       ──────────        ─────────────
+Approve  →  user_reports='approved'  →  attachments  →  bead created  →  plan added  →  approves plan  →  reassigned  →  admin_notes updated
+                  │                          │                │                │                │                 │                  ↑
+                  │                          │                │                │                │                 │                  │
+                  └─ (1) query ─ (2) fetch blobs ─ (3) file ─ (4a) plan ─ (4b) approve ─ (4c) route ─ (5) writeback ┘
 ```
 
-| Stage | What happens | Tools |
-|---|---|---|
-| 1 | Query prod for approved (or pending) reports | `incluir-prod-postgres` skill |
-| 2 | Fetch attachment blobs from MinIO bucket `user-reports` | the recipe in §4 |
-| 3 | File one BEADS task per report — with verbatim PT-BR body, provenance, attachment artifacts | `create_task` + filing discipline §5 |
-| 4 | Assign to the right specialist via `assignee:` | routing matrix §6 |
-| 5 | When the bead closes, append a status note back onto `user_reports.admin_notes` so the original reporter knows the request shipped | recipe in §7 |
+| Stage | What happens | Owner | Tools |
+|---|---|---|---|
+| 1 | Query prod for approved reports | GLaDOS | `incluir-prod-postgres` |
+| 2 | Fetch attachment blobs from MinIO `user-reports` bucket | GLaDOS | recipe §4 |
+| 3 | File one BEADS task per report — verbatim PT-BR body, provenance, attachment artifacts | GLaDOS | `create_task` + filing §5 |
+| **4a** | **PLANNING GATE — bead assigned to Wheatley. He researches, sharpens scope, resolves open questions, verifies dependencies actually exist in the repo, tightens acceptance criteria.** | **Wheatley** | his planning lane |
+| **4b** | **Wheatley bounces the plan back to GLaDOS. GLaDOS surfaces the plan to the operator for approval.** | **GLaDOS** | `send_message` to operator |
+| **4c** | **On operator approval, GLaDOS reassigns the bead to the right specialist per the routing matrix §6.** | **GLaDOS** | `update_task assignee:` |
+| 5 | When the specialist's bead closes (PR-opened), append `BEADS: <id> shipped <date> — <pr-url>` to `user_reports.admin_notes` so the feedback loop closes | GLaDOS | SQL §7 |
 
-Stages 1–4 typically run together (operator pings "found a bunch of approved reports, file them"). Stage 5 runs later, ambient — when GLaDOS sees a close event on an intake-derived bead.
+**The planning gate is the centerpiece of this flow.** Intake-derived asks arrive with operator urgency rankings (low/medium/high) and PT-BR description quality that varies — sometimes thorough, sometimes one sentence with attachments. Wheatley turns that raw intake into a spec a specialist can claim and execute against, without losing days to back-and-forth clarification. Skipping the planning gate is the failure mode that produces half-specified beads that stall.
+
+Stages 1–3 typically run in one operator interaction ("file these as beads"). Stage 4a runs asynchronously in Wheatley's queue. Stage 4b–4c run when Wheatley pings back. Stage 5 runs ambient, on PR-opened events from intake-derived beads.
 
 ---
 
@@ -220,11 +224,13 @@ Title:       <Action verb> <object> <where> (intake <8-char-id>)
 Priority:    Per §5.4 (urgency → priority mapping)
 Type:        feature | bug | chore — match the user_reports.kind
 Labels:      project:incluir   (mandatory, exactly one)
-Assignee:    <specialist> per §6 routing
+Assignee:    wheatley   (ALWAYS — planning gate per §0/§6)
 Description: Verbatim PT-BR + structured fields per §5.3
 ```
 
 The `(intake <8-char-id>)` suffix on the title is **non-negotiable** — it makes the provenance grep-able later. The 8-char id is the first segment of the user_reports uuid.
+
+**Assignee is ALWAYS wheatley at filing time.** Specialist routing happens at stage 4c, AFTER Wheatley produces a plan AND the operator approves it. See §6.
 
 ### 5.2 The strict mapping discipline (READ THIS BEFORE BATCH FILING)
 
@@ -306,25 +312,60 @@ The `file` artifact gives future agents the path to re-read the image. The `note
 
 ---
 
-## 6. Routing matrix (stage 4)
+## 6. Routing (two-stage)
 
-Translate the report's `area` and content into a specialist `assignee`:
+Routing is **two-stage**: every intake bead lands with Wheatley first, then gets reassigned to a specialist AFTER planning + operator approval. The intermediate planning step is what makes the specialist's claim productive instead of half-specified.
 
-| Signal in description / area | Assignee |
+### 6.1 Stage 4a — Wheatley (always, no exceptions)
+
+Every intake-derived bead is filed with `assignee: wheatley`. He owns the planning lane, so he produces:
+
+- Concrete scope (resolves the open questions in the bead's PROPOSED SCOPE section)
+- Dependency verification (greps the repo to confirm the schema / route / component actually exists)
+- Sharpened acceptance criteria (testable conditions, not vibes)
+- Routing recommendation (which specialist should claim once approved)
+- Cipher / cross-cutting flags (security posture concerns, multi-specialist work, etc.)
+
+Wheatley's deliverable lands as a notes-append on the bead, not a separate document. The bead description stays in operator-intake shape; the plan accumulates as Wheatley's progress notes.
+
+### 6.2 Stage 4b — operator approval
+
+When Wheatley pings GLaDOS that a plan is ready, GLaDOS surfaces it to the operator with a short summary + recommended routing. The operator either:
+
+- ✅ Approves → proceed to 4c (specialist reassignment)
+- 🔁 Requests changes → bounce back to Wheatley with the requested adjustments
+- ❌ Rejects → close the bead with reason; writeback to user_reports per §7.2 (`wont-fix`)
+
+This is the only stage where the operator interacts with intake-derived work directly. Keep the surfacing crisp — bead id + title + Wheatley's plan summary in ≤5 bullets + recommended specialist.
+
+### 6.3 Stage 4c — specialist routing
+
+After operator approval, GLaDOS reassigns via `update_task(id, assignee: <specialist>)`. The routing matrix:
+
+| Signal in description / area | Specialist |
 |---|---|
 | Frontend tab, button, CSS, layout, page added | **vance** |
 | Database schema, migration, API endpoint, server logic | **rex** |
 | Mobile / React Native / app store | **scout** |
-| Auth, permissions, audit log, secrets, RBAC | **cipher** (for posture review) + **rex** (for implementation) |
+| Auth, permissions, audit log, secrets, RBAC | **cipher** (posture review) + **rex** (implementation) |
 | Infra, deploy, env var, container, DNS | **peppy** |
 | Documentation, runbook, API reference | **atlas** |
 | SEO, content strategy, conversion funnel | **sage** |
 | Test coverage, regression, E2E | **izzy** |
-| Cross-discipline ("add a feature with UI + API + tests") | leave unassigned; GLaDOS will fan out subtasks |
+| Cross-discipline (UI + API + tests) | **leave with wheatley as sub-task coordinator**, OR file split sub-beads with `discovered-from:<parent>` |
 
-If the routing is ambiguous, default to **unassigned** and let `bd ready` surface it to whichever specialist picks it up. Don't force-route an unclear ask.
+If Wheatley's plan flagged an ambiguous routing, GLaDOS pings the operator before reassigning. Don't force-route an unclear ask.
 
-For PII-touching mutations (any "edit user data" intake), ALWAYS add a co-assignment hint to **cipher** in the bead notes — Cipher needs to review the audit-log discipline before implementation lands.
+**For PII-touching mutations (any "edit user data" intake):** ALWAYS add a co-assignment hint to **cipher** in the bead notes — Cipher needs to review the audit-log discipline before implementation lands.
+
+### 6.4 Why the planning gate is non-negotiable
+
+Skipping straight from filing to specialist routing produces half-specified work. Specialists then either:
+- Stall waiting on clarification ("does this apply per-day or per-session?")
+- Make assumptions that don't match operator intent
+- Burn a session on scope refinement that should have happened upstream
+
+Wheatley's lane IS this gap. He turns operator-approved intake into spec-shaped work. The cost is one extra stage in the pipeline; the win is specialists getting work they can actually execute.
 
 ---
 
@@ -388,13 +429,25 @@ Then ask: "File all of them as beads, or pick specific ones?"
 
 ### "File the approved reports"
 
-Build the strict mapping per §5.2, fetch any attachments per §4, then file in a single batched message (multiple `create_task` calls). Verify the literal-close-tag pattern check in §5.5 before each call.
+Build the strict mapping per §5.2, fetch any attachments per §4, then file in a single batched message (multiple `create_task` calls). Verify the literal-close-tag pattern check in §5.5 before each call. **Every bead gets `assignee: wheatley` at filing time — no exceptions, no routing at this stage.**
 
-Report back to the operator with a clean table of new bead IDs + titles + assignees.
+After filing, ping Wheatley via `send_message` listing the new bead IDs + titles + priorities + a one-line "what I want from you" framing. Reference the screenshots' on-disk paths if any are attached. Wheatley orders the queue by his own judgment of complexity.
+
+Report back to the operator with a clean table of new bead IDs + titles. All assignee=wheatley. Note that the operator will see specialist routing in stage 4c, after Wheatley plans.
 
 ### "Show me what they're asking for"
 
 Read the fetched images via the Read tool. Operator may want you to summarize the visual content beyond the PT-BR description.
+
+### "Wheatley finished planning bead X, what next?"
+
+This is stage 4b. Read the bead's notes (Wheatley appends his plan there), summarize for the operator in ≤5 bullets: scope, key dependency findings, sharpened acceptance criteria, recommended specialist, any open questions Wheatley flagged. Ask the operator: approve / request changes / reject.
+
+On approve → `update_task(id, assignee: <specialist>)` per the §6.3 matrix. Ping the specialist with a fresh dispatch message including the bead ID + the Wheatley-enriched scope.
+
+On request-changes → bounce back to Wheatley with the operator's adjustments as new notes.
+
+On reject → `close_task` with the operator's reason; run the §7.2 `wont-fix` writeback to user_reports.
 
 ### "Close the loop on bead X"
 
@@ -410,11 +463,13 @@ Run the writeback in §7.1 with the bead's PR URL. Confirm the admin_notes row u
 | Synthesize a title — always use a verb-object phrase that maps to the user's actual ask | Vague titles ("User feedback") rot fast. The user already gave you the verb. |
 | Skip the `(intake <id>)` suffix | Provenance becomes ungrepable. Future GLaDOS needs to trace a bead back to a report and won't be able to. |
 | Translate the PT-BR description to English in the verbatim block | Verbatim means verbatim. The PROPOSED SCOPE section is where English engineering analysis lives; the USER REQUEST block stays in the user's language. |
-| Assign a bead to a specialist without checking they actually own the lane | Mis-assignment burns specialist attention. If unsure, leave unassigned. |
+| **Skip the planning gate and route straight to a specialist** | **Half-specified work stalls. Specialists burn cycles on clarification that should have happened upstream. Wheatley's lane IS this gap.** |
+| **Assign directly to a specialist at filing time** | The §5.1 assignee is ALWAYS wheatley. Specialist routing happens at stage 4c, after planning + operator approval. |
+| **Surface a Wheatley plan to the operator without summarizing in ≤5 bullets** | Operator approval is the bottleneck; respect their attention budget. Bullet form, not essay form. |
 | Pull the same approved report into two beads | Use the §2 duplicate-filing guard. If you bypassed it (operator override), at least cross-link the two beads with `related:` |
 | Forget to writeback after PR-opened | The feedback loop never closes. Use §7's pattern reliably. |
 | Compose batch filings by reaching into a shared mental buffer for "the description" | This is the title-to-body cross-pollination bug. Build the mapping FIRST, then file by ID lookup. |
-| Paste a literal `</description>` or `</invoke>` close-tag fragment into ANY argument | Wire-format truncation. Scan for `</` before every `create_task`. |
+| Paste a literal close-tag fragment (`&lt;/description&gt;`, `&lt;/invoke&gt;`) into ANY argument | Wire-format truncation. Scan for `&lt;/` before every `create_task`. |
 
 ---
 
@@ -438,6 +493,16 @@ Also during this batch:
 - `fef2eff6` had a single zero-byte legacy `screenshot.webp` row (v1.1 stub from the v1.2 migration window). Not fetchable. Documented in the bead as "legacy stub, not usable."
 
 The two real images turned out to be screenshots of `/home/admin/errors` itself, captured by the user to illustrate the 401-flood problem — they made the request immediately concrete in a way the prose alone didn't. Image fetching is high-signal; don't skip it when the size > 0.
+
+### 2026-05-25 — the planning-gate added (this skill's first revision)
+
+After the initial 4-bead batch shipped with `assignee:` filled in directly (vance / rex / etc. per the original routing matrix), the operator codified a new flow: **intake → GLaDOS files → Wheatley plans → operator approves plan → specialist claims**.
+
+Reasoning (operator's framing, verbatim): "this is a good flow valid in the skill, wheats plan them, we approve dispatch to specialists".
+
+The four beads from the morning batch (`aperture-pubp`, `-9v6e`, `-le5k`, `-nw4b`) were retroactively reassigned to wheatley with a notes-append explaining the planning brief. The skill was updated to make wheatley the default assignee at filing time, with the §6.3 specialist matrix moving to stage 4c (post-approval reassignment).
+
+Subsequent intake batches MUST follow this flow. Skipping the planning gate is a banned anti-pattern in §9.
 
 ---
 
