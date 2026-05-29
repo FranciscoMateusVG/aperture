@@ -5,3 +5,4 @@ deploy-workflow
 worktree-discipline
 specialist-delegation
 scope-from-artifact
+investigator-mode

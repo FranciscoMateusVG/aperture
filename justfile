@@ -170,6 +170,21 @@ build-mcp:
     cd mcp-server && pnpm install && pnpm build
     @echo "✅ MCP server built"
 
+# Build the Sentry MCP wrap server (aperture-ttzz)
+build-mcp-sentry:
+    @echo "🔨 Building Sentry MCP wrap server..."
+    cd mcp-server-sentry && pnpm install && pnpm build
+    @echo "✅ Sentry MCP wrap server built"
+
+# Run the Sentry MCP wrap server's test suite
+test-mcp-sentry:
+    @echo "🧪 Running Sentry MCP wrap server tests..."
+    cd mcp-server-sentry && pnpm test
+    @echo "✅ Sentry MCP wrap tests passed"
+
+# Build BOTH MCP servers — used by `just setup-all`.
+build-mcp-all: build-mcp build-mcp-sentry
+
 # Check MCP server config
 check-mcp:
     #!/usr/bin/env bash

@@ -5,3 +5,4 @@ worktree-discipline
 specialist-delegation
 verify-user-path
 audit-route-contract
+playwright-gotchas
