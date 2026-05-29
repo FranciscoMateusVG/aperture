@@ -3,3 +3,5 @@ team
 beads
 worktree-discipline
 specialist-delegation
+verify-user-path
+audit-route-contract

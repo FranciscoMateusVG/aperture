@@ -136,3 +136,34 @@ gh pr edit <your-pr-num> --base main
 **Recovery procedure (after auto-close):** see `aperture:incluir-deploy` Gotcha #9 for the full fresh-PR + cross-link-comment procedure. Banked precedents: PR #237→#245 (Vance, 2026-05-14), PR #242→#244 (Rex, 2026-05-14).
 
 Worktree itself stays alive through the recovery — same branch, same files. You're only re-opening the GitHub PR surface, not the local work.
+
+### 8.1 The squash-merge-aftermath rebase trap (banked 2026-05-27)
+
+A second stacked-PR failure mode, distinct from auto-close. When you base a child branch on a parent PR's branch (e.g. `git checkout pr-453-rex-refactor && git checkout -b my-stacked-work`), your child branch carries the parent's pre-merge commits. After the parent squash-merges to main:
+
+- Git's view of main now contains ONE squashed commit with the parent's full diff
+- Your child branch's history still contains the parent's INDIVIDUAL pre-merge commits
+- Plain `git rebase origin/main` will try to replay those pre-merge commits onto main → each one conflicts add/add with the squashed main version of the same files
+
+**Symptom:** rebase conflicts in files that you personally never touched. The conflict markers appear in files the parent created (e.g. backend adapter files when you only edited frontend code).
+
+**The fix:** use `git rebase --onto` with the cutoff at the last parent commit so git replays ONLY your commits:
+
+```bash
+# branch:  parent-commit-1 → parent-commit-2 → parent-commit-3 (LAST PARENT) → your-commit
+# After parent merges, you want to replay ONLY your-commit onto origin/main.
+
+git fetch origin
+git rebase --onto origin/main <last-parent-commit-sha> <your-branch>
+
+# Or equivalently if you're already on your branch:
+git rebase --onto origin/main <last-parent-commit-sha>
+```
+
+Find `<last-parent-commit-sha>` via `git log --oneline` on your branch — it's the last commit that came from the parent PR's branch, before your own commits started.
+
+**Banked precedent**: 2026-05-27, Vance on PR #454 (vwkg/k4qz-v2 stacked on Rex's #453). She'd based her branch on `pr-453-rex-refactor`; after #453 squash-merged, `git rebase origin/main` conflicted on Rex's backend adapter files Vance never touched. Recovered via `git rebase --onto origin/main 31b7ef3` where `31b7ef3` was the last commit from Rex's branch.
+
+**Prevention pattern**: when you must stack on an open PR, record the last-parent-commit SHA at branch-creation time in your BEADS notes. Future-you (or another agent recovering the worktree) doesn't have to dig through git log to find it.
+
+**Even better prevention**: don't base on the parent's branch at all. Base on `origin/main` and just include the parent's expected changes as local-only deltas that you'll drop at rebase time. More work upfront, no rebase trap.
