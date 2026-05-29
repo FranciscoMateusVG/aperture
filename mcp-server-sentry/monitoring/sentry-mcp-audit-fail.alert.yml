@@ -1,0 +1,92 @@
+# R9 — Sentry MCP audit-failure alert rule.
+#
+# Watches for stderr lines from aperture-bus-sentry matching the audit
+# emission failure pattern from src/audit.ts. Fires within 5 minutes
+# of any blackout. Wired to the operator notification channel.
+#
+# Cipher's wiring contract (aperture-ttzz): a complete audit blackout
+# must surface within 5 minutes, not "eventually when someone reads logs".
+#
+# Deploy to xerox Grafana/Loki alerting under
+# /etc/loki/rules/aperture-sentry/audit-fail.yml.
+
+groups:
+  - name: aperture-sentry-mcp-audit
+    interval: 1m
+    rules:
+      - alert: SentryMcpAuditEmissionFailed
+        # Match the stderr line format from audit.ts:
+        #   "[sentry-mcp] audit emission failed: ..."
+        expr: |
+          count_over_time(
+            {service="aperture-bus-sentry"}
+              |~ "(?i)audit.*fail"
+            [5m]
+          ) > 0
+        for: 1m
+        labels:
+          severity: warning
+          team: aperture
+          owner: peppy
+          surface: sentry-mcp-audit
+        annotations:
+          summary: "Sentry MCP audit emission failing"
+          description: |
+            One or more Sentry MCP tool calls failed to push their audit line to Loki.
+            This is a fail-soft path — calls themselves succeeded — but the audit
+            trail is incomplete during the failure window.
+
+            Recovery:
+              1. Check Loki ingester health: `systemctl status loki` on xerox
+              2. Check aperture-bus-sentry stderr for the underlying cause
+              3. If Loki is unreachable, investigate xerox network / disk pressure
+              4. After recovery, no replay is possible — the lost audit window is
+                 documented as a gap in the agent.sentry_query stream
+
+            Owner: peppy. Skill: aperture:sentry-query.
+
+      - alert: SentryMcpAuditChannelBlackout
+        # Alternative shape: NO audit lines from a known-active session.
+        # If aperture-bus-sentry stderr shows "server ready" but no
+        # agent.sentry_query lines appear in 30 min, the audit channel
+        # may be silently dropping. Conservative threshold to avoid noise
+        # during idle periods (no Sentry usage = no audit lines = normal).
+        expr: |
+          (
+            count_over_time(
+              {service="aperture-bus-sentry"} |~ "server ready"
+              [30m]
+            ) > 0
+          )
+          AND
+          (
+            count_over_time(
+              {service="aperture-bus-sentry", event="agent.sentry_query"}
+              [30m]
+            ) == 0
+          )
+          AND
+          (
+            count_over_time(
+              {service="aperture-bus", event="agent.task_update"}
+              [30m]
+            ) > 0
+          )
+        for: 5m
+        labels:
+          severity: warning
+          team: aperture
+          owner: peppy
+          surface: sentry-mcp-audit
+        annotations:
+          summary: "Sentry MCP audit channel silent during active session"
+          description: |
+            aperture-bus-sentry has been running >=30m and other Aperture activity
+            shows on Loki, but ZERO agent.sentry_query audit lines have appeared.
+            This may indicate:
+              - Loki dropping the audit stream
+              - Wrap layer crashed but stderr lines didn't reach Loki
+              - All Sentry tool calls are being denied at the allowlist (R3) gate
+                (verify by checking the allowlist file content)
+
+            Investigate within 5 min per R9 contract.
