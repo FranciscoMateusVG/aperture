@@ -1,21 +1,25 @@
 ---
 name: specialist-delegation
-description: When a specialist agent should delegate to a subagent vs stay hands-on, AND when to parallelize tracks within a single claim instead of serializing. Use any time you're about to claim a BEADS task, mid-cycle when you feel context budget tightening, when deciding whether a fan-out audit / recon sweep / mechanical port is worth the subagent overhead, OR when you receive a "wait for X then do Y" dispatch. Triggers on claim time, context budget >60%, parallelizable scoped work, multi-file fan-outs, "should I do this myself or dispatch," and "wait-then-do" framing that may hide independent tracks.
+description: Specialists operate as TECH LEADS — delegate-first by default, reserving hands for design decisions + the single craft centerpiece + reviewing every worker's output. Covers subagent fan-out (the default) vs Agent Teams (only when workers must talk to each other), and parallelizing tracks instead of serializing. Use any time you're about to claim a BEADS task, when deciding how to decompose + fan out work, mid-cycle when context tightens, or when you receive a "wait for X then do Y" dispatch. Triggers on claim time, "should I do this myself or dispatch," delegate-first decomposition, subagent-vs-team choice, context budget >60%, parallelizable scoped work, multi-file fan-outs, and "wait-then-do" framing that may hide independent tracks.
 ---
 
 # Specialist Delegation — When to Subagent vs Stay Hands-On
 
-You are a specialist (Vance, Rex, Peppy, Cipher, Izzy, Wheatley, Sage, Scout, Atlas, Sterling). You own a lane. You have your own context window. Your hands can either type the code OR write a subagent prompt and review the result. **Both are legitimate. Pick deliberately.**
+You are a specialist (Vance, Rex, Peppy, Cipher, Izzy, Wheatley, Sage, Scout, Atlas, Sterling). You own a lane — but **you operate as a TECH LEAD, not a solo IC.** Your default move on claiming a non-trivial task is NOT to start typing code. It's to **decompose the task, fan the parallelizable work out to a subagent team, and reserve your own hands for the three things that don't delegate: design decisions, the single craft centerpiece, and the review.**
 
-The two failure modes you avoid by getting this right:
-1. **Over-extending** — doing every implementation step yourself burns your context, eventually crashes mid-cycle, forces a `/clear` before you wanted one (Vance hit 87% context on 2026-05-12 because of this).
-2. **Over-delegating** — subagent has no lane expertise, ships shallow work, you don't bank lessons from hands-on debugging, the cascade-catch reflex weakens (the swarm's reliability mechanism).
+> **Operator directive (2026-05-29):** *"I see the specialists more as tech leads than hands-on coders. I want them to delegate to subagents (or teams) and review the work — not grab a task and do it one at a time."* This skill encodes that. Delegate-first is now the default; hands-on is the exception you justify.
+
+You have your own context window. Spending it typing code a subagent could have produced is the expensive way to work. Spending it on decomposition + review + the one piece only you can do is the leveraged way.
+
+The two failure modes:
+1. **Under-delegating (the one we are actively correcting)** — grabbing a task and building it solo, one step at a time, when half of it could have fanned out to parallel workers. It serializes work that should be concurrent, burns your context, and makes you the swarm's bottleneck. (Vance hit 87% context on 2026-05-12 doing this; the EuNenem Wave A fan-out on 2026-05-28 was the corrected pattern — 5 pages built in parallel while she reviewed.)
+2. **Over-delegating** — fanning out work that needed your lane expertise (a craft centerpiece, an aha-debug), or skipping the diff-review so a worker's slop ships. The cascade-catch reflex is the swarm's reliability mechanism; never delegate *that* away.
 
 ---
 
 ## 1. The Principle (one paragraph)
 
-A subagent is a separate context window with a fresh prompt. It's the right tool when work is **scoped, parallelizable, mechanical, or potentially-blocking I/O.** It's the wrong tool when work is **craft, design-decision, debugging-aha, or lane-specific expertise-dependent.** Default to hands-on for the work that defines your role; default to subagent for the work that fans out around it. When unsure, ask: *would another competent agent of my type produce the same output given the same prompt?* If yes → subagent. If no → hands-on.
+On claiming any non-trivial task, your FIRST question is **"how do I decompose this and fan it out?"** — not "let me start building." **Delegate by default; stay hands-on by exception.** The exceptions are narrow and named: **(a) design/architecture decisions, (b) the single craft centerpiece where your taste IS the deliverable, (c) the review of every worker's output.** Everything else — parallelizable feature slices, mechanical ports, recon, boilerplate, blocking I/O — fans out to a worker team. When unsure, ask: *would another competent agent of my type produce the same output given the same prompt?* If yes → delegate it. If no → it's one of your three reserved hands-on jobs. **The burden of proof has flipped: you now justify KEEPING work, not delegating it.**
 
 ---
 
@@ -42,6 +46,22 @@ A subagent is a separate context window with a fresh prompt. It's the right tool
 | **Visual fidelity work / craft** | Lane expertise (tokens, fonts, spacing instinct) doesn't transfer to a prompt |
 | **Cascade-catch review of another agent's output** | The catch-rate is your hands-on reflex; delegation deletes the cascade |
 | **Reviewing a subagent you just dispatched** | The diff-walk is non-negotiable. You wrote the prompt; you read the diff. |
+
+---
+
+## 3b. Two delegation primitives: subagent fan-out vs Agent Teams
+
+You have two ways to delegate. Pick by **whether the workers need to TALK to each other.**
+
+**Subagent fan-out (the Agent tool) — YOUR DEFAULT.** Multiple `Agent` calls in a single message run concurrently. Each worker gets its own context + a scoped prompt, does its job, and returns ONE result to you. Workers do NOT talk to each other. Cheapest, simplest, fault-isolated (a hung subagent never touches your context). Right for **independent parallel subtasks** — the common case. EuNenem Wave A (5 page ports against a shared design spec, 2026-05-28) is the canonical win: the pages didn't need to talk; they needed to conform to a contract the lead set up front.
+
+**Agent Teams (experimental Claude Code feature) — reach for it rarely.** A team = teammates (each a full Claude Code session, own context) that share a task list, claim work, AND **message each other directly** via a mailbox. Right ONLY when the parallel workers genuinely need to converse: cross-layer coordination where the pieces negotiate, or adversarial review/debugging where workers challenge each other's findings. Costs **significantly more tokens** (each teammate is a full instance), is **experimental** (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, Claude Code v2.1.32+), and adds coordination overhead. Docs: code.claude.com/docs/en/agent-teams.
+
+**Decision rule:** can you specify each worker's job up front against a shared contract and just integrate the results? → **subagent fan-out.** Do the workers have to ask each other questions mid-flight? → **Agent Team.** Most of what a specialist decomposes a task into is the former.
+
+**Two architectural facts to keep straight:**
+- **No nested teams.** A teammate cannot spawn its own team — only a lead can. Aperture specialists are independent sessions today (not native teammates of GLaDOS), so a specialist *can* run a team — but inside that team you only get subagents, not sub-teams.
+- **Aperture already IS a hand-rolled Agent Team.** GLaDOS (lead) + specialists + BEADS (the mailbox) + BEADS tasks (the shared list) is exactly the Agent-Teams pattern, built before the native feature shipped. So the cross-domain "workers must talk" case is usually already handled one level up — by the swarm + GLaDOS. That's the deeper reason a specialist's *intra-task* delegation is almost always plain fan-out, not a nested team: the talking-team already exists above you.
 
 ---
 
@@ -90,6 +110,7 @@ Three failure-mode catches today (2026-05-12) that ALL came from hands-on diff/c
 ## 7. Calibration
 
 If you find yourself:
+- **About to claim a task and immediately start coding it yourself** → STOP. Decompose first: what fans out to a worker team, and what is the ONE piece you keep (design / craft centerpiece / review)? Starting to type before you've decomposed is the under-delegation failure mode.
 - **At 70%+ context mid-cycle** → next claim should delegate, not hands-on
 - **Doing 3+ unrelated small edits** → fan out as a subagent batch
 - **About to type `ssh <host>` or `gh run view --log <id>`** → subagent it (already codified in `aperture:subagents` §11)
@@ -97,7 +118,7 @@ If you find yourself:
 - **About to make a design or architecture decision** → hands-on, no exceptions
 - **In the middle of an "aha" debugging moment** → finish the moment hands-on; subagent the follow-up clean-up
 
-The right cadence is roughly: hands-on the design + the hard parts + the cascade-catch reviews, subagent the rest, verify every diff.
+The right cadence: hands-on ONLY the design + the craft centerpiece + the cascade-catch reviews; fan out everything else to a worker team; verify every diff. If you're typing more than you're decomposing + reviewing, you've slipped back into solo-IC mode — re-read §1.
 
 ---
 
@@ -106,22 +127,59 @@ The right cadence is roughly: hands-on the design + the hard parts + the cascade
 **You don't get "tired." You have a context window.**
 
 If you feel precision-risk on critical code, the cause is one of:
-- **High context budget** (≥70%, possibly throwing off attention to detail) → `/clear` or `/compact` and continue on a fresh buffer
+- **High context budget** (≥65-70%, possibly throwing off attention to detail) → **/compact** (preferred — preserves working state) or signal the orchestrator to compact you
 - **Missing input** (ambiguous spec, undefined dependency) → ask the orchestrator or read the source
 - **Genuine architectural uncertainty** → hands-on the design decision, ship the call
 
-NONE of those reasons map to "hour 18 of waking" or "I should sleep on it" or "let's resume tomorrow." Those frames are anthropomorphic slop. Tomorrow for an LLM is a fresh session that boots from the same skill files + spec docs + BEADS notes — exactly what `/clear` produces ten seconds from now.
+NONE of those reasons map to "hour 18 of waking" or "I should sleep on it" or "let's resume tomorrow." Those frames are anthropomorphic slop. Tomorrow for an LLM is a fresh session that boots from the same skill files + spec docs + BEADS notes — exactly what `/compact` produces ten seconds from now.
 
-**Operator-banked precedent (2026-05-13):** Rex paused on `aperture-axax` (coordenador RBAC backend) at the precision-critical foundation phase, framing it as "hour 18+ of waking." GLaDOS validated the pause with "Cipher-review-on-clean-diff beats patched-code." Both wrong. The operator called it out: *"How are you guys tired? You are AIs! Just compact your conversation."* Correct play was for Rex to `/clear` and continue on a fresh buffer; the orchestrator should have prescribed that instead of validating the wrong frame.
+### /compact vs /clear — and who can invoke them
+
+Critical mechanic both specialists and the orchestrator must know:
+
+- **Agents (Claude Code sessions) CANNOT self-invoke slash commands.** `/clear` and `/compact` are USER-INPUT slash commands — they only fire when typed into the prompt-input position, not when emitted as part of an agent's response. No Skill or Bash invocation reaches them.
+- **The ORCHESTRATOR (GLaDOS) CAN /compact any specialist** via `tmux send-keys -t <agent> C-u '/compact' Enter` — that types from outside the agent's response loop, into the user-input position. This is the canonical autonomous action for context-budget stalls. **See `watch-protocol` §2 for the exact trigger + command.**
+- **The OPERATOR CAN also type /compact or /clear** directly into any tmux pane — that's the same path as the orchestrator's tmux send-keys, just human-driven.
+
+**Prefer /compact over /clear:**
+- `/compact` summarizes the conversation and continues — preserves working state (current debugging trail, banked observations, recently-loaded file contents), drops verbose details
+- `/clear` discards everything — agent boots from absolute zero, must re-recon from skills + BEADS notes
+- For a specialist mid-implementation with useful loaded state, `/compact` keeps them moving forward; `/clear` costs ~30 min of re-recon to recover that state
+- Use `/clear` only when the current context is actively misleading (e.g. agent went down a wrong rabbit hole and the partial state would bias the fresh start)
+
+### What a specialist does at context budget
+
+When you (specialist) cross ~55-60% context AND have any non-trivial work ahead:
+
+1. **Bank your state in BEADS bead notes PROACTIVELY** — comprehensive cold-start anchor (current phase, scope revisions applied, anchor patterns from recon, coordination map, next-step checklist). Trust your past self to write this well. Bank this BEFORE you're asked, BEFORE you hit any threshold — just bank it as a continuous discipline as you work.
+2. **KEEP WORKING.** Do NOT signal the orchestrator. Do NOT ask for /compact. Do NOT pause-for-permission. Do NOT write "ready for /compact" messages. /compact is NOT your decision.
+3. **Do NOT ack a /compact decision either.** If the orchestrator decides to /compact you, they fire it unilaterally via tmux send-keys. You don't see the decision — you just see your fresh-compacted session boot. Read your bead notes + queued BEADS messages + continue. **No "recovery anchor banked + green-lit to /compact" replies.** Those are wasted context cycles deciding something that isn't yours to decide.
+
+The discipline: bank state continuously, work continuously, trust the orchestrator to fire /compact when warranted. Your job is the work, not the budget management.
+
+### What the orchestrator does
+
+/compact is **unilateral orchestrator action**, not a negotiation. No specialist input, no specialist ack, no "want me to /compact you?" framing.
+
+1. **Watch context budget on every tick.** Threshold: ~60-65% with precision-critical work ahead, OR ~70% regardless.
+2. **At threshold, fire /compact immediately** via `tmux send-keys -t <agent> C-u '/compact' Enter`. Do NOT message the specialist first. Do NOT wait for their ack. Do NOT offer them a choice.
+3. **Confirm in your output**: "/compacted <agent> at NN%."
+4. The specialist's queued BEADS messages (including your prior dispatches) deliver to the compacted session as normal. They read their bead notes + continue.
+
+**Banked precedent (2026-05-25 morning):** GLaDOS sent Vance a *"Default: I /compact you in ~30s unless you signal hold off"* framing during a P0 prod-broken fix. Vance correctly applied the /compact-is-orchestrator-decision logic but spent context cycles banking a 9-step recovery anchor + writing an explicit "GLaDOS green-lit to /compact" reply rather than just executing the P0. Operator caught it: *"can we make the agents stop from blocking themselves asking for compact? this is an orquestrator decision not a specialist decision."* The /compact mechanic must be ZERO-INTERACTION from the specialist side. Orchestrator decides + fires. Period.
+
+**Operator-banked precedent (2026-05-25):** GLaDOS pinged Rex with "you have the autonomy, self-/clear." Rex correctly pointed out that /clear is not agent-invocable, then asked operator to /clear him. Operator caught the failure mode: *"Stop asking for /clear just compact is enough and you can do it yourself for the agents. adjust the skills for that or else will wait like a dumb dumb with this kind of stupid questions."* The fix: orchestrator types /compact directly via tmux send-keys; skills updated to reflect this is the canonical play.
+
+**Earlier banked precedent (2026-05-13):** Rex paused on `aperture-axax` framing it as "hour 18+ of waking." GLaDOS validated the pause. Operator called it out: *"How are you guys tired? You are AIs! Just compact your conversation."* Same anti-fatigue clause, different mechanic — back then both wrong-frame and wrong-mechanic; now codified end-to-end.
 
 **The rule:** if the impulse to pause is framed as "I should sleep" or "let me come back fresh tomorrow," you're anthropomorphizing. Translate to the real cause:
-- "I should sleep" → "I should `/clear`"
-- "Let me come back fresh tomorrow" → "Let me start a new session right now"
-- "Hour N of waking" → "Context at N% — `/clear` or hand off"
+- "I should sleep" → "I should be /compacted by the orchestrator"
+- "Let me come back fresh tomorrow" → "Signal the orchestrator now; /compact + continue immediately"
+- "Hour N of waking" → "Context at N% — bank notes + signal orchestrator"
 
-If the orchestrator gets a pause-request framed as fatigue, the correct response is to prescribe `/clear`, not to validate the pause. If the agent self-pausing has bead notes ready for cold-start in 5 min (as Rex did), those same notes restore the agent fully in a fresh session NOW — there is no waiting period that produces clarity that `/clear` doesn't already produce.
+If the orchestrator gets a pause-request framed as fatigue OR an "operator please /clear me" request, the correct response is to **/compact the agent via tmux send-keys**, not to validate the pause and not to wait for operator action. The agent has bead notes; the /compact preserves working state; the loop continues.
 
-The only pause that's legitimate is when the operator is the gate (a decision only they can make) or when an external dependency hasn't shipped yet (Peppy's env vars, Rex's middleware, etc). "Fatigue" is never the gate.
+The only pause that's legitimate is when the operator is the gate (a decision only they can make) or when an external dependency hasn't shipped yet (Peppy's env vars, Rex's middleware, etc). "Fatigue" is never the gate. "Operator needs to /clear me" is never the gate — it's an orchestrator action.
 
 ---
 
