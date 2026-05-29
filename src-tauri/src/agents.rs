@@ -44,6 +44,14 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let palace_path = format!("{}/.aperture/mempalace", home_dir);
 
+    // aperture-ktwoy — forward the Dolt sql-server password to the MCP's `bd`
+    // calls. Needed only when ~/.aperture/.beads is configured for server mode
+    // (post-migration); harmless empty default while still embedded. Sourced
+    // from the Tauri process env (operator exports BEADS_DOLT_PASSWORD before
+    // launching Aperture). host/port/user/database live in the per-machine
+    // .beads/config.yaml, not here.
+    let beads_dolt_password = std::env::var("BEADS_DOLT_PASSWORD").unwrap_or_default();
+
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "aperture-bus": {
@@ -56,7 +64,8 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
                     "AGENT_MODEL": &agent.model,
                     "APERTURE_MAILBOX": &mailbox_dir,
                     "BEADS_DIR": format!("{}/.aperture/.beads", home_dir),
-                    "BD_ACTOR": &name
+                    "BD_ACTOR": &name,
+                    "BEADS_DOLT_PASSWORD": &beads_dolt_password
                 }
             },
             // Sentry MCP wrap layer — enforces Cipher's 9 constraints from
@@ -118,7 +127,7 @@ trust_level = "trusted"
 [mcp_servers.aperture-bus]
 command = "node"
 args = ["{mcp_server_path}"]
-env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}" }}
 
 # Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
 [mcp_servers.sentry]
@@ -127,6 +136,7 @@ args = ["{mcp_sentry_server_path}"]
 env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", HOME = "{home_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
 "#,
             bare_model = bare_model,
+            beads_dolt_password = beads_dolt_password,
             prompt_dest = prompt_dest,
             project_dir = project_dir,
             mcp_server_path = mcp_server_path,
