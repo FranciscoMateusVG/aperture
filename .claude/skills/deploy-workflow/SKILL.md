@@ -201,6 +201,30 @@ Report format:
 - Compose ID: <dokploy-compose-id>
 ```
 
+### 8.1 Stateful App Probes — `curl / → 200` is necessary but NOT sufficient
+
+For any app that has **auth + a DB** (which is most non-trivial apps), the homepage GET is the WEAKEST possible layer-8 probe. A 200 from `curl -I /` proves Traefik routing reached the container and the HTTP server is up. It tells you **nothing** about:
+
+- Database connection pool state
+- Schema alignment (column/table existence vs. what the code reads)
+- Session/auth middleware health
+- Any code path past the public landing page
+
+**Banked precedent (2026-06-11):** `aperture-edgi9` flipped autoDeploy on eunenem-staging and verified layer-8 with `curl -I https://eunenem.pocketsoftware.com.br/ → HTTP 200`. Probe green. The very next bug surfaced (`aperture-44pr2`) was a schema-drift 500 on `/admin/usuario/<id>` — a route behind session auth that runs a DB query against a column the running schema didn't have. 7 migrations had stacked up over 8 days while the homepage kept serving 200s the whole time.
+
+**Rule: layer-8 for any stateful app needs at LEAST two probes beyond the homepage.**
+
+| Probe class | What it catches | Example |
+|---|---|---|
+| DB-touching unauth route | Connection pool exhaustion, schema drift, DB-down | `curl /healthz` (if it does a DB ping) or any public page that loads from DB |
+| Auth-gated route | Session middleware regressions, auth-cookie config errors, 500-vs-401 confusion | `curl -I /admin` and verify it returns **401/302**, not 500 |
+
+The auth-gated probe is sneaky: you don't need a valid session. You just need the server to respond with the correct UNAUTHED state (typically 401 or 302-to-login). A 500 here means session middleware exploded BEFORE the auth check — classic schema-drift or env-var misconfig symptom.
+
+**Bonus probe for apps with admin panels:** spot-check at least one admin route per role. The 2026-06-11 precedent was specifically `/admin/usuario/<id>` — the admin-only routes are usually the LAST ones any agent thinks to probe, and they're often where schema-heavy queries live.
+
+If `/healthz` does NOT do a DB ping in your app, file a follow-up task to make it do one. A health check that only checks "the process is up" is half a health check.
+
 ---
 
 ## 9. Troubleshooting Quick Reference
