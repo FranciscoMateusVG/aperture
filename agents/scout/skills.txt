@@ -4,3 +4,4 @@ beads
 worktree-discipline
 specialist-delegation
 playwright-gotchas
+stacked-pr-verification

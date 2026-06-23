@@ -359,3 +359,9 @@ Backend migrations are the highest-risk window for this bug class — and the ea
 If you find yourself merging a backend-migration PR without running it, stop. Run it. Fix the gaps in the same PR. Future-you will not remember to come back. CI will not catch them. Code review may not catch them. The next person to find each one will be a real user, in production, watching their click do nothing — exactly like the operator on 2026-05-09.
 
 Don't let that be how the work ships.
+
+---
+
+## Companion Skill — Prevention vs Detection
+
+This skill is **post-merge detection** — it catches contract drift that has already shipped. Its companion `aperture:stacked-pr-verification` is **pre-merge prevention**: when a consumer PR depends on a producer PR still open in review, fetch the parent's head (`git fetch origin pull/<n>/head:ref`) and read the actual handler bodies before rebasing. That stops the drift from ever reaching main. Use prevention while building stacked/parallel-track work; use this detection skill on migrations and after any route-renaming merge.

@@ -9,3 +9,4 @@ glados-loop
 specialist-delegation
 incluir-intake-to-bead
 scope-from-artifact
+stacked-pr-verification
