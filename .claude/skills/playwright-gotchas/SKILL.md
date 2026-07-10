@@ -109,6 +109,32 @@ test("GET /painel/helena → 200; any other slug → 404", async ({ page }) => {
 
 ---
 
+## 4. E2E spec FORMAT is caught by nothing until a branch-cut reds the full-repo biome — run `biome check --write` as the LAST step before commit
+
+**Symptom:** You (or a teammate) cut a fresh branch off `staging`, touch something unrelated, and the CI `lint` step (`pnpm check`'s full-repo `biome`) fails — pointing at an `e2e/*.spec.ts` file **you never edited**. It's an *inherited* red: an e2e spec landed on `staging` unformatted, and now every branch cut after it fails full-repo biome until someone reformats the file. Locally the author's per-file `biome check` looked clean and CI on the author's PR was green — so nothing flagged it before merge.
+
+**Cause:** Playwright specs live outside every format-catching gate. In the engine repo: Playwright is **not run by CI** (`aperture-zn1ud`), the app-level `tsc` **excludes `e2e/`**, and the root `tsc` covers `src/` only. So an e2e spec's *formatting* is validated by exactly one thing — the full-repo `biome` in the `lint` step — and that only trips when a branch is cut and biome walks the whole tree, inheriting the unformatted file's red onto an innocent branch. The classic self-own: running a **read-only** `biome check` (easy to do with `| tail -1`, which hides the complaint) after your *final* edits instead of `biome check --write`, OR running `--write` early and then making one more edit whose formatting never gets applied.
+
+**Fix:** Make `biome check --write` the **last** step before `git commit` on any e2e spec — after the final edit — and confirm it changed nothing:
+
+```bash
+# LAST thing before committing an e2e spec — after every edit is done:
+biome check --write e2e/my-gate.spec.ts     # or: pnpm lint --write <file>
+biome check e2e/my-gate.spec.ts             # must say "No fixes applied"
+git diff --stat e2e/my-gate.spec.ts         # must be EMPTY (write changed nothing)
+git add e2e/my-gate.spec.ts && git commit ...
+```
+
+Two rules that make it stick:
+- A **read-only** `biome check` is not enough — it reports but doesn't fix, and a truncated view (`| tail -1`) can hide the one line that matters.
+- Running `--write` and *then* making another edit **doesn't count** — the later edit's formatting is unapplied. Re-run `--write` after the *last* change.
+
+**Where this shows up:** any repo where Playwright specs sit outside the typecheck + test gates (engine `e2e/`, and any app whose `tsconfig` excludes the e2e dir). If your spec's only format gate is a whole-repo linter that runs on branch-cut rather than per-file on your PR, this bites. It is a **gate-coverage** gotcha, not an API quirk — the spec runs fine; it's the *format* that rots silently and lands on someone else's branch.
+
+**Source:** Izzy, engine PR #381 (`aperture-8r5kp`, W2 enforcement gate) — merged unformatted after a read-only `biome check` followed my final edits; became the 4th inherited-staging-red of the fblrt wave, fixed by Rex in #384. Banked `aperture-103mj`.
+
+---
+
 ## Adding a new gotcha
 
 When Playwright bites you in a way that took >10 minutes to figure out and would bite someone else the same way, bank it here. Use the same shape:
