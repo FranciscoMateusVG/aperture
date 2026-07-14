@@ -54,7 +54,15 @@ The repo justfile exports these top-level — **always use `just plan` / `just a
 - API: reachable **directly from the Mac over the tailnet** (no SSH hop, unlike xerox): `curl -H "x-api-key: $TOKEN" http://100.102.73.112:3000/api/<endpoint>`
 - Token + admin credentials: **`peppy/secrets` mempalace drawer** (search "pocketsoftware"). Never inline.
 - Known quirk: Dokploy auto-appends a random suffix to `appName` (e.g. `smoke-test-a1b2c3` → `smoke-test-a1b2c3-xzeddp`); container names follow the compose YAML, routing unaffected. `serviceName` in domain.create must match the compose service key.
-- Live services: `smoke-test` project, composeId `LJNUSXC2aBAiB-3-SPDap` → https://test.pocketsoftware.com.br (whoami smoke test; safe to replace when a real app needs the subdomain — operator call).
+- Live compose services (composeIds):
+
+| Compose project | composeId | Notes |
+|-----------------|-----------|-------|
+| `smoke-test` | `LJNUSXC2aBAiB-3-SPDap` | https://test.pocketsoftware.com.br — safe to replace |
+| `secrets` (Infisical) | `LdNVw0rTWKSuPIcjPQUnY` | image `infisical/infisical:v0.146.0-postgres`; tailnet-only :3005 |
+| `databases` (Postgres) | `jka-xKKG232F0Jetb2w_v` | `platform-postgres:5432` on dokploy-network; zero host ports |
+| `storage` (MinIO) | `YuH5TqYxOnGxY5UXnHNTC` | image `minio/minio:RELEASE.2025-09-07T16-13-09Z`; S3 public at s3.pocketsoftware.com.br |
+| `observability` (obs-stack) | `iU9vjea42NJzGFZDQEJnq` | Prometheus + Grafana + Alertmanager + cAdvisor; tailnet-only |
 
 ## 5. Access Model
 
@@ -239,7 +247,58 @@ Superuser password + composeId + app DB entries: `peppy/secrets` mempalace drawe
 
 ---
 
-## 11. Banked Gotchas
+## 11. Storage (MinIO)
+
+MinIO object storage — live since 2026-07-14, BEADS `aperture-n6ukt`. Implements the 3-2-1 backup doctrine for app file storage.
+
+### Endpoints
+
+| Endpoint | URL | Access |
+|----------|-----|--------|
+| S3 API (public) | `https://s3.pocketsoftware.com.br` | Public — LE cert via Traefik. Anonymous path: `/minio/health/live` only |
+| Console | `http://100.102.73.112:9001` | Tailnet-only — OCI SL blocks publicly (verified timeout) |
+| Port 9000 | — | **NEVER host-published** — internal via `dokploy-network` only |
+
+Root MinIO credentials + replicator secret + per-app keys: **`peppy/secrets` mempalace drawer — never inline.**
+
+### Bucket Ritual
+
+```bash
+# From pocketsoftware-terraform repo root:
+minio/provision-bucket.sh <app_name>
+# → creates <app>-data bucket + <app>_s3 user + bucket-scoped policy
+# → prints five S3_* values
+```
+
+After the script:
+1. Store all five `S3_*` values in the app's Infisical project (peppy-admin API)
+2. If the bucket holds user data, add `<app>-data` to `minio/replication-list.txt`
+
+**Public-read doctrine:** `mc anonymous set download` is NEVER a default — operator-gated decision per bucket.
+
+Full bucket ritual + provisioning script details: `pocketsoftware-terraform/AGENTS.md §10`.
+
+### Replication Brain (3-2-1: server → Mini → OCI)
+
+- **Brain**: Mac Mini, `mini-watchtower/oci-replication.sh`, cron **05:55 UTC** daily
+- **Nightly ballet**: 05:30 Infisical backup → 05:40 Postgres dumps → 05:55 replication to OCI
+- **Sync semantics**: `rclone sync` for MinIO buckets (mirrors deletions; OCI versioning preserves history) + `rclone copy` for backup dirs (never deletes remote)
+- **rclone remotes**: `[minio]` uses a custom `replicator-policy` user (built-in `readonly` lacks `s3:ListBucket`) + `[oci]` uses customer secret key #2
+- **OCI bucket**: `pocketsoftware-replica` (versioned, Terraform-managed `replica-bucket.tf`)
+- **Recipe**: `just replication-status`
+- **3-2-1 verified 2026-07-14**: `minio/demoapp-data/drill.txt` + all dumps + `backups/infisical/KEYS.txt` confirmed in OCI replica
+
+### Cloud Restore Drill (EXERCISED 2026-07-14 — 1m36s)
+
+Object deleted → mc stat confirmed absence (403, not 404 — see gotcha 24) → `rclone copy oci:pocketsoftware-replica/minio/<bucket>/<obj>` → scp relay to server → `mc cp` with root alias → byte-match verified. Total: 1m36s.
+
+OCI versioning additionally protects against bad syncs — previous object versions recoverable via `oci os object list-object-versions`.
+
+Full restore commands: `pocketsoftware-terraform/AGENTS.md §10 — Cloud Restore Procedure`.
+
+---
+
+## 12. Banked Gotchas
 
 1. **OCI S3-compat state 501** — see §3. Symptom: apply succeeds creating resources, then "Failed to persist state". Never lose the errored.tfstate.
 2. **OCI customer-secret-keys have a ~3-4 min propagation delay** before the S3-compat API accepts them (fresh keys fail auth briefly).
@@ -262,4 +321,11 @@ Superuser password + composeId + app DB entries: `peppy/secrets` mempalace drawe
 18. **GitHub webhooks cannot reach tailnet-only Dokploy — `autoDeploy` is structurally impossible** (2026-07-14): Dokploy port 3000 is not publicly reachable; GitHub cannot deliver webhooks. `autoDeploy=true` never fires. ALL deploys on this server are API-triggered (`POST /api/compose.deploy`). Ignore any claim that autoDeploy works here.
 19. **`REVOKE CONNECT FROM PUBLIC` is isolation-critical in the Postgres ritual** (2026-07-14): Postgres grants `CONNECT` to `PUBLIC` on every new database by default. Without the revoke step, any DB user can connect to any other app's DB. The `databases/provision-db.sh` script includes this step — never skip it.
 20. **`pg_restore` cross-env role warnings are benign — but ritual-before-restore is the correct DR procedure** (2026-07-14): when restoring to a fresh environment, `pg_restore` emits `ERROR: role "<app>_user" does not exist`. Symptom: 1 error ignored. Fix: run `provision-db.sh` first to recreate the user, then `pg_restore --no-owner`. The warning is benign (data restores correctly), but the ritual is the right procedure.
+21. **Dispatch secrets must be read from source-of-truth at dispatch time, never from controller memory** (2026-07-14): a worker was dispatched with a hallucinated secret from controller memory instead of `terraform output`. The worker self-healed by pulling the real value. Always fetch sensitive outputs fresh (e.g. `terraform output -raw replication-secret`) at the moment of dispatch — never rely on a value you think you remember.
+22. **MinIO built-in `readonly` policy lacks `s3:ListBucket` — rclone sync needs a custom policy** (2026-07-14): attaching `readonly` to the replicator user causes `rclone sync` to fail (cannot list bucket contents). Create a custom `replicator-policy` that includes `s3:ListBucket` alongside `s3:GetObject`. Symptom: rclone exits with `AccessDenied` on bucket listing even though credentials are correct.
+23. **`minio/mc` image default entrypoint is `mc` — use `--entrypoint sh` for pipelines** (2026-07-14): `docker run minio/mc -c "..."` fails because the default entrypoint is `mc`. Always use `docker run --entrypoint sh minio/mc:<tag> -c "<commands>"` for any multi-step shell pipeline.
+24. **MinIO returns 403, not 404, for missing objects on private buckets** (2026-07-14): a scoped key against a non-existent object returns `403 AccessDenied`, not `404`. The correct absence check is `mc stat` — output "Object does not exist" means it's truly gone; 403 from a scoped key is ambiguous (could be missing or permission-denied). Use root alias with `mc stat` for unambiguous absence verification.
+25. **`infisical` CLI 0.42.6 does not auto-consume `MACHINE_IDENTITY_*` env vars; alpine needs `ca-certificates`** (2026-07-14): fetch the token via the universal-auth API and pass it with `--token` explicitly. Alpine images also need `apk add ca-certificates` before any HTTPS call to a Let's Encrypt-signed endpoint, including `s3.pocketsoftware.com.br`.
+26. **`S3_FORCE_PATH_STYLE` is not an aws-cli env var** (2026-07-14): the aws CLI does not read `S3_FORCE_PATH_STYLE` from the environment. Pass `--endpoint-url https://s3.pocketsoftware.com.br` directly on every CLI invocation. SDKs use `forcePathStyle: true` in client config. The env var is only a documentation convention for passing the value to app processes.
+27. **Dokploy `compose.deploy` does not recreate unchanged containers** (2026-07-14): if only a mounted config file changed (e.g. `prometheus.yml`) but the compose definition didn't, the redeploy leaves the container running with the old config. For Prometheus config changes: `docker restart obs-prometheus` after deploy, or add `--web.enable-lifecycle` to the Prometheus command and `POST http://obs-prometheus:9090/-/reload`.
 <!-- Add new gotchas above this line, numbered, with date + symptom + fix. -->
