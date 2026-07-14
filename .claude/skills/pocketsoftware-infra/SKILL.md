@@ -170,7 +170,76 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ---
 
-## 10. Banked Gotchas
+## 10. Databases (platform-postgres)
+
+Central shared Postgres 17 for all pocketsoftware apps. Live since 2026-07-14 (BEADS `aperture-sazvl`).
+
+### Key Facts
+
+| Field | Value |
+|-------|-------|
+| Compose project | `databases` (composeId `jka-xKKG232F0Jetb2w_v`) |
+| Internal DNS | `platform-postgres:5432` on `dokploy-network` |
+| Published ports | **NONE** — zero by design, verified public-closed + tailnet-closed |
+| Superuser credentials | `peppy/secrets` drawer — never inline, never given to apps |
+
+### Provisioning Ritual
+
+```bash
+# From pocketsoftware-terraform repo root:
+databases/provision-db.sh <app_name>
+# → prints DATABASE_URL, then store it in Infisical (peppy-admin API)
+# → backups pick up the new DB automatically (dynamic enumeration)
+```
+
+What the script does: `CREATE DATABASE` + `CREATE USER` + `GRANT PRIVILEGES` + **`REVOKE CONNECT FROM PUBLIC`** (isolation-critical — see gotcha xviii below) + `GRANT ALL ON SCHEMA public` (PG15+ requirement).
+
+Full runbook: `pocketsoftware-terraform/AGENTS.md §9`.
+
+### Connection Pattern
+
+Apps receive `DATABASE_URL` via Infisical injection (`infisical run -- <cmd>`). Internal host: `platform-postgres:5432` on `dokploy-network`. Zero app has superuser access.
+
+### No-Superuser Rule
+
+No app ever receives superuser credentials. Admin access = `docker exec platform-postgres psql -U postgres` over SSH only. Superuser password: `peppy/secrets` drawer.
+
+### Backups + Restore
+
+- **Backup**: Mini cron 05:40 UTC daily, `pg_dump --format=custom` per DB, 14d retention, `mini:~/pocketsoftware-backups/platform-postgres/`. Dynamic enumeration — new apps auto-included. Recipe: `just pg-backup-status`.
+- **Restore drill** (EXERCISED 2026-07-14, ~11s): dump→Mini→server→scratch container→`pg_restore --no-owner`→row 42 verified.
+- **DR note**: run `provision-db.sh` first to recreate the app user before `pg_restore`, otherwise benign role-grant warnings appear.
+
+Full restore commands: `pocketsoftware-terraform/AGENTS.md §9`.
+
+### Split Triggers
+
+Move an app to its own Postgres when:
+- One app dominating CPU/IO on the shared instance
+- Connection limits hit (PostgresConnectionsHigh alert sustained)
+- Backup windows becoming too long
+- App becoming business-critical needing full isolation
+
+Splitting = update `DATABASE_URL` in Infisical + redeploy. Zero code change.
+
+### PgBouncer (DEFERRED)
+
+**Do not pre-install.** Infisical layer makes retrofit a 5-minute secret swap. Pre-installing risks wrong pool mode (transaction pooling breaks prepared statements / `LISTEN/NOTIFY`). Tripwire: `PostgresConnectionsHigh` alert. Bead: `aperture-n6ukt`.
+
+### Alert Runbook
+
+| Alert | Severity | Response |
+|-------|----------|----------|
+| `PostgresDown` | critical | All apps lose DB. Restart `platform-postgres` immediately. Drill passed 2026-07-14. |
+| `PostgresConnectionsHigh` | warning | Review `pg_stat_activity`; consider PgBouncer (bead `aperture-n6ukt`). |
+
+### Drawer Pointer
+
+Superuser password + composeId + app DB entries: `peppy/secrets` mempalace drawer.
+
+---
+
+## 11. Banked Gotchas
 
 1. **OCI S3-compat state 501** — see §3. Symptom: apply succeeds creating resources, then "Failed to persist state". Never lose the errored.tfstate.
 2. **OCI customer-secret-keys have a ~3-4 min propagation delay** before the S3-compat API accepts them (fresh keys fail auth briefly).
@@ -190,4 +259,7 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 15. **CLI/server version skew: pin `@infisical/cli@0.42.6`** (banked 2026-07-14): latest `@infisical/cli` speaks `/api/v4/secrets` → 404 on server v0.146. Always pin `@infisical/cli@0.42.6` in app images and throwaway containers paired with this server version.
 16. **Tailscale SSH intercepts tailnet-ip:22** (banked 2026-07-14): automation from the Mini targeting `100.102.73.112:22` triggers Tailscale's interactive re-auth flow (not a standard SSH session). Use the **public IP `163.176.231.29:22`** + dedicated key `~/.ssh/pocketsoftware-backup` for any machine-to-machine automation. Stage-2 hardening (restricted command) is a deferred bead.
 17. **Image tags can be stale — always `docker manifest inspect` before pinning** (banked 2026-07-14): `v0.151.0-postgres` never existed; the plan pin was a guess. Run `docker manifest inspect infisical/infisical:<tag>` to verify a tag exists and has an arm64 layer before committing it to the compose file.
+18. **GitHub webhooks cannot reach tailnet-only Dokploy — `autoDeploy` is structurally impossible** (2026-07-14): Dokploy port 3000 is not publicly reachable; GitHub cannot deliver webhooks. `autoDeploy=true` never fires. ALL deploys on this server are API-triggered (`POST /api/compose.deploy`). Ignore any claim that autoDeploy works here.
+19. **`REVOKE CONNECT FROM PUBLIC` is isolation-critical in the Postgres ritual** (2026-07-14): Postgres grants `CONNECT` to `PUBLIC` on every new database by default. Without the revoke step, any DB user can connect to any other app's DB. The `databases/provision-db.sh` script includes this step — never skip it.
+20. **`pg_restore` cross-env role warnings are benign — but ritual-before-restore is the correct DR procedure** (2026-07-14): when restoring to a fresh environment, `pg_restore` emits `ERROR: role "<app>_user" does not exist`. Symptom: 1 error ignored. Fix: run `provision-db.sh` first to recreate the user, then `pg_restore --no-owner`. The warning is benign (data restores correctly), but the ritual is the right procedure.
 <!-- Add new gotchas above this line, numbered, with date + symptom + fix. -->
