@@ -73,12 +73,63 @@ The repo justfile exports these top-level — **always use `just plan` / `just a
 
 `ansible/setup-instance.yml` in the repo — 3 idempotent plays (base+Docker CE noble/arm64, Dokploy+Tailscale, hardening). Re-run any time: `just ansible` (mutative tier). Syntax check: `just ansible-check` (free). Tailscale join is guarded (BackendState=Running) — a re-run never needs an auth key unless the server was wiped; then mint a new single-use key (operator).
 
-## 8. Banked Gotchas
+## 8. Monitoring
+
+> All pocketsoftware observability components are **tailnet-only**. Public probes time out — verified live 2026-07-14.
+
+### Component URLs
+
+| Component | URL | Notes |
+|-----------|-----|-------|
+| Grafana | `http://100.102.73.112:3001` | pocketsoftware; admin creds in `peppy/secrets` drawer |
+| Prometheus | `http://100.102.73.112:9090` | pocketsoftware; no auth |
+| Alertmanager | `http://100.102.73.112:9093` | pocketsoftware; no auth |
+| node_exporter | `http://100.102.73.112:9100` | pocketsoftware |
+| cAdvisor | `http://100.102.73.112:8081` | pocketsoftware |
+| Uptime Kuma | `http://100.88.209.119:3001` | Mac Mini watchtower; creds in `peppy/secrets` drawer |
+| WAHA | `http://100.88.209.119:3002` | Mac Mini watchtower; dashboard creds in `peppy/secrets` drawer |
+| Alert relay | `http://100.88.209.119:8090` | Mac Mini; `GET /` → `ok` (health probe) |
+
+**Tailnet-only probes (both verified 2026-07-14 — use these to confirm config is correct):**
+```bash
+# Tailnet — must succeed (200 or 302):
+curl -o /dev/null -w '%{http_code}' --max-time 8 http://100.102.73.112:3001
+# Public — must time out (000):
+curl -o /dev/null -w '%{http_code}' --max-time 8 http://163.176.231.29:3001
+```
+
+### Alert Channels
+
+| Channel | When | Method |
+|---------|------|--------|
+| WhatsApp group "EuNenem - Desenvolvimento" (`120363400896220484@g.us`) | all alerts (warning + critical) | Alertmanager → relay `100.88.209.119:8090` → WAHA `/api/sendText` |
+| Gmail SMTP (`franciscomateusvg@gmail.com`) | critical severity only | Alertmanager `critical-multi` receiver |
+
+### Kuma Monitors
+
+7 monitors provisioned by `mini-watchtower/kuma-monitors.py` (idempotent). To add a monitor, edit the `MONITORS` list in that file and re-run the script. Credentials (`KUMA_USER`, `KUMA_PASS`, `WAHA_API_KEY`, `CHAT_ID`) come from the **`peppy/secrets` mempalace drawer** — never hardcode them.
+
+```bash
+# Run provisioning (from pocketsoftware-terraform repo root):
+python3 -m venv /tmp/kuma-venv && /tmp/kuma-venv/bin/pip install uptime-kuma-api
+KUMA_URL=http://100.88.209.119:3001 KUMA_USER=<drawer> KUMA_PASS=<drawer> \
+  WAHA_API_KEY=<drawer> CHAT_ID=<drawer> \
+  /tmp/kuma-venv/bin/python3 mini-watchtower/kuma-monitors.py
+```
+
+## 9. Banked Gotchas
 
 1. **OCI S3-compat state 501** — see §3. Symptom: apply succeeds creating resources, then "Failed to persist state". Never lose the errored.tfstate.
 2. **OCI customer-secret-keys have a ~3-4 min propagation delay** before the S3-compat API accepts them (fresh keys fail auth briefly).
 3. **RTK hook truncates long terraform output** mid-stream — for full plans use `rtk proxy terraform plan` (or `just plan`).
 4. **Dokploy appName auto-suffix** — see §4.
 5. **just brace escaping**: `{{{{.Names}}` in justfile → `{{.Names}}` in shell (docker Go-templates).
+6. **WAHA `:latest` is amd64-only** (banked 2026-07-14): `devlikeapro/waha:latest` is an amd64 image. On arm64 (Mac Mini M-series) use `devlikeapro/waha:arm` tag — the `arm` tag tracks the latest arm64-compatible build. Symptom: container exits immediately or crashes with architecture mismatch.
+7. **WAHA engine must be NOWEB on arm64** (banked 2026-07-14): the WEBJS engine uses Puppeteer/Chromium which crashes on arm64 (no matching Chromium build). Set `WHATSAPP_DEFAULT_ENGINE=NOWEB` in the WAHA container env. NOWEB is a lightweight no-browser engine that works reliably on arm64.
+8. **rsync `--delete` removes `.env`** (banked 2026-07-14): `rsync -az --delete mini-watchtower/ mini:pocketsoftware-watchtower/` will delete any file on the remote that is not in the local source — including the `.env` file (which is gitignored and lives only on the Mini). Always add `--exclude .env` to the rsync command. Without it, the stack loses its secrets and all containers exit.
+9. **WAHA dashboard creds auto-generate in container logs** (banked 2026-07-14): on first start, WAHA generates a random admin password and prints it once to stdout. Run `docker logs watchtower-waha 2>&1 | grep -i password` immediately after first start to capture it. Bank in `peppy/secrets` drawer — it is NOT recoverable later without resetting the container data.
+10. **WhatsApp canonical chat-id drops the Brazilian ninth digit** (banked 2026-07-14): Brazilian mobile numbers added a 9th digit around 2012, but WhatsApp's internal representation still uses the 8-digit legacy format. Example: number `(31) 99391-4426` → WAHA chat-id `553193914426@c.us` (not `5531993914426@c.us`). Test with a relay `POST /alert` and confirm delivery before banking the id.
+11. **Push before Dokploy deploy** (banked 2026-07-14): Dokploy's compose deploy clones directly from GitHub (`origin/main`) at deploy time. If local commits haven't been pushed yet, the deploy fails with `Compose file not found`. Always `git push origin main` before triggering any Dokploy deploy — especially when multiple tasks write files before the first push.
+12. **Kuma 1.x has no native WAHA notification provider** (banked 2026-07-14): the `type="waha"` notification type exists only in Kuma 2.x. On Kuma 1.23.x (used here), use `NotificationType.WEBHOOK` with `webhookContentType="custom"` and a LiquidJS body template that emits WAHA's `sendText` JSON payload. The `uptime-kuma-api` v1.x library also has no WAHA entry in `NotificationType` — passing an unknown type raises `TypeError`.
 
 <!-- Add new gotchas above this line, numbered, with date + symptom + fix. -->
