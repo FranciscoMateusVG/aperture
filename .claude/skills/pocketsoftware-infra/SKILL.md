@@ -102,7 +102,7 @@ curl -o /dev/null -w '%{http_code}' --max-time 8 http://163.176.231.29:3001
 
 | Channel | When | Method |
 |---------|------|--------|
-| WhatsApp group "EuNenem - Desenvolvimento" (`120363400896220484@g.us`) | all alerts (warning + critical) | Alertmanager → relay `100.88.209.119:8090` → WAHA `/api/sendText` |
+| Operator DM (`553193914426@c.us`) | all alerts (warning + critical) | Alertmanager → relay `100.88.209.119:8090` → WAHA `/api/sendText` |
 | Gmail SMTP (`franciscomateusvg@gmail.com`) | critical severity only | Alertmanager `critical-multi` receiver |
 
 ### Kuma Monitors
