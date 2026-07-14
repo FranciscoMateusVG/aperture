@@ -117,7 +117,60 @@ KUMA_URL=http://100.88.209.119:3001 KUMA_USER=<drawer> KUMA_PASS=<drawer> \
   /tmp/kuma-venv/bin/python3 mini-watchtower/kuma-monitors.py
 ```
 
-## 9. Banked Gotchas
+## 9. Secrets (Infisical)
+
+> **API-FIRST MANAGEMENT PRINCIPLE (operator directive — encode this everywhere):** Every platform service (Dokploy, Infisical, Kuma, future Postgres/MinIO/GlitchTip) gets a Peppy-owned API credential banked in the `peppy/secrets` drawer at bootstrap time. Operator clicks are for gates/approvals ONLY — never routine management. One-time browser-automation bootstrap is the approved pattern for services without a headless path (precedent: peppy-admin machine identity, 2026-07-14).
+
+### URLs
+
+| Endpoint | URL |
+|----------|-----|
+| UI / API (tailnet) | `http://100.102.73.112:3005` — tailnet-only, port 3005 NOT in OCI security list |
+| Internal (container network) | `http://infisical-backend:8080` — reachable on `dokploy-network` |
+
+Probe pair: `curl --max-time 8 http://100.102.73.112:3005` must return 200/302; `curl --max-time 8 http://163.176.231.29:3005` must time out (000).
+
+### Credentials
+
+All values (admin login, ENCRYPTION_KEY, AUTH_SECRET, DB password, machine-identity registry) live in the **`peppy/secrets` mempalace drawer** ("PocketSoftware Infisical"). **Never write values in any file or report** — always point here.
+
+### Per-App Onboarding Ritual
+
+1. Create a project in Infisical. Record `projectId`.
+2. Create a machine identity (Universal Auth). Capture `CLIENT_ID` + `CLIENT_SECRET` → bank in drawer immediately.
+3. Grant viewer: `POST /api/v2/workspace/{projectId}/identity-memberships/{identityId}` `{"role":"viewer"}`.
+4. Dokploy env for the app carries **only** three vars: `INFISICAL_API_URL`, `INFISICAL_CLIENT_ID`, `INFISICAL_CLIENT_SECRET`.
+5. App entrypoint: `infisical run --projectId <id> --env prod -- <cmd>` (CLI pinned `@infisical/cli@0.42.6`).
+
+Zero app secrets touch Dokploy env fields.
+
+### Working API Sequence (v0.146)
+
+```bash
+# Auth
+POST /api/v1/auth/universal-auth/login  {clientId, clientSecret}  → Bearer accessToken
+
+# Create project
+POST /api/v2/workspace  {name, organizationId}
+
+# Write secret
+POST /api/v3/secrets/raw/<NAME>  {workspaceId, environment, secretValue}
+
+# Grant viewer
+POST /api/v2/workspace/{projectId}/identity-memberships/{identityId}  {role: "viewer"}
+```
+
+### DR Procedure (exercised 2026-07-14, total 1m41s)
+
+Restore dump (from `mini:~/pocketsoftware-backups/infisical/`) to scratch Postgres (`--no-owner` if ownership errors) + scratch Redis + `infisical/infisical:v0.146.0-postgres` with the **same ENCRYPTION_KEY + AUTH_SECRET** from KEYS.txt → universal-auth login → read known secret back. Full recovery = dump + escrowed keys, nothing else.
+
+Backup architecture: Mini cron 05:30 UTC daily, 14d retention, dedicated key `~/.ssh/pocketsoftware-backup`, dumps land at `mini:~/pocketsoftware-backups/infisical/`, KEYS.txt escrow beside dumps (chmod 600). Recipe: `just infisical-backup-status`.
+
+Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secrets (Infisical)`.
+
+---
+
+## 10. Banked Gotchas
 
 1. **OCI S3-compat state 501** — see §3. Symptom: apply succeeds creating resources, then "Failed to persist state". Never lose the errored.tfstate.
 2. **OCI customer-secret-keys have a ~3-4 min propagation delay** before the S3-compat API accepts them (fresh keys fail auth briefly).
@@ -132,4 +185,9 @@ KUMA_URL=http://100.88.209.119:3001 KUMA_USER=<drawer> KUMA_PASS=<drawer> \
 11. **Push before Dokploy deploy** (banked 2026-07-14): Dokploy's compose deploy clones directly from GitHub (`origin/main`) at deploy time. If local commits haven't been pushed yet, the deploy fails with `Compose file not found`. Always `git push origin main` before triggering any Dokploy deploy — especially when multiple tasks write files before the first push.
 12. **Kuma 1.x has no native WAHA notification provider** (banked 2026-07-14): the `type="waha"` notification type exists only in Kuma 2.x. On Kuma 1.23.x (used here), use `NotificationType.WEBHOOK` with `webhookContentType="custom"` and a LiquidJS body template that emits WAHA's `sendText` JSON payload. The `uptime-kuma-api` v1.x library also has no WAHA entry in `NotificationType` — passing an unknown type raises `TypeError`.
 
+13. **`infisical-migrate` requires the FULL env** (banked 2026-07-14): the migrate command validates ALL env vars including `ENCRYPTION_KEY`. The migrate service must have the complete env set (same as infisical-backend), not just `DB_CONNECTION_URI`. Symptom: migrate exits with env validation error on first deploy.
+14. **Failed migrate leaves `is_locked=1`** (banked 2026-07-14): a crashed migrate run sets `infisical_migrations_lock.is_locked=1` in Postgres. Clear it via `UPDATE infisical_migrations_lock SET is_locked=0` before redeploying — otherwise next migrate exits immediately without running and the backend never starts.
+15. **CLI/server version skew: pin `@infisical/cli@0.42.6`** (banked 2026-07-14): latest `@infisical/cli` speaks `/api/v4/secrets` → 404 on server v0.146. Always pin `@infisical/cli@0.42.6` in app images and throwaway containers paired with this server version.
+16. **Tailscale SSH intercepts tailnet-ip:22** (banked 2026-07-14): automation from the Mini targeting `100.102.73.112:22` triggers Tailscale's interactive re-auth flow (not a standard SSH session). Use the **public IP `163.176.231.29:22`** + dedicated key `~/.ssh/pocketsoftware-backup` for any machine-to-machine automation. Stage-2 hardening (restricted command) is a deferred bead.
+17. **Image tags can be stale — always `docker manifest inspect` before pinning** (banked 2026-07-14): `v0.151.0-postgres` never existed; the plan pin was a guess. Run `docker manifest inspect infisical/infisical:<tag>` to verify a tag exists and has an arm64 layer before committing it to the compose file.
 <!-- Add new gotchas above this line, numbered, with date + symptom + fix. -->
