@@ -63,6 +63,7 @@ The repo justfile exports these top-level — **always use `just plan` / `just a
 | `databases` (Postgres) | `jka-xKKG232F0Jetb2w_v` | `platform-postgres:5432` on dokploy-network; zero host ports |
 | `storage` (MinIO) | `YuH5TqYxOnGxY5UXnHNTC` | image `minio/minio:RELEASE.2025-09-07T16-13-09Z`; S3 public at s3.pocketsoftware.com.br |
 | `observability` (obs-stack) | `iU9vjea42NJzGFZDQEJnq` | Prometheus + Grafana + Alertmanager + cAdvisor; tailnet-only |
+| `errors` (GlitchTip) | `BKwXJr1GK5b3Cb_Oopflw` | `glitchtip/glitchtip:6.2.0`; public at glitchtip.pocketsoftware.com.br |
 
 ## 5. Access Model
 
@@ -298,7 +299,44 @@ Full restore commands: `pocketsoftware-terraform/AGENTS.md §10 — Cloud Restor
 
 ---
 
-## 12. Banked Gotchas
+## 12. Error Tracking (GlitchTip)
+
+GlitchTip 6.2.0 — Sentry-compatible error tracker. Live since 2026-07-14. Every app gets a DSN from Infisical. Full runbook: `pocketsoftware-terraform/AGENTS.md §11`.
+
+### Endpoints
+
+| Endpoint | URL |
+|----------|-----|
+| Public UI / DSN ingress | `https://glitchtip.pocketsoftware.com.br` |
+| Health probe | `https://glitchtip.pocketsoftware.com.br/_health/` (trailing slash — Gotcha 31) |
+| Compose project | `errors` (composeId `BKwXJr1GK5b3Cb_Oopflw`) |
+
+Registration disabled (403 after superuser created). Internal port: **8000** (Gotcha 28 — not 8080).
+
+Credentials (admin login, SECRET_KEY, API token, DSN registry): **`peppy/secrets` mempalace drawer — never inline.**
+
+### Per-App DSN Onboarding Ritual (API-first)
+
+1. **Create project** via API: `POST /api/0/teams/pocketsoftware/platform/projects/` with peppy-admin token (from `peppy/secrets` drawer). Capture DSN.
+2. **Wire email alert rule explicitly** — GlitchTip creates none by default (Gotcha 30). POST the alert, then wire the recipient via Django shell (`docker exec glitchtip-web ./manage.py shell`) because v6.2.0 recipient REST sub-route 404s.
+3. **Store DSN in app's Infisical project** as `GLITCHTIP_DSN` via peppy-admin API.
+
+Full API sequence + Django shell commands: `pocketsoftware-terraform/AGENTS.md §11`.
+
+### Platform Dividends
+
+- DB `glitchtip_db` on `platform-postgres` (customer #1) — isolation + backups inherited automatically.
+- Nightly `pg-glitchtip_db-*.dump` via dynamic enumeration (2.0M verified 2026-07-14).
+- OCI replication picks up dumps in the 05:55 ballet.
+- SMTP via shared Gmail app password (same as Alertmanager).
+
+### Kuma Coverage
+
+Monitor #10: `https://glitchtip.pocketsoftware.com.br/_health/`
+
+---
+
+## 13. Banked Gotchas
 
 1. **OCI S3-compat state 501** — see §3. Symptom: apply succeeds creating resources, then "Failed to persist state". Never lose the errored.tfstate.
 2. **OCI customer-secret-keys have a ~3-4 min propagation delay** before the S3-compat API accepts them (fresh keys fail auth briefly).
@@ -328,4 +366,8 @@ Full restore commands: `pocketsoftware-terraform/AGENTS.md §10 — Cloud Restor
 25. **`infisical` CLI 0.42.6 does not auto-consume `MACHINE_IDENTITY_*` env vars; alpine needs `ca-certificates`** (2026-07-14): fetch the token via the universal-auth API and pass it with `--token` explicitly. Alpine images also need `apk add ca-certificates` before any HTTPS call to a Let's Encrypt-signed endpoint, including `s3.pocketsoftware.com.br`.
 26. **`S3_FORCE_PATH_STYLE` is not an aws-cli env var** (2026-07-14): the aws CLI does not read `S3_FORCE_PATH_STYLE` from the environment. Pass `--endpoint-url https://s3.pocketsoftware.com.br` directly on every CLI invocation. SDKs use `forcePathStyle: true` in client config. The env var is only a documentation convention for passing the value to app processes.
 27. **Dokploy `compose.deploy` does not recreate unchanged containers** (2026-07-14): if only a mounted config file changed (e.g. `prometheus.yml`) but the compose definition didn't, the redeploy leaves the container running with the old config. For Prometheus config changes: `docker restart obs-prometheus` after deploy, or add `--web.enable-lifecycle` to the Prometheus command and `POST http://obs-prometheus:9090/-/reload`.
+28. **GlitchTip 6.2.0 (granian) listens on port 8000, not 8080** (2026-07-14): the container exposes port 8000. Traefik domain records must target `glitchtip-web:8000`. The original plan specified 8080 — this caused a failed domain binding corrected after inspection of the running container.
+29. **`ENABLE_USER_REGISTRATION=False` only applies once ≥1 user exists** (2026-07-14): on a fresh DB with zero users, the registration endpoint is open regardless of this flag. The bootstrap window is open from first deploy until the superuser is created. Create the superuser immediately after `glitchtip-migrate` exits `Completed 0` — before anything else.
+30. **GlitchTip creates NO default email alert rule per project — wire one explicitly; v6.2.0 recipient REST sub-route 404s** (2026-07-14): every new project has zero alert rules. An event is ingested but no notification fires. In v6.2.0, `POST /api/0/projects/.../alerts/<id>/recipients/` returns 404. Wire the `AlertRecipient` record via `docker exec glitchtip-web ./manage.py shell` instead.
+31. **GlitchTip health endpoint is `/_health/` with a trailing slash** (2026-07-14): `/_health` (no trailing slash) returns 301/404. Kuma monitor and any health probe must use `/_health/` for a clean unauthenticated 200.
 <!-- Add new gotchas above this line, numbered, with date + symptom + fix. -->
