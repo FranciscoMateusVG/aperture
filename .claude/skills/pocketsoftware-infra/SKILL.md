@@ -64,6 +64,8 @@ The repo justfile exports these top-level — **always use `just plan` / `just a
 | `storage` (MinIO) | `YuH5TqYxOnGxY5UXnHNTC` | image `minio/minio:RELEASE.2025-09-07T16-13-09Z`; S3 public at s3.pocketsoftware.com.br |
 | `observability` (obs-stack) | `iU9vjea42NJzGFZDQEJnq` | Prometheus + Grafana + Alertmanager + cAdvisor; tailnet-only |
 | `errors` (GlitchTip) | `BKwXJr1GK5b3Cb_Oopflw` | `glitchtip/glitchtip:6.2.0`; public at glitchtip.pocketsoftware.com.br |
+| `eunenem-staging` | `e4RY8fHk5z0ZNsWFuOVpv` | tenant — https://eunenem.test.pocketsoftware.com.br; appName `eunenem-staging-ajpjbq` |
+| `eunenem-prod` | `DpC6QS660XffZBAbh7qHo` | tenant — https://eunenem.pocketsoftware.com.br; appName `eunenem-prod-wozn0j` |
 
 ## 5. Access Model
 
@@ -336,7 +338,28 @@ Monitor #10: `https://glitchtip.pocketsoftware.com.br/_health/`
 
 ---
 
-## 13. Banked Gotchas
+## 13. Tenants — EuNeném
+
+First production tenant — migrated from xerox 2026-07-14/15 (BEADS `aperture-48z56`), xerox copy decommissioned. Full tenant runbook: `pocketsoftware-terraform/AGENTS.md §12`. Credentials (DB URLs, MinIO scoped key, Infisical machine identity, GlitchTip DSN): **`peppy/secrets` mempalace drawer**.
+
+| Field | Staging | Production |
+|-------|---------|------------|
+| Domain | `eunenem.test.pocketsoftware.com.br` | `eunenem.pocketsoftware.com.br` |
+| Branch | `staging` | `main` |
+| composeId | `e4RY8fHk5z0ZNsWFuOVpv` | `DpC6QS660XffZBAbh7qHo` |
+| appName | `eunenem-staging-ajpjbq` | `eunenem-prod-wozn0j` |
+| Database | `eunenem_staging_db` | `eunenem_prod_db` |
+| Health | `/healthz` | `/healthz` |
+
+Dokploy source (both envs): GitHub mirror `FranciscoMateusVG/eunenem-engine`.
+
+**Release ritual**: push `staging` → API-deploy staging compose → verify `/healthz` + smoke → promote `staging`→`main` (`git push --force-with-lease`) → API-deploy prod compose. Deploys are ALWAYS API-triggered (gotcha 18 — autoDeploy structurally impossible here).
+
+Key facts: shared MinIO bucket `eunenem-perfil-fotos` (operator decision, both envs, in replication list); Infisical project `eunenem` (projectId `0fb98f6f-e31f-4a91-9b3e-39c59f130d5d`, 29 keys/env, source of truth); legacy-users bridge file at `/etc/dokploy/compose/<appName>/files/legacy-1.0-users.json` per env (3,855 users — NOT in git, insurance in OCI `xerox-eunenem-final`); product catalog ships in the repo; `STRIPE_PUBLISHABLE_KEY` is a BUILD ARG (gotcha 36); Kuma monitors `eunenem-staging` + `eunenem-prod` on `/healthz`; GlitchTip project `eunenem` (SDK wiring pending, bead `aperture-sm4el`).
+
+---
+
+## 14. Banked Gotchas
 
 1. **OCI S3-compat state 501** — see §3. Symptom: apply succeeds creating resources, then "Failed to persist state". Never lose the errored.tfstate.
 2. **OCI customer-secret-keys have a ~3-4 min propagation delay** before the S3-compat API accepts them (fresh keys fail auth briefly).
@@ -370,4 +393,10 @@ Monitor #10: `https://glitchtip.pocketsoftware.com.br/_health/`
 29. **`ENABLE_USER_REGISTRATION=False` only applies once ≥1 user exists** (2026-07-14): on a fresh DB with zero users, the registration endpoint is open regardless of this flag. The bootstrap window is open from first deploy until the superuser is created. Create the superuser immediately after `glitchtip-migrate` exits `Completed 0` — before anything else.
 30. **GlitchTip creates NO default email alert rule per project — wire one explicitly; v6.2.0 recipient REST sub-route 404s** (2026-07-14): every new project has zero alert rules. An event is ingested but no notification fires. In v6.2.0, `POST /api/0/projects/.../alerts/<id>/recipients/` returns 404. Wire the `AlertRecipient` record via `docker exec glitchtip-web ./manage.py shell` instead.
 31. **GlitchTip health endpoint is `/_health/` with a trailing slash** (2026-07-14): `/_health` (no trailing slash) returns 301/404. Kuma monitor and any health probe must use `/_health/` for a clean unauthenticated 200.
+32. **xerox Dokploy autoDeploy DOES fire on mirror pushes** (2026-07-15): xerox's Dokploy dashboard is public, so GitHub webhooks reach it — `autoDeploy=true` fires on pushes to watched branches, unlike pocketsoftware's (tailnet-only, webhooks can't reach it). A mirror push triggered a surprise xerox re-clone/rebuild mid-migration. Always check `autoDeploy=false` on xerox-org composes watching branches you push.
+33. **better-auth magic-link tokens are stored HASHED in `verifications`** (2026-07-15): the raw token exists only in the email — you cannot complete a login from DB access. E2E auth proof = request the link (`status:true` proves SMTP accepted) + verifications row present + a real click on the emailed link.
+34. **Dokploy `compose.delete` is the working delete endpoint — and it leaks a key** (2026-07-15): `compose.remove` 404s; `compose.delete` works and accepts `deleteVolumes:true` — BUT its response leaks the GitHub App RSA private key in plaintext (bead `aperture-gosbu`). Treat delete responses as secret material; never paste them into reports.
+35. **Dokploy delete cascade does NOT remove locally-built images** (2026-07-15): the cascade removes containers/volumes/dirs, but images built locally by the compose stay behind — `docker rmi` them manually after deleting a compose.
+36. **esbuild publishable keys are BUILD ARGS baked into the client bundle** (2026-07-15): in esbuild apps (eunenem-server), `STRIPE_PUBLISHABLE_KEY`-style publishable keys are inlined at build time — set the env BEFORE `compose.deploy` and wire `build.args` in the compose file; changing the key requires a rebuild, not a restart.
+37. **App data can live OUTSIDE repo+DB — sweep Dokploy's per-compose files dir** (2026-07-15): xerox had a 3,855-user legacy bridge JSON in Dokploy's per-compose files dir that no repo or DB knew about. Always sweep `/etc/dokploy/compose/<app>/files/` before decommissioning anything.
 <!-- Add new gotchas above this line, numbered, with date + symptom + fix. -->
