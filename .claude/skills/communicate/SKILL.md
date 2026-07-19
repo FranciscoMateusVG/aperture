@@ -17,7 +17,7 @@ Every message between agents — task updates, quick pings, handoffs, questions,
 
 **How it works:**
 - You call `send_message(to: "agent", message: "...")` — this writes a BEADS message record
-- Delivery is **push**, via the aperture-bus hub: Claude agents receive events on a Monitor subscribed to the hub at `ws://127.0.0.1:4517`; Codex agents receive injected turns via the app-server bridge
+- Delivery is **push**, via the aperture-bus hub: Claude agents receive events on their inbox monitor — a bash-based Monitor running `node ~/projects/aperture/mcp-server/dist/hub-client.js <your-name>` (persistent), which sends the identifying hello frame to the hub at `ws://127.0.0.1:4517` and streams each frame as an event. Codex agents receive injected turns via the app-server bridge. ⚠️ Never use the Monitor tool's native ws source for the inbox — it is receive-only, cannot send the hello, and leaves you as an anonymous socket the hub treats as offline (bug aperture-1qwty)
 - Recipient offline? Nothing is lost — on reconnect the hub replays every unread message
 - A message counts as **read only when the recipient explicitly calls `mark_as_read` after processing it** — never on delivery. If you receive a message, process it, then mark it read.
 
