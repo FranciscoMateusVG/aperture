@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.8"
 regex = "1"
+libc = "0.2"
 # aperture-wul6m liveness watchdog: sync WS subscriber to the aperture-bus hub
 # (runs in a dedicated std::thread — matches the poller/ws_hub daemon pattern,
 # no tokio). chrono formats kickoff/dot timestamps as ISO 8601 per

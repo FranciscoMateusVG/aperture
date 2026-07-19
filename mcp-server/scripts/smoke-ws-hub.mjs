@@ -14,6 +14,8 @@
 // Run: node scripts/smoke-ws-hub.mjs   (from mcp-server/, after npx tsc)
 
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import WebSocket from "ws";
@@ -21,6 +23,15 @@ import WebSocket from "ws";
 const here = dirname(fileURLToPath(import.meta.url));
 const hubPath = resolve(here, "..", "dist", "ws-hub.js");
 const port = 20000 + Math.floor(Math.random() * 20000);
+const tokenDir = mkdtempSync(resolve(tmpdir(), "hub-smoke-tokens-"));
+const TOKENS = {
+  watchdog: "21".repeat(32),
+  testbot: "22".repeat(32),
+  glados: "23".repeat(32),
+};
+for (const [principal, token] of Object.entries(TOKENS)) {
+  writeFileSync(resolve(tokenDir, `${principal}.token`), token, { mode: 0o600 });
+}
 
 let failed = false;
 const pass = (msg) => console.log(`PASS: ${msg}`);
@@ -42,6 +53,7 @@ const hub = spawn(process.execPath, [hubPath], {
     ...process.env,
     APERTURE_WS_PORT: String(port),
     APERTURE_HUB_SKIP_REPLAY: "1",
+    APERTURE_HUB_TOKEN_DIR: tokenDir,
   },
   stdio: ["ignore", "ignore", "pipe"],
 });
@@ -104,8 +116,10 @@ function waitForClose(ws, what, timeoutMs = 3000) {
   });
 }
 
-const hello = (ws, role, agent) =>
-  ws.send(JSON.stringify(agent ? { type: "hello", role, agent } : { type: "hello", role }));
+const hello = (ws, role, agent) => {
+  const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
+  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token: TOKENS[principal] }));
+};
 
 try {
   // ── Setup: subscriber first, then the fake agent ──
@@ -194,6 +208,7 @@ try {
 }
 
 clearTimeout(watchdog);
+rmSync(tokenDir, { recursive: true, force: true });
 if (failed) {
   console.error("SMOKE TEST: FAILED");
   process.exit(1);

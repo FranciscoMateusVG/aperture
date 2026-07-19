@@ -28,6 +28,7 @@
  */
 
 import WebSocket from "ws";
+import { readFileSync } from "node:fs";
 
 const agent = process.argv[2];
 if (!agent) {
@@ -36,13 +37,26 @@ if (!agent) {
 }
 
 const url = process.env.APERTURE_HUB_URL ?? "ws://127.0.0.1:4517";
-const token = process.env.APERTURE_HUB_TOKEN;
+let token = process.env.APERTURE_HUB_TOKEN;
+const tokenFile = process.env.APERTURE_HUB_TOKEN_FILE;
+if (!token && tokenFile) {
+  try {
+    token = readFileSync(tokenFile, "utf8");
+  } catch {
+    console.log("HUB_CLIENT_ERROR unable to read agent token file");
+    process.exit(2);
+  }
+}
+if (!token) {
+  console.log("HUB_CLIENT_ERROR missing agent token");
+  process.exit(2);
+}
 
 const ws = new WebSocket(url, { perMessageDeflate: false });
 
 ws.on("open", () => {
   const hello: Record<string, unknown> = { type: "hello", role: "agent", agent };
-  if (token) hello.token = token;
+  hello.token = token;
   ws.send(JSON.stringify(hello));
 });
 

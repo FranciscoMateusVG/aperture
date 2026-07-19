@@ -52,6 +52,7 @@ name = "aperture"
 version = "1.2.0"
 dependencies = [
  "chrono",
+ "libc",
  "portable-pty",
  "regex",
  "serde",

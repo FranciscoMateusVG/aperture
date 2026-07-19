@@ -277,8 +277,17 @@ fn subscriber_loop(shared: Arc<Mutex<Shared>>) {
     loop {
         match tungstenite::connect(HUB_URL) {
             Ok((mut socket, _resp)) => {
-                // hello as a subscriber (agent name not required for this role).
-                let hello = r#"{"type":"hello","role":"subscriber"}"#;
+                let token_path = match crate::hub_auth::token_path("watchdog") {
+                    Ok(p) => p,
+                    Err(_) => { mark_disconnected(&shared); std::thread::sleep(backoff); continue; }
+                };
+                let token = match std::fs::read_to_string(token_path) {
+                    Ok(t) => t,
+                    Err(_) => { mark_disconnected(&shared); std::thread::sleep(backoff); continue; }
+                };
+                let hello = serde_json::json!({
+                    "type": "hello", "role": "subscriber", "agent": "watchdog", "token": token
+                }).to_string();
                 if socket.send(Message::Text(hello.into())).is_err() {
                     mark_disconnected(&shared);
                     std::thread::sleep(backoff);

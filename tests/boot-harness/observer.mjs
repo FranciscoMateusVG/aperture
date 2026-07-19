@@ -31,6 +31,9 @@ const require = createRequire(
   new URL("../../mcp-server/package.json", import.meta.url),
 );
 const WebSocket = require("ws");
+const tokenDir = process.env.APERTURE_HUB_TOKEN_DIR;
+if (!tokenDir) throw new Error("observer: APERTURE_HUB_TOKEN_DIR is required");
+const token = readFileSync(`${tokenDir}/watchdog.token`, "utf8").trim();
 
 // ── Arg parsing ──
 const expectedAgents = [];
@@ -214,7 +217,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   }
 }
 
-ws.send(JSON.stringify({ type: "hello", role: "subscriber" }));
+ws.send(JSON.stringify({ type: "hello", role: "subscriber", agent: "watchdog", token }));
 emit({ event: "observer_subscribed", url });
 
 ws.on("message", (data) => {

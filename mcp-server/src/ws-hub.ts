@@ -27,6 +27,10 @@
  *                                (testing hook; smoke tests have no BEADS)
  */
 import { WebSocketServer, WebSocket } from "ws";
+import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { getUnreadMessages } from "./beads.js";
 import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
 
@@ -34,6 +38,9 @@ const HOST = "127.0.0.1";
 const PORT = Number(process.env.APERTURE_WS_PORT ?? 4517);
 const SKIP_REPLAY = process.env.APERTURE_HUB_SKIP_REPLAY === "1";
 const HEARTBEAT_MS = 30_000;
+const MAX_FRAME_BYTES = 16 * 1024;
+const TOKEN_DIR = process.env.APERTURE_HUB_TOKEN_DIR ?? join(homedir(), ".aperture", "run", "hub-tokens");
+const AGENT_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 type Role = "agent" | "subscriber" | "producer";
 
@@ -66,6 +73,36 @@ function broadcastPresence(agent: string, event: PresenceEvent): void {
     if (conn.role === "subscriber") send(ws, msg);
   }
   log("presence", { agent, presence: event });
+}
+
+/** Read a launcher-provisioned token without following symlinks or accepting
+ * group/world-readable credentials. The value is never included in logs. */
+function readAgentToken(agent: string): Buffer | null {
+  if (!AGENT_NAME.test(agent)) return null;
+  let fd: number | null = null;
+  try {
+    fd = openSync(join(TOKEN_DIR, `${agent}.token`), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0) return null;
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return null;
+    const token = readFileSync(fd);
+    return token.length >= 32 && token.length <= 256 ? token : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function validAgentToken(agent: string, presented: unknown): boolean {
+  if (typeof presented !== "string" || presented.length > 256) return false;
+  const expected = readAgentToken(agent);
+  if (!expected) return false;
+  // Compare fixed-length digests so token length is not observable through an
+  // early-return timing difference.
+  const actualDigest = createHash("sha256").update(presented).digest();
+  const expectedDigest = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(actualDigest, expectedDigest);
 }
 
 /**
@@ -111,8 +148,12 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): b
     return false;
   }
   const agent = typeof msg.agent === "string" && msg.agent.length > 0 ? msg.agent : null;
-  if (role === "agent" && !agent) {
-    log("bad_hello", { reason: "agent_name_required" });
+  if (!agent) {
+    log("bad_hello", { reason: "principal_required", role });
+    return false;
+  }
+  if (!validAgentToken(agent, msg.token)) {
+    log("bad_hello", { reason: "invalid_token", role, agent });
     return false;
   }
   conn.role = role;
@@ -135,10 +176,14 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): b
   return true;
 }
 
-function handleNotify(ws: WebSocket, msg: Record<string, unknown>): void {
+function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): void {
   const to = typeof msg.to === "string" ? msg.to : "";
   const id = typeof msg.id === "string" ? msg.id : "";
-  const from = typeof msg.from === "string" ? msg.from : "unknown";
+  const from = conn.agent ?? "unknown";
+  if (typeof msg.from === "string" && msg.from !== from) {
+    log("notify_rejected", { reason: "from_mismatch", agent: from });
+    return;
+  }
   const preview = typeof msg.preview === "string" ? msg.preview : "";
   const target = agents.get(to);
   if (codexBridges.has(to)) {
@@ -166,7 +211,7 @@ const codexBridges = startCodexBridges({
   skipReplay: SKIP_REPLAY,
 });
 
-const wss = new WebSocketServer({ host: HOST, port: PORT });
+const wss = new WebSocketServer({ host: HOST, port: PORT, maxPayload: MAX_FRAME_BYTES });
 
 wss.on("listening", () => {
   log("listening", { host: HOST, port: PORT, skipReplay: SKIP_REPLAY });
@@ -179,6 +224,10 @@ wss.on("error", (err) => {
 wss.on("connection", (ws) => {
   const conn: Conn = { role: null, agent: null, isAlive: true };
   conns.set(ws, conn);
+  const helloDeadline = setTimeout(() => {
+    if (conn.role === null) ws.close(4001, "expected hello");
+  }, 5_000);
+  helloDeadline.unref?.();
 
   ws.on("pong", () => {
     conn.isAlive = true;
@@ -206,12 +255,14 @@ wss.on("connection", (ws) => {
     if (conn.role === null) {
       if (msg.type !== "hello" || !handleHello(ws, conn, msg)) {
         ws.close(4001, "expected hello");
+      } else {
+        clearTimeout(helloDeadline);
       }
       return;
     }
 
     if (conn.role === "producer" && msg.type === "notify") {
-      handleNotify(ws, msg);
+      handleNotify(ws, conn, msg);
       return;
     }
 
@@ -220,6 +271,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    clearTimeout(helloDeadline);
     conns.delete(ws);
     if (conn.role === "agent" && conn.agent && agents.get(conn.agent) === ws) {
       agents.delete(conn.agent);

@@ -29,7 +29,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,13 @@ if (!existsSync(hubPath)) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TOKENS = {
+  watchdog: "01".repeat(32),
+  "izzy-test": "02".repeat(32),
+  glados: "03".repeat(32),
+  "dup-test": "04".repeat(32),
+  dup2: "05".repeat(32),
+};
 
 /**
  * Spawn a fresh hub on a random high port.
@@ -58,12 +65,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function spawnHub() {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-test-agents-"));
+  const tokenDir = mkdtempSync(join(tmpdir(), "hub-test-tokens-"));
+  for (const [principal, token] of Object.entries(TOKENS)) {
+    writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
+  }
   const proc = spawn(process.execPath, [hubPath], {
     env: {
       ...process.env,
       APERTURE_WS_PORT: String(port),
       APERTURE_HUB_SKIP_REPLAY: "1",
       APERTURE_AGENTS_DIR: emptyAgentsDir,
+      APERTURE_HUB_TOKEN_DIR: tokenDir,
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
@@ -115,6 +127,7 @@ async function spawnHub() {
   function stop() {
     proc.kill("SIGKILL");
     rmSync(emptyAgentsDir, { recursive: true, force: true });
+    rmSync(tokenDir, { recursive: true, force: true });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
@@ -129,8 +142,19 @@ function connect(port) {
   });
 }
 
-const hello = (ws, role, agent) =>
-  ws.send(JSON.stringify(agent ? { type: "hello", role, agent } : { type: "hello", role }));
+const hello = (ws, role, agent) => {
+  const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
+  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token: TOKENS[principal] }));
+};
+
+async function authenticate(hub, ws, role, agent) {
+  const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
+  hello(ws, role, agent);
+  await hub.waitForEvent(
+    (e) => e.event === "hello" && e.role === role && e.agent === principal,
+    `authenticated ${role} hello for ${principal}`,
+  );
+}
 
 /** Attach a live frame recorder to a socket. Returns the array of parsed frames. */
 function recordFrames(ws) {
@@ -199,7 +223,7 @@ test("agent hello: subscriber gets presence join; agent socket gets NO ack frame
   const hub = await spawnHub();
   try {
     const subscriber = await connect(hub.port);
-    hello(subscriber, "subscriber");
+    await authenticate(hub, subscriber, "subscriber");
 
     const agent = await connect(hub.port);
     const agentFrames = recordFrames(agent);
@@ -208,7 +232,7 @@ test("agent hello: subscriber gets presence join; agent socket gets NO ack frame
       (m) => m.type === "presence" && m.agent === "izzy-test" && m.event === "join",
       "presence join for izzy-test",
     );
-    hello(agent, "agent", "izzy-test");
+    await authenticate(hub, agent, "agent", "izzy-test");
     const join = await joinPromise;
     assert.equal(typeof join.ts, "string", "presence event carries a ts");
 
@@ -260,17 +284,71 @@ test("first frame must be hello: garbage JSON and valid-JSON non-hello both clos
   }
 });
 
+test("hello authentication fails closed for missing, invalid, and wrong-principal tokens", async () => {
+  const hub = await spawnHub();
+  try {
+    const cases = [
+      { type: "hello", role: "agent", agent: "izzy-test" },
+      { type: "hello", role: "agent", agent: "izzy-test", token: "ff".repeat(32) },
+      { type: "hello", role: "agent", agent: "izzy-test", token: TOKENS.glados },
+      { type: "hello", role: "subscriber", agent: "watchdog" },
+      { type: "hello", role: "producer", agent: "glados", token: "malformed" },
+    ];
+    for (const frame of cases) {
+      const ws = await connect(hub.port);
+      const closed = waitForClose(ws, "unauthenticated hello close");
+      ws.send(JSON.stringify(frame));
+      const result = await closed;
+      assert.equal(result.code, 4001, "auth failure uses the generic hello rejection code");
+      assert.equal(result.reason, "expected hello", "auth failure does not disclose credential details");
+    }
+    assert.equal(
+      hub.stderrEvents.some((e) => e.event === "presence" && e.agent === "izzy-test"),
+      false,
+      "failed authentication never registers presence",
+    );
+  } finally {
+    hub.stop();
+  }
+});
+
+test("authenticated producer cannot spoof notify.from", async () => {
+  const hub = await spawnHub();
+  try {
+    const agent = await connect(hub.port);
+    await authenticate(hub, agent, "agent", "izzy-test");
+    const frames = recordFrames(agent);
+
+    const producer = await connect(hub.port);
+    await authenticate(hub, producer, "producer", "glados");
+    producer.send(
+      JSON.stringify({ type: "notify", to: "izzy-test", id: "spoof", from: "mallory", preview: "x" }),
+    );
+
+    await sleep(250);
+    assert.equal(frames.some((f) => f.id === "spoof"), false, "spoofed notification is not delivered");
+    assert.equal(
+      hub.stderrEvents.some((e) => e.event === "notify_forwarded" && e.id === "spoof"),
+      false,
+      "spoofed notification is not treated as forwarded",
+    );
+    closeAll(agent, producer);
+  } finally {
+    hub.stop();
+  }
+});
+
 // ── c. producer notify → online agent ───────────────────────────────────────
 
 test("producer notify to online agent: exactly-once delivery + ok ack", async () => {
   const hub = await spawnHub();
   try {
     const agent = await connect(hub.port);
-    hello(agent, "agent", "izzy-test");
+    await authenticate(hub, agent, "agent", "izzy-test");
     const agentFrames = recordFrames(agent);
 
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
 
     const okPromise = waitFor(producer, (m) => m.type === "ok" && m.id === "msg-1", "ok ack");
     const deliveryPromise = waitFor(
@@ -310,7 +388,7 @@ test("producer notify to offline agent: still acked ok, notify_offline logged, n
   const hub = await spawnHub();
   try {
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
 
     const okPromise = waitFor(producer, (m) => m.type === "ok" && m.id === "msg-2", "ok ack");
     producer.send(
@@ -341,7 +419,7 @@ test("agent_replaced (old alive): old closed 4000, two joins / zero leaves, deli
   const hub = await spawnHub();
   try {
     const subscriber = await connect(hub.port);
-    hello(subscriber, "subscriber");
+    await authenticate(hub, subscriber, "subscriber");
     const presenceFrames = recordFrames(subscriber);
 
     const sockA = await connect(hub.port);
@@ -351,13 +429,13 @@ test("agent_replaced (old alive): old closed 4000, two joins / zero leaves, deli
       (m) => m.type === "presence" && m.agent === "dup-test" && m.event === "join",
       "first join",
     );
-    hello(sockA, "agent", "dup-test");
+    await authenticate(hub, sockA, "agent", "dup-test");
     await firstJoin;
 
     const sockB = await connect(hub.port);
     const framesB = recordFrames(sockB);
     const aClosed = waitForClose(sockA, "old socket close");
-    hello(sockB, "agent", "dup-test");
+    await authenticate(hub, sockB, "agent", "dup-test");
 
     const closed = await aClosed;
     assert.equal(closed.code, 4000, "replaced socket closed with code 4000");
@@ -381,7 +459,7 @@ test("agent_replaced (old alive): old closed 4000, two joins / zero leaves, deli
 
     // Delivery pin: notify now reaches B, and never A (A is closed).
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
     const deliveryB = waitFor(sockB, (m) => m.type === "message" && m.id === "msg-dup", "delivery to B");
     producer.send(
       JSON.stringify({ type: "notify", to: "dup-test", id: "msg-dup", from: "glados", preview: "z" }),
@@ -410,7 +488,7 @@ test("agent_replaced (old dead first): abrupt TCP death then fast re-hello — n
   const hub = await spawnHub();
   try {
     const subscriber = await connect(hub.port);
-    hello(subscriber, "subscriber");
+    await authenticate(hub, subscriber, "subscriber");
     const presenceFrames = recordFrames(subscriber);
 
     const sockA = await connect(hub.port);
@@ -419,7 +497,7 @@ test("agent_replaced (old dead first): abrupt TCP death then fast re-hello — n
       (m) => m.type === "presence" && m.agent === "dup2" && m.event === "join",
       "join for A",
     );
-    hello(sockA, "agent", "dup2");
+    await authenticate(hub, sockA, "agent", "dup2");
     await joinA;
 
     // Abrupt death: destroy the TCP socket with no close frame, then re-hello
@@ -427,11 +505,11 @@ test("agent_replaced (old dead first): abrupt TCP death then fast re-hello — n
     sockA.terminate();
     const sockB = await connect(hub.port);
     const framesB = recordFrames(sockB);
-    hello(sockB, "agent", "dup2");
+    await authenticate(hub, sockB, "agent", "dup2");
 
     // Hard invariant 1: B is the mapped socket — a notify reaches it.
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
     const deliveryB = waitFor(sockB, (m) => m.type === "message" && m.id === "msg-dup2", "delivery to B");
     producer.send(
       JSON.stringify({ type: "notify", to: "dup2", id: "msg-dup2", from: "glados", preview: "q" }),
@@ -478,7 +556,7 @@ test("post-hello junk from an agent is ignored; connection stays open and still 
   const hub = await spawnHub();
   try {
     const agent = await connect(hub.port);
-    hello(agent, "agent", "izzy-test");
+    await authenticate(hub, agent, "agent", "izzy-test");
     // Give the hello a beat so the junk below is unambiguously post-hello.
     await sleep(100);
 
@@ -500,7 +578,7 @@ test("post-hello junk from an agent is ignored; connection stays open and still 
 
     // The connection survived both: a later notify still reaches it.
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
     const delivery = waitFor(agent, (m) => m.type === "message" && m.id === "after-junk", "delivery after junk");
     producer.send(
       JSON.stringify({ type: "notify", to: "izzy-test", id: "after-junk", from: "glados", preview: "still here" }),
@@ -519,7 +597,7 @@ test("SIGTERM: hub logs shutdown and exits 0", async () => {
   try {
     // A connected client makes shutdown exercise the close-all path too.
     const agent = await connect(hub.port);
-    hello(agent, "agent", "izzy-test");
+    await authenticate(hub, agent, "agent", "izzy-test");
 
     const exitCode = await new Promise((resolvePromise) => {
       hub.proc.on("exit", (code) => resolvePromise(code));

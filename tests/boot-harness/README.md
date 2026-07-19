@@ -19,8 +19,9 @@ the SAME code the Tauri GUI runs — agent registry load, tmux window creation,
 launcher-script generation, Claude kickoff positional, Codex app-server spawn
 + resume gate. `smoke-boot.sh` resolves the bin from
 `src-tauri/target/{release,debug}/aperture-boot` and builds it with
-`cargo build --bin aperture-boot` if missing. `APERTURE_BOOT_CMD` remains as
-an explicit override (eval'd instead of the bin) for direct-stub debugging.
+`cargo build --bin aperture-boot` if missing. `APERTURE_BOOT_BIN` may point to
+an alternate executable for direct-stub debugging; arbitrary shell command
+strings are deliberately unsupported.
 
 **Zero-send-keys guarantee**: the harness never calls `tmux send-keys`. Boot
 is entirely CLI-arg driven post-#37 — Claude gets a static kickoff positional
