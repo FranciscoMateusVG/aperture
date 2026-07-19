@@ -27,7 +27,7 @@
  *   APERTURE_AGENTS_DIR — manifest tree (default ~/.claude/aperture)
  *   APERTURE_RUN_DIR    — socket dir    (default ~/.aperture/run)
  */
-import { chmodSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import WebSocket from "ws";
@@ -408,11 +408,21 @@ export class CodexBridgeClient {
    */
   private publishThreadReady(threadId: string): void {
     const path = this.threadReadyPath();
+    const temp = `${path}.${process.pid}.tmp`;
+    let fd: number | null = null;
     try {
-      writeFileSync(path, `${threadId}\n`, { encoding: "utf8", mode: 0o600 });
-      chmodSync(path, 0o600);
+      if (!/^[A-Za-z0-9-]{1,128}$/.test(threadId)) throw new Error("invalid thread id");
+      assertSecureRunDir();
+      fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      writeFileSync(fd, `${threadId}\n`, { encoding: "utf8" });
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = null;
+      renameSync(temp, path);
       this.hooks.log("codex_thread_ready", { agent: this.agent });
     } catch (e: unknown) {
+      if (fd !== null) closeSync(fd);
+      rmSync(temp, { force: true });
       // The bridge remains correctly bound; launcher retry/timeout supplies
       // the visible failure path instead of a silent ownership regression.
       this.hooks.log("codex_thread_ready_error", {
@@ -431,6 +441,9 @@ export class CodexBridgeClient {
   }
 
   private threadReadyPath(): string {
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(this.agent)) {
+      throw new Error("invalid agent name for thread handoff");
+    }
     return join(RUN_DIR, `${this.agent}.thread-id`);
   }
 
@@ -612,6 +625,17 @@ export class CodexBridgeClient {
       this.hooks.log("codex_inject_error", { agent: this.agent, method, ids, error: e.message });
     });
   }
+}
+
+/** The handoff directory is a trust boundary: an attacker-controlled symlink
+ * would defeat the leaf-file O_NOFOLLOW check by redirecting the whole path. */
+function assertSecureRunDir(): void {
+  const stat = lstatSync(RUN_DIR);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("insecure run directory type");
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error("insecure run directory owner");
+  }
+  if ((stat.mode & 0o022) !== 0) throw new Error("insecure run directory permissions");
 }
 
 // ── manager (hub-facing surface) ──

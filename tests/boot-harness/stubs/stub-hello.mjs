@@ -20,6 +20,7 @@
 // tolerated by the hub, kept uniform here.
 
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(
   new URL("../../../mcp-server/package.json", import.meta.url),
@@ -38,6 +39,12 @@ if (!agent) {
 }
 const port = Number(argValue("--port") ?? process.env.APERTURE_WS_PORT ?? 4517);
 const url = `ws://127.0.0.1:${port}`;
+const tokenDir = process.env.APERTURE_HUB_TOKEN_DIR;
+if (!tokenDir) {
+  process.stderr.write("stub-hello: APERTURE_HUB_TOKEN_DIR is required\n");
+  process.exit(2);
+}
+const token = readFileSync(`${tokenDir}/${agent}.token`, "utf8").trim();
 
 const RETRY_MS = 500;
 const MAX_ATTEMPTS = 20;
@@ -71,7 +78,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   }
 }
 
-ws.send(JSON.stringify({ type: "hello", role: "agent", agent }));
+ws.send(JSON.stringify({ type: "hello", role: "agent", agent, token }));
 log("stub_hello_sent", { url });
 
 // Any pushed messages (replay / notify_forwarded) are logged for forensics.

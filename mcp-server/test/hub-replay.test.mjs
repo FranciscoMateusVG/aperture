@@ -71,6 +71,13 @@ if (!existsSync(stubBdPath)) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TOKENS = {
+  watchdog: "11".repeat(32),
+  "rp-test": "12".repeat(32),
+  "rp-empty": "13".repeat(32),
+  "rl-test": "14".repeat(32),
+  glados: "15".repeat(32),
+};
 
 /**
  * Spawn a fresh hub on a random high port with the bd stub wired in.
@@ -85,11 +92,16 @@ async function spawnHub({ bdFail = false } = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-replay-agents-"));
   const dataDir = mkdtempSync(join(tmpdir(), "hub-replay-bdstub-"));
+  const tokenDir = mkdtempSync(join(tmpdir(), "hub-replay-tokens-"));
+  for (const [principal, token] of Object.entries(TOKENS)) {
+    writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
+  }
 
   const env = {
     ...process.env,
     APERTURE_WS_PORT: String(port),
     APERTURE_AGENTS_DIR: emptyAgentsDir,
+    APERTURE_HUB_TOKEN_DIR: tokenDir,
     BD_STUB_DIR: dataDir,
     PATH: `${stubBinDir}:${process.env.PATH ?? ""}`,
     BD_PATH: stubBdPath,
@@ -164,6 +176,7 @@ async function spawnHub({ bdFail = false } = {}) {
     proc.kill("SIGKILL");
     rmSync(emptyAgentsDir, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
+    rmSync(tokenDir, { recursive: true, force: true });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
@@ -202,8 +215,19 @@ function connect(port) {
   });
 }
 
-const hello = (ws, role, agent) =>
-  ws.send(JSON.stringify(agent ? { type: "hello", role, agent } : { type: "hello", role }));
+const hello = (ws, role, agent) => {
+  const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
+  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token: TOKENS[principal] }));
+};
+
+async function authenticate(hub, ws, role, agent) {
+  const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
+  hello(ws, role, agent);
+  await hub.waitForEvent(
+    (e) => e.event === "hello" && e.role === role && e.agent === principal,
+    `authenticated ${role} hello for ${principal}`,
+  );
+}
 
 /** Attach a live frame recorder to a socket. Returns the array of parsed frames. */
 function recordFrames(ws) {
@@ -289,7 +313,7 @@ test("replay-on-connect: 2 unread rows → exactly 2 message frames, one bd quer
 
     const agent = await connect(hub.port);
     const frames = recordFrames(agent);
-    hello(agent, "agent", RP);
+    await authenticate(hub, agent, "agent", RP);
 
     const replayEv = await hub.waitForEvent(
       (e) => e.event === "replay" && e.agent === RP,
@@ -329,7 +353,7 @@ test("replay-exactly-once-per-connect: rows still unread → reconnect replays s
     // Connect #1.
     const first = await connect(hub.port);
     const firstFrames = recordFrames(first);
-    hello(first, "agent", RP);
+    await authenticate(hub, first, "agent", RP);
     await hub.until(
       () => firstFrames.filter((f) => f.type === "message").length >= 2,
       "first-connect replay",
@@ -354,7 +378,7 @@ test("replay-exactly-once-per-connect: rows still unread → reconnect replays s
     // closes the rows via mark_as_read, every reconnect replays them.
     const second = await connect(hub.port);
     const secondFrames = recordFrames(second);
-    hello(second, "agent", RP);
+    await authenticate(hub, second, "agent", RP);
     await hub.until(
       () => secondFrames.filter((f) => f.type === "message").length >= 2,
       "second-connect replay",
@@ -387,7 +411,7 @@ test("replay-after-read: one row closed via mark_as_read → reconnect replays o
 
     const first = await connect(hub.port);
     const firstFrames = recordFrames(first);
-    hello(first, "agent", RP);
+    await authenticate(hub, first, "agent", RP);
     await hub.until(
       () => firstFrames.filter((f) => f.type === "message").length >= 2,
       "first-connect replay of both rows",
@@ -404,7 +428,7 @@ test("replay-after-read: one row closed via mark_as_read → reconnect replays o
 
     const second = await connect(hub.port);
     const secondFrames = recordFrames(second);
-    hello(second, "agent", RP);
+    await authenticate(hub, second, "agent", RP);
     await hub.until(
       () => secondFrames.filter((f) => f.type === "message").length >= 1,
       "second-connect replay",
@@ -427,7 +451,7 @@ test("no-unread: agent with no seed file → hello succeeds, zero message frames
   const hub = await spawnHub();
   try {
     const subscriber = await connect(hub.port);
-    hello(subscriber, "subscriber");
+    await authenticate(hub, subscriber, "subscriber");
 
     const agent = await connect(hub.port);
     const frames = recordFrames(agent);
@@ -436,7 +460,7 @@ test("no-unread: agent with no seed file → hello succeeds, zero message frames
       (m) => m.type === "presence" && m.agent === "rp-empty" && m.event === "join",
       "presence join for rp-empty",
     );
-    hello(agent, "agent", "rp-empty");
+    await authenticate(hub, agent, "agent", "rp-empty");
     await joinPromise;
 
     const replayEv = await hub.waitForEvent(
@@ -463,7 +487,7 @@ test("bd-failure: bd exits 1 → replay_error logged, connection survives, live 
   try {
     const agent = await connect(hub.port);
     const frames = recordFrames(agent);
-    hello(agent, "agent", RP);
+    await authenticate(hub, agent, "agent", RP);
 
     const errEv = await hub.waitForEvent(
       (e) => e.event === "replay_error" && e.agent === RP,
@@ -480,7 +504,7 @@ test("bd-failure: bd exits 1 → replay_error logged, connection survives, live 
 
     // Live delivery still works on the surviving connection.
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
     const delivery = waitFor(
       agent,
       (m) => m.type === "message" && m.id === "live-after-fail",
@@ -528,9 +552,9 @@ test("replay-vs-live: notify racing an in-flight replay → both frames arrive, 
     // Subscriber + producer connect and hello FIRST, so the notify below has
     // no connection-setup latency of its own.
     const subscriber = await connect(hub.port);
-    hello(subscriber, "subscriber");
+    await authenticate(hub, subscriber, "subscriber");
     const producer = await connect(hub.port);
-    hello(producer, "producer");
+    await authenticate(hub, producer, "producer");
     await hub.waitForEvent((e) => e.event === "hello" && e.role === "producer", "producer hello");
 
     const agent = await connect(hub.port);
@@ -540,7 +564,7 @@ test("replay-vs-live: notify racing an in-flight replay → both frames arrive, 
       (m) => m.type === "presence" && m.agent === RL && m.event === "join",
       "join for rl-test",
     );
-    hello(agent, "agent", RL);
+    await authenticate(hub, agent, "agent", RL);
     // The join broadcast happens synchronously inside handleHello BEFORE
     // replayUnread's bd child has spawned, so firing the notify the instant
     // the join is observed guarantees (1) the agent is mapped → the live

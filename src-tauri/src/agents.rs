@@ -1,5 +1,6 @@
 use crate::codex_appserver;
 use crate::config;
+use crate::hub_auth;
 use crate::launcher;
 use crate::state::AppState;
 use crate::tmux;
@@ -189,6 +190,8 @@ pub fn boot_agent_process(
     let claude_bin = std::env::var("APERTURE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let pane_codex_bin = std::env::var("APERTURE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let launcher_path_prefix = std::env::var("APERTURE_LAUNCHER_PATH_PREFIX").ok();
+    let hub_token_path = hub_auth::provision_token(&name)?;
+    let hub_token_path = hub_token_path.to_string_lossy().into_owned();
 
     let mcp_config = serde_json::json!({
         "mcpServers": {
@@ -203,7 +206,8 @@ pub fn boot_agent_process(
                     "APERTURE_MAILBOX": &mailbox_dir,
                     "BEADS_DIR": format!("{}/.aperture/.beads", home_dir),
                     "BD_ACTOR": &name,
-                    "BEADS_DOLT_PASSWORD": &beads_dolt_password
+                    "BEADS_DOLT_PASSWORD": &beads_dolt_password,
+                    "APERTURE_HUB_TOKEN_FILE": &hub_token_path
                 }
             },
             // Sentry MCP wrap layer — enforces Cipher's 9 constraints from
@@ -275,6 +279,7 @@ pub fn boot_agent_process(
             beads_dir: &beads_dir,
             beads_dolt_password: &beads_dolt_password,
             home_dir: &home_dir,
+            hub_token_path: &hub_token_path,
         });
         fs::write(&config_toml_path, &config_toml).map_err(|e| e.to_string())?;
 

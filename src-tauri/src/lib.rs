@@ -3,6 +3,7 @@ mod agents;
 mod codex_appserver;
 mod config;
 mod launcher;
+mod hub_auth;
 mod poller;
 mod state;
 mod tmux;
@@ -108,6 +109,11 @@ pub fn run() {
     std::thread::spawn(move || {
         poller::run_message_poller(poller_state);
     });
+
+    if let Err(e) = hub_auth::provision_token("watchdog") {
+        eprintln!("[aperture] fatal: cannot provision hub watchdog token: {e}");
+        return;
+    }
 
     // Start the aperture-bus WS hub daemon (Comms Layer v2, Phase 1 —
     // docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md). Claude

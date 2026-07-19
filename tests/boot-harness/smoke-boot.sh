@@ -17,7 +17,7 @@
 #                         extra claude agents (fleet-1..fleet-n) in a temp
 #                         overlay registry and boot them all in one
 #                         aperture-boot invocation
-#   APERTURE_BOOT_CMD=…   explicit override: eval'd INSTEAD of aperture-boot
+#   APERTURE_BOOT_BIN=…   executable-path override for aperture-boot
 #                         (kept for direct-stub debugging)
 #   APERTURE_BOOT_RUN_DIR run-dir root (default /tmp/aperture-boot-harness)
 #
@@ -80,6 +80,13 @@ RUN_DIR="$RUN_ROOT/run-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$RUN_DIR"
 export APERTURE_STUB_LOG_DIR="$RUN_DIR/stubs"
 mkdir -p "$APERTURE_STUB_LOG_DIR"
+export APERTURE_HUB_TOKEN_DIR="$RUN_DIR/hub-tokens"
+mkdir -m 700 -p "$APERTURE_HUB_TOKEN_DIR"
+# The subscriber exists before any agent launch. Agent credentials are
+# provisioned/rotated by the real boot path under test.
+umask 077
+"$REAL_NODE" -e 'require("fs").writeFileSync(process.argv[1], require("crypto").randomBytes(32).toString("hex"), {mode:0o600})' \
+    "$APERTURE_HUB_TOKEN_DIR/watchdog.token"
 
 PORT="$("$REAL_NODE" -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
 export APERTURE_WS_PORT="$PORT"
@@ -153,6 +160,7 @@ tmux new-session -d -s "$SMOKE_SESSION" -x 220 -y 50
 tmux set-environment -t "$SMOKE_SESSION" APERTURE_STUB_LOG_DIR "$APERTURE_STUB_LOG_DIR"
 tmux set-environment -t "$SMOKE_SESSION" APERTURE_WS_PORT "$PORT"
 tmux set-environment -t "$SMOKE_SESSION" APERTURE_REAL_NODE "$REAL_NODE"
+tmux set-environment -t "$SMOKE_SESSION" APERTURE_HUB_TOKEN_DIR "$APERTURE_HUB_TOKEN_DIR"
 # l3: the REAL claude agent's boot routine (registry prompt) runs hub-client.js,
 # which reads APERTURE_HUB_URL — point it at THIS run's test hub so a real
 # model's hello lands on the observer's hub, not the production 4517.
@@ -205,11 +213,11 @@ trap cleanup EXIT
 # bridge publishes the real thread-id where the pane launcher reads it.
 if [ "$MODE" = "l2" ]; then
     mkdir -p "$RUN_DIR/bridge-run"
-    APERTURE_WS_PORT="$PORT" APERTURE_HUB_SKIP_REPLAY=1 \
+    APERTURE_WS_PORT="$PORT" APERTURE_HUB_SKIP_REPLAY=1 APERTURE_HUB_TOKEN_DIR="$APERTURE_HUB_TOKEN_DIR" \
         APERTURE_RUN_DIR="$RUN_DIR/bridge-run" \
         "$REAL_NODE" "$HUB_JS" 2> "$RUN_DIR/hub.log" &
 else
-    APERTURE_WS_PORT="$PORT" APERTURE_HUB_SKIP_REPLAY=1 \
+    APERTURE_WS_PORT="$PORT" APERTURE_HUB_SKIP_REPLAY=1 APERTURE_HUB_TOKEN_DIR="$APERTURE_HUB_TOKEN_DIR" \
         "$REAL_NODE" "$HUB_JS" 2> "$RUN_DIR/hub.log" &
 fi
 HUB_PID=$!
@@ -298,10 +306,15 @@ RUN_STATE_DIR="$HOME/.aperture/run"
 THREAD_ID_FILE="$RUN_STATE_DIR/codex-smoke.thread-id"
 
 if [ -n "${APERTURE_BOOT_CMD:-}" ]; then
-    # Explicit override: lets us drive stubs directly (debugging) without
-    # touching this script's structure.
-    echo "🔍 spawning agents via APERTURE_BOOT_CMD (explicit override)"
-    eval "$APERTURE_BOOT_CMD"
+    echo "❌ APERTURE_BOOT_CMD was removed: arbitrary shell eval is not supported; use APERTURE_BOOT_BIN=/path/to/executable"
+    exit 2
+fi
+if [ -n "${APERTURE_BOOT_BIN:-}" ]; then
+    if [ ! -x "$APERTURE_BOOT_BIN" ]; then
+        echo "❌ APERTURE_BOOT_BIN is not executable"
+        exit 2
+    fi
+    BIN="$APERTURE_BOOT_BIN"
 else
     # Resolve the headless boot bin: release, else debug, else build it.
     BIN=""
@@ -320,6 +333,8 @@ else
         fi
         BIN="$REPO/src-tauri/target/debug/aperture-boot"
     fi
+
+fi
 
     # MODE=l2 pre-seed: no real codex-bridge will publish a thread id, so seed
     # the gate file ourselves. NOTE: boot_agent_process clears this exact file
@@ -348,7 +363,6 @@ else
         # Re-seed after the boot-time stale-file clear (see note above).
         printf 'l2-stub-thread\n' > "$THREAD_ID_FILE"
     fi
-fi
 
 # ── (e) wait for the observer verdict ──
 set +e

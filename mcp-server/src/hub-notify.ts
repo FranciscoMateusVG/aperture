@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { readFileSync } from "node:fs";
 
 /**
  * Best-effort push notification to the comms-layer v2 WS hub (ws-hub.ts).
@@ -13,6 +14,8 @@ import WebSocket from "ws";
  */
 
 const HUB_PORT = Number(process.env.APERTURE_WS_PORT ?? 4517);
+const AGENT_NAME = process.env.AGENT_NAME ?? "";
+const TOKEN_FILE = process.env.APERTURE_HUB_TOKEN_FILE ?? "";
 const HUB_NOTIFY_TIMEOUT_MS = 1500;
 
 export interface HubNotification {
@@ -61,7 +64,14 @@ export function notifyHub(
     }
 
     ws.on("open", () => {
-      ws!.send(JSON.stringify({ type: "hello", role: "producer" }));
+      let token: string;
+      try {
+        token = readFileSync(TOKEN_FILE, "utf8");
+      } catch {
+        finish("hub credential unavailable");
+        return;
+      }
+      ws!.send(JSON.stringify({ type: "hello", role: "producer", agent: AGENT_NAME, token }));
       ws!.send(JSON.stringify({ type: "notify", ...note }));
     });
 

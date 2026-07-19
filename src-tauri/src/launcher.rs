@@ -69,6 +69,7 @@ pub fn build_claude_launcher(
     format!(
         r#"#!/bin/bash
 {path_line}
+export APERTURE_HUB_TOKEN_FILE="${{APERTURE_HUB_TOKEN_DIR:-$HOME/.aperture/run/hub-tokens}}/{name}.token"
 cd "{project_dir}"
 PROMPT=$(cat "{prompt_path}")
 exec {claude_bin} --dangerously-skip-permissions --model {model} --system-prompt "$PROMPT" --mcp-config {mcp_config_path} --name {name}{kickoff}
@@ -121,8 +122,11 @@ for _ in $(seq 1 40); do [ -S "{sock_path}" ] && break; sleep 0.25; done
 # handoff, up to 60s), then RESUME that thread so turn 1 (the kickoff) is live
 # in the pane.
 THREAD_ID_FILE="{thread_id_file}"
-for _ in $(seq 1 240); do [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
+for _ in $(seq 1 240); do [ -f "$THREAD_ID_FILE" ] && [ ! -L "$THREAD_ID_FILE" ] && [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
 THREAD_ID=$(cat "$THREAD_ID_FILE" 2>/dev/null)
+case "$THREAD_ID" in
+  ''|*[!A-Za-z0-9-]*) echo "invalid thread handoff" >&2; exit 1 ;;
+esac
 exec {codex_bin} resume "$THREAD_ID" --remote "unix://{sock_path}"
 "#
     )
@@ -148,6 +152,7 @@ pub struct CodexConfigParams<'a> {
     pub beads_dir: &'a str,
     pub beads_dolt_password: &'a str,
     pub home_dir: &'a str,
+    pub hub_token_path: &'a str,
 }
 
 /// Build the Codex `config.toml` contents. Byte-identical to the template
@@ -165,7 +170,7 @@ trust_level = "trusted"
 [mcp_servers.aperture-bus]
 command = "sh"
 args = ["{bus_start_sh}"]
-env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}" }}
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}", APERTURE_HUB_TOKEN_FILE = "{hub_token_path}" }}
 
 # Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
 [mcp_servers.sentry]
@@ -185,6 +190,7 @@ env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", 
         mailbox_dir = p.mailbox_dir,
         beads_dir = p.beads_dir,
         home_dir = p.home_dir,
+        hub_token_path = p.hub_token_path,
     )
 }
 
@@ -272,6 +278,7 @@ mod tests {
             beads_dir: "/Users/x/.aperture/.beads",
             beads_dolt_password: "hunter2",
             home_dir: "/Users/x",
+            hub_token_path: "/Users/x/.aperture/run/hub-tokens/vex.token",
         }
     }
 
@@ -298,6 +305,7 @@ mod tests {
             s,
             r#"#!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export APERTURE_HUB_TOKEN_FILE="${APERTURE_HUB_TOKEN_DIR:-$HOME/.aperture/run/hub-tokens}/atlas.token"
 cd "/Users/x/projects/aperture"
 PROMPT=$(cat "/tmp/aperture-prompt-atlas.md")
 exec claude --dangerously-skip-permissions --model opus --system-prompt "$PROMPT" --mcp-config /tmp/aperture-mcp-atlas.json --name atlas 'Session start. Run your boot routine now: start your inbox monitor per your system prompt, then check get_messages and process any unread messages, marking each read after you handle it.'
@@ -351,8 +359,11 @@ for _ in $(seq 1 40); do [ -S "/Users/x/.aperture/run/vex.sock" ] && break; slee
 # handoff, up to 60s), then RESUME that thread so turn 1 (the kickoff) is live
 # in the pane.
 THREAD_ID_FILE="/Users/x/.aperture/run/vex.thread-id"
-for _ in $(seq 1 240); do [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
+for _ in $(seq 1 240); do [ -f "$THREAD_ID_FILE" ] && [ ! -L "$THREAD_ID_FILE" ] && [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
 THREAD_ID=$(cat "$THREAD_ID_FILE" 2>/dev/null)
+case "$THREAD_ID" in
+  ''|*[!A-Za-z0-9-]*) echo "invalid thread handoff" >&2; exit 1 ;;
+esac
 exec codex resume "$THREAD_ID" --remote "unix:///Users/x/.aperture/run/vex.sock"
 "#
         );
@@ -383,7 +394,7 @@ trust_level = "trusted"
 [mcp_servers.aperture-bus]
 command = "sh"
 args = ["/Users/x/projects/aperture/mcp-server/start.sh"]
-env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3-codex", APERTURE_MAILBOX = "/Users/x/.aperture/mailbox", BEADS_DIR = "/Users/x/.aperture/.beads", BD_ACTOR = "vex", BEADS_DOLT_PASSWORD = "hunter2" }
+env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3-codex", APERTURE_MAILBOX = "/Users/x/.aperture/mailbox", BEADS_DIR = "/Users/x/.aperture/.beads", BD_ACTOR = "vex", BEADS_DOLT_PASSWORD = "hunter2", APERTURE_HUB_TOKEN_FILE = "/Users/x/.aperture/run/hub-tokens/vex.token" }
 
 # Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
 [mcp_servers.sentry]
