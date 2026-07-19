@@ -20,6 +20,8 @@
   --accent-purple: #9b59b6;
   --accent-teal: #1abc9c;
   --accent-pink: #e91e63;
+  --accent-grey: #5a5a72;
+  --accent-amber: #e6a23c;
   --border: #2a2a4a;
   --radius: 6px;
   --navbar-height: 40px;
@@ -331,6 +333,7 @@ html, body {
 }
 
 .agent-mini__icon {
+  position: relative;
   font-size: 16px;
   width: 22px;
   text-align: center;
@@ -341,6 +344,54 @@ html, body {
 
 .agent-mini--running .agent-mini__icon {
   filter: none;
+}
+
+/* ── Presence dot ──
+   Additive layer on the icon's bottom-right corner (avatar-status style),
+   never a replacement for agent-mini--running. Only rendered while the
+   agent process actually exists — see docs/presence-dots-spec.md.
+   `online` always reads as calm/steady; the two "don't trust this yet"
+   states (booting, stuck) are the ones that visibly move, on purpose —
+   motion draws the eye to "this still needs confirming." */
+.agent-mini__presence {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--bg-card);
+  box-sizing: content-box;
+}
+
+.agent-mini__presence--spawned { background: var(--accent-grey); }
+.agent-mini__presence--online  { background: var(--accent-green); }
+
+.agent-mini__presence--booting {
+  background: var(--accent-amber);
+  animation: presence-pulse-amber 1.4s ease-in-out infinite;
+}
+
+.agent-mini__presence--stuck {
+  background: var(--accent-red);
+  animation: presence-pulse-stuck 1s ease-in-out infinite;
+}
+
+@keyframes presence-pulse-amber {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(230, 162, 60, 0.55); }
+  50%      { box-shadow: 0 0 0 4px rgba(230, 162, 60, 0); }
+}
+
+@keyframes presence-pulse-stuck {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-mini__presence--booting,
+  .agent-mini__presence--stuck {
+    animation: none;
+  }
 }
 
 .agent-mini__name {

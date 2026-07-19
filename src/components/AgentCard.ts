@@ -1,5 +1,6 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
+import { deriveDotState, dotTooltip } from "../services/hub-presence";
 import type { AgentConfigModal } from "./AgentConfigModal";
 
 const AGENT_THEME: Record<string, { icon: string; color: string }> = {
@@ -33,8 +34,19 @@ export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpda
     ].filter(Boolean).join(" ");
     card.dataset.agentName = agent.name;
     card.style.setProperty("--agent-color", theme.color);
+
+    // Presence dot — additive layer, only meaningful while a process
+    // actually exists. Never rendered for a stopped agent (that would be
+    // a fifth phantom state; see docs/presence-dots-spec.md non-goals).
+    let presenceDot = "";
+    if (isRunning) {
+      const dotState = deriveDotState(agent);
+      const tooltip = dotTooltip(dotState, agent);
+      presenceDot = `<span class="agent-mini__presence agent-mini__presence--${dotState}" title="${tooltip}"></span>`;
+    }
+
     card.innerHTML = `
-      <span class="agent-mini__icon">${theme.icon}</span>
+      <span class="agent-mini__icon">${theme.icon}${presenceDot}</span>
       <span class="agent-mini__name">${agent.name}</span>
       ${wantsAttention ? `<span class="agent-mini__badge" title="Agent has a message — open their tmux window to read it">●</span>` : ""}
       <span class="agent-mini__model">${agent.model}</span>
