@@ -89,6 +89,19 @@ pub fn spawn_app_server(agent_name: &str, codex_home: &str) -> Result<String, St
     fs::create_dir_all(&run_dir)
         .map_err(|e| format!("Failed to create {}: {}", run_dir, e))?;
 
+    // Cross-process spawn-if-absent (aperture-r8n62): the in-process `servers()`
+    // map is always empty in a fresh `aperture-boot` process, so a stale map is
+    // no evidence that the socket is free. Probe the sock directly — if a
+    // healthy app-server (from a prior boot or the running launcher) already
+    // owns it, reuse it instead of deleting the sock and stacking an orphan.
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        println!(
+            "[aperture] codex app-server for '{}' already live on {} — reusing (no respawn)",
+            agent_name, sock
+        );
+        return Ok(sock);
+    }
+
     let handle = {
         let mut map = servers().lock().map_err(|e| e.to_string())?;
         if let Some(existing) = map.get(&agent_name.to_string()) {
@@ -223,5 +236,62 @@ pub fn shutdown() {
             }
         }
         let _ = fs::remove_file(socket_path(&name));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// aperture-r8n62 regression: when a healthy app-server already owns the
+    /// socket, `spawn_app_server` must reuse it — return the sock path WITHOUT
+    /// deleting the sock or spawning a duplicate. We stand in for the live
+    /// app-server with a bound `UnixListener`; if the reuse path fired, the
+    /// listener's socket file survives the call (the spawn path would have
+    /// `fs::remove_file`d it). Full spawn-reuse across `aperture-boot` restarts
+    /// is integration-tested via the aperture-boot-twice scenario.
+    ///
+    /// NOTE: `spawn_app_server` derives the sock path from `$HOME`, so this test
+    /// mutates the process-global `HOME`. It is the only HOME-mutating test in
+    /// this module; keep it that way to avoid cross-test races.
+    #[test]
+    fn spawn_app_server_reuses_live_socket_without_respawn() {
+        // Keep the path short: unix socket paths must fit in SUN_LEN (~104 on
+        // macOS), so we can't nest under the long system temp dir.
+        let tmp = std::path::PathBuf::from(format!("/tmp/ap-r8n62-{}", std::process::id()));
+        let run = tmp.join(".aperture/run");
+        fs::create_dir_all(&run).expect("create temp run dir");
+
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp);
+
+        let agent = "tc";
+        let sock = socket_path(agent);
+
+        // Stand in for a healthy, listening app-server.
+        let _listener = UnixListener::bind(&sock).expect("bind fake app-server socket");
+
+        let result = spawn_app_server(agent, "/tmp/does-not-matter");
+
+        // Restore HOME before asserting so a failure can't leak it.
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(result.as_deref(), Ok(sock.as_str()), "reuse must return the live sock path");
+        assert!(
+            std::path::Path::new(&sock).exists(),
+            "reuse path must NOT delete the live socket"
+        );
+        // Reuse returns before touching the in-process map — no supervisor registered.
+        assert!(
+            servers().lock().unwrap().get(agent).is_none(),
+            "reuse path must not register a supervisor handle"
+        );
+
+        drop(_listener);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

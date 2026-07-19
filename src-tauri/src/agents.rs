@@ -414,6 +414,17 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
     // (no-op for Claude agents, which never register one).
     codex_appserver::stop_app_server(&name);
 
+    // aperture-wul6m: clear watchdog eligibility for a DELIBERATE stop so it is
+    // never fought. Removing the kickoff file drops the agent below the
+    // "expected-present" gate (eligibility = running window + kickoff file);
+    // on_agent_stopped also clears any in-memory presence/attempt state so a
+    // later restart begins from a clean slate.
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let _ = fs::remove_file(format!("{}/.aperture/run/{}.kickoff", home, name));
+        crate::watchdog::on_agent_stopped(&name);
+    }
+
     // Re-acquire to update status
     {
         let mut app_state = state.lock().map_err(|e| e.to_string())?;
