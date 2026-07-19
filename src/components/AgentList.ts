@@ -1,6 +1,7 @@
 import { commands } from "../services/tauri-commands";
 import { createAgentCard } from "./AgentCard";
 import { createAgentConfigModal } from "./AgentConfigModal";
+import { deriveDotState } from "../services/hub-presence";
 
 export function createAgentList(container: HTMLElement) {
   const wrapper = document.createElement("div");
@@ -26,7 +27,13 @@ export function createAgentList(container: HTMLElement) {
 
       // Build a hash of current state to detect changes. Include attention so
       // the badge appears/disappears without waiting for status/model changes.
-      const hash = agents.map(a => `${a.name}:${a.status}:${a.model}:${a.attention ? 1 : 0}`).join("|");
+      // Also include the derived presence-dot state so a dot_state flip (or
+      // the 60s stuck deadline the backend watchdog computes) triggers a
+      // rebuild on the very next poll tick — same self-healing mechanism as
+      // status/model, nothing dot-specific needed here.
+      const hash = agents
+        .map(a => `${a.name}:${a.status}:${a.model}:${a.attention ? 1 : 0}:${deriveDotState(a)}`)
+        .join("|");
 
       // Only rebuild DOM if something actually changed
       if (hash !== lastAgentHash) {
