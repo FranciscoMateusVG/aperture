@@ -1,6 +1,13 @@
 mod agent_loader;
 mod agents;
+// Comms Layer v2, Phase 2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
+// codex_harness (@@BEADS@@ pane-scraping) and its beads_parser are
+// disconnected — no callers remain. Both files are deleted in Phase 3;
+// allow(dead_code) keeps `cargo check` clean until then.
+#[allow(dead_code)]
 mod beads_parser;
+mod codex_appserver;
+#[allow(dead_code)]
 mod codex_harness;
 mod config;
 mod poller;
@@ -104,9 +111,12 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             // Kill the WS hub child on app exit so it doesn't outlive the
-            // launcher and hold port 4517 across restarts.
+            // launcher and hold port 4517 across restarts. Same for the
+            // per-agent codex app-servers (Comms v2 Phase 2) so stale
+            // processes never squat on ~/.aperture/run/*.sock.
             if let tauri::RunEvent::Exit = event {
                 ws_hub::shutdown();
+                codex_appserver::shutdown();
             }
         });
 }

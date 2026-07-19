@@ -1,4 +1,4 @@
-use crate::codex_harness;
+use crate::codex_appserver;
 use crate::config;
 use crate::state::AppState;
 use crate::tmux;
@@ -110,11 +110,19 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);
-        // Prepend any unread BEADS messages so Codex sees them on the first turn
-        let prompt_content = codex_harness::inject_pending_messages(&name, prompt_content);
+        // Comms Layer v2, Phase 2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
+        // codex_harness::inject_pending_messages() is no longer called here.
+        // Unread messages are replayed by the aperture-bus codex-bridge over
+        // the app-server socket instead of being prepended to the prompt.
         let prompt_dest = format!("{}/prompt.md", codex_home);
         fs::write(&prompt_dest, &prompt_content).map_err(|e| e.to_string())?;
 
+        // Comms Layer v2, Phase 2: aperture-bus is launched through
+        // mcp-server/start.sh (resolved from project_dir, same as the other
+        // mcp paths in config.rs). start.sh requires AGENT_NAME in the env
+        // and exec's dist/index.js, which also reads AGENT_ROLE/AGENT_MODEL/
+        // APERTURE_MAILBOX plus the BEADS vars — so those are kept.
+        let bus_start_sh = format!("{}/mcp-server/start.sh", project_dir);
         let config_toml = format!(
             r#"model = "{bare_model}"
 model_instructions_file = "{prompt_dest}"
@@ -125,8 +133,8 @@ sandbox_mode = "danger-full-access"
 trust_level = "trusted"
 
 [mcp_servers.aperture-bus]
-command = "node"
-args = ["{mcp_server_path}"]
+command = "sh"
+args = ["{bus_start_sh}"]
 env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}" }}
 
 # Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
@@ -139,7 +147,7 @@ env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", 
             beads_dolt_password = beads_dolt_password,
             prompt_dest = prompt_dest,
             project_dir = project_dir,
-            mcp_server_path = mcp_server_path,
+            bus_start_sh = bus_start_sh,
             mcp_sentry_server_path = mcp_sentry_server_path,
             name = name,
             role = agent.role,
@@ -150,15 +158,26 @@ env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", 
         );
         fs::write(&config_toml_path, &config_toml).map_err(|e| e.to_string())?;
 
+        // Comms Layer v2, Phase 2 (spec §Protocol 2): spawn the supervised
+        // `codex app-server --listen unix://~/.aperture/run/<name>.sock`
+        // BEFORE the pane launches, so `codex --remote` has a live socket to
+        // attach to. The app-server carries CODEX_HOME (model + MCP wiring
+        // live in config.toml above); the pane is just the interactive TUI.
+        let sock_path = codex_appserver::spawn_app_server(&name, &codex_home)?;
+
         format!(
             r#"#!/bin/bash
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH"
 export CODEX_HOME="{codex_home}"
-exec codex --yolo
+# Wait for the supervised app-server (codex_appserver.rs) to bring the
+# socket up before attaching — its spawn thread runs concurrently.
+for _ in $(seq 1 40); do [ -S "{sock_path}" ] && break; sleep 0.25; done
+exec codex --remote "unix://{sock_path}"
 "#,
             codex_home = codex_home,
+            sock_path = sock_path,
         )
     } else {
         let config_path = format!("/tmp/aperture-mcp-{}.json", name);
@@ -194,12 +213,12 @@ exec claude --dangerously-skip-permissions --model {} --system-prompt "$PROMPT" 
 
     tmux::tmux_send_keys(window_id.clone(), launcher_path)?;
 
-    // For Codex agents: start the BEADS output monitor in the background.
-    // The monitor scrapes tmux pane output for @@BEADS@@ command blocks and
-    // executes them on the agent's behalf, closing the outbound BEADS loop.
-    if agent.model.starts_with("codex/") {
-        codex_harness::start_output_monitor(window_id.clone(), name.clone());
-    }
+    // Comms Layer v2, Phase 2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
+    // codex_harness::start_output_monitor() is no longer called. Outbound
+    // Codex comms flow through the aperture-bus MCP server (wired into
+    // config.toml above); inbound delivery is injected by the bus
+    // codex-bridge via the app-server socket. The @@BEADS@@ pane-scraping
+    // module stays on disk until Phase 3 deletes it.
 
     // Auto-confirm the workspace trust prompt — but ONLY when the dialog is
     // actually visible. Sending Enter blindly at fixed intervals would stomp
@@ -263,6 +282,10 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
         std::thread::sleep(std::time::Duration::from_millis(500));
         let _ = tmux::tmux_kill_window(window_id);
     }
+
+    // Comms Layer v2, Phase 2: kill this agent's supervised codex app-server
+    // (no-op for Claude agents, which never register one).
+    codex_appserver::stop_app_server(&name);
 
     // Re-acquire to update status
     {

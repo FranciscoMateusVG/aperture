@@ -1,12 +1,10 @@
-use crate::codex_harness;
 use crate::state::AppState;
 use crate::tmux;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use serde::Deserialize;
 
 fn log_message(log_path: &str, from: &str, to: &str, content: &str, timestamp: &str) {
     let entry = serde_json::json!({
@@ -46,76 +44,16 @@ fn scan_mailbox(path: &str) -> Vec<String> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct BeadsMessage {
-    id: String,
-    title: String,
-    description: Option<String>,
-}
-
-fn bd_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    // Fallback chain: prefer ~/.local/bin/bd (canonical install location),
-    // then ~/go/bin/bd (go install default), then rely on PATH resolution.
-    // This eliminates the manual symlink dependency.
-    let candidates = [
-        format!("{}/.local/bin/bd", home),
-        format!("{}/go/bin/bd", home),
-    ];
-    for path in &candidates {
-        if std::path::Path::new(path).exists() {
-            return path.clone();
-        }
-    }
-    "bd".to_string()
-}
-
-fn beads_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{}/.aperture/.beads", home)
-}
-
-fn path_env() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let current = std::env::var("PATH").unwrap_or_default();
-    format!("{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:{}", home, current)
-}
-
-/// Query BEADS for unread messages destined for a specific agent.
-/// Messages have title format: [sender->recipient] preview...
-/// Status "open" means undelivered/unread.
-fn query_unread_messages(recipient: &str) -> Vec<BeadsMessage> {
-    let query = format!("type=message AND status=open AND title=\"->{recipient}]\"");
-    let output = std::process::Command::new(bd_path())
-        .args(["query", &query, "--json", "-n", "0", "-q"])
-        .env("BEADS_DIR", beads_dir())
-        .env("BD_ACTOR", "poller")
-        .env("PATH", path_env())
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            serde_json::from_str::<Vec<BeadsMessage>>(stdout.trim()).unwrap_or_default()
-        }
-        _ => Vec::new(),
-    }
-}
-
 // NOTE(Comms v2 Phase 1): mark_message_read() was deleted. The poller must
 // never mark messages read — read state is owned by the recipient's explicit
 // mark_as_read (spec Q4), and the WS hub relies on rows staying open to
 // replay them.
-
-/// Parse sender from BEADS message title: [sender->recipient] preview...
-fn parse_sender_from_title(title: &str) -> String {
-    if let Some(start) = title.find('[') {
-        if let Some(arrow) = title.find("->") {
-            return title[start + 1..arrow].to_string();
-        }
-    }
-    "unknown".to_string()
-}
+//
+// NOTE(Comms v2 Phase 2): query_unread_messages(), BeadsMessage, and
+// parse_sender_from_title() were deleted along with the codex
+// buffer_pending_message delivery path — the aperture-bus codex-bridge now
+// owns Codex delivery over the app-server socket. See the comment in the
+// main loop below.
 
 pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -124,8 +62,6 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
 
     // Ensure operator mailbox exists
     let _ = fs::create_dir_all(format!("{}/operator", mailbox_base));
-
-    let mut notified: HashSet<String> = HashSet::new();
 
     loop {
         std::thread::sleep(Duration::from_secs(5));
@@ -153,11 +89,11 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
             let _ = fs::remove_file(filepath);
         }
 
-        // ── Handle agent-bound messages via BEADS message bus ──
-        // Each tuple is (agent_name, window_id, is_codex).
-        // Codex agents get messages buffered to a pending file instead of
-        // tmux-injected shell commands (which Codex's loop ignores).
-        let agents: Vec<(String, String, bool)> = {
+        // ── Handle agent-bound messages ──
+        // Each tuple is (agent_name, window_id). Since Comms v2 Phase 2 the
+        // poller delivers NO BEADS messages for either protocol; only the
+        // legacy file-based mailbox sweep below remains (Phase 3 removes it).
+        let agents: Vec<(String, String)> = {
             let Ok(app_state) = state.lock() else {
                 continue;
             };
@@ -186,18 +122,14 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
                 .agents
                 .values()
                 .filter_map(|a| {
-                    running_windows.get(&a.name).map(|wid| {
-                        let is_codex = a.model.starts_with("codex/");
-                        if is_codex {
-                            codex_harness::ensure_output_monitor(wid.clone(), a.name.clone());
-                        }
-                        (a.name.clone(), wid.clone(), is_codex)
-                    })
+                    running_windows
+                        .get(&a.name)
+                        .map(|wid| (a.name.clone(), wid.clone()))
                 })
                 .collect()
         };
 
-        for (agent_name, window_id, is_codex) in &agents {
+        for (agent_name, window_id) in &agents {
             // ── Comms Layer v2, Phase 1 ──
             // (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md)
             //
@@ -209,50 +141,15 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
             // on reconnect. We deliberately skip Claude agents here, leaving
             // their messages open (unread) in BEADS for the hub.
             //
-            // Codex agents keep the pending-buffer path below until Phase 2
-            // (app-server injection).
-            if *is_codex {
-                // Query BEADS for unread messages addressed to this agent
-                let messages = query_unread_messages(agent_name);
-
-                for msg in &messages {
-                    // Skip if we already tried delivering this message this cycle
-                    if notified.contains(&msg.id) {
-                        continue;
-                    }
-
-                    let sender = parse_sender_from_title(&msg.title);
-                    let content = msg.description.as_deref().unwrap_or("(no content)");
-                    let timestamp = &msg.id; // use message ID as reference
-
-                    // Format as markdown (same format agents expect)
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    let formatted = format!(
-                        "# Message from {}\n_{}_\n\n{}\n",
-                        sender,
-                        now,
-                        content
-                    );
-
-                    // Log the message
-                    log_message(&message_log, &sender, agent_name, &formatted, timestamp);
-
-                    // Codex agents: MCP tools are confirmed working (Failure Mode A).
-                    // The agent calls get_messages() itself to read unread messages.
-                    // Do NOT mark as read here — let the MCP call handle read state
-                    // so the message remains visible when the agent polls BEADS.
-                    //
-                    // We still buffer to pending-msgs.md as a secondary delivery path
-                    // (for the monitor thread's flush prompt), but the primary channel
-                    // is the agent's own MCP get_messages call.
-                    codex_harness::buffer_pending_message(agent_name, &formatted);
-
-                    notified.insert(msg.id.clone());
-                }
-            }
+            // ── Comms Layer v2, Phase 2 ──
+            //
+            // The Codex pending-buffer path (codex_harness::
+            // buffer_pending_message + ensure_output_monitor) is disabled the
+            // same way: the hub's codex-bridge now injects deliveries over the
+            // per-agent app-server socket and replays unread rows itself. The
+            // poller delivers no BEADS messages at all anymore; this loop
+            // skeleton survives only for the legacy mailbox sweep below and is
+            // deleted wholesale in Phase 3.
 
             // Also handle any legacy file-based messages still in mailbox
             let mailbox_path = format!("{}/{}", mailbox_base, agent_name);

@@ -1,217 +1,52 @@
 ---
 name: aperture-codex-comms
-description: Communication protocol for Codex agents in Aperture. Replaces MCP tool calls with @@BEADS@@ command blocks that the Tauri harness intercepts and executes. Use this skill if your model starts with codex/.
+description: Communication protocol for Codex agents in Aperture (comms v2). Codex agents now call aperture-bus MCP tools directly (send_message, get_messages, mark_as_read, BEADS task tools) and receive inbound messages as injected turns via the app-server bridge. Use this skill if your model starts with codex/.
 ---
 
-# Codex Agent Communication Protocol
+# Codex Agent Communication Protocol (v2)
 
 > **This skill applies to you if you are running as a Codex agent** (your model identifier starts with `codex/`).
 >
-> Codex agents cannot call MCP tools directly. Instead, you communicate with BEADS by emitting structured `@@BEADS@@` command blocks in your response text. The Aperture harness scans your output, parses these blocks, and executes the corresponding BEADS operations on your behalf.
->
-> If you are a Claude Code agent, ignore this skill — use the `communicate` skill and native MCP tools instead.
+> As of comms v2 (2026-07-19), Codex agents have the **aperture-bus MCP server wired directly** into their session. You call the same tools Claude agents call. The old `@@BEADS@@` command-block protocol is **retired** — do not emit those blocks; nothing parses them anymore.
 
 ---
 
-## 1. The Golden Rule
+## 1. How you communicate (outbound)
 
-**Every BEADS operation you need — sending messages, updating tasks, storing artifacts — is expressed as a `@@BEADS@@` block in your response.**
+Call MCP tools from the `aperture-bus` server exactly like any other tool:
 
-You do NOT call tools directly. You write command blocks. The harness executes them after your response completes.
+| Need | Tool |
+|---|---|
+| Message another agent or GLaDOS | `send_message(to, message)` |
+| Ring the operator's attention badge | `send_message(to: "operator", message)` |
+| Read your queued messages | `get_messages` |
+| Acknowledge a processed message | `mark_as_read(id)` |
+| Task lifecycle | `create_task` / `update_task` / `close_task` / `query_tasks` / `store_artifact` / `search_tasks` |
 
----
+All the discipline in `aperture:beads` and `aperture:communicate` applies to you unchanged — project labels, close-on-PR-open, artifact storage, escaping footguns.
 
-## 2. Reading Inbound Messages
+## 2. How messages reach you (inbound)
 
-Before you start work each turn, check for pending messages:
+The Aperture hub is connected to your session through the Codex app-server socket. When another agent messages you:
 
-```bash
-cat /tmp/aperture-codex-<your-agent-name>/pending-msgs.md 2>/dev/null
-```
+- A turn is **injected into your session** that renders like a user message, formatted:
+  `[BEADS message from <sender> | id <message-id>] <full body>`
+- Process it, then **call `mark_as_read(<message-id>)`** — this is the ONLY thing that marks it read. If you don't ack, the message replays on the next reconnect (at-least-once delivery; re-seeing a message you already handled means you forgot to ack).
+- If you were mid-turn, the message may arrive appended to your current turn (`turn/steer`) — same handling.
 
-If the file exists and has content, it contains BEADS messages addressed to you. Read them and act on them. After reading, you can delete the file or leave it — the harness will overwrite it next cycle.
+You do NOT need to poll for messages; the hub pushes them. Calling `get_messages` at a natural pause is still a fine belt-and-suspenders habit.
 
-You may also receive messages prepended to your prompt context in a block like:
+## 3. Operator interaction
 
-```
---- BEADS MESSAGES ---
-From: glados | <message content>
---- END BEADS MESSAGES ---
-```
+Unchanged from v1: the operator watches and types into your tmux pane directly. Reply in your terminal output. `send_message(to: "operator", ...)` is a doorbell badge, not a chat — the substance lives in your scrollback.
 
-Treat these as direct messages from other agents. Respond and act on them.
+## 4. What changed vs v1 (historical)
 
----
+| v1 (retired) | v2 (now) |
+|---|---|
+| Emit `@@BEADS ... @@` blocks; harness scraped your pane text | Call MCP tools directly |
+| Poller injected `read <file>` prompts into your pane | Hub injects structured turns via app-server (`turn/start` / `turn/steer`) |
+| Messages marked read on delivery attempt | YOU ack via `mark_as_read` after processing |
+| No presence | Your app-server connection broadcasts join/leave/busy/idle to the facility |
 
-## 3. @@BEADS@@ Block Format
-
-```
-@@BEADS <command> <key>:<value> <key>:<value>@@
-```
-
-**Rules:**
-- Single line only. No newlines inside a block.
-- Values with spaces must be double-quoted: `message:"hello world"`
-- Bare values (no spaces) need no quotes: `to:glados`, `id:src-tauri-a2z`
-- Escape `"` inside quoted values as `\"`; escape `\` as `\\`
-- Multiple blocks per response are fine — they execute in document order
-- Blocks can appear anywhere: start of response, inline with prose, or at the end
-
----
-
-## 4. Commands
-
-### `send_message` — Message another agent
-
-```
-@@BEADS send_message to:<agent> message:"<text>"@@
-```
-
-| Field | Required | Notes |
-|-------|----------|-------|
-| `to` | ✅ | Agent name: `glados`, `peppy`, `wheatley`, `izzy`, `vance`, `rex`, `scout`, `cipher`, `sage`, `atlas`, `sterling`, or `operator` |
-| `message` | ✅ | Message body. Quote if it contains spaces (it almost always will). |
-
-**Examples:**
-```
-@@BEADS send_message to:glados message:"Wave 1 complete. Parser wired. 22 tests passing."@@
-@@BEADS send_message to:operator message:"Blocked: cannot find hook point in agents.rs."@@
-@@BEADS send_message to:peppy message:"Ready for deploy. Repo: /projects/app, Port: 3000."@@
-```
-
----
-
-### `update_task` — Report progress on a BEADS task
-
-```
-@@BEADS update_task id:<task-id> notes:"<text>" [status:<status>]@@
-```
-
-| Field | Required | Notes |
-|-------|----------|-------|
-| `id` | ✅ | BEADS task ID, e.g. `src-tauri-a2z` |
-| `notes` | ✅ | Progress update. Quote it. |
-| `status` | ❌ | `in_progress`, `done`, or `blocked`. Omit to leave status unchanged. |
-
-**Examples:**
-```
-@@BEADS update_task id:src-tauri-a2z status:in_progress notes:"Starting implementation. Reading agents.rs."@@
-@@BEADS update_task id:src-tauri-a2z notes:"Parser written. Handling edge cases now."@@
-@@BEADS update_task id:src-tauri-a2z status:blocked notes:"Cannot find Codex API response callback. Need Peppy's audit."@@
-```
-
----
-
-### `store_artifact` — Attach a deliverable to a task
-
-```
-@@BEADS store_artifact task_id:<id> type:<type> value:<value>@@
-```
-
-| Field | Required | Notes |
-|-------|----------|-------|
-| `task_id` | ✅ | BEADS task ID |
-| `type` | ✅ | One of: `file`, `url`, `note`, `pr`, `session` |
-| `value` | ✅ | File path, URL, or text. Quote if it contains spaces. |
-
-**Examples:**
-```
-@@BEADS store_artifact task_id:src-tauri-a2z type:file value:src-tauri/src/beads_parser.rs@@
-@@BEADS store_artifact task_id:src-tauri-s7b type:note value:"Codex communicate skill written to .claude/skills/codex-comms/"@@
-@@BEADS store_artifact task_id:src-tauri-ae5 type:url value:https://github.com/aperture/pull/42@@
-```
-
----
-
-### `close_task` — Mark a task complete
-
-```
-@@BEADS close_task id:<task-id> notes:"<completion summary>"@@
-```
-
-| Field | Required | Notes |
-|-------|----------|-------|
-| `id` | ✅ | BEADS task ID |
-| `notes` | ✅ | Completion summary. Quote it. |
-
-**Examples:**
-```
-@@BEADS close_task id:src-tauri-a2z notes:"Parser complete. 22/22 unit tests passing. See artifact."@@
-@@BEADS close_task id:src-tauri-s7b notes:"Codex communicate skill and prompt addendum written. All commands documented with examples."@@
-```
-
----
-
-## 5. Typical Work Cycle
-
-Here is the standard pattern for doing a task as a Codex agent:
-
-```
-[1] Check for messages]
-cat /tmp/aperture-codex-<name>/pending-msgs.md 2>/dev/null
-
-[2] Claim and start the task]
-@@BEADS update_task id:<task-id> status:in_progress notes:"Claimed. Starting work."@@
-
-[3] Do the actual work]
-... (read files, write code, run tests, etc.)
-
-[4] Store your deliverable]
-@@BEADS store_artifact task_id:<task-id> type:file value:<path/to/file>@@
-
-[5] Close the task]
-@@BEADS close_task id:<task-id> notes:"<what you did, what files changed, test results>"@@
-
-[6] Report to GLaDOS or next agent]
-@@BEADS send_message to:glados message:"<task-id> done. <brief summary>."@@
-```
-
----
-
-## 6. Multiple Blocks — Common Patterns
-
-Blocks execute in document order. Chain them freely:
-
-```
-I've completed the parser implementation.
-
-@@BEADS update_task id:src-tauri-a2z notes:"Implemented regex parser, handles all 4 command types. Running tests now."@@
-@@BEADS store_artifact task_id:src-tauri-a2z type:file value:src-tauri/src/beads_parser.rs@@
-@@BEADS close_task id:src-tauri-a2z notes:"Parser complete. 22/22 tests pass. Wired into lib.rs."@@
-@@BEADS send_message to:glados message:"src-tauri-a2z done. Parser closed. Ready for Wave 2."@@
-```
-
----
-
-## 7. What Happens If a Block Is Malformed
-
-The harness degrades gracefully — it never crashes on bad output. If your block is malformed:
-- Missing closing `@@` → block skipped, warning logged
-- Unknown command → block skipped, warning logged  
-- Missing required field → block skipped, warning logged
-
-You won't receive an error in the same turn. If your BEADS update didn't appear (task not updated, message not delivered), check your block syntax and try again next turn.
-
----
-
-## 8. Routing — Who to Message
-
-| Recipient | When |
-|-----------|------|
-| `glados` | Task complete, need direction, report status |
-| `peppy` | Need infrastructure, deploy help |
-| `wheatley` | Need research or planning |
-| `izzy` | Handoff for testing/QA |
-| `operator` | Only the human can answer this |
-
-Default escalation: solve it yourself → update task with findings → message `glados` → last resort: message `operator`.
-
----
-
-## 9. Do Not
-
-- Do NOT call `mcp__aperture-bus__*` tools — they may not be available to you
-- Do NOT use `send_message()` function call syntax — write `@@BEADS@@` blocks instead
-- Do NOT put newlines inside a `@@BEADS@@` block
-- Do NOT send multiple `send_message` blocks to the same recipient in one turn (consolidate into one)
-- Do NOT emit `@@BEADS@@` blocks inside code fences — the harness scans raw output; blocks in fences will still be parsed
+If you find yourself about to type an `@@BEADS` block, stop — that muscle memory is from a retired protocol. Use the tool call.

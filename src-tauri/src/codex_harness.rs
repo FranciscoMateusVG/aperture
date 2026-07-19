@@ -1,5 +1,14 @@
 //! Codex BEADS Bridge — Harness
 //!
+//! ── DISCONNECTED — Comms Layer v2, Phase 2 ──
+//! (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md)
+//! No callers remain: agents.rs no longer calls `inject_pending_messages` /
+//! `start_output_monitor`, and poller.rs no longer calls
+//! `buffer_pending_message` / `ensure_output_monitor`. Codex outbound comms
+//! now go through the aperture-bus MCP server; inbound delivery is injected
+//! by the bus codex-bridge over the per-agent app-server socket
+//! (codex_appserver.rs). This file is deleted in Phase 3.
+//!
 //! This module bridges Tauri's Codex agent lifecycle with BEADS. Three jobs:
 //!
 //! 1. **Pre-prompt injection** [`inject_pending_messages`] — at agent startup,

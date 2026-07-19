@@ -9,7 +9,9 @@
  *                       (one socket per name; a new connection replaces the
  *                       old). On connect, unread BEADS messages are replayed.
  *   - role=subscriber → presence watchers (GLaDOS, launcher UI). Receive
- *                       {type:"presence", agent, event:"join"|"leave", ts}.
+ *                       {type:"presence", agent, event, ts} with event one of
+ *                       "join"|"leave"|"busy"|"idle" (busy/idle come from
+ *                       Codex bridge turn state; see codex-bridge.ts).
  *   - role=producer   → MCP send-queue drains. Send
  *                       {type:"notify", to, id, from, preview}; the hub
  *                       forwards {type:"message", id, from, preview} to the
@@ -26,6 +28,7 @@
  */
 import { WebSocketServer, WebSocket } from "ws";
 import { getUnreadMessages } from "./beads.js";
+import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.APERTURE_WS_PORT ?? 4517);
@@ -57,7 +60,7 @@ function send(ws: WebSocket, obj: unknown): void {
   }
 }
 
-function broadcastPresence(agent: string, event: "join" | "leave"): void {
+function broadcastPresence(agent: string, event: PresenceEvent): void {
   const msg = { type: "presence", agent, event, ts: new Date().toISOString() };
   for (const [ws, conn] of conns) {
     if (conn.role === "subscriber") send(ws, msg);
@@ -138,7 +141,12 @@ function handleNotify(ws: WebSocket, msg: Record<string, unknown>): void {
   const from = typeof msg.from === "string" ? msg.from : "unknown";
   const preview = typeof msg.preview === "string" ? msg.preview : "";
   const target = agents.get(to);
-  if (target) {
+  if (codexBridges.has(to)) {
+    // Codex agent: no Monitor socket — deliver by injecting a turn into its
+    // app-server thread. The bridge fetches the full body from BEADS itself.
+    codexBridges.deliver(to);
+    log("notify_codex", { to, id, from });
+  } else if (target) {
     send(target, { type: "message", id, from, preview });
     log("notify_forwarded", { to, id, from });
   } else {
@@ -148,6 +156,15 @@ function handleNotify(ws: WebSocket, msg: Record<string, unknown>): void {
   // Always ack so the producer's await resolves.
   send(ws, { type: "ok", id });
 }
+
+// Phase 2: Codex bridge clients — one WS-over-unix-socket JSON-RPC client per
+// discovered Codex agent (manifest model "codex/…"). A connected+bound bridge
+// counts as presence for that agent; busy/idle tracks turn state.
+const codexBridges = startCodexBridges({
+  broadcastPresence,
+  log,
+  skipReplay: SKIP_REPLAY,
+});
 
 const wss = new WebSocketServer({ host: HOST, port: PORT });
 
@@ -233,6 +250,7 @@ heartbeat.unref?.();
 function shutdown(signal: string): void {
   log("shutdown", { signal });
   clearInterval(heartbeat);
+  codexBridges.stop();
   for (const ws of conns.keys()) {
     ws.close(1001, "hub shutting down");
   }
