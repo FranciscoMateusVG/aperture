@@ -8,3 +8,4 @@ research-artifact-placement
 e2e-catches-what-lower-cant
 dont-model-phantom-cases
 observability-as-evidence
+surface-fetch-errors
