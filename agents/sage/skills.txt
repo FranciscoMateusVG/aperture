@@ -5,3 +5,4 @@ worktree-discipline
 specialist-delegation
 spec-deviation-discipline
 research-artifact-placement
+e2e-catches-what-lower-cant

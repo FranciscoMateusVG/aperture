@@ -8,3 +8,4 @@ audit-route-contract
 playwright-gotchas
 spec-deviation-discipline
 research-artifact-placement
+e2e-catches-what-lower-cant
