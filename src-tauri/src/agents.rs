@@ -248,6 +248,34 @@ pub fn boot_agent_process(
         let beads_dir = format!("{}/.aperture/.beads", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
         fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
 
+        // aperture-kc7lb: Codex reads its ChatGPT login from $CODEX_HOME/auth.json.
+        // The per-agent CODEX_HOME lives in /tmp (wiped on reboot) and is created
+        // fresh above, so without seeding it from the operator's canonical
+        // ~/.codex/auth.json every codex agent boots to the sign-in screen — and
+        // a pane-side login only writes to /tmp, so it recurs after every reboot.
+        // Seed when the source exists and the dest is missing or older: a fresh
+        // operator login propagates on next launch, while a newer in-agent token
+        // refresh isn't clobbered by a stale central file. Non-fatal on failure —
+        // the agent still launches, it just shows the sign-in screen.
+        let central_auth = format!("{}/.codex/auth.json", home_dir);
+        let agent_auth = format!("{}/auth.json", codex_home);
+        let seed_auth = match (fs::metadata(&central_auth), fs::metadata(&agent_auth)) {
+            (Ok(src), Ok(dst)) => matches!(
+                (src.modified(), dst.modified()),
+                (Ok(s), Ok(d)) if s > d
+            ),
+            (Ok(_), Err(_)) => true,
+            (Err(_), _) => false,
+        };
+        if seed_auth {
+            if let Err(e) = fs::copy(&central_auth, &agent_auth) {
+                eprintln!(
+                    "[aperture] warning: failed to seed codex auth.json for {}: {}",
+                    name, e
+                );
+            }
+        }
+
         // Copy prompt into codex_home so the path is always correct.
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
