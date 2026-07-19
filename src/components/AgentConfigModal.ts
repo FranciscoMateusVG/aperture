@@ -1,9 +1,20 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
 
-const CLAUDE_MODELS = ["opus", "sonnet", "haiku"] as const;
-const CODEX_MODELS = ["codex/gpt-5.4", "codex/gpt-5.4-mini", "codex/gpt-5.3-codex"] as const;
-const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS] as const;
+// value = what the CLI accepts; label = what the operator sees.
+// Claude aliases resolve to the current generation (fable → Fable 5, sonnet → Sonnet 5, opus → Opus 4.8).
+const CLAUDE_MODELS = [
+  { value: "fable", label: "fable 5" },
+  { value: "sonnet", label: "sonnet 5" },
+  { value: "opus", label: "opus 4.8" },
+] as const;
+// GPT-5.6 celestial family (live catalog 2026-07-19)
+const CODEX_MODELS = [
+  { value: "codex/gpt-5.6-sol", label: "gpt-5.6-sol" },
+  { value: "codex/gpt-5.6-terra", label: "gpt-5.6-terra" },
+  { value: "codex/gpt-5.6-luna", label: "gpt-5.6-luna" },
+] as const;
+const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS].map(m => m.value);
 
 export interface AgentConfigModal {
   open: (agent: AgentDef) => void;
@@ -34,10 +45,10 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
           <span class="agent-config-modal__label">Model</span>
           <select class="agent-config-modal__select">
             <optgroup label="Claude">
-              ${CLAUDE_MODELS.map(m => `<option value="${m}">${m}</option>`).join("")}
+              ${CLAUDE_MODELS.map(m => `<option value="${m.value}">${m.label}</option>`).join("")}
             </optgroup>
             <optgroup label="Codex">
-              ${CODEX_MODELS.map(m => `<option value="${m}">${m}</option>`).join("")}
+              ${CODEX_MODELS.map(m => `<option value="${m.value}">${m.label}</option>`).join("")}
             </optgroup>
           </select>
         </div>
