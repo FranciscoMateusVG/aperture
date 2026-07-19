@@ -239,7 +239,148 @@ pub fn spawn_watchdog(app_state: Arc<Mutex<AppState>>) {
     // Decision-loop thread — recomputes dots and evaluates re-kicks on a tick.
     {
         let shared = Arc::clone(&shared);
+        let app_state = Arc::clone(&app_state);
         std::thread::spawn(move || decision_loop(shared, app_state));
+    }
+
+    // Unread-age sweep thread (aperture-mler9) — the present-but-deaf guard.
+    // Presence-deafness (above) catches a DISCONNECTED monitor; this catches
+    // the connected-but-never-woken session: the hub forwards, the hub-client
+    // prints, the Monitor captures to its output file — and the harness never
+    // re-invokes the idle session (observed 2026-07-19 on opus/sonnet panes
+    // while fable panes woke fine). The agent sits green with unread messages
+    // aging indefinitely. Sweep: if a running, hub-online, non-codex agent's
+    // oldest unread BEADS message exceeds UNREAD_DEAF_AGE, type a tier-1
+    // inbox nudge into its pane (same actuator as the boot nudge). Isolated in
+    // its own thread so a slow/hung `bd` can only ever stall the sweep itself.
+    {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || unread_sweep_loop(shared, app_state));
+    }
+}
+
+/// How often the unread-age sweep queries BEADS. Each pass is one `bd query`
+/// for ALL open messages (not per-agent), so this stays cheap.
+const UNREAD_SWEEP_INTERVAL: Duration = Duration::from_secs(45);
+
+/// Oldest-unread age past which a hub-online agent is declared present-but-deaf.
+/// Comfortably above the hub's push latency (ms) and a normal read cycle, well
+/// below "operator notices work stalled."
+const UNREAD_DEAF_AGE: Duration = Duration::from_secs(90);
+
+/// Minimum gap between inbox nudges to the same agent — never spam a pane.
+const UNREAD_RENUDGE_GAP: Duration = Duration::from_secs(300);
+
+/// The tier-1 inbox nudge typed into a present-but-deaf agent's pane.
+const INBOX_NUDGE_TEXT: &str = "Inbox check (watchdog): unread BEADS messages are waiting for you — the push wake did not fire. Call get_messages now, process each message, then mark_as_read.";
+
+/// One pass result: recipient name → oldest unread message age.
+fn query_oldest_unread() -> Option<HashMap<String, Duration>> {
+    let home = std::env::var("HOME").ok()?;
+    let out = std::process::Command::new("bd")
+        .args(["query", "type=message AND status=open", "--json", "-n", "0"])
+        .env("BEADS_DIR", format!("{}/.aperture/.beads", home))
+        .env("BD_ACTOR", "watchdog")
+        .env(
+            "PATH",
+            format!(
+                "/opt/homebrew/bin:/usr/local/bin:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+    let at = now();
+    let mut oldest: HashMap<String, Duration> = HashMap::new();
+    for row in rows {
+        // Title format: "[from->to] preview…" — recipient is between "->" and "]".
+        let Some(title) = row.get("title").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(recipient) = title
+            .split(']')
+            .next()
+            .and_then(|head| head.split("->").nth(1))
+            .map(|r| r.trim().to_string())
+        else {
+            continue;
+        };
+        let Some(created) = row
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        else {
+            continue;
+        };
+        let created_st: SystemTime = UNIX_EPOCH + Duration::from_millis(created.timestamp_millis().max(0) as u64);
+        let age = at.duration_since(created_st).unwrap_or_default();
+        let entry = oldest.entry(recipient).or_default();
+        if age > *entry {
+            *entry = age;
+        }
+    }
+    Some(oldest)
+}
+
+fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>) {
+    let mut last_nudge: HashMap<String, SystemTime> = HashMap::new();
+    loop {
+        std::thread::sleep(UNREAD_SWEEP_INTERVAL);
+
+        let Some(oldest) = query_oldest_unread() else {
+            continue; // bd unavailable this pass — try again next interval.
+        };
+        if oldest.is_empty() {
+            continue;
+        }
+
+        // Snapshot roster: running, non-codex Claude agents with a window.
+        let roster: Vec<(String, Option<String>)> = {
+            let Ok(s) = app_state.lock() else { continue };
+            s.agents
+                .values()
+                .filter(|a| a.status == "running" && !a.model.starts_with("codex/"))
+                .map(|a| (a.name.clone(), a.tmux_window_id.clone()))
+                .collect()
+        };
+
+        let at = now();
+        for (name, window_id) in roster {
+            let Some(age) = oldest.get(&name) else { continue };
+            if *age < UNREAD_DEAF_AGE {
+                continue;
+            }
+            // Only nudge agents the hub currently believes are online — an
+            // offline agent is the presence-deafness path's job (re-kick),
+            // and nudging an empty pane is pointless.
+            let online = {
+                let Ok(s) = shared.lock() else { continue };
+                s.presence.get(&name).map(|p| p.online).unwrap_or(false)
+            };
+            if !online {
+                continue;
+            }
+            if let Some(last) = last_nudge.get(&name) {
+                if at.duration_since(*last).unwrap_or_default() < UNREAD_RENUDGE_GAP {
+                    continue;
+                }
+            }
+            let Some(win) = window_id else {
+                continue;
+            };
+            eprintln!(
+                "[watchdog] {name}: present-but-deaf — oldest unread {}s old, nudging inbox check",
+                age.as_secs()
+            );
+            let _ = crate::tmux::tmux_send_keys(win.clone(), INBOX_NUDGE_TEXT.into());
+            std::thread::sleep(Duration::from_millis(700));
+            let _ = crate::tmux::tmux_send_keys(win, String::new());
+            last_nudge.insert(name, at);
+        }
     }
 }
 
