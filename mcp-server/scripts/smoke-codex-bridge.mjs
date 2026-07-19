@@ -11,7 +11,7 @@
 // Run: node scripts/smoke-codex-bridge.mjs   (from mcp-server/, after npx tsc)
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -126,6 +126,23 @@ let threadId;
 try {
   threadId = await bridge.startThread();
   pass(`thread/start → ${threadId}`);
+  if (bridge.isBound && bridge.boundThreadId === threadId) {
+    pass("thread/start explicitly binds bridge ownership to its returned thread");
+  } else {
+    fail(
+      `thread/start did not bind bridge ownership (bound=${bridge.boundThreadId}, expected=${threadId})`,
+    );
+  }
+  const readyPath = resolve(RUN_DIR, "smoke.thread-id");
+  if (
+    existsSync(readyPath) &&
+    readFileSync(readyPath, "utf8").trim() === threadId &&
+    (statSync(readyPath).mode & 0o777) === 0o600
+  ) {
+    pass("thread/start publishes a mode-0600 exact thread id for remote TUI resume");
+  } else {
+    fail("thread/start did not publish the expected thread-ready file");
+  }
 } catch (e) {
   fail(`thread/start failed: ${e.message}\n${serverLog.slice(-2000)}`);
   await cleanup(1);
