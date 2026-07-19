@@ -1,0 +1,110 @@
+# Boot-verification CI — wires the aperture-xt16e harness into GitHub Actions
+# on the Mac Mini self-hosted runner (aperture-jar5i).
+#
+# WHY: comms is our bread and butter; the auto-kickoff + hub supervisor fixes
+# (aperture-syepg #37, aperture-256ru #41) are only durable if the boot
+# harness runs automatically. Without CI it runs "when someone remembers".
+#
+# JOBS:
+#   - boot-smoke   (PR-gated, path-filtered): L1 rust unit tests + the three
+#     MCP suites + L2 boot smoke (stub CLIs). Fast, no real API cost.
+#   - nightly-fleet (cron): thundering-herd fleet x5 (races are probabilistic)
+#     + one real-binary L3 run (~2 real turns/night), results.json archived
+#     for time-to-hello SLA drift.
+#
+# RUNNER PREREQS (Mac Mini, tracked on aperture-jar5i): an aperture-scoped
+# self-hosted runner with labels [self-hosted, macOS, arm64, mac-mini], plus
+# `cargo` (rustup) and `tmux` on PATH — both were MISSING at wiring time
+# (node/pnpm/just already present). CI stays red until those land.
+#
+# PATH FILTER: only fires when the launcher / hub / bridge / harness surface
+# changes — the exact files whose regressions the harness catches.
+
+name: boot-verification
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'src-tauri/**'
+      - 'mcp-server/src/**'
+      - 'mcp-server/test/**'
+      - 'tests/boot-harness/**'
+      - 'justfile'
+      - '.github/workflows/boot-verification.yml'
+  schedule:
+    # 08:00 UTC = 05:00 BRT (quiet hours). Cron ignores the path filter and
+    # always runs against the default branch.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  # Per-ref: a new push to a PR cancels its older in-flight run; different PRs
+  # run concurrently across the multi-runner mini.
+  group: boot-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boot-smoke:
+    # PR + manual: fast, stub-CLI path — no real claude/codex, no API cost.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS, arm64, mac-mini]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: L1 — Rust launcher/config unit tests
+        run: just test-rust
+
+      - name: MCP suites — hub protocol / replay / codex bind-order
+        run: just test-mcp
+
+      - name: L2 — boot verification smoke (stub CLIs)
+        run: just smoke-boot l2
+
+      - name: Upload boot-harness run dir on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-harness-run-${{ github.run_id }}
+          path: /tmp/aperture-boot-harness/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  nightly-fleet:
+    # Cron only: probabilistic race coverage + one real-binary acceptance run.
+    if: github.event_name == 'schedule'
+    runs-on: [self-hosted, macOS, arm64, mac-mini]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Thundering-herd fleet smoke — 7 agents x5 (MODE=l2)
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            echo "── fleet run $i/5 ──"
+            just smoke-boot-fleet 7 l2
+          done
+
+      - name: Real-binary acceptance — MODE=l3 (one run)
+        run: just smoke-boot l3
+
+      - name: Archive results.json (time-to-hello SLA drift)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-sla-${{ github.run_id }}
+          path: /tmp/aperture-boot-harness/**/results.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload full run dir on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-run-${{ github.run_id }}
+          path: /tmp/aperture-boot-harness/**
+          if-no-files-found: ignore
+          retention-days: 14
