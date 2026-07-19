@@ -75,6 +75,7 @@ For deeper pane-state diagnosis when the tick signal alone doesn't resolve stuck
 | An agent reports a discovered follow-up | File it as a P3 (or appropriate priority) bead with `discovered-from:<parent>` link, apply the project label, ack the agent. |
 | CI flake suspected (single failure on a non-deterministic test) | Kick `gh run rerun --failed <id>` once. If it fails again, it's not a flake. |
 | Agent reports their tool gap (e.g. "MCP create_task doesn't accept labels") | Apply the workaround yourself and continue. Don't make them ask twice. |
+| **Specialist solo-grinding parallelizable work** — pane shows sequential hands-on edits across many files / long sequential tool-call chains on work that decomposes (multi-file port, fixture batches, recon + implement + test all in one context) | Ping them with a decompose reminder: "Tech Lead Mode — fan this out. Which parts are you keeping (design/centerpiece/review) and which go to subagents?" Reference `specialist-delegation` §1. Solo-IC mode is a stall on the whole conveyor, not a style choice. |
 
 ---
 
