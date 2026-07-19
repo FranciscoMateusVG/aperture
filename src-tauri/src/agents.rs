@@ -1,5 +1,6 @@
 use crate::codex_appserver;
 use crate::config;
+use crate::launcher;
 use crate::state::AppState;
 use crate::tmux;
 use std::fs;
@@ -51,6 +52,15 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
     // launching Aperture). host/port/user/database live in the per-machine
     // .beads/config.yaml, not here.
     let beads_dolt_password = std::env::var("BEADS_DOLT_PASSWORD").unwrap_or_default();
+
+    // aperture-xt16e — test/ops knobs for the generated launcher scripts.
+    // Unset in normal operation, which keeps the generated output
+    // byte-identical to the historical inline templates. The env reads live
+    // here (side-effecting layer); the pure builders in launcher.rs only see
+    // plain values.
+    let claude_bin = std::env::var("APERTURE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let pane_codex_bin = std::env::var("APERTURE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let launcher_path_prefix = std::env::var("APERTURE_LAUNCHER_PATH_PREFIX").ok();
 
     let mcp_config = serde_json::json!({
         "mcpServers": {
@@ -124,39 +134,20 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         // and exec's dist/index.js, which also reads AGENT_ROLE/AGENT_MODEL/
         // APERTURE_MAILBOX plus the BEADS vars — so those are kept.
         let bus_start_sh = format!("{}/mcp-server/start.sh", project_dir);
-        let config_toml = format!(
-            r#"model = "{bare_model}"
-model_instructions_file = "{prompt_dest}"
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-
-[projects."{project_dir}"]
-trust_level = "trusted"
-
-[mcp_servers.aperture-bus]
-command = "sh"
-args = ["{bus_start_sh}"]
-env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}" }}
-
-# Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
-[mcp_servers.sentry]
-command = "node"
-args = ["{mcp_sentry_server_path}"]
-env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", HOME = "{home_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
-"#,
-            bare_model = bare_model,
-            beads_dolt_password = beads_dolt_password,
-            prompt_dest = prompt_dest,
-            project_dir = project_dir,
-            bus_start_sh = bus_start_sh,
-            mcp_sentry_server_path = mcp_sentry_server_path,
-            name = name,
-            role = agent.role,
-            model = agent.model,
-            mailbox_dir = mailbox_dir,
-            beads_dir = beads_dir,
-            home_dir = home_dir,
-        );
+        let config_toml = launcher::build_codex_config_toml(&launcher::CodexConfigParams {
+            bare_model,
+            prompt_dest: &prompt_dest,
+            project_dir: &project_dir,
+            bus_start_sh: &bus_start_sh,
+            mcp_sentry_server_path: &mcp_sentry_server_path,
+            name: &name,
+            role: &agent.role,
+            model: &agent.model,
+            mailbox_dir: &mailbox_dir,
+            beads_dir: &beads_dir,
+            beads_dolt_password: &beads_dolt_password,
+            home_dir: &home_dir,
+        });
         fs::write(&config_toml_path, &config_toml).map_err(|e| e.to_string())?;
 
         // Comms Layer v2, Phase 2 (spec §Protocol 2): spawn the supervised
@@ -166,19 +157,11 @@ env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", 
         // live in config.toml above); the pane is just the interactive TUI.
         let sock_path = codex_appserver::spawn_app_server(&name, &codex_home)?;
 
-        format!(
-            r#"#!/bin/bash
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH"
-export CODEX_HOME="{codex_home}"
-# Wait for the supervised app-server (codex_appserver.rs) to bring the
-# socket up before attaching — its spawn thread runs concurrently.
-for _ in $(seq 1 40); do [ -S "{sock_path}" ] && break; sleep 0.25; done
-exec codex --remote "unix://{sock_path}"
-"#,
-            codex_home = codex_home,
-            sock_path = sock_path,
+        launcher::build_codex_launcher(
+            &pane_codex_bin,
+            launcher_path_prefix.as_deref(),
+            &codex_home,
+            &sock_path,
         )
     } else {
         let config_path = format!("/tmp/aperture-mcp-{}.json", name);
@@ -195,14 +178,15 @@ exec codex --remote "unix://{sock_path}"
         let prompt_path = format!("/tmp/aperture-prompt-{}.md", name);
         fs::write(&prompt_path, &prompt_content).map_err(|e| e.to_string())?;
 
-        format!(
-            r#"#!/bin/bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-cd "{}"
-PROMPT=$(cat "{}")
-exec claude --dangerously-skip-permissions --model {} --system-prompt "$PROMPT" --mcp-config {} --name {}
-"#,
-            project_dir, prompt_path, agent.model, config_path, name
+        launcher::build_claude_launcher(
+            &claude_bin,
+            launcher_path_prefix.as_deref(),
+            &project_dir,
+            &prompt_path,
+            &agent.model,
+            &config_path,
+            &name,
+            true, // fresh_session — resume support arrives with aperture-syepg
         )
     };
     fs::write(&launcher_path, &launcher_script).map_err(|e| e.to_string())?;

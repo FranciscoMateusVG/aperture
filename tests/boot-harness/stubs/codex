@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# stubs/codex — fake `codex` CLI pane process for L2 boot verification
+# (aperture-xt16e).
+#
+# Stands in for the real codex binary when the launcher script runs
+#   exec codex --remote "unix://<sock>"
+# (see src-tauri/src/agents.rs). Injected via APERTURE_CODEX_BIN /
+# APERTURE_LAUNCHER_PATH_PREFIX (env knobs being added by a parallel worker).
+#
+# What it does:
+#   1. Records full argv (one per line) + selected env to
+#      $APERTURE_STUB_LOG_DIR/codex-argv.txt.
+#   2. Parses --remote unix://<sock> and records the socket path to
+#      codex-sock.txt — the L2 codex assertion is argv + socket path
+#      correctness (the real presence bind happens app-server-side, driven by
+#      the hub's codex bridge, not by this pane process).
+#   3. Sleeps until SIGTERM, like a TUI pane would.
+#
+# TODO(aperture-xt16e follow-up): full codex L2 coverage requires a fake
+# app-server speaking JSON-RPC (initialize/initialized, thread/start, turn
+# injection) over the unix socket, so the hub's codex-bridge can actually
+# connect + bind and the observer can assert codex_bound / codex_inject.
+# Lift the pattern from mcp-server/scripts/smoke-codex-bridge.mjs (the
+# existing fake-app-server-shaped harness) when building it. Until then this
+# stub only proves the pane side: argv shape + socket path.
+set -euo pipefail
+
+LOG_DIR="${APERTURE_STUB_LOG_DIR:-/tmp/aperture-boot-harness}"
+mkdir -p "$LOG_DIR"
+
+{
+    # Append + pid header: this stub is invoked TWICE per L2 run through the
+    # real spawn path — once as the supervised app-server child
+    # (`codex app-server --listen unix://…`, via codex_appserver.rs honoring
+    # APERTURE_CODEX_BIN) and once as the tmux pane (`codex --remote …`).
+    # '>' would clobber the first invocation's evidence.
+    echo "# --- invocation pid=$$ ---"
+    printf '%s\n' "$@"
+    # Env lines are '#'-prefixed so argv-diff tooling can filter them out.
+    echo "# env PATH=$PATH"
+    echo "# env PWD=$PWD"
+} >> "$LOG_DIR/codex-argv.txt"
+
+# Parse --remote unix://<sock> from argv (pane invocation only — the
+# app-server invocation has --listen, not --remote, and must not clobber
+# the pane's recorded socket with an empty value).
+SOCK=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--remote" ]; then
+        SOCK="${arg#unix://}"
+        break
+    fi
+    prev="$arg"
+done
+if [ -n "$SOCK" ]; then
+    echo "$SOCK" >> "$LOG_DIR/codex-sock.txt"
+fi
+
+# Simulate the long-lived TUI pane: sleep until SIGTERM/SIGINT.
+trap 'exit 0' TERM INT
+while :; do
+    sleep 3600 &
+    wait $! || true
+done

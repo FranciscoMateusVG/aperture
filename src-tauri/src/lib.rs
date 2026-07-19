@@ -2,6 +2,7 @@ mod agent_loader;
 mod agents;
 mod codex_appserver;
 mod config;
+mod launcher;
 mod poller;
 mod state;
 mod tmux;

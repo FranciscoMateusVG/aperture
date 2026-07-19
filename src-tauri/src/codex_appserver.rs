@@ -49,8 +49,15 @@ fn path_env() -> String {
 }
 
 /// Resolve the codex binary the same way poller.rs resolves `bd`: known
-/// install locations first, then fall back to PATH resolution.
+/// install locations first, then fall back to PATH resolution. The
+/// APERTURE_CODEX_BIN env var (aperture-xt16e) overrides everything and is
+/// used verbatim — no existence probe.
 fn codex_bin() -> String {
+    if let Ok(bin) = std::env::var("APERTURE_CODEX_BIN") {
+        if !bin.is_empty() {
+            return bin;
+        }
+    }
     let home = home_dir();
     let candidates = [
         format!("{}/.npm-global/bin/codex", home),
