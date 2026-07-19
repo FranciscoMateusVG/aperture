@@ -30,4 +30,14 @@ export interface AgentDef {
    *  live "{N}s ago" counter — cosmetic display math, not a deadline
    *  decision, so it's safe to compute client-side from this. */
   dot_state_since?: string | null;
+  /** Current-work summary (aperture-nr65b). Three-state field, see
+   *  hub-presence.ts::deriveWorkSummary for the full contract:
+   *  undefined/null = no data (stopped, or the backend's bd query failed);
+   *  "" = query succeeded, nothing claimed (idle); non-empty = the claimed
+   *  bead's id, paired with current_task_title. */
+  current_task_id?: string | null;
+  current_task_title?: string | null;
+  /** Count of other in_progress beads beyond current_task_id, when the
+   *  latter is non-empty. */
+  current_task_extra_count?: number | null;
 }

@@ -1,9 +1,11 @@
-# Launcher presence dots — card-state spec
+# Launcher agent-card truth — presence dot + current-work summary spec
 
-Design contract for `aperture-8gypy` (green/red, hub-confirmed) and
-`aperture-syepg` (grey/amber, kickoff-fired). Both PRs render into the
-*same* dot element on the agent card; this doc is the shared contract so
-neither side has to guess the other's shape.
+One contract document for the whole card-truth surface, per operator
+directive: the presence dot (`aperture-8gypy` green/red hub-confirmed,
+`aperture-syepg` grey/amber kickoff-fired) and the current-work summary
+line (`aperture-nr65b`) render into the *same* card, share the same
+poll-not-push architecture, and are specified here together so no
+implementer has to cross-reference two docs to know the full shape.
 
 Context: today the card shows a running/stopped binary the moment a tmux
 window exists — that's exactly how 7 dead-silent sessions read as "booted."
@@ -149,6 +151,81 @@ recomputed each render, so the operator sees the stuck timer climb, not a
 frozen number. This is cosmetic display math, not a deadline decision, so
 it's fine to compute client-side even though the state itself never is.
 
+## Current-work summary line (`aperture-nr65b`)
+
+Operator request 2026-07-19, verbatim: *"below each agent a small summary
+of what he is working and when he is idle... that would help A LOT."* Sits
+directly under `.agent-mini__row` as `.agent-mini__work`, using the exact
+same architecture as the dot: backend resolves truth, exposes it as more
+optional `AgentDef` fields, frontend polls and renders — no new transport.
+
+### Backend: `agents.rs::resolve_current_tasks`
+
+One `bd list --status=in_progress --json --no-pager --limit 0` spawn per
+`list_agents` poll cycle (not one per agent — ~100ms measured against the
+live repo, well inside the 3s budget). Groups results by `assignee`, sorts
+each group by `started_at` descending (ISO 8601 strings sort correctly as
+plain text), keeps the top bead + a count of the rest.
+
+**Three-state field, not two** — this is the part worth reading closely.
+The naive shape is "has data" vs "doesn't," but the real cardinality is
+three: query failed (no data at all), query succeeded with nothing claimed
+(idle — a normal, common state), and query succeeded with a claim. Collapse
+the first two into one "absent" value and idle silently renders as "no
+data" (or vice versa) — see `aperture:dont-model-phantom-cases` for why that
+collapse is the bug, not a simplification. The fix is a sentinel, not a
+fourth field:
+
+```rust
+pub current_task_id: Option<String>,        // None = no data; Some("") = idle; Some(id) = claimed
+pub current_task_title: Option<String>,     // set alongside a non-empty current_task_id
+pub current_task_extra_count: Option<u32>,  // count of OTHER in_progress beads beyond current_task_id
+```
+
+`resolve_current_tasks` itself returns `Option<HashMap<assignee, CurrentTask>>`
+— `None` means the `bd` call failed this cycle (non-zero exit, bad JSON,
+spawn failure); `Some(map)` means it succeeded, and an assignee simply
+absent from the map is the real idle case. `list_agents` translates that
+into the three-state field above; only there does the empty-string sentinel
+get materialized.
+
+### Frontend: `hub-presence.ts::deriveWorkSummary`
+
+```ts
+export function deriveWorkSummary(agent: AgentDef, dotState: DotState): WorkSummary | null {
+  if (dotState === "booting") return { text: "Booting…", tooltip: "…" };
+  if (dotState === "stuck") return { text: "Stuck", tooltip: "…" };
+  if (agent.current_task_id == null) return null;       // no data — render nothing
+  if (agent.current_task_id === "") return { text: "Idle", tooltip: "…" };
+  // non-empty: render current_task_title (+N more) with a full-id tooltip
+}
+```
+
+`booting`/`stuck` **override** the work line entirely — an agent that
+isn't reachable isn't "working on X," it's booting or stuck, and showing
+the stale claimed-bead title in that state would be exactly the kind of
+comforting lie this whole card-truth epic exists to remove. Composes with
+the dot state computed earlier in this doc, not a separate signal.
+
+Bead titles are free text — including, transitively, user-submitted report
+titles via `aperture:incluir-intake-to-bead` — so both the summary text and
+tooltip are HTML-escaped before landing in `innerHTML` (`AgentCard.ts::escapeHtml`).
+Everything else already interpolated in that file (`agent.name`,
+`agent.model`) comes from a closed, trusted set and doesn't need it.
+
+### Markup
+
+```html
+<div class="agent-mini">
+  <div class="agent-mini__row"> <!-- unchanged existing row --> </div>
+  <div class="agent-mini__work" title="{full id + title}">{text}</div>
+</div>
+```
+
+Only rendered when `deriveWorkSummary` returns non-null — i.e. never for a
+stopped agent, and never when there's no data at all (same "absent field =
+card renders exactly as today" invariant as the dot).
+
 ## Non-goals / phantom cases deliberately not modeled
 
 - No separate `busy` vs `idle` color. The hub emits both for Codex bridge
@@ -165,3 +242,6 @@ it's fine to compute client-side even though the state itself never is.
   no `@tauri-apps/api/event` listener. All three were in this doc's first
   draft and are deliberately removed per the amendment above — the frontend
   is a pure renderer of backend-computed state, full stop.
+- No pane-activity scraping ("actively generating"), no message previews,
+  no per-bead progress bar. Explicitly out of scope for v1 per the operator
+  bead — the summary line answers "what bead, or idle," nothing deeper.
