@@ -19,9 +19,9 @@
  *   - thread/list bind path: bindThread() calls this.deliver() right after
  *     thread/resume + bindToThread — the pre-bind message is RE-FETCHED from
  *     BEADS and injected exactly once, after resume. Not lost. (test: pin b)
- *   - thread/start bootstrap path (fresh session, PR #34): bindThread()
- *     injects only the static kickoff and returns WITHOUT calling deliver().
- *     See FINDING in the fresh-session test below.
+ *   - thread/start bootstrap path (fresh session): bindThread() refetches
+ *     unread after it owns the new thread, then steers those rows into the
+ *     active kickoff turn. (test: fresh-session symmetry pin below)
  *
  * Run: cd mcp-server && pnpm build && node --test test/codex-bind-order.test.mjs
  */
@@ -187,7 +187,7 @@ test("HEADLINE injection-before-bind (existing thread, thread/list delayed): mes
   assert.equal(preResumeTurns.length, 0, "no turn injection before thread/resume");
 });
 
-test("injection-before-bind (fresh session, thread/start bootstrap per PR #34): pre-bind message NOT injected at bind — pinned FINDING; recovered on next notify via turn/steer", async (t) => {
+test("injection-before-bind (fresh session, thread/start bootstrap): pre-bind message is refetched and steered at bind", async (t) => {
   const { server, bridge, logs } = await scenario(t, { threads: [] });
 
   setUnread([msgRow("m-f1", "glados", "cbx-f", "message racing a fresh session")]);
@@ -199,7 +199,8 @@ test("injection-before-bind (fresh session, thread/start bootstrap per PR #34): 
     () => server.callsOf("turn/start").length > 0,
     "kickoff turn injected",
   );
-  await delay(400); // grace: give any (hypothetical) deliver-on-bind time to land
+  await waitFor(() => server.turnCallsContaining("m-f1").length > 0, "m-f1 injected on fresh bind");
+  await delay(300); // grace: a buggy double-delivery would land in the same chain
 
   // Kickoff went in, explicitly owned via thread/start (not thread/list).
   assert.ok(
@@ -209,30 +210,9 @@ test("injection-before-bind (fresh session, thread/start bootstrap per PR #34): 
   const kickoffs = server.turnCallsContaining(CODEX_KICKOFF_TEXT.slice(0, 40));
   assert.equal(kickoffs.length, 1, "exactly one kickoff turn");
 
-  // ── FINDING (aperture-xt16e, pinned observed behavior) ──────────────────
-  // The thread/start bootstrap path in bindThread() returns after injecting
-  // the kickoff WITHOUT calling this.deliver(), unlike the thread/list path
-  // (which refetches unread on bind). A message delivered toward the bridge
-  // before bind on a FRESH session therefore gets NO transport-level push at
-  // bind time. It is not durably lost — it stays unread in BEADS and the
-  // kickoff text instructs the agent to run get_messages — but the push-
-  // delivery guarantee the thread/list path provides is absent here. If the
-  // agent's boot get_messages fails/races, the message waits for the NEXT
-  // notify or reconnect. Asymmetry worth a follow-up bead.
-  assert.equal(
-    server.turnCallsContaining("m-f1").length,
-    0,
-    "PINNED: bootstrap path does not deliver pre-bind unread at bind time (see FINDING)",
-  );
-
-  // Recovery surface: the next hub notify injects it. turnActive is true
-  // (optimistically set by the kickoff turn/start, no completion emitted), so
-  // it goes in as turn/steer.
-  bridge.deliver();
-  await waitFor(() => server.turnCallsContaining("m-f1").length > 0, "m-f1 recovered on next notify");
   const inj = server.turnCallsContaining("m-f1");
-  assert.equal(inj.length, 1, "recovered exactly once");
-  assert.equal(inj[0].method, "turn/steer", "kickoff turn still active → steer");
+  assert.equal(inj.length, 1, "pre-bind unread injected exactly once on fresh bind");
+  assert.equal(inj[0].method, "turn/steer", "kickoff turn active → steer delivery");
 });
 
 test("no-thread-at-connect: thread/start failure retried with backoff, no crash, bind completes + thread-ready file published", async (t) => {
