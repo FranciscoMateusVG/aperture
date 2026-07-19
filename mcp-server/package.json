@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test:hub": "node --test test/hub-protocol.test.mjs"
+    "test:hub": "node --test test/hub-protocol.test.mjs",
+    "test:codex-bind": "node --test test/codex-bind-order.test.mjs",
+    "test:replay": "node --test test/hub-replay.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
