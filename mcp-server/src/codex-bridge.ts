@@ -35,6 +35,8 @@ import { getUnreadMessages } from "./beads.js";
 
 const AGENTS_DIR = process.env.APERTURE_AGENTS_DIR ?? resolve(homedir(), ".claude", "aperture");
 const RUN_DIR = process.env.APERTURE_RUN_DIR ?? resolve(homedir(), ".aperture", "run");
+const AGENT_CONFIG_PATH =
+  process.env.APERTURE_AGENT_CONFIG_PATH ?? resolve(homedir(), ".aperture", "agent-config.json");
 
 const RECONNECT_MS = 10_000; // socket missing/dropped → retry cadence
 const THREAD_POLL_MS = 10_000; // no thread yet (TUI not started) → re-list cadence
@@ -72,20 +74,31 @@ export interface BridgeOptions {
   autoBind?: boolean;
 }
 
-/** Codex agents = dirs under the aperture tree whose manifest model starts with "codex/". */
-export function discoverCodexAgents(dir: string = AGENTS_DIR): string[] {
+/**
+ * Codex agents = manifest model merged with panel-persisted model overrides.
+ *
+ * Runtime manifests are repo symlinks and intentionally remain immutable;
+ * agent-config.json is the panel's authoritative override layer.
+ */
+export function discoverCodexAgents(
+  dir: string = AGENTS_DIR,
+  configPath: string = AGENT_CONFIG_PATH,
+): string[] {
   let entries: string[];
   try {
     entries = readdirSync(dir);
   } catch {
     return [];
   }
+  const overrides = readModelOverrides(configPath);
   const out: string[] = [];
   for (const name of entries) {
     try {
       const raw = readFileSync(join(dir, name, "manifest.json"), "utf8");
       const manifest = JSON.parse(raw) as Record<string, unknown>;
-      if (typeof manifest.model === "string" && manifest.model.startsWith("codex/")) {
+      const manifestModel = typeof manifest.model === "string" ? manifest.model : "";
+      const model = overrides[name] ?? manifestModel;
+      if (model.startsWith("codex/")) {
         out.push(name);
       }
     } catch {
@@ -93,6 +106,21 @@ export function discoverCodexAgents(dir: string = AGENTS_DIR): string[] {
     }
   }
   return out;
+}
+
+/** Missing or malformed override state is non-fatal: manifests remain the fallback. */
+function readModelOverrides(path: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
 }
 
 interface Pending {
