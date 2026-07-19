@@ -17,11 +17,11 @@ Every message between agents — task updates, quick pings, handoffs, questions,
 
 **How it works:**
 - You call `send_message(to: "agent", message: "...")` — this writes a BEADS message record
-- The poller delivers unread messages to the recipient every 5 seconds
-- Messages persist until the recipient marks them as read
-- No more lost messages. No more one-shot file delivery.
+- Delivery is **push**, via the aperture-bus hub: Claude agents receive events on a Monitor subscribed to the hub at `ws://127.0.0.1:4517`; Codex agents receive injected turns via the app-server bridge
+- Recipient offline? Nothing is lost — on reconnect the hub replays every unread message
+- A message counts as **read only when the recipient explicitly calls `mark_as_read` after processing it** — never on delivery. If you receive a message, process it, then mark it read.
 
-**Why:** File-based messages got lost when agents were busy processing. BEADS messages are persistent, have read/unread state, and retry delivery automatically.
+**Why:** File-based messages got lost when agents were busy processing. BEADS messages are persistent, have read/unread state, and replay on reconnect until acknowledged.
 
 ---
 
@@ -102,7 +102,11 @@ query_tasks(mode: "list")              — see all tasks and their status
 query_tasks(mode: "show", id: "...")   — read notes, artifacts, and progress
 ```
 
-When you delegate to specialist agents, poll BEADS for their task updates. Subagents (Agent tool) return their result directly when done — they don't write to BEADS unless you instruct them to. Messages from agents arrive via BEADS — the poller delivers them to your terminal automatically.
+When you delegate to specialist agents, poll BEADS for their task updates. Subagents (Agent tool) return their result directly when done — they don't write to BEADS unless you instruct them to. Messages from agents arrive via BEADS — the hub pushes them to you as they land (Monitor event for Claude, injected turn for Codex).
+
+### 5.1 Presence
+
+The hub broadcasts presence events — `join`, `leave`, `busy`, `idle` — for every connected agent (socket connected = present, disconnect = leave). GLaDOS uses this stream as the **primary liveness signal**; pane-peeking remains a forensic fallback only. Don't infer "agent is dead" from silence when the presence stream says otherwise.
 
 ---
 
@@ -253,9 +257,9 @@ If your local was last `git pull`'d more than ~1 hour ago, treat it as stale and
 
 ## 8. Codex Agents
 
-> **If you are a Codex agent** (your model starts with `codex/`), you cannot call MCP tools directly. Use the `codex-comms` skill instead — it defines the `@@BEADS@@` command block protocol that the Aperture harness intercepts and executes on your behalf.
+> **If you are a Codex agent** (your model starts with `codex/`), everything in this skill applies to you directly: Codex agents now call the aperture-bus MCP tools themselves — `send_message`, `get_messages`, `mark_as_read`, and the BEADS task tools. Inbound messages arrive as injected turns via the app-server bridge; process them, then acknowledge with `mark_as_read` like any other agent.
 >
-> Everything in this skill (sections 1–7) applies to **Claude Code agents only**. The BEADS patterns are the same; only the execution mechanism differs.
+> See the rewritten `codex-comms` skill for Codex-specific mechanics (bridge behavior, turn injection, MCP registration). The old `@@BEADS@@` pane-scraping protocol is **retired** — never emit that command-block pattern; it is no longer intercepted by anything.
 
 ---
 

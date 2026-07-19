@@ -28,9 +28,8 @@ pub struct AppState {
     /// aperture-ttzz (allowlist, audit emission, operator approval).
     pub mcp_sentry_server_path: String,
     /// Vestigial — kept so we don't have to thread a removal through
-    /// `default_state`. Was used by an older message DB; today the message
-    /// log is JSONL at `~/.aperture/message-log.jsonl` and BEADS owns the
-    /// real durable store.
+    /// `default_state`. Was used by an older message DB; today BEADS owns
+    /// the durable message store (delivery via the aperture-bus WS hub).
     #[allow(dead_code)]
     pub db_path: String,
     pub project_dir: String,

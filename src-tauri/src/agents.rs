@@ -110,10 +110,11 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);
-        // Comms Layer v2, Phase 2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
-        // codex_harness::inject_pending_messages() is no longer called here.
-        // Unread messages are replayed by the aperture-bus codex-bridge over
-        // the app-server socket instead of being prepended to the prompt.
+        // Comms Layer v2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
+        // unread messages are replayed by the aperture-bus codex-bridge over
+        // the app-server socket; nothing is prepended to the prompt here.
+        // (Historical: the pre-v2 codex_harness prompt-injection path was
+        // deleted in Phase 3.)
         let prompt_dest = format!("{}/prompt.md", codex_home);
         fs::write(&prompt_dest, &prompt_content).map_err(|e| e.to_string())?;
 
@@ -213,12 +214,11 @@ exec claude --dangerously-skip-permissions --model {} --system-prompt "$PROMPT" 
 
     tmux::tmux_send_keys(window_id.clone(), launcher_path)?;
 
-    // Comms Layer v2, Phase 2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
-    // codex_harness::start_output_monitor() is no longer called. Outbound
-    // Codex comms flow through the aperture-bus MCP server (wired into
-    // config.toml above); inbound delivery is injected by the bus
-    // codex-bridge via the app-server socket. The @@BEADS@@ pane-scraping
-    // module stays on disk until Phase 3 deletes it.
+    // Comms Layer v2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
+    // outbound Codex comms flow through the aperture-bus MCP server (wired
+    // into config.toml above); inbound delivery is injected by the bus
+    // codex-bridge via the app-server socket. (Historical: the pre-v2
+    // codex_harness pane-scraping monitor was deleted in Phase 3.)
 
     // Auto-confirm the workspace trust prompt — but ONLY when the dialog is
     // actually visible. Sending Enter blindly at fixed intervals would stomp

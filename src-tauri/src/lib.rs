@@ -1,14 +1,6 @@
 mod agent_loader;
 mod agents;
-// Comms Layer v2, Phase 2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
-// codex_harness (@@BEADS@@ pane-scraping) and its beads_parser are
-// disconnected — no callers remain. Both files are deleted in Phase 3;
-// allow(dead_code) keeps `cargo check` clean until then.
-#[allow(dead_code)]
-mod beads_parser;
 mod codex_appserver;
-#[allow(dead_code)]
-mod codex_harness;
 mod config;
 mod poller;
 mod state;
@@ -78,7 +70,8 @@ pub fn run() {
         }
     }
 
-    // Start background message delivery poller
+    // Start the operator-mailbox sweep (attention badges only — agent
+    // message delivery is owned by the WS hub / codex-bridge, see poller.rs)
     let poller_state = Arc::clone(&app_state);
     std::thread::spawn(move || {
         poller::run_message_poller(poller_state);
