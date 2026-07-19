@@ -1,0 +1,732 @@
+//! Pure command-builders for the per-agent launcher scripts and configs.
+//!
+//! Extracted from `agents.rs::start_agent` (aperture-xt16e) as a
+//! behavior-preserving refactor: with default parameters (bin = "claude" /
+//! "codex", no PATH prefix) the output of every builder is byte-identical to
+//! the templates that previously lived inline in `start_agent`. No I/O, no
+//! env reads, no tauri types here — the side-effecting layer (`agents.rs`)
+//! resolves env knobs (APERTURE_CLAUDE_BIN, APERTURE_CODEX_BIN,
+//! APERTURE_LAUNCHER_PATH_PREFIX) and passes plain values in.
+
+/// Build the bash launcher script for a Claude agent pane.
+///
+/// * `claude_bin` — binary to exec; the default call site passes "claude"
+///   unless APERTURE_CLAUDE_BIN overrides it.
+/// * `path_prefix` — optional directory list prepended to the exported PATH
+///   (before /opt/homebrew/bin); lets tests shadow binaries. `None` keeps the
+///   historical PATH line byte-identical.
+/// * `fresh_session` — reserved for the kickoff-prompt work (aperture-syepg):
+///   fresh sessions will append a static positional kickoff argument after
+///   `--name`; resume/continue sessions will not. Until that lands the flag
+///   has no effect on output; current call sites pass `true`.
+pub fn build_claude_launcher(
+    claude_bin: &str,
+    path_prefix: Option<&str>,
+    project_dir: &str,
+    prompt_path: &str,
+    model: &str,
+    mcp_config_path: &str,
+    name: &str,
+    fresh_session: bool,
+) -> String {
+    let _ = fresh_session; // no output change until aperture-syepg lands
+    let path_line = match path_prefix {
+        Some(prefix) => format!(
+            r#"export PATH="{}:/opt/homebrew/bin:/usr/local/bin:$PATH""#,
+            prefix
+        ),
+        None => r#"export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH""#.to_string(),
+    };
+    format!(
+        r#"#!/bin/bash
+{path_line}
+cd "{project_dir}"
+PROMPT=$(cat "{prompt_path}")
+exec {claude_bin} --dangerously-skip-permissions --model {model} --system-prompt "$PROMPT" --mcp-config {mcp_config_path} --name {name}
+"#
+    )
+}
+
+/// Build the bash launcher script for a Codex agent pane (the interactive TUI
+/// that attaches to the supervised app-server socket).
+///
+/// * `codex_bin` — binary to exec; default call site passes "codex" unless
+///   APERTURE_CODEX_BIN overrides it.
+/// * `path_prefix` — same semantics as in [`build_claude_launcher`].
+pub fn build_codex_launcher(
+    codex_bin: &str,
+    path_prefix: Option<&str>,
+    codex_home: &str,
+    sock_path: &str,
+) -> String {
+    let path_line = match path_prefix {
+        Some(prefix) => format!(
+            r#"export PATH="{}:/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH""#,
+            prefix
+        ),
+        None => r#"export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH""#
+            .to_string(),
+    };
+    format!(
+        r#"#!/bin/bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+{path_line}
+export CODEX_HOME="{codex_home}"
+# Wait for the supervised app-server (codex_appserver.rs) to bring the
+# socket up before attaching — its spawn thread runs concurrently.
+for _ in $(seq 1 40); do [ -S "{sock_path}" ] && break; sleep 0.25; done
+exec {codex_bin} --remote "unix://{sock_path}"
+"#
+    )
+}
+
+/// Inputs for the per-agent Codex `config.toml` (written to
+/// `$CODEX_HOME/config.toml`). All values are interpolated verbatim — see the
+/// KNOWN-BROKEN(quoting) tests below for the current escaping gaps.
+pub struct CodexConfigParams<'a> {
+    /// Model id with the `codex/` prefix stripped (top-level `model = ...`).
+    pub bare_model: &'a str,
+    /// Path the agent prompt was copied to (`$CODEX_HOME/prompt.md`).
+    pub prompt_dest: &'a str,
+    pub project_dir: &'a str,
+    /// `<project_dir>/mcp-server/start.sh` — aperture-bus launcher.
+    pub bus_start_sh: &'a str,
+    pub mcp_sentry_server_path: &'a str,
+    pub name: &'a str,
+    pub role: &'a str,
+    /// Full model string as configured (keeps the `codex/` prefix).
+    pub model: &'a str,
+    pub mailbox_dir: &'a str,
+    pub beads_dir: &'a str,
+    pub beads_dolt_password: &'a str,
+    pub home_dir: &'a str,
+}
+
+/// Build the Codex `config.toml` contents. Byte-identical to the template
+/// formerly inline in `agents.rs::start_agent`.
+pub fn build_codex_config_toml(p: &CodexConfigParams) -> String {
+    format!(
+        r#"model = "{bare_model}"
+model_instructions_file = "{prompt_dest}"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[projects."{project_dir}"]
+trust_level = "trusted"
+
+[mcp_servers.aperture-bus]
+command = "sh"
+args = ["{bus_start_sh}"]
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}" }}
+
+# Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
+[mcp_servers.sentry]
+command = "node"
+args = ["{mcp_sentry_server_path}"]
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", HOME = "{home_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
+"#,
+        bare_model = p.bare_model,
+        beads_dolt_password = p.beads_dolt_password,
+        prompt_dest = p.prompt_dest,
+        project_dir = p.project_dir,
+        bus_start_sh = p.bus_start_sh,
+        mcp_sentry_server_path = p.mcp_sentry_server_path,
+        name = p.name,
+        role = p.role,
+        model = p.model,
+        mailbox_dir = p.mailbox_dir,
+        beads_dir = p.beads_dir,
+        home_dir = p.home_dir,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    /// Fresh per-test scratch directory under the OS temp dir.
+    fn test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aperture-launcher-test-{}-{}",
+            label,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write an executable stub binary that prints its cwd on line 1 and then
+    /// each argv element on its own line. Used in place of the real `claude`
+    /// so tests can observe exactly what the launcher script executes.
+    fn make_stub(dir: &Path, file_name: &str) -> String {
+        let stub = dir.join(file_name);
+        fs::write(
+            &stub,
+            "#!/bin/bash\npwd\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        stub.to_str().unwrap().to_string()
+    }
+
+    /// Run a launcher script through bash; returns (cwd line, argv lines) as
+    /// printed by the stub. If the script blows up before exec'ing the stub,
+    /// cwd comes back empty / wrong — which is exactly what the quoting
+    /// torture tests assert on.
+    fn run_launcher(dir: &Path, launcher: &str) -> (String, Vec<String>) {
+        let script = dir.join("launcher.sh");
+        fs::write(&script, launcher).unwrap();
+        let out = Command::new("bash").arg(&script).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut lines = stdout.lines().map(|s| s.to_string());
+        let cwd = lines.next().unwrap_or_default();
+        (cwd, lines.collect())
+    }
+
+    /// Value following `flag` in an argv list.
+    fn argv_value(argv: &[String], flag: &str) -> Option<String> {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1).cloned())
+    }
+
+    /// Whatever trails `--name <name>` on the exec line (the kickoff slot).
+    fn kickoff_suffix(script: &str, name: &str) -> String {
+        let exec_line = script
+            .lines()
+            .find(|l| l.starts_with("exec "))
+            .expect("launcher has an exec line");
+        let marker = format!("--name {}", name);
+        let idx = exec_line.find(&marker).expect("exec line has --name");
+        exec_line[idx + marker.len()..].trim().to_string()
+    }
+
+    fn sample_codex_params<'a>() -> CodexConfigParams<'a> {
+        CodexConfigParams {
+            bare_model: "gpt-5.3-codex",
+            prompt_dest: "/tmp/aperture-codex-vex/prompt.md",
+            project_dir: "/Users/x/projects/aperture",
+            bus_start_sh: "/Users/x/projects/aperture/mcp-server/start.sh",
+            mcp_sentry_server_path: "/Users/x/projects/aperture/mcp-server-sentry/dist/index.js",
+            name: "vex",
+            role: "builder",
+            model: "codex/gpt-5.3-codex",
+            mailbox_dir: "/Users/x/.aperture/mailbox",
+            beads_dir: "/Users/x/.aperture/.beads",
+            beads_dolt_password: "hunter2",
+            home_dir: "/Users/x",
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Current-behavior pins (must pass now)
+    // ------------------------------------------------------------------
+
+    /// Byte-identity pin against the template that lived inline in agents.rs
+    /// before the aperture-xt16e extraction. If this fails, the refactor is
+    /// no longer behavior-preserving.
+    #[test]
+    fn claude_launcher_golden_default() {
+        let s = build_claude_launcher(
+            "claude",
+            None,
+            "/Users/x/projects/aperture",
+            "/tmp/aperture-prompt-atlas.md",
+            "opus",
+            "/tmp/aperture-mcp-atlas.json",
+            "atlas",
+            true,
+        );
+        assert_eq!(
+            s,
+            r#"#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+cd "/Users/x/projects/aperture"
+PROMPT=$(cat "/tmp/aperture-prompt-atlas.md")
+exec claude --dangerously-skip-permissions --model opus --system-prompt "$PROMPT" --mcp-config /tmp/aperture-mcp-atlas.json --name atlas
+"#
+        );
+    }
+
+    #[test]
+    fn claude_launcher_contains_expected_flags() {
+        let s = build_claude_launcher(
+            "claude",
+            None,
+            "/proj",
+            "/tmp/prompt.md",
+            "sonnet",
+            "/tmp/mcp.json",
+            "borealis",
+            true,
+        );
+        assert!(s.contains("--dangerously-skip-permissions"));
+        assert!(s.contains("--model sonnet"));
+        assert!(s.contains(r#"--system-prompt "$PROMPT""#));
+        assert!(s.contains("--mcp-config /tmp/mcp.json"));
+        assert!(s.contains("--name borealis"));
+        assert!(s.contains(r#"cd "/proj""#));
+        assert!(s.contains(r#"PROMPT=$(cat "/tmp/prompt.md")"#));
+    }
+
+    /// Byte-identity pin for the codex pane launcher.
+    #[test]
+    fn codex_launcher_golden_default() {
+        let s = build_codex_launcher(
+            "codex",
+            None,
+            "/tmp/aperture-codex-vex",
+            "/Users/x/.aperture/run/vex.sock",
+        );
+        assert_eq!(
+            s,
+            r#"#!/bin/bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH"
+export CODEX_HOME="/tmp/aperture-codex-vex"
+# Wait for the supervised app-server (codex_appserver.rs) to bring the
+# socket up before attaching — its spawn thread runs concurrently.
+for _ in $(seq 1 40); do [ -S "/Users/x/.aperture/run/vex.sock" ] && break; sleep 0.25; done
+exec codex --remote "unix:///Users/x/.aperture/run/vex.sock"
+"#
+        );
+    }
+
+    #[test]
+    fn codex_launcher_contains_codex_home_and_socket_wait() {
+        let s = build_codex_launcher("codex", None, "/tmp/ch", "/run/a.sock");
+        assert!(s.contains(r#"export CODEX_HOME="/tmp/ch""#));
+        assert!(s.contains(r#"for _ in $(seq 1 40); do [ -S "/run/a.sock" ] && break; sleep 0.25; done"#));
+        assert!(s.contains(r#"exec codex --remote "unix:///run/a.sock""#));
+    }
+
+    /// Byte-identity pin for the codex config.toml template.
+    #[test]
+    fn codex_config_toml_golden_default() {
+        let s = build_codex_config_toml(&sample_codex_params());
+        assert_eq!(
+            s,
+            r#"model = "gpt-5.3-codex"
+model_instructions_file = "/tmp/aperture-codex-vex/prompt.md"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[projects."/Users/x/projects/aperture"]
+trust_level = "trusted"
+
+[mcp_servers.aperture-bus]
+command = "sh"
+args = ["/Users/x/projects/aperture/mcp-server/start.sh"]
+env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3-codex", APERTURE_MAILBOX = "/Users/x/.aperture/mailbox", BEADS_DIR = "/Users/x/.aperture/.beads", BD_ACTOR = "vex", BEADS_DOLT_PASSWORD = "hunter2" }
+
+# Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
+[mcp_servers.sentry]
+command = "node"
+args = ["/Users/x/projects/aperture/mcp-server-sentry/dist/index.js"]
+env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3-codex", HOME = "/Users/x", BEADS_DIR = "/Users/x/.aperture/.beads", BD_ACTOR = "vex" }
+"#
+        );
+    }
+
+    #[test]
+    fn codex_config_toml_round_trips_with_expected_fields() {
+        let s = build_codex_config_toml(&sample_codex_params());
+        let t: toml::Table = s.parse().expect("config.toml must be valid TOML");
+        assert_eq!(t["model"].as_str(), Some("gpt-5.3-codex"));
+        assert_eq!(
+            t["model_instructions_file"].as_str(),
+            Some("/tmp/aperture-codex-vex/prompt.md")
+        );
+        assert_eq!(t["approval_policy"].as_str(), Some("never"));
+        assert_eq!(t["sandbox_mode"].as_str(), Some("danger-full-access"));
+        assert_eq!(
+            t["projects"]["/Users/x/projects/aperture"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        let bus = &t["mcp_servers"]["aperture-bus"];
+        assert_eq!(bus["command"].as_str(), Some("sh"));
+        assert_eq!(
+            bus["args"][0].as_str(),
+            Some("/Users/x/projects/aperture/mcp-server/start.sh")
+        );
+        assert_eq!(bus["env"]["AGENT_NAME"].as_str(), Some("vex"));
+        assert_eq!(bus["env"]["BEADS_DOLT_PASSWORD"].as_str(), Some("hunter2"));
+        let sentry = &t["mcp_servers"]["sentry"];
+        assert_eq!(sentry["command"].as_str(), Some("node"));
+        assert_eq!(sentry["env"]["BD_ACTOR"].as_str(), Some("vex"));
+    }
+
+    #[test]
+    fn claude_bin_knob_substitutes() {
+        let s = build_claude_launcher(
+            "/tmp/fake/claude-stub",
+            None,
+            "/proj",
+            "/p.md",
+            "opus",
+            "/m.json",
+            "atlas",
+            true,
+        );
+        assert!(s.contains("exec /tmp/fake/claude-stub --dangerously-skip-permissions"));
+        assert!(!s.contains("exec claude "));
+    }
+
+    #[test]
+    fn codex_bin_knob_substitutes() {
+        let s = build_codex_launcher("/tmp/fake/codex-stub", None, "/tmp/ch", "/run/a.sock");
+        assert!(s.contains(r#"exec /tmp/fake/codex-stub --remote "unix:///run/a.sock""#));
+        assert!(!s.contains("exec codex "));
+    }
+
+    #[test]
+    fn path_prefix_prepends_in_claude_launcher() {
+        let s = build_claude_launcher(
+            "claude",
+            Some("/tmp/shadow/bin"),
+            "/proj",
+            "/p.md",
+            "opus",
+            "/m.json",
+            "atlas",
+            true,
+        );
+        assert!(
+            s.contains(r#"export PATH="/tmp/shadow/bin:/opt/homebrew/bin:/usr/local/bin:$PATH""#)
+        );
+    }
+
+    #[test]
+    fn path_prefix_prepends_in_codex_launcher() {
+        let s = build_codex_launcher("codex", Some("/tmp/shadow/bin"), "/tmp/ch", "/run/a.sock");
+        assert!(s.contains(
+            r#"export PATH="/tmp/shadow/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH""#
+        ));
+    }
+
+    /// Functional baseline: with clean parameters the generated script cd's
+    /// into the project dir and execs the binary with the argv intact. This
+    /// proves the bash harness works, so failures in the quoting torture
+    /// tests below mean the template is broken, not the harness.
+    #[test]
+    fn claude_launcher_execs_stub_with_intact_argv() {
+        let dir = test_dir("baseline");
+        let stub = make_stub(&dir, "claude-stub");
+        let project_dir = dir.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+
+        let s = build_claude_launcher(
+            &stub,
+            None,
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            "opus",
+            "/tmp/mcp.json",
+            "atlas",
+            true,
+        );
+        let (cwd, argv) = run_launcher(&dir, &s);
+        assert_eq!(cwd, project_dir.to_str().unwrap());
+        assert_eq!(argv_value(&argv, "--model").as_deref(), Some("opus"));
+        assert_eq!(
+            argv_value(&argv, "--system-prompt").as_deref(),
+            Some("PROMPT_CONTENT")
+        );
+        assert_eq!(argv_value(&argv, "--name").as_deref(), Some("atlas"));
+    }
+
+    /// Functional: PATH-prefix knob lets a shadow dir win binary resolution
+    /// for a bare (non-absolute) binary name.
+    #[test]
+    fn path_prefix_shadow_binary_wins() {
+        let dir = test_dir("shadow");
+        let shadow_bin = dir.join("shadowbin");
+        fs::create_dir_all(&shadow_bin).unwrap();
+        make_stub(&shadow_bin, "claude");
+        let project_dir = dir.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+
+        let s = build_claude_launcher(
+            "claude", // bare name — resolved via the exported PATH
+            Some(shadow_bin.to_str().unwrap()),
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            "opus",
+            "/tmp/mcp.json",
+            "atlas",
+            true,
+        );
+        let (cwd, argv) = run_launcher(&dir, &s);
+        assert_eq!(cwd, project_dir.to_str().unwrap());
+        assert_eq!(argv_value(&argv, "--name").as_deref(), Some("atlas"));
+    }
+
+    /// Pin: a semicolon smuggled into the model string does NOT execute a
+    /// second command today — `exec` replaces the shell before bash reaches
+    /// the text after the `;`. (The argv is still truncated; see the
+    /// KNOWN-BROKEN companion test below.)
+    #[test]
+    fn model_semicolon_does_not_spawn_second_command() {
+        let dir = test_dir("semicolon-pin");
+        let stub = make_stub(&dir, "claude-stub");
+        let project_dir = dir.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+        let marker = dir.join("pwned");
+
+        let model = format!("opus; touch {}", marker.display());
+        let s = build_claude_launcher(
+            &stub,
+            None,
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            &model,
+            "/tmp/mcp.json",
+            "atlas",
+            true,
+        );
+        let _ = run_launcher(&dir, &s);
+        assert!(
+            !marker.exists(),
+            "injected command after ';' must not run (exec should have replaced the shell)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Quoting torture cases — DESIRED behavior, currently broken.
+    // The launcher templates interpolate with zero escaping; each test below
+    // asserts what SHOULD happen and is ignored until the escaping work
+    // lands. Verified to fail today (see aperture-xt16e).
+    // ------------------------------------------------------------------
+
+    // KNOWN-BROKEN(quoting): a double quote in project_dir terminates the
+    // cd "..." string early and corrupts the rest of the script.
+    #[test]
+    #[ignore = "known-broken: unescaped interpolation, see aperture-xt16e"]
+    fn quoting_project_dir_with_double_quote() {
+        let dir = test_dir("quote-dir");
+        let stub = make_stub(&dir, "claude-stub");
+        let project_dir = dir.join(r#"we"ird"#);
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+
+        let s = build_claude_launcher(
+            &stub,
+            None,
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            "opus",
+            "/tmp/mcp.json",
+            "atlas",
+            true,
+        );
+        let (cwd, _argv) = run_launcher(&dir, &s);
+        assert_eq!(
+            cwd,
+            project_dir.to_str().unwrap(),
+            "script must cd into the literal directory even when its name contains a double quote"
+        );
+    }
+
+    // KNOWN-BROKEN(quoting): `$HOME` inside project_dir is interpolated into
+    // a double-quoted cd context, so bash EXPANDS it instead of treating it
+    // as a literal path component.
+    #[test]
+    #[ignore = "known-broken: unescaped interpolation, see aperture-xt16e"]
+    fn quoting_project_dir_with_dollar_home_literal() {
+        let dir = test_dir("dollar-home");
+        let stub = make_stub(&dir, "claude-stub");
+        let project_dir = dir.join("$HOME").join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+
+        let s = build_claude_launcher(
+            &stub,
+            None,
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            "opus",
+            "/tmp/mcp.json",
+            "atlas",
+            true,
+        );
+        let (cwd, _argv) = run_launcher(&dir, &s);
+        assert_eq!(
+            cwd,
+            project_dir.to_str().unwrap(),
+            "a literal $HOME path component must NOT be expanded by the shell"
+        );
+    }
+
+    // KNOWN-BROKEN(quoting): the agent name is interpolated unquoted after
+    // --name, so a space splits it into two argv words.
+    #[test]
+    #[ignore = "known-broken: unescaped interpolation, see aperture-xt16e"]
+    fn quoting_agent_name_with_space() {
+        let dir = test_dir("name-space");
+        let stub = make_stub(&dir, "claude-stub");
+        let project_dir = dir.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+
+        let s = build_claude_launcher(
+            &stub,
+            None,
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            "opus",
+            "/tmp/mcp.json",
+            "space name",
+            true,
+        );
+        let (_cwd, argv) = run_launcher(&dir, &s);
+        assert_eq!(
+            argv_value(&argv, "--name").as_deref(),
+            Some("space name"),
+            "an agent name containing a space must arrive as a single argv element"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("space name"),
+            "no stray argv after the name"
+        );
+    }
+
+    // KNOWN-BROKEN(quoting): the model is interpolated unquoted, so a
+    // semicolon truncates the exec argv (everything after the ';' is parsed
+    // as a second command — which never runs thanks to exec, but the flags
+    // after --model are silently dropped).
+    #[test]
+    #[ignore = "known-broken: unescaped interpolation, see aperture-xt16e"]
+    fn quoting_model_with_semicolon_preserves_full_argv() {
+        let dir = test_dir("semicolon-argv");
+        let stub = make_stub(&dir, "claude-stub");
+        let project_dir = dir.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let prompt = dir.join("prompt.md");
+        fs::write(&prompt, "PROMPT_CONTENT").unwrap();
+
+        let model = "opus; touch /tmp/should-not-matter";
+        let s = build_claude_launcher(
+            &stub,
+            None,
+            project_dir.to_str().unwrap(),
+            prompt.to_str().unwrap(),
+            model,
+            "/tmp/mcp.json",
+            "atlas",
+            true,
+        );
+        let (_cwd, argv) = run_launcher(&dir, &s);
+        assert_eq!(
+            argv_value(&argv, "--model").as_deref(),
+            Some(model),
+            "the model string must arrive verbatim as one argv element"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--system-prompt"),
+            "flags after --model must not be swallowed by the ';'"
+        );
+    }
+
+    // KNOWN-BROKEN(quoting): a double quote in prompt_dest breaks the TOML
+    // basic string and the whole config.toml fails to parse.
+    #[test]
+    #[ignore = "known-broken: unescaped interpolation, see aperture-xt16e"]
+    fn quoting_toml_double_quote_in_prompt_dest() {
+        let mut p = sample_codex_params();
+        let prompt_dest = r#"/tmp/aperture-codex-vex/pro"mpt.md"#;
+        p.prompt_dest = prompt_dest;
+        let s = build_codex_config_toml(&p);
+        let t: toml::Table = s
+            .parse()
+            .expect("config.toml must stay parseable when prompt_dest contains a double quote");
+        assert_eq!(
+            t["model_instructions_file"].as_str(),
+            Some(prompt_dest),
+            "the quote must round-trip intact"
+        );
+    }
+
+    // KNOWN-BROKEN(quoting): a double quote in the BEADS dolt password
+    // breaks the inline env table and the whole config.toml fails to parse.
+    #[test]
+    #[ignore = "known-broken: unescaped interpolation, see aperture-xt16e"]
+    fn quoting_toml_double_quote_in_beads_password() {
+        let mut p = sample_codex_params();
+        let password = r#"hu"nter2"#;
+        p.beads_dolt_password = password;
+        let s = build_codex_config_toml(&p);
+        let t: toml::Table = s
+            .parse()
+            .expect("config.toml must stay parseable when the password contains a double quote");
+        assert_eq!(
+            t["mcp_servers"]["aperture-bus"]["env"]["BEADS_DOLT_PASSWORD"].as_str(),
+            Some(password),
+            "the quote must round-trip intact"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Kickoff-prompt contract (aperture-syepg) — documents what Peppy's
+    // change must satisfy; his PR un-ignores these.
+    // ------------------------------------------------------------------
+
+    /// Fresh sessions append a STATIC positional kickoff argument after
+    /// --name: non-empty, and identical regardless of agent/model/paths
+    /// (zero interpolation of user or BEADS content).
+    #[test]
+    #[ignore = "un-ignore when aperture-syepg lands"]
+    fn kickoff_fresh_session_appends_static_positional_prompt() {
+        let a = build_claude_launcher(
+            "claude", None, "/proj-a", "/tmp/pa.md", "opus", "/tmp/ma.json", "atlas", true,
+        );
+        let b = build_claude_launcher(
+            "claude", None, "/proj-b", "/tmp/pb.md", "sonnet", "/tmp/mb.json", "borealis", true,
+        );
+        let ka = kickoff_suffix(&a, "atlas");
+        let kb = kickoff_suffix(&b, "borealis");
+        assert!(
+            !ka.is_empty(),
+            "fresh session must append a positional kickoff argument after --name"
+        );
+        assert_eq!(
+            ka, kb,
+            "kickoff text must be static — identical across agents/models/paths"
+        );
+    }
+
+    /// Resume/continue sessions (fresh_session = false) must NOT append the
+    /// kickoff positional argument.
+    #[test]
+    #[ignore = "un-ignore when aperture-syepg lands"]
+    fn kickoff_resume_session_omits_positional_prompt() {
+        let s = build_claude_launcher(
+            "claude", None, "/proj", "/tmp/p.md", "opus", "/tmp/m.json", "atlas", false,
+        );
+        assert_eq!(
+            kickoff_suffix(&s, "atlas"),
+            "",
+            "resume sessions must end the exec line at --name <name>"
+        );
+    }
+}
