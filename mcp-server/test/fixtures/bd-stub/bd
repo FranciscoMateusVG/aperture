@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# bd-stub — PATH/BD_PATH-injectable stand-in for the real `bd` binary, used by
+# test/hub-replay.test.mjs to pin the WS hub's replay-on-reconnect behavior
+# (aperture-xt16e) without touching hub code or a real BEADS store.
+#
+# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages, ~line 326):
+#   bd query 'type=message AND status=open AND title="->RECIPIENT]"' --json -n 0
+#     → prints the JSON array in $BD_STUB_DIR/unread-RECIPIENT.json, or [] if
+#       that file is absent.
+#
+# Behavior knobs (env):
+#   BD_STUB_DIR   (required) — seed-file dir; also receives bd-calls.log, one
+#                  line per invocation with the full argv joined by tabs
+#                  (evidence + call-count assertions).
+#   BD_STUB_FAIL=1 — exit 1 with stderr after logging the call (pins the hub's
+#                  replay_error / connection-survives path).
+#
+# ANY argv shape other than the getUnreadMessages query above exits 2 with a
+# loud stderr message. This is deliberate: if beads.ts ever changes the query
+# shape (contract drift), the replay tests fail instead of silently passing
+# against a stub that no longer models reality.
+
+set -u
+
+if [[ -z "${BD_STUB_DIR:-}" ]]; then
+  echo "bd-stub: BD_STUB_DIR is not set — this stub must only run under hub-replay.test.mjs" >&2
+  exit 2
+fi
+
+# Evidence log: full argv, tab-separated, one line per invocation.
+argv_line=""
+for arg in "$@"; do
+  argv_line+="${arg}"$'\t'
+done
+printf '%s\n' "${argv_line%$'\t'}" >> "$BD_STUB_DIR/bd-calls.log"
+
+if [[ "${BD_STUB_FAIL:-}" == "1" ]]; then
+  echo "bd-stub: simulated bd failure (BD_STUB_FAIL=1)" >&2
+  exit 1
+fi
+
+# The one recognized shape: query <getUnreadMessages-query> --json -n 0
+if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" == "0" ]]; then
+  query="$2"
+  re='^type=message AND status=open AND title="->(.+)\]"$'
+  if [[ "$query" =~ $re ]]; then
+    recipient="${BASH_REMATCH[1]}"
+    seed="$BD_STUB_DIR/unread-${recipient}.json"
+    if [[ -f "$seed" ]]; then
+      cat "$seed"
+    else
+      echo "[]"
+    fi
+    exit 0
+  fi
+fi
+
+echo "bd-stub: unrecognized argv shape (contract drift from beads.ts getUnreadMessages?): $*" >&2
+exit 2
