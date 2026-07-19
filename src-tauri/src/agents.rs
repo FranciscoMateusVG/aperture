@@ -322,9 +322,9 @@ pub fn update_agent_model(
     model: String,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    let valid = matches!(model.as_str(), "opus" | "sonnet" | "haiku") || model.starts_with("codex/");
+    let valid = matches!(model.as_str(), "opus" | "sonnet" | "haiku" | "fable") || model.starts_with("codex/");
     if !valid {
-        return Err(format!("Invalid model '{}'. Must be opus/sonnet/haiku or codex/<model>", model));
+        return Err(format!("Invalid model '{}'. Must be opus/sonnet/haiku/fable or codex/<model>", model));
     }
 
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
