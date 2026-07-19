@@ -1,0 +1,9 @@
+{
+  "name": "codex-smoke",
+  "emoji": "🧪",
+  "model": "codex/gpt-5",
+  "window": "codex-smoke",
+  "role": "smoke-test",
+  "kind": "codex",
+  "enabled": true
+}
