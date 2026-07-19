@@ -219,6 +219,18 @@ wss.on("listening", () => {
 
 wss.on("error", (err) => {
   log("server_error", { error: err.message });
+  // aperture-3x136: a fatal listen error (EADDRINUSE from a stale/orphan hub,
+  // EACCES, etc.) means this process will never serve. Previously we only
+  // logged and stayed alive — the Rust supervisor's try_wait then saw the
+  // child as "still running" and never respawned, so freeing the port by
+  // hand did NOT self-heal. Exit non-zero so the supervisor's respawn loop
+  // fires: once the squatter is gone (its own shutdown sweep, or the
+  // supervisor's residual-listener kill), the next spawn binds cleanly.
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "EADDRINUSE" || code === "EACCES" || code === "EADDRNOTAVAIL") {
+    log("server_error_fatal_exit", { code });
+    process.exit(1);
+  }
 });
 
 wss.on("connection", (ws) => {

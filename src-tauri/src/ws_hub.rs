@@ -119,12 +119,22 @@ pub fn spawn_ws_hub(project_dir: String) {
                         println!("[aperture] ws-hub bound {} (pid {} verified)", HUB_PORT, pid);
                     }
                     Some(listener) => {
+                        // aperture-3x136: a DIFFERENT pid holds the port — a
+                        // stale/orphan hub (e.g. after a `tauri dev` hot-restart,
+                        // which re-execs the binary without firing the clean-exit
+                        // residual-kill sweep). Previously we only logged and told
+                        // the operator to kill it by hand. Since 4517 is OUR hub
+                        // port exclusively, any squatter is always a stale aperture
+                        // hub — kill it so the respawn loop can bind. Our own child
+                        // (which lost the bind race) already exited(1) on EADDRINUSE
+                        // (ws-hub.ts), so the next spawn 2s later takes the freed
+                        // port cleanly. Self-heals what used to need a manual kill.
                         eprintln!(
-                            "[aperture] ERROR: ws-hub spawned pid {} but port {} is held by pid {} \
-                             — a stale/orphan hub is squatting the port (aperture-256ru); delivery \
-                             may be STALE. Kill pid {} then relaunch.",
-                            pid, HUB_PORT, listener, listener
+                            "[aperture] ws-hub: pid {} lost the bind race; port {} squatted by stale \
+                             hub pid {} (aperture-256ru) — killing the squatter so the respawn binds.",
+                            pid, HUB_PORT, listener
                         );
+                        let _ = Command::new("kill").args(["-9", &listener.to_string()]).status();
                     }
                     None => {
                         eprintln!(

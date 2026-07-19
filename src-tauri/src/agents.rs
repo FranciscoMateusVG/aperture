@@ -341,9 +341,11 @@ pub fn boot_agent_process(
     // aperture-syepg: record the kickoff-fired timestamp for Claude — the
     // kickoff positional is baked into the launcher we just fired, so this
     // instant is turn-1 fire. Feeds the presence dots (aperture-8gypy) + the
-    // watchdog re-kick (aperture-wul6m). Codex records its own at bridge-inject
-    // time (PR #34). Shared file: ~/.aperture/run/<name>.kickoff = unix-epoch
-    // millis (ASCII).
+    // watchdog re-kick (aperture-wul6m). Codex writes its OWN .kickoff stamp
+    // from the codex-bridge at bind time (aperture-3x136) — an earlier version
+    // of this comment claimed the bridge did so via PR #34, but it never
+    // actually wrote the file, which left every codex dot permanently grey.
+    // Shared file: ~/.aperture/run/<name>.kickoff = unix-epoch millis (ASCII).
     if !agent.model.starts_with("codex/") {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

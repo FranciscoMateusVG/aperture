@@ -403,6 +403,36 @@ export class CodexBridgeClient {
     // file, so pane launch scripts timed out and exec'd `codex resume ""`.
     if (changed || !existsSync(this.threadReadyPath())) this.publishThreadReady(threadId);
     this.ensureThreadReadyLoop();
+    // aperture-3x136 (dots): the presence-dot state machine (watchdog::compute_dot)
+    // needs a <agent>.kickoff timestamp to ever paint anything but grey/"spawned"
+    // — green requires kickoff_millis AND stable presence. The Tauri launcher
+    // writes .kickoff only for Claude agents (agents.rs); the earlier claim that
+    // "Codex records its own at bridge-inject time" was never implemented, so
+    // codex dots were permanently grey despite live join/busy/idle presence.
+    // Bind is codex's "I'm live" moment — stamp it here, mirroring the Claude
+    // launcher's write-at-launch.
+    this.publishKickoffStamp();
+  }
+
+  /**
+   * aperture-3x136 (dots): write ~/.aperture/run/<agent>.kickoff = unix-epoch
+   * millis (ASCII) so the presence-dot state machine can leave the grey
+   * "spawned" state. Idempotent per bind; a fresh stamp on reconnect is fine —
+   * stable online presence wins over the booting/stuck deadline regardless.
+   */
+  private publishKickoffStamp(): void {
+    try {
+      writeFileSync(this.kickoffPath(), `${Date.now()}`, { encoding: "utf8" });
+    } catch (e: unknown) {
+      this.hooks.log("codex_kickoff_stamp_error", {
+        agent: this.agent,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private kickoffPath(): string {
+    return join(RUN_DIR, `${this.agent}.kickoff`);
   }
 
   /**
