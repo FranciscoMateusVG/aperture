@@ -691,9 +691,10 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
     // change must satisfy; his PR un-ignores these.
     // ------------------------------------------------------------------
 
-    /// Fresh sessions append a STATIC positional kickoff argument after
-    /// --name: non-empty, and identical regardless of agent/model/paths
-    /// (zero interpolation of user or BEADS content).
+    /// Fresh sessions append a STATIC kickoff token as a shell-SINGLE-quoted
+    /// positional argument after --name (alongside --system-prompt): non-empty
+    /// and identical regardless of agent/model/paths — zero interpolation of
+    /// user or BEADS content. (Shape confirmed with Peppy's empirical test.)
     #[test]
     #[ignore = "un-ignore when aperture-syepg lands"]
     fn kickoff_fresh_session_appends_static_positional_prompt() {
@@ -709,9 +710,18 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
             !ka.is_empty(),
             "fresh session must append a positional kickoff argument after --name"
         );
+        assert!(
+            ka.starts_with('\'') && ka.ends_with('\'') && ka.len() >= 3,
+            "kickoff must be a shell-single-quoted static token, got: {}",
+            ka
+        );
         assert_eq!(
             ka, kb,
             "kickoff text must be static — identical across agents/models/paths"
+        );
+        assert!(
+            a.contains(r#"--system-prompt "$PROMPT""#),
+            "--system-prompt stays alongside the kickoff positional"
         );
     }
 
@@ -727,6 +737,38 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
             kickoff_suffix(&s, "atlas"),
             "",
             "resume sessions must end the exec line at --name <name>"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Codex pane kickoff contract (aperture-syepg/17amw) — Peppy+Rex are
+    // pivoting the pane from `exec codex --remote unix://sock` (which opens
+    // an empty TUI that won't attach to bridge threads) to
+    // `codex resume <thread-id> --remote unix://sock` behind a thread-id
+    // wait gate. The thread-id-file mechanism is NOT locked yet, so these
+    // assertions stay LOOSE (no pin on the thread-id file path). The
+    // un-ignored `codex_launcher_golden_default` pin above documents today's
+    // behavior; the PR that changes it must update that pin in the same
+    // diff (visible-contract-change discipline).
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "un-ignore when aperture-syepg/17amw lands"]
+    fn codex_pane_resumes_bridge_thread_behind_wait_gate() {
+        let s = build_codex_launcher("codex", None, "/tmp/ch", "/run/a.sock");
+        assert!(
+            s.contains("codex resume"),
+            "pane must resume the bridge thread, not open a bare TUI"
+        );
+        assert!(
+            s.contains(r#"--remote "unix://"#),
+            "pane must still attach over the app-server unix socket"
+        );
+        let exec_idx = s.find("\nexec ").expect("launcher has an exec line");
+        let before_exec = &s[..exec_idx];
+        assert!(
+            before_exec.contains("for ") || before_exec.contains("until "),
+            "a wait/poll gate must run before exec (socket and/or thread-id readiness)"
         );
     }
 }
