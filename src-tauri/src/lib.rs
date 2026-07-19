@@ -6,6 +6,7 @@ mod launcher;
 mod poller;
 mod state;
 mod tmux;
+mod watchdog;
 mod ws_hub;
 
 use std::sync::{Arc, Mutex};
@@ -114,6 +115,13 @@ pub fn run() {
     // tmux injection. Skips with a warning if ws-hub.js isn't built yet.
     let project_dir = app_state.lock().unwrap().project_dir.clone();
     ws_hub::spawn_ws_hub(project_dir);
+
+    // Start the liveness watchdog (aperture-wul6m) — the agent-side half of
+    // comms-v2 reliability. Subscribes to the hub's presence stream and re-kicks
+    // any expected-present agent that goes silent past the 60s deadline (a hub
+    // bounce killed its exit-on-drop inbox monitor and it couldn't self-heal).
+    // Also computes the presence-dot state the launcher polls via list_agents.
+    watchdog::spawn_watchdog(Arc::clone(&app_state));
 
     tauri::Builder::default()
         .manage(app_state)
