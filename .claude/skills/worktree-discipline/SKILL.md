@@ -125,6 +125,8 @@ When the parent merges via the auto-merge workflow on `monorepo-incluir`, `gh pr
 
 **Prevention:** prefer `--base main` for your PR. If your work doesn't typecheck or test against current main, reconsider whether you should be opening the PR yet — wait until the parent merges, then rebase onto fresh main and open.
 
+**Before you stack at all, verify against the parent's actual code.** `aperture:stacked-pr-verification` is the pre-merge discipline: fetch the parent PR's head (`git fetch origin pull/<n>/head:ref`) and read the real handler bodies before rebasing, so the swap-over is a mechanical rebase with no contract surprises. The recovery procedures below are the operational gotchas that skill keeps from becoming panic-fixes.
+
 **If you genuinely must stack:** retarget to main as soon as the parent's CI is green and merge is imminent, BEFORE the parent merges:
 
 ```bash

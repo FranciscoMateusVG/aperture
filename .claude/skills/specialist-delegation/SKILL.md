@@ -194,6 +194,8 @@ A dispatch shaped "do X, then do Y" is sometimes a real dependency and sometimes
 
 Get this right and your throughput approximately doubles whenever a wait-for-merge / wait-for-cascade / wait-for-deploy step sits in front of independent craft work.
 
+> **When the parallel track is a stacked PR, pair this with `aperture:stacked-pr-verification`.** Running Track 2 (the dependent consumer) while Track 1 (the producer PR) is in flight is only *safe* because you can verify Track 2 against Track 1's actual code before rebasing — `git fetch origin pull/<n>/head:ref` + read the real handler bodies. That verification step is what turns "build it in parallel and hope the contract holds" into "build it in parallel and prove the contract holds." Parallel tracks without it is how a swap-over ships a latent contract bug.
+
 ### The test (one question)
 
 When you see "wait for X, then do Y":
