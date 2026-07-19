@@ -13,7 +13,7 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
     // before doing any expensive I/O (subprocess calls, file writes). This
     // prevents the global state mutex from blocking list_agents polling and
     // other commands for the full duration of agent startup.
-    let (agent, tmux_session, mcp_server_path, project_dir) = {
+    let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         let agent = app_state
             .agents
@@ -29,6 +29,7 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
             agent,
             app_state.tmux_session.clone(),
             app_state.mcp_server_path.clone(),
+            app_state.mcp_sentry_server_path.clone(),
             app_state.project_dir.clone(),
         )
     }; // ← mutex released here; all I/O below is lock-free
@@ -43,6 +44,14 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let palace_path = format!("{}/.aperture/mempalace", home_dir);
 
+    // aperture-ktwoy — forward the Dolt sql-server password to the MCP's `bd`
+    // calls. Needed only when ~/.aperture/.beads is configured for server mode
+    // (post-migration); harmless empty default while still embedded. Sourced
+    // from the Tauri process env (operator exports BEADS_DOLT_PASSWORD before
+    // launching Aperture). host/port/user/database live in the per-machine
+    // .beads/config.yaml, not here.
+    let beads_dolt_password = std::env::var("BEADS_DOLT_PASSWORD").unwrap_or_default();
+
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "aperture-bus": {
@@ -54,6 +63,25 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
                     "AGENT_ROLE": &agent.role,
                     "AGENT_MODEL": &agent.model,
                     "APERTURE_MAILBOX": &mailbox_dir,
+                    "BEADS_DIR": format!("{}/.aperture/.beads", home_dir),
+                    "BD_ACTOR": &name,
+                    "BEADS_DOLT_PASSWORD": &beads_dolt_password
+                }
+            },
+            // Sentry MCP wrap layer — enforces Cipher's 9 constraints from
+            // aperture-ttzz (allowlist, mutation/attachment approval, audit
+            // emission, token redaction). If mcp-server-sentry/dist is not
+            // built yet, the agent's MCP client will fail to start `sentry`
+            // and other tools (aperture-bus, mempalace) still work.
+            "sentry": {
+                "type": "stdio",
+                "command": "node",
+                "args": [&mcp_sentry_server_path],
+                "env": {
+                    "AGENT_NAME": &name,
+                    "AGENT_ROLE": &agent.role,
+                    "AGENT_MODEL": &agent.model,
+                    "HOME": &home_dir,
                     "BEADS_DIR": format!("{}/.aperture/.beads", home_dir),
                     "BD_ACTOR": &name
                 }
@@ -99,17 +127,26 @@ trust_level = "trusted"
 [mcp_servers.aperture-bus]
 command = "node"
 args = ["{mcp_server_path}"]
-env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", APERTURE_MAILBOX = "{mailbox_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}", BEADS_DOLT_PASSWORD = "{beads_dolt_password}" }}
+
+# Sentry MCP wrap layer — enforces Cipher's 9 constraints (aperture-ttzz).
+[mcp_servers.sentry]
+command = "node"
+args = ["{mcp_sentry_server_path}"]
+env = {{ AGENT_NAME = "{name}", AGENT_ROLE = "{role}", AGENT_MODEL = "{model}", HOME = "{home_dir}", BEADS_DIR = "{beads_dir}", BD_ACTOR = "{name}" }}
 "#,
             bare_model = bare_model,
+            beads_dolt_password = beads_dolt_password,
             prompt_dest = prompt_dest,
             project_dir = project_dir,
             mcp_server_path = mcp_server_path,
+            mcp_sentry_server_path = mcp_sentry_server_path,
             name = name,
             role = agent.role,
             model = agent.model,
             mailbox_dir = mailbox_dir,
             beads_dir = beads_dir,
+            home_dir = home_dir,
         );
         fs::write(&config_toml_path, &config_toml).map_err(|e| e.to_string())?;
 

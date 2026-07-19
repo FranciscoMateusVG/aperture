@@ -225,3 +225,11 @@ DDD's strength — clean separation between domain, application, and infrastruct
 ## 9. Closing Thought
 
 If you find yourself writing `// TODO: wire X in production`, stop. That comment is the bug. Either complete the wiring before you push, or don't open the PR. Future-you will not remember to come back. CI will not catch it. Code review may not catch it. The next person to find it will be a real user, in production, getting an error toast. Don't let that be how the work ships.
+
+---
+
+## 10. Read the test-side companion: `aperture:e2e-catches-what-lower-cant`
+
+This skill is the **build-side** discipline for the composition-root-gap failure class — *how* to introduce a port/adapter without shipping it half-wired. The **test-side companion** is `aperture:e2e-catches-what-lower-cant`, which explains *why* unit + integration tests cannot catch the gap (they inject fakes directly into the test app, bypassing the prod composition root entirely) and *what* E2E coverage must do to surface it (exercise the real composition path, assert at the level where the failure lives).
+
+Read both as a pair. They describe the same class of failure from opposite ends — the build side codifies the wiring discipline you apply when introducing the adapter; the test side codifies the coverage discipline that catches the gap when the wiring discipline slips. Bug class recurrence on monorepo-incluir (`aperture-y57q` blob-storage, `aperture-3ghh` survey adapters) is what earned the test-side skill its slot under aperture-4la6's promotion-by-recurrence heuristic; both incidents are also case studies for the build-side discipline in this skill.

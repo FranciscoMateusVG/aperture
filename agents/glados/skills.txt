@@ -5,5 +5,9 @@ deploy-workflow
 subagents
 worktree-discipline
 watch-protocol
+glados-loop
 specialist-delegation
+incluir-intake-to-bead
+scope-from-artifact
+pocketsoftware-infra
 agent-liveness

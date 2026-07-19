@@ -150,6 +150,105 @@ Use the doorbell for:
 
 **Default escalation path:** Try to solve it yourself → update BEADS with findings → if truly stuck, message GLaDOS via BEADS → last resort, ring the operator's doorbell.
 
+### 7.1 Evidence-attached doorbell rule — NON-NEGOTIABLE
+
+**Banked precedent: lz9y AI intake, 2026-05-23 — three premature "feature live" claims to operator in 90 minutes, each one wrong at a different layer.**
+
+When you tell the operator "X is ready" / "feature is live" / "you can test now" / "deploy complete" — your message MUST include **evidence attached**, not a promise. Evidence = the canonical verify command + its output (or a verbatim quote from the verify), not a description of what you intended to verify.
+
+| ❌ Promise (banned) | ✅ Evidence (required) |
+|---|---|
+| "Container has the env var" | `docker exec X env \| grep VAR → VAR=true` |
+| "Feature is live, you can test" | `curl https://prod/feature → HTTP 200` + `grep /_next/static/chunks/*.js → "FLAG_NAME":"true"` + the URL operator should open |
+| "PR merged and deployed" | PR URL + merge timestamp + deploy SHA + container restart timestamp + `curl` of the new feature endpoint |
+| "Backend endpoint works" | `curl -X POST https://api/route -d '{...}' → 200 {...}` |
+| "Sidebar entry visible" | bundle-grep for the flag value + a description of the role used + screenshot (or the assertion that the bundle inlined the value) |
+
+If you can't produce the evidence, you don't ring the doorbell yet. You either:
+- Do the verify first, then ring with the output attached, OR
+- Ring with "X is *almost* ready — gate N of M still pending: [the missing verify]"
+
+**The "almost ready" framing is fine.** The banned shape is "X is ready" without evidence, because that ranks the operator's attention against a claim that may not hold. Each false-positive ring burns doorbell credibility; over a session, the operator stops trusting the badge.
+
+### 7.2 Multi-layer verify for "feature live" — the canonical chain
+
+**The general principle (project-agnostic):**
+
+> A feature isn't live until **every layer between source and user** is independently verified at the artifact that layer produces. Each layer is a separate failure surface; jointly they're sufficient, individually they're not. Verify each at the layer's OWN artifact, not at a dependency's artifact.
+
+For your specific project + feature kind, you need to:
+
+1. **Enumerate the layers** the feature passes through from source-control to a user clicking it. Common layer types:
+   - Source merged (PR / commit / release tag)
+   - Build artifact produced (compiled binary / built bundle / packaged container / published package)
+   - Build-time configuration baked (env vars inlined into the artifact, feature flags compiled in, native code linked)
+   - Artifact distributed (uploaded to registry / pushed to CDN / shipped to app store / published to npm)
+   - Runtime environment configured (env vars set, secrets mounted, config files placed, DNS pointed)
+   - Service running (process up, port listening, health endpoint green, app store live, package installed)
+   - Gate logic resolves correctly (auth check, feature flag, role check, A/B branch)
+   - User can reach the surface (URL responds / app opens / CLI command found)
+   - User-visible behavior matches expected (the actual artifact at the surface — UI element renders, response payload correct, command output correct)
+
+2. **For EACH layer, identify the canonical probe** — the smallest command/check that interrogates that layer's OWN artifact, not the one upstream of it.
+
+3. **Run every layer's probe; attach every output to the doorbell.**
+
+**The trap to avoid (recurring across many feature kinds):** verifying layer N+1 because it's cheaper, and inferring layer N. Examples of this anti-pattern:
+- Checking the env var is set on the running container (layer 5) and inferring the build-time-inlined client bundle has it (layer 3) — the container has the var but the already-built bundle doesn't. Banked 2026-05-23 (Next.js NEXT_PUBLIC_).
+- Checking the package is published to the registry (layer 4) and inferring downstream apps will resolve it (layer 8) — peer-deps or lockfiles can pin the old version.
+- Checking the container is running (layer 6) and inferring the route exists (layer 8) — a stale image can be running fine while missing the new route.
+- Checking the new column exists in the DB (layer 5) and inferring the code that uses it ships in the same deploy (layer 6) — schema + code can drift.
+- Checking the API responds (layer 8) and inferring the auth gate resolves correctly (layer 7) — a permissive default can mask a broken gate.
+
+### 7.2.1 Example protocol catalogue (extend per project)
+
+The general principle is universal; the specific probes are project-specific. Start from your project's existing patterns; add a protocol the first time you ship that kind of feature, refine it the next time. Three reference examples below — replace / extend with the protocols your stack actually needs.
+
+**Example A — Web app feature behind a flag (Next.js + Docker + Dokploy, monorepo-incluir):**
+1. PR merged → SHA + merge time
+2. Build args declared in Dockerfile → `grep "ARG NEXT_PUBLIC_FLAG" Dockerfile` (only NEXT_PUBLIC_ vars need build-arg wiring; server-only env vars skip this)
+3. Build args passed via docker-compose → `grep "build.args" docker-compose.yml | grep FLAG`
+4. Deploy completed → container restart timestamp
+5. Runtime env present (server-only flags) → `docker exec X env | grep FLAG`
+6. Build-time bake present (NEXT_PUBLIC_ flags) → `curl prod/_next/static/chunks/*.js | grep "FLAG":"true"` — the canonical layer-3 probe
+7. Route responds with auth → `curl prod/page → 200`
+8. Sidebar/nav surface renders → bundle-grep OR authenticated screenshot
+
+**Example B — Backend API endpoint (any HTTP service):**
+1. PR merged
+2. Deploy reached the running service (restart timestamp or revision id)
+3. Endpoint exists → `curl -I prod/api/route` → expected method-allowed status (not 404)
+4. Endpoint with auth → `curl -X POST -H "auth: ..." -d '...' prod/api/route` → expected payload shape
+5. Downstream side effects → live query of the DB / queue / log that should reflect the action
+
+**Example C — Library / SDK release (any package registry):**
+1. Version tag pushed
+2. Package published → registry shows the version (`npm view @org/pkg versions`, `cargo search`, `pip show`, etc.)
+3. Downstream consumer can resolve → in a fresh project: install the version, import a known-new symbol
+4. Downstream consumer's lockfile updated (peer-dep / engines / minimum-version constraint resolves correctly)
+5. Smoke test exercising the new symbol passes in the consumer
+
+**For your project's other feature kinds** — mobile app store release, native binary distribution, CLI tool, browser extension, scheduled job, message-queue consumer, IaC change, DNS change, etc. — file the protocol the FIRST time the feature kind ships, in this catalogue, with the same shape: layers + per-layer probe + canonical artifact. Future agents can then run the existing protocol instead of re-deriving it.
+
+### 7.2.2 The meta-rule for any feature kind
+
+> The verify chain for a feature must probe EVERY layer between source and user-visible behavior. The most-skipped layer is "build-time inlining" — anywhere a value gets baked into an artifact at build time, runtime env-check is NOT the right probe; the artifact itself is.
+
+If you don't have a protocol for the feature kind you just shipped, you're not ready to claim "live" — you're ready to author the protocol (in §7.2.1) and then run it. Future-you (and every other agent) gets the durable benefit.
+
+### 7.3 Verify against ORIGIN/main, not your local checkout
+
+**Banked precedent: lz9y AI intake recon, 2026-05-23 — orchestrator grepped local working tree and concluded "frontend doesn't exist," then filed 3 duplicate beads as if greenfield. Vance's subagents caught the duplication, but only after wasted dispatches.**
+
+Before claiming "X is missing" or "X was never built," verify against the CANONICAL reality, not a potentially-stale local mirror:
+
+- File-system claims → `git fetch && git ls-tree origin/main --name-only | grep X` (NOT `find ~/projects/X` on a possibly-stale local clone)
+- Code-content claims → `git show origin/main:path/to/file` (NOT `cat` on local)
+- Deployed-state claims → curl the prod URL or `docker exec` on the live container (NOT the local dev server)
+- Bead-state claims → `bd list --status=open` after `bd dolt pull` (NOT a cached list from session start)
+
+If your local was last `git pull`'d more than ~1 hour ago, treat it as stale and `git fetch` before any claim about main's contents. The same recursion applies that Cipher and Atlas codified: "verify against reality" needs to be applied at the RIGHT artifact layer — local-stale-clone is not the reality you're claiming about.
+
 ---
 
 ## 8. Codex Agents

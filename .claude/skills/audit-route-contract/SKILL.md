@@ -279,7 +279,80 @@ The bug is invisible to every observability layer except a real user clicking an
 
 ---
 
-## 9. Closing Thought
+## 9. GET/POST Sibling-Endpoint Shape Parity
+
+A related-but-distinct bug class to phantom routes: **the route exists, but its response shape silently disagrees with a sibling route on the same entity.** The frontend gets a 200 OK with the wrong shape, sometimes silently drops fields, sometimes shows a misleading toast ("Resposta inesperada do servidor (sem dados do voluntário)"). All paths are valid HTTP; the bug is in the contract.
+
+### The recurring pattern
+
+A route file has two handlers operating on the same conceptual entity:
+
+- `GET /api/widgets/:id` — does a rich JOIN + builds a nested response (`{ id, widget: { ...joined fields... } }`)
+- `POST /api/widgets/:id/actions` — inserts a row and returns a flat shape (`{ id, ...flat columns... }`)
+
+The frontend reads BOTH endpoints to populate the same UI surface. It deserializes the GET shape correctly. It calls the POST and expects the same shape — but the POST handler shipped without the JOIN+serialization the GET does. Frontend reads `response.nested_field` → `undefined` → falls into the error branch.
+
+### Banked precedents (2026-05-09 → 2026-05-27)
+
+| Bead | Surface | Failure shape |
+|---|---|---|
+| `aperture-et45` | `GET /api/volunteers/:id` | Missing user JOIN; frontend wanted nested user data; got volunteer-only row |
+| (banked earlier) | volunteer-related GET | Same family — JOIN missing |
+| `aperture-q2az` | `POST /api/keys/:keyId/assignments` | GET returns nested `currentHolder`; POST returned flat `{assignmentId, keyId, ...}`; frontend `serializeHolder(undefined)` → error toast |
+
+Three instances in <3 weeks. Time to bake the discipline.
+
+### The rule
+
+**When reviewing a route file with both GET and POST handlers returning the same conceptual entity, the POST response shape MUST be a strict subset-or-equal of the GET serialization** — OR the frontend MUST consume both responses through a shared shape-coercion helper that normalizes the difference.
+
+The two acceptable shapes for a sibling pair:
+
+**Shape parity (preferred):**
+```ts
+// GET handler
+return c.json({ assignmentId, currentHolder: serializeHolder(joinedRow) });
+
+// POST handler — IDENTICAL outer shape
+return c.json({ assignmentId, currentHolder: serializeHolder(joinedRow) });
+```
+
+**Shared coercion helper (acceptable for legacy code):**
+```ts
+// Frontend
+const holder = parseAssignmentResponse(response);  // handles both shapes
+```
+
+The forbidden shape:
+```ts
+// GET — nested
+return c.json({ assignmentId, currentHolder: {...} });
+// POST — flat (BUG)
+return c.json({ assignmentId, volunteerId, name, ... });
+```
+
+### Review checklist for sibling endpoints
+
+When auditing a route file:
+
+1. **List every endpoint** that returns the same conceptual entity (by Zod schema name, by handler grouping, or by URL prefix).
+2. **For each pair**, identify the response shape — manually if no schema, via the Zod response schema if present.
+3. **Check shape parity** — do they have identical top-level keys? Identical nesting? If POST inserts a row, does it re-fetch + JOIN before returning, or does it return the bare insert?
+4. **Trace frontend consumption** — does the frontend pass both responses through the same parser (e.g. `serializeHolder`, `parseWidget`)? If yes, the parser is the contract — both endpoints must produce shape the parser accepts. If no, every endpoint is its own contract.
+5. **Red-flag indicators**:
+   - POST handler that returns `c.json({ ...insertedRow })` without a follow-up SELECT
+   - POST handler that returns `c.json({ id, ...input })` echoing input + the generated id only
+   - Sibling GET handler with a visible JOIN or serializer call that POST doesn't have
+
+### Why this matters more than it looks
+
+These bugs are invisible to TypeScript (the response type is often `unknown` after the network boundary), invisible to CI (the backend test asserts insert worked, the frontend test mocks the response), and invisible to a deployed smoke test (the 200 OK passes "the route exists" check). Only an operator clicking the actual UI catches them — same trap as phantom routes, different surface.
+
+If you ship a new POST handler, **ship its sibling-endpoint shape check in the same PR**. Don't trust "the GET already works, surely the POST returns the right thing."
+
+---
+
+## 10. Closing Thought
 
 Backend migrations are the highest-risk window for this bug class — and the easiest to audit. The script in §4 is 30 lines. It runs in seconds. It will tell you, deterministically, every place where the frontend has gotten ahead of the backend's actual surface.
 

@@ -1,7 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { resolve } from "node:path";
+import { homedir } from "node:os";
 import { MailboxStore } from "./store.js";
+import { MessageQueue } from "./message-queue.js";
 import { createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead } from "./beads.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
@@ -16,6 +19,21 @@ const mailboxDir = process.env.APERTURE_MAILBOX; // optional override
 
 const store = new MailboxStore(mailboxDir);
 store.ensureMailbox(AGENT_NAME);
+
+// aperture-ktwoy — durable fire-and-forget queue for agent-to-agent messages.
+// send_message enqueues + returns instantly; this background worker flushes to
+// BEADS (createMessage), retrying on failure and replaying persisted messages
+// on restart. Only send_message is queued (it is read-after-write-safe — the
+// recipient reads via the 5s poller); all task writes stay synchronous.
+const sendQueue = new MessageQueue({
+  queueFilePath: resolve(homedir(), ".aperture", "send-queue", `${AGENT_NAME}.jsonl`),
+  flush: async (m) => {
+    // createMessage throws on bd failure → the queue keeps the message and
+    // retries. It NEVER falls back to a divergent local store (split-brain).
+    await createMessage(m.from, m.to, m.content);
+  },
+});
+sendQueue.start();
 
 const server = new McpServer({
   name: "aperture-bus",
@@ -68,21 +86,18 @@ server.tool(
       };
     }
 
-    // All agent-to-agent messages go through BEADS
-    try {
-      const result = await createMessage(AGENT_NAME, target, message);
-      const parsed = JSON.parse(result);
-      const msgId = parsed.id ?? "unknown";
-      return {
-        content: [{ type: "text", text: `Message sent to ${target} via BEADS (${msgId}). The poller will deliver it.` }],
-      };
-    } catch (e: any) {
-      // Fallback to file-based delivery if BEADS fails
-      const filepath = store.sendMessage(AGENT_NAME, target, message);
-      return {
-        content: [{ type: "text", text: `Message sent to ${target} (file fallback). Delivered to: ${filepath}` }],
-      };
-    }
+    // All agent-to-agent messages go through BEADS, via the durable
+    // fire-and-forget queue (aperture-ktwoy). Enqueue + return INSTANTLY; the
+    // background worker flushes to BEADS (createMessage) with retry + restart
+    // replay. This is read-after-write-safe: the sender never re-reads a sent
+    // message and the recipient receives it via the 5s poller, so the small
+    // async flush delay is invisible. No file-fallback here — the queue's
+    // retry handles backend hiccups; falling back to a divergent store would
+    // be split-brain (Cipher/Peppy guardrail).
+    sendQueue.enqueue(AGENT_NAME, target, message);
+    return {
+      content: [{ type: "text", text: `Message queued for ${target}. The poller will deliver it.` }],
+    };
   }
 );
 
