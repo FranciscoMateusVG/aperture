@@ -549,7 +549,7 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
                 window_id,
                 tier,
                 attempt,
-            } => execute_rekick(&name, is_codex, window_id.as_deref(), tier, attempt),
+            } => execute_rekick(app_state, &name, is_codex, window_id.as_deref(), tier, attempt),
             RekickOrder::RingOperator { name } => ring_operator(app_state, &name),
         }
     }
@@ -575,6 +575,7 @@ enum RekickOrder {
 }
 
 fn execute_rekick(
+    app_state: &Arc<Mutex<AppState>>,
     name: &str,
     is_codex: bool,
     window_id: Option<&str>,
@@ -624,7 +625,21 @@ fn execute_rekick(
             // .kickoff file → the next tick sees a newer timestamp and resets
             // this agent's attempt counter to a clean slate.
             match crate::boot_agent_headless(name) {
-                Ok(win) => eprintln!("[watchdog] {name}: respawned, new window {win}"),
+                Ok(win) => {
+                    eprintln!("[watchdog] {name}: respawned, new window {win}");
+                    // aperture-3x136: write the fresh window id back into
+                    // AppState. boot_agent_headless runs stateless (CI-callable)
+                    // so it can't do this itself — and without the writeback
+                    // every subsequent respawn kills the long-dead OLD id
+                    // (no-op) and orphans another window (the 4-windows-per-
+                    // codex-agent incident, 2026-07-19).
+                    if let Ok(mut a) = app_state.lock() {
+                        if let Some(agent) = a.agents.get_mut(name) {
+                            agent.tmux_window_id = Some(win);
+                            agent.status = "running".into();
+                        }
+                    }
+                }
                 Err(e) => eprintln!("[watchdog] {name}: respawn failed: {e}"),
             }
         }

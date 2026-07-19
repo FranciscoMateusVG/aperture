@@ -53,6 +53,18 @@ interface Conn {
 const conns = new Map<WebSocket, Conn>();
 /** Presence map: agent name → its (single) live socket. */
 const agents = new Map<string, WebSocket>();
+/**
+ * Latest presence event per agent (aperture-3x136). The hub previously only
+ * BROADCAST presence and never stored it, so a subscriber connecting (or
+ * reconnecting) AFTER an agent's join/busy/idle had no way to learn the agent
+ * was present. This bit the watchdog subscriber: on any hub restart the codex
+ * bridges re-join, but if the watchdog reconnects a beat later it misses those
+ * joins — and since a codex bridge lives inside the hub, respawning the pane
+ * never re-emits its join, so the watchdog false-re-kicked idle codex agents
+ * forever. We now snapshot this map to every subscriber on hello. "leave"
+ * deletes; every other event sets.
+ */
+const presenceState = new Map<string, PresenceEvent>();
 
 /** Structured single-line JSON logging to stderr. */
 function log(event: string, fields: Record<string, unknown> = {}): void {
@@ -68,6 +80,9 @@ function send(ws: WebSocket, obj: unknown): void {
 }
 
 function broadcastPresence(agent: string, event: PresenceEvent): void {
+  // Remember current state so a later subscriber hello can be snapshotted.
+  if (event === "leave") presenceState.delete(agent);
+  else presenceState.set(agent, event);
   const msg = { type: "presence", agent, event, ts: new Date().toISOString() };
   for (const [ws, conn] of conns) {
     if (conn.role === "subscriber") send(ws, msg);
@@ -160,6 +175,15 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): b
   conn.agent = agent;
   log("hello", { role, agent });
 
+  if (role === "subscriber") {
+    // aperture-3x136: hand the newcomer the current presence of everyone so it
+    // isn't blind to agents that joined before it (re)connected — the fix for
+    // the watchdog false-re-kick loop on hub restart.
+    for (const [name, event] of presenceState) {
+      send(ws, { type: "presence", agent: name, event, ts: new Date().toISOString() });
+    }
+  }
+
   if (role === "agent" && agent) {
     // One socket per agent name — a new connection replaces the old one.
     // The replaced socket's close handler sees it is no longer the mapped
@@ -219,6 +243,18 @@ wss.on("listening", () => {
 
 wss.on("error", (err) => {
   log("server_error", { error: err.message });
+  // aperture-3x136: a fatal listen error (EADDRINUSE from a stale/orphan hub,
+  // EACCES, etc.) means this process will never serve. Previously we only
+  // logged and stayed alive — the Rust supervisor's try_wait then saw the
+  // child as "still running" and never respawned, so freeing the port by
+  // hand did NOT self-heal. Exit non-zero so the supervisor's respawn loop
+  // fires: once the squatter is gone (its own shutdown sweep, or the
+  // supervisor's residual-listener kill), the next spawn binds cleanly.
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "EADDRINUSE" || code === "EACCES" || code === "EADDRNOTAVAIL") {
+    log("server_error_fatal_exit", { code });
+    process.exit(1);
+  }
 });
 
 wss.on("connection", (ws) => {

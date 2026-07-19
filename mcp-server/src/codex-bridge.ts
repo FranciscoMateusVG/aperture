@@ -27,7 +27,7 @@
  *   APERTURE_AGENTS_DIR — manifest tree (default ~/.claude/aperture)
  *   APERTURE_RUN_DIR    — socket dir    (default ~/.aperture/run)
  */
-import { closeSync, constants, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import WebSocket from "ws";
@@ -244,16 +244,14 @@ export class CodexBridgeClient {
     const result = (await this.request("thread/start", params)) as Record<string, unknown> | null;
     const direct = result?.threadId ?? result?.id;
     if (typeof direct === "string") {
-      this.bindToThread(direct, "thread_start");
-      this.publishThreadReady(direct);
+      this.bindToThread(direct, "thread_start"); // publishes thread-ready (3x136)
       return direct;
     }
     const wrapped = result?.thread;
     if (wrapped && typeof wrapped === "object") {
       const id = (wrapped as Record<string, unknown>).id;
       if (typeof id === "string") {
-        this.bindToThread(id, "thread_start");
-        this.publishThreadReady(id);
+        this.bindToThread(id, "thread_start"); // publishes thread-ready (3x136)
         return id;
       }
     }
@@ -399,6 +397,60 @@ export class CodexBridgeClient {
       this.hooks.broadcastPresence(this.agent, "join");
     }
     if (changed) this.hooks.log("codex_bound", { agent: this.agent, threadId, source });
+    // aperture-3x136: publish the pane handoff file on EVERY bind, not only on
+    // thread_start. When the hub restarts while app-servers survive, the
+    // bridge rebinds via thread_list — previously that path never wrote the
+    // file, so pane launch scripts timed out and exec'd `codex resume ""`.
+    if (changed || !existsSync(this.threadReadyPath())) this.publishThreadReady(threadId);
+    this.ensureThreadReadyLoop();
+    // aperture-3x136 (dots): the presence-dot state machine (watchdog::compute_dot)
+    // needs a <agent>.kickoff timestamp to ever paint anything but grey/"spawned"
+    // — green requires kickoff_millis AND stable presence. The Tauri launcher
+    // writes .kickoff only for Claude agents (agents.rs); the earlier claim that
+    // "Codex records its own at bridge-inject time" was never implemented, so
+    // codex dots were permanently grey despite live join/busy/idle presence.
+    // Bind is codex's "I'm live" moment — stamp it here, mirroring the Claude
+    // launcher's write-at-launch.
+    this.publishKickoffStamp();
+  }
+
+  /**
+   * aperture-3x136 (dots): write ~/.aperture/run/<agent>.kickoff = unix-epoch
+   * millis (ASCII) so the presence-dot state machine can leave the grey
+   * "spawned" state. Idempotent per bind; a fresh stamp on reconnect is fine —
+   * stable online presence wins over the booting/stuck deadline regardless.
+   */
+  private publishKickoffStamp(): void {
+    try {
+      writeFileSync(this.kickoffPath(), `${Date.now()}`, { encoding: "utf8" });
+    } catch (e: unknown) {
+      this.hooks.log("codex_kickoff_stamp_error", {
+        agent: this.agent,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private kickoffPath(): string {
+    return join(RUN_DIR, `${this.agent}.kickoff`);
+  }
+
+  /**
+   * aperture-3x136: the launcher removes <agent>.thread-id before every pane
+   * (re)spawn and its wait gate expects the bridge to rewrite it. If the
+   * bridge is ALREADY bound when that happens (surviving app-server, watchdog
+   * re-kick), no bind event fires — so keep a small unref'd loop that
+   * republishes whenever the file is missing while a thread is bound.
+   */
+  private threadReadyTimer: NodeJS.Timeout | null = null;
+  private ensureThreadReadyLoop(): void {
+    if (this.threadReadyTimer) return;
+    this.threadReadyTimer = setInterval(() => {
+      if (this.threadId && !existsSync(this.threadReadyPath())) {
+        this.publishThreadReady(this.threadId);
+      }
+    }, 5000);
+    this.threadReadyTimer.unref?.();
   }
 
   /**

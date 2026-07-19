@@ -124,6 +124,10 @@ for _ in $(seq 1 40); do [ -S "{sock_path}" ] && break; sleep 0.25; done
 THREAD_ID_FILE="{thread_id_file}"
 for _ in $(seq 1 240); do [ -f "$THREAD_ID_FILE" ] && [ ! -L "$THREAD_ID_FILE" ] && [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
 THREAD_ID=$(cat "$THREAD_ID_FILE" 2>/dev/null)
+# aperture-3x136 + aperture-278a4: never exec `codex resume ""` — a missing or
+# malformed thread id means the codex-bridge (inside ws-hub.js) never published
+# a valid handoff. Reject empty AND any non-[A-Za-z0-9-] content, failing loud
+# in the pane instead of dying on a cryptic resume error or a poisoned id.
 case "$THREAD_ID" in
   ''|*[!A-Za-z0-9-]*) echo "invalid thread handoff" >&2; exit 1 ;;
 esac
@@ -361,12 +365,28 @@ for _ in $(seq 1 40); do [ -S "/Users/x/.aperture/run/vex.sock" ] && break; slee
 THREAD_ID_FILE="/Users/x/.aperture/run/vex.thread-id"
 for _ in $(seq 1 240); do [ -f "$THREAD_ID_FILE" ] && [ ! -L "$THREAD_ID_FILE" ] && [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
 THREAD_ID=$(cat "$THREAD_ID_FILE" 2>/dev/null)
+# aperture-3x136 + aperture-278a4: never exec `codex resume ""` — a missing or
+# malformed thread id means the codex-bridge (inside ws-hub.js) never published
+# a valid handoff. Reject empty AND any non-[A-Za-z0-9-] content, failing loud
+# in the pane instead of dying on a cryptic resume error or a poisoned id.
 case "$THREAD_ID" in
   ''|*[!A-Za-z0-9-]*) echo "invalid thread handoff" >&2; exit 1 ;;
 esac
 exec codex resume "$THREAD_ID" --remote "unix:///Users/x/.aperture/run/vex.sock"
 "#
         );
+    }
+
+    /// aperture-3x136 + aperture-278a4: the pane must fail loud on an empty OR
+    /// malformed thread id, never exec `codex resume ""` or a poisoned id.
+    #[test]
+    fn codex_launcher_guards_empty_thread_id() {
+        let s = build_codex_launcher("codex", None, "/tmp/ch", "/run/a.sock");
+        assert!(s.contains(r#"''|*[!A-Za-z0-9-]*) echo "invalid thread handoff" >&2; exit 1 ;;"#));
+        // The guard must sit BEFORE the exec line.
+        let guard = s.find("invalid thread handoff").unwrap();
+        let exec = s.find("exec codex resume").unwrap();
+        assert!(guard < exec);
     }
 
     #[test]
