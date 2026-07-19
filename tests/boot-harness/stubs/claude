@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# stubs/claude — fake `claude` CLI for L2 boot verification (aperture-xt16e).
+#
+# Stands in for the real claude binary when the launcher script runs
+#   exec claude --dangerously-skip-permissions --model M --system-prompt "$P" \
+#        --mcp-config C --name N
+# (see src-tauri/src/agents.rs). Injected via APERTURE_CLAUDE_BIN /
+# APERTURE_LAUNCHER_PATH_PREFIX (env knobs being added by a parallel worker —
+# point either at this file / this directory).
+#
+# What it does:
+#   1. Records full argv (one per line) + selected env to
+#      $APERTURE_STUB_LOG_DIR/claude-argv.txt (default /tmp/aperture-boot-harness)
+#      — this is the L2 "prompt byte-integrity / argv diff" evidence.
+#   2. Resolves its agent name (env APERTURE_STUB_AGENT_NAME, else the
+#      launcher's own --name flag).
+#   3. Execs stub-hello.mjs, which connects to the WS hub, sends the agent
+#      hello, and stays connected until SIGTERM — simulating a booted agent
+#      with a live Monitor.
+set -euo pipefail
+
+LOG_DIR="${APERTURE_STUB_LOG_DIR:-/tmp/aperture-boot-harness}"
+mkdir -p "$LOG_DIR"
+
+{
+    printf '%s\n' "$@"
+    # Env lines are '#'-prefixed so argv-diff tooling can filter them out.
+    echo "# env PATH=$PATH"
+    echo "# env PWD=$PWD"
+} > "$LOG_DIR/claude-argv.txt"
+
+# Agent name: env wins, else parse the --name flag the claude launcher passes.
+AGENT_NAME="${APERTURE_STUB_AGENT_NAME:-}"
+if [ -z "$AGENT_NAME" ]; then
+    prev=""
+    for arg in "$@"; do
+        if [ "$prev" = "--name" ]; then
+            AGENT_NAME="$arg"
+            break
+        fi
+        prev="$arg"
+    done
+fi
+if [ -z "$AGENT_NAME" ]; then
+    echo "stubs/claude: no APERTURE_STUB_AGENT_NAME and no --name flag in argv" >&2
+    exit 2
+fi
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$HERE/stub-hello.mjs" --agent "$AGENT_NAME"

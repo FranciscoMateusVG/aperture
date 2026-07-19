@@ -237,3 +237,28 @@ status:
     echo ""
     echo "========================="
     echo "Run 'just status' before each session to catch issues early."
+
+# ============== Boot verification harness (aperture-xt16e) ==============
+
+# L2/L3 boot smoke: hub + observer + agent spawn. mode=l2 (stub CLIs, default) or l3 (real).
+# NOTE: exits 3 (BLOCKED) until the headless boot entry point lands (aperture-syepg),
+# unless APERTURE_BOOT_CMD is set — see tests/boot-harness/README.md.
+smoke-boot mode="l2":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "🔍 Boot verification smoke (MODE={{mode}})"
+    MODE={{mode}} tests/boot-harness/smoke-boot.sh
+
+# Hub protocol unit tests (test file owned by mcp-server test worker)
+test-hub:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f mcp-server/test/hub-protocol.test.mjs ]; then
+        echo "⚠️  mcp-server/test/hub-protocol.test.mjs not present yet (in flight on another branch)"
+        exit 1
+    fi
+    cd mcp-server && node --test test/hub-protocol.test.mjs
+
+# L1: Rust unit tests (launcher/config generation)
+test-rust:
+    cd src-tauri && cargo test
