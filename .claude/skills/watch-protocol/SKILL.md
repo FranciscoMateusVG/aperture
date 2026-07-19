@@ -42,6 +42,8 @@ A tick is incomplete without all three. Reading only one of them is what produce
 | **2** | **Bead state** | `bd list --status=in_progress -l project:<x>` and `bd list --status=open ...` | What's claimed, by whom, and whether anything moved since last tick |
 | **3** | **PR state** | `gh pr list --state=open --json state,mergeStateStatus,statusCheckRollup` | CI health per PR, mergeable vs blocked, what's queued |
 
+For deeper pane-state diagnosis when the tick signal alone doesn't resolve stuck-vs-working-vs-waiting, see **`agent-liveness §1-§4`** — it covers the four signals, classification table, and direct intervention via `tmux send-keys`.
+
 **Why pane-first:** PR-state and bead-state lag the real swarm activity by minutes-to-hours. A specialist actively thinking for 12 min on integration tests shows ZERO signal in PR/bead state — but the pane shows `Hullaballooing… (12m 42s)`. Conversely, an agent stalled on a typed-but-unsent `cat` command shows NO signal anywhere except in the pane buffer. **The pane is ground truth.**
 
 **"tick: nothing to report" is valid ONLY when all three signals are read AND every active agent's pane shows either:**
