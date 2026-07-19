@@ -35,6 +35,43 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         )
     }; // ← mutex released here; all I/O below is lock-free
 
+    let window_id = boot_agent_process(
+        &agent,
+        tmux_session,
+        mcp_server_path,
+        mcp_sentry_server_path,
+        project_dir,
+    )?;
+
+    // Re-acquire lock only to write the final status
+    {
+        let mut app_state = state.lock().map_err(|e| e.to_string())?;
+        let agent_mut = app_state.agents.get_mut(&name).unwrap();
+        agent_mut.tmux_window_id = Some(window_id);
+        agent_mut.status = "running".into();
+    }
+
+    Ok(())
+}
+
+/// GUI-free spawn core (aperture-syepg). Creates the tmux window, writes the
+/// per-agent MCP config + launcher script, fires the launcher (baking the
+/// static Claude kickoff / the Codex resume-gate), and returns the tmux window
+/// id. Shared by the Tauri `start_agent` command and the headless
+/// `aperture-boot` bin (aperture-xt16e L3 harness / watchdog aperture-wul6m).
+/// Plain data in — no AppState / mutex — which is what makes it callable
+/// headlessly. The env knobs (APERTURE_CLAUDE_BIN / APERTURE_CODEX_BIN /
+/// APERTURE_LAUNCHER_PATH_PREFIX) are read here so the headless path honors
+/// them identically to the GUI path.
+pub fn boot_agent_process(
+    agent: &AgentDef,
+    tmux_session: String,
+    mcp_server_path: String,
+    mcp_sentry_server_path: String,
+    project_dir: String,
+) -> Result<String, String> {
+    let name = agent.name.clone();
+
     // Create a dedicated tmux window for this agent
     let window_id = tmux::tmux_create_window(tmux_session, name.clone())?;
 
@@ -155,6 +192,13 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         // BEFORE the pane launches, so `codex --remote` has a live socket to
         // attach to. The app-server carries CODEX_HOME (model + MCP wiring
         // live in config.toml above); the pane is just the interactive TUI.
+        // aperture-syepg: clear any stale exact-id handoff file from a previous
+        // session before (re)spawning, so the launcher's thread-id wait gate
+        // can't read a dead UUID. The codex-bridge (Rex, PR #34) re-writes it
+        // (mode 0600) after it binds the fresh kickoff thread. Path mirrors the
+        // socket: <run>/<name>.thread-id.
+        let _ = fs::remove_file(format!("{}/.aperture/run/{}.thread-id", home_dir, name));
+
         let sock_path = codex_appserver::spawn_app_server(&name, &codex_home)?;
 
         launcher::build_codex_launcher(
@@ -198,6 +242,22 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
 
     tmux::tmux_send_keys(window_id.clone(), launcher_path)?;
 
+    // aperture-syepg: record the kickoff-fired timestamp for Claude — the
+    // kickoff positional is baked into the launcher we just fired, so this
+    // instant is turn-1 fire. Feeds the presence dots (aperture-8gypy) + the
+    // watchdog re-kick (aperture-wul6m). Codex records its own at bridge-inject
+    // time (PR #34). Shared file: ~/.aperture/run/<name>.kickoff = unix-epoch
+    // millis (ASCII).
+    if !agent.model.starts_with("codex/") {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let run_dir = format!("{}/.aperture/run", home_dir);
+        let _ = fs::create_dir_all(&run_dir);
+        let _ = fs::write(format!("{}/{}.kickoff", run_dir, name), millis.to_string());
+    }
+
     // Comms Layer v2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
     // outbound Codex comms flow through the aperture-bus MCP server (wired
     // into config.toml above); inbound delivery is injected by the bus
@@ -231,15 +291,7 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         }
     });
 
-    // Re-acquire lock only to write the final status
-    {
-        let mut app_state = state.lock().map_err(|e| e.to_string())?;
-        let agent_mut = app_state.agents.get_mut(&name).unwrap();
-        agent_mut.tmux_window_id = Some(window_id);
-        agent_mut.status = "running".into();
-    }
-
-    Ok(())
+    Ok(window_id)
 }
 
 #[tauri::command]
