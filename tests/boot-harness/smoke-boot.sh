@@ -118,7 +118,19 @@ if [ -n "$FLEET" ]; then
   "enabled": true
 }
 EOF
-        echo "You are fleet-$i, a boot-verification stub agent (aperture-xt16e). Do nothing." > "$d/prompt.md"
+        cat > "$d/prompt.md" <<PROMPT
+You are fleet-$i, a boot-verification agent (aperture-xt16e L3).
+
+Your ONLY job, immediately on session start, before any other response:
+
+1. Start a persistent background Monitor with exactly this command:
+   "\${APERTURE_REAL_NODE:-node}" mcp-server/dist/hub-client.js fleet-$i
+   (APERTURE_HUB_URL and APERTURE_REAL_NODE are already set in your
+   environment; the command is relative to your working directory.)
+2. Then do nothing else. Wait silently for events.
+
+In MODE=l2 this prompt is never read by a model (the stub CLI ignores it).
+PROMPT
         AGENTS+=("fleet-$i")
     done
     REGISTRY="$OVERLAY"
@@ -141,6 +153,10 @@ tmux new-session -d -s "$SMOKE_SESSION" -x 220 -y 50
 tmux set-environment -t "$SMOKE_SESSION" APERTURE_STUB_LOG_DIR "$APERTURE_STUB_LOG_DIR"
 tmux set-environment -t "$SMOKE_SESSION" APERTURE_WS_PORT "$PORT"
 tmux set-environment -t "$SMOKE_SESSION" APERTURE_REAL_NODE "$REAL_NODE"
+# l3: the REAL claude agent's boot routine (registry prompt) runs hub-client.js,
+# which reads APERTURE_HUB_URL — point it at THIS run's test hub so a real
+# model's hello lands on the observer's hub, not the production 4517.
+tmux set-environment -t "$SMOKE_SESSION" APERTURE_HUB_URL "ws://127.0.0.1:$PORT"
 
 HUB_PID=""
 OBS_PID=""
@@ -160,10 +176,16 @@ cleanup() {
         kill "$p" 2>/dev/null || true
     done
     tmux kill-session -t "$SMOKE_SESSION" 2>/dev/null || true
-    # The codex stub is also spawned as the supervised app-server child of
-    # aperture-boot (codex_appserver.rs honors APERTURE_CODEX_BIN); when the
-    # bin exits its supervisor thread dies and the child is orphaned — reap it.
-    pkill -f "$HERE/stubs/codex app-server" 2>/dev/null || true
+    # aperture-boot's exit orphans the supervised codex app-server child
+    # (codex_appserver.rs supervisor thread dies with the process — see the
+    # non-blocking FINDING in the bead). Reap it per smoke agent BY SOCK PATH,
+    # which covers BOTH the l2 stub and the l3 REAL codex app-server (verified
+    # leaked in the first l3 acceptance run) without ever matching any
+    # production agent's app-server.
+    for a in "${AGENTS[@]}"; do
+        pkill -f "app-server --listen unix://$HOME/.aperture/run/$a.sock" 2>/dev/null || true
+        rm -f "$HOME/.aperture/run/$a.sock"
+    done
     # Smoke agents' droppings under the REAL run dir (product convention:
     # ~/.aperture/run/<name>.{thread-id,kickoff}).
     rm -f "$HOME/.aperture/run/codex-smoke.thread-id" \
