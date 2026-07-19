@@ -6,3 +6,4 @@ dokploy-api
 worktree-discipline
 specialist-delegation
 pocketsoftware-infra
+spec-deviation-discipline
