@@ -6,6 +6,7 @@ mod config;
 mod poller;
 mod state;
 mod tmux;
+mod ws_hub;
 
 use std::sync::{Arc, Mutex};
 
@@ -76,6 +77,13 @@ pub fn run() {
         poller::run_message_poller(poller_state);
     });
 
+    // Start the aperture-bus WS hub daemon (Comms Layer v2, Phase 1 —
+    // docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md). Claude
+    // message delivery now flows through this hub instead of the poller's
+    // tmux injection. Skips with a warning if ws-hub.js isn't built yet.
+    let project_dir = app_state.lock().unwrap().project_dir.clone();
+    ws_hub::spawn_ws_hub(project_dir);
+
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
@@ -92,6 +100,13 @@ pub fn run() {
             // Build metadata for the launcher footer (semver + git SHA + build date)
             get_version,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // Kill the WS hub child on app exit so it doesn't outlive the
+            // launcher and hold port 4517 across restarts.
+            if let tauri::RunEvent::Exit = event {
+                ws_hub::shutdown();
+            }
+        });
 }

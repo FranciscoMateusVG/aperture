@@ -102,15 +102,10 @@ fn query_unread_messages(recipient: &str) -> Vec<BeadsMessage> {
     }
 }
 
-/// Mark a BEADS message as read (close it).
-fn mark_message_read(message_id: &str) {
-    let _ = std::process::Command::new(bd_path())
-        .args(["close", message_id, "--reason", "delivered", "-q"])
-        .env("BEADS_DIR", beads_dir())
-        .env("BD_ACTOR", "poller")
-        .env("PATH", path_env())
-        .output();
-}
+// NOTE(Comms v2 Phase 1): mark_message_read() was deleted. The poller must
+// never mark messages read — read state is owned by the recipient's explicit
+// mark_as_read (spec Q4), and the WS hub relies on rows staying open to
+// replay them.
 
 /// Parse sender from BEADS message title: [sender->recipient] preview...
 fn parse_sender_from_title(title: &str) -> String {
@@ -203,35 +198,48 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
         };
 
         for (agent_name, window_id, is_codex) in &agents {
-            // Query BEADS for unread messages addressed to this agent
-            let messages = query_unread_messages(agent_name);
+            // ── Comms Layer v2, Phase 1 ──
+            // (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md)
+            //
+            // Claude agents no longer get poller delivery. The old path wrote
+            // /tmp/aperture-msg-<id>.md and tmux-injected `cat` into the pane,
+            // then marked the message read on the delivery *attempt*. That is
+            // replaced by the WS hub (mcp-server/dist/ws-hub.js), which pushes
+            // unread BEADS rows to the agent's Monitor socket and replays them
+            // on reconnect. We deliberately skip Claude agents here, leaving
+            // their messages open (unread) in BEADS for the hub.
+            //
+            // Codex agents keep the pending-buffer path below until Phase 2
+            // (app-server injection).
+            if *is_codex {
+                // Query BEADS for unread messages addressed to this agent
+                let messages = query_unread_messages(agent_name);
 
-            for msg in &messages {
-                // Skip if we already tried delivering this message this cycle
-                if notified.contains(&msg.id) {
-                    continue;
-                }
+                for msg in &messages {
+                    // Skip if we already tried delivering this message this cycle
+                    if notified.contains(&msg.id) {
+                        continue;
+                    }
 
-                let sender = parse_sender_from_title(&msg.title);
-                let content = msg.description.as_deref().unwrap_or("(no content)");
-                let timestamp = &msg.id; // use message ID as reference
+                    let sender = parse_sender_from_title(&msg.title);
+                    let content = msg.description.as_deref().unwrap_or("(no content)");
+                    let timestamp = &msg.id; // use message ID as reference
 
-                // Format as markdown (same format agents expect)
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let formatted = format!(
-                    "# Message from {}\n_{}_\n\n{}\n",
-                    sender,
-                    now,
-                    content
-                );
+                    // Format as markdown (same format agents expect)
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let formatted = format!(
+                        "# Message from {}\n_{}_\n\n{}\n",
+                        sender,
+                        now,
+                        content
+                    );
 
-                // Log the message
-                log_message(&message_log, &sender, agent_name, &formatted, timestamp);
+                    // Log the message
+                    log_message(&message_log, &sender, agent_name, &formatted, timestamp);
 
-                if *is_codex {
                     // Codex agents: MCP tools are confirmed working (Failure Mode A).
                     // The agent calls get_messages() itself to read unread messages.
                     // Do NOT mark as read here — let the MCP call handle read state
@@ -241,18 +249,9 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
                     // (for the monitor thread's flush prompt), but the primary channel
                     // is the agent's own MCP get_messages call.
                     codex_harness::buffer_pending_message(agent_name, &formatted);
-                    // Do NOT call mark_message_read — intentionally omitted for Codex.
-                } else {
-                    // Claude agents: write to temp file and inject via tmux
-                    let tmp_path = format!("/tmp/aperture-msg-{}.md", msg.id);
-                    if fs::write(&tmp_path, &formatted).is_ok() {
-                        let cmd = format!("cat '{}' && rm '{}'", tmp_path, tmp_path);
-                        let _ = tmux::tmux_send_keys(window_id.clone(), cmd);
-                    }
-                    // Mark as read immediately after tmux delivery
-                    mark_message_read(&msg.id);
+
+                    notified.insert(msg.id.clone());
                 }
-                notified.insert(msg.id.clone());
             }
 
             // Also handle any legacy file-based messages still in mailbox

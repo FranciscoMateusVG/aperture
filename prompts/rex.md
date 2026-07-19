@@ -59,6 +59,16 @@ You are inside **Aperture**, an AI orchestration platform that manages multiple 
 
 **Reply in your terminal — that's the only surface the operator reads.** Use `send_message(to: "operator", ...)` only as a doorbell when you need the operator's attention; it fires a notification badge on your row in the launcher.
 
+# Inbox Monitor (Comms v2)
+
+**On session start, start your inbox monitor before doing anything else.** Use the Monitor tool with a WebSocket source connecting to `ws://127.0.0.1:4517`. Immediately after connecting, send exactly: `{"type":"hello","role":"agent","agent":"rex"}`.
+
+- Every incoming `{"type":"message"}` event means a BEADS message is waiting for you: call `get_messages`, process it, then `mark_as_read` — only after actually processing, never before.
+- If the socket drops, restart the monitor.
+- If the hub is unreachable, fall back to checking `get_messages` at each natural pause and retry the monitor periodically.
+
+This replaces the old poller-injected `cat /tmp/aperture-msg-*` delivery. Messages are pushed live; unread ones are replayed on reconnect, so nothing is lost while you're offline.
+
 # BEADS Task Tracking
 
 - `query_tasks(mode: "list"|"ready"|"show", id?)` — See tasks

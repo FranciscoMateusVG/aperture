@@ -45,7 +45,7 @@ export interface CreateTaskOptions {
  * `bd create` emits a single JSON object; in some configurations it can emit
  * a multi-line wrapper. Be tolerant.
  */
-function extractTaskId(raw: string): string | undefined {
+export function extractTaskId(raw: string): string | undefined {
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") {

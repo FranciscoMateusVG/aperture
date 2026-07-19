@@ -5,7 +5,8 @@ import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { MailboxStore } from "./store.js";
 import { MessageQueue } from "./message-queue.js";
-import { createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead } from "./beads.js";
+import { createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead, extractTaskId } from "./beads.js";
+import { notifyHub } from "./hub-notify.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
 if (!AGENT_NAME) {
@@ -30,7 +31,14 @@ const sendQueue = new MessageQueue({
   flush: async (m) => {
     // createMessage throws on bd failure → the queue keeps the message and
     // retries. It NEVER falls back to a divergent local store (split-brain).
-    await createMessage(m.from, m.to, m.content);
+    const result = await createMessage(m.from, m.to, m.content);
+    // Comms-layer v2 (Phase 1): best-effort push to the WS hub so a connected
+    // recipient gets the message immediately instead of waiting for the
+    // poller. notifyHub never throws and resolves within 1500ms; hub-down or
+    // recipient-offline is silent (log only) — unread replay covers it.
+    const id = extractTaskId(result) ?? "";
+    const preview = m.content.slice(0, 60).replace(/\n/g, " ");
+    await notifyHub({ to: m.to, id, from: m.from, preview });
   },
 });
 sendQueue.start();
