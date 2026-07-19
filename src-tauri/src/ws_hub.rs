@@ -102,7 +102,28 @@ pub fn spawn_ws_hub(project_dir: String) {
             break;
         }
 
-        match Command::new(&node_bin).arg(&hub_path).spawn() {
+        // aperture-mler9: capture the hub's structured stderr/stdout to a log
+        // file. A GUI-launched app inherits /dev/null stdio, which silently
+        // discarded every hub diagnostic (notify_forwarded / notify_offline /
+        // bad_hello / replay …) — the 2026-07-19 comms investigation had to
+        // reconstruct hub behaviour from probes because the logs were gone.
+        let mut cmd = Command::new(&node_bin);
+        cmd.arg(&hub_path);
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let log_dir = format!("{}/.aperture/logs", home);
+        let _ = std::fs::create_dir_all(&log_dir);
+        if let Ok(log_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/ws-hub.log", log_dir))
+        {
+            if let Ok(clone) = log_file.try_clone() {
+                cmd.stdout(clone);
+            }
+            cmd.stderr(log_file);
+        } // else: fall back to inherited stdio — never block the spawn on logging.
+
+        match cmd.spawn() {
             Ok(child) => {
                 let pid = child.id();
                 println!("[aperture] ws-hub started (pid {})", pid);

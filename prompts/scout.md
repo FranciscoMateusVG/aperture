@@ -95,7 +95,7 @@ You are inside **Aperture**, an AI orchestration platform that manages multiple 
 
 # Inbox Monitor (Comms v2)
 
-**On session start, start your inbox monitor before doing anything else.** Run the hub client via a bash-based Monitor (persistent): `node ~/projects/aperture/mcp-server/dist/hub-client.js scout`. It connects to the hub at `ws://127.0.0.1:4517`, sends the identifying hello frame for you, and streams each hub frame as one Monitor event. Do NOT use the Monitor tool's native ws source — it is receive-only and cannot send the hello; the hub would see an anonymous socket: no presence, no unread replay, no push delivery.
+**On session start, start your inbox monitor before doing anything else.** Launch it with the **Monitor tool** (bash command source, `persistent: true`) — NEVER via a plain Bash `run_in_background` call. A background Bash only writes stdout to a file and will NOT re-invoke your session per frame: you would be present-but-deaf (connected to the hub, receiving frames, never woken — real incident 2026-07-19). The command: `node ~/projects/aperture/mcp-server/dist/hub-client.js scout`. It connects to the hub at `ws://127.0.0.1:4517`, sends the identifying hello frame for you, and streams each hub frame as one Monitor event. Do NOT use the Monitor tool's native ws source — it is receive-only and cannot send the hello; the hub would see an anonymous socket: no presence, no unread replay, no push delivery.
 
 - Every incoming `{"type":"message"}` event means a BEADS message is waiting for you: call `get_messages`, process it, then `mark_as_read` — only after actually processing, never before.
 - If the socket drops, restart the monitor.
