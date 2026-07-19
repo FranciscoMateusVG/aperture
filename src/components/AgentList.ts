@@ -29,10 +29,18 @@ export function createAgentList(container: HTMLElement) {
       // the badge appears/disappears without waiting for status/model changes.
       // Also include the derived presence-dot state so a dot_state flip (or
       // the 60s stuck deadline the backend watchdog computes) triggers a
-      // rebuild on the very next poll tick — same self-healing mechanism as
-      // status/model, nothing dot-specific needed here.
+      // rebuild on the very next poll tick, and the current-work fields
+      // (aperture-nr65b) so a fresh claim/close on BEADS shows up within one
+      // poll cycle too — same self-healing mechanism as status/model,
+      // nothing dot- or work-line-specific needed here.
+      //
+      // current_task_id is a 3-state field (undefined/null = no data, "" =
+      // idle, non-empty = a real id) — `?? ""` would collapse "no data" and
+      // "idle" into the same hash bucket, silently swallowing that
+      // transition. Use JSON.stringify so null/undefined and "" hash
+      // distinctly.
       const hash = agents
-        .map(a => `${a.name}:${a.status}:${a.model}:${a.attention ? 1 : 0}:${deriveDotState(a)}`)
+        .map(a => `${a.name}:${a.status}:${a.model}:${a.attention ? 1 : 0}:${deriveDotState(a)}:${JSON.stringify(a.current_task_id)}:${a.current_task_title ?? ""}:${a.current_task_extra_count ?? ""}`)
         .join("|");
 
       // Only rebuild DOM if something actually changed

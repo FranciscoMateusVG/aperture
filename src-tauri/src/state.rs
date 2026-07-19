@@ -15,6 +15,39 @@ pub struct AgentDef {
     /// message body lives in their tmux scrollback.
     #[serde(default)]
     pub attention: bool,
+    /// Current-work summary line (aperture-nr65b). Resolved from BEADS on
+    /// each `list_agents` poll — the top `in_progress` bead assigned to this
+    /// agent, most-recently-claimed first. Three distinct states, all
+    /// load-bearing for the frontend (see docs/presence-dots-spec.md):
+    ///
+    /// - `None` — no data available: agent is stopped, or the `bd` query
+    ///   itself failed this cycle. Frontend renders nothing extra, exactly
+    ///   as it did before this feature shipped.
+    /// - `Some("")` (empty string sentinel) — query succeeded, agent has no
+    ///   in_progress bead claimed. Frontend renders "idle."
+    /// - `Some(id)` (non-empty) — the claimed bead's id; current_task_title
+    ///   carries its title, current_task_extra_count the count of other
+    ///   in_progress beads beyond this one.
+    ///
+    /// See agents.rs::resolve_current_tasks for how the distinction is made.
+    #[serde(default)]
+    pub current_task_id: Option<String>,
+    #[serde(default)]
+    pub current_task_title: Option<String>,
+    /// Count of OTHER in_progress beads beyond the one shown (0 = just this
+    /// one). `None` alongside `current_task_id: None` means "no data,"
+    /// never "definitely zero."
+    #[serde(default)]
+    pub current_task_extra_count: Option<u32>,
+    /// Presence-dot state (aperture-8gypy / aperture-wul6m). Backend-computed
+    /// by the wul6m watchdog actor once it ships; absent today (safe no-op —
+    /// frontend derives spawned/booting locally from kickoff_fired_at).
+    #[serde(default)]
+    pub dot_state: Option<String>,
+    #[serde(default)]
+    pub dot_state_since: Option<String>,
+    #[serde(default)]
+    pub kickoff_fired_at: Option<String>,
 }
 
 pub struct AppState {

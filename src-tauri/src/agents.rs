@@ -3,10 +3,101 @@ use crate::config;
 use crate::launcher;
 use crate::state::AppState;
 use crate::tmux;
+use std::collections::HashMap;
 use std::fs;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use crate::state::AgentDef;
+
+/// One assignee's resolved current-work summary (aperture-nr65b).
+struct CurrentTask {
+    id: String,
+    title: String,
+    extra_count: u32,
+}
+
+/// Resolve every agent's current-work summary from BEADS in a single `bd`
+/// invocation — one process spawn per `list_agents` poll (every 3s), not one
+/// per agent. Groups all `in_progress` beads by assignee, sorts each group by
+/// `started_at` descending (ISO 8601 strings sort correctly as plain text),
+/// and keeps the top one + a count of the rest.
+///
+/// Returns `None` if the query itself failed (bd not on PATH, bad JSON,
+/// non-zero exit) — list_agents must never fail just because the
+/// work-summary line couldn't be resolved this cycle, but it DOES need to
+/// tell "query failed, no data" apart from "query succeeded, this assignee
+/// simply has nothing in_progress" (the latter is a real, common state —
+/// e.g. no one has anything claimed right now — and must render as "idle,"
+/// not as "no data available," which is a materially different frontend
+/// outcome). `Some(map)` with an assignee absent from the map means idle;
+/// `None` means suppress the summary line entirely, same as before this
+/// feature shipped.
+fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
+    let output = Command::new("bd")
+        .args(["list", "--status=in_progress", "--json", "--no-pager", "--limit", "0"])
+        .env(
+            "PATH",
+            format!(
+                "/opt/homebrew/bin:/usr/local/bin:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            eprintln!(
+                "[aperture] warn: `bd list --status=in_progress` exited non-zero ({}): {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[aperture] warn: failed to spawn `bd` for current-task resolution: {}", e);
+            return None;
+        }
+    };
+
+    let issues: Vec<serde_json::Value> = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[aperture] warn: failed to parse `bd list --json` output: {}", e);
+            return None;
+        }
+    };
+
+    // Group by assignee, tracking (started_at, id, title) so we can sort
+    // each group without a second pass.
+    let mut by_assignee: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for issue in &issues {
+        let assignee = issue.get("assignee").and_then(|v| v.as_str());
+        let id = issue.get("id").and_then(|v| v.as_str());
+        let title = issue.get("title").and_then(|v| v.as_str());
+        let started_at = issue.get("started_at").and_then(|v| v.as_str()).unwrap_or("");
+        if let (Some(assignee), Some(id), Some(title)) = (assignee, id, title) {
+            by_assignee
+                .entry(assignee.to_string())
+                .or_default()
+                .push((started_at.to_string(), id.to_string(), title.to_string()));
+        }
+    }
+
+    Some(
+        by_assignee
+            .into_iter()
+            .map(|(assignee, mut tasks)| {
+                // Most-recently-claimed first.
+                tasks.sort_by(|a, b| b.0.cmp(&a.0));
+                let extra_count = (tasks.len() - 1) as u32;
+                let (_, id, title) = tasks.into_iter().next().expect("group is never empty");
+                (assignee, CurrentTask { id, title, extra_count })
+            })
+            .collect(),
+    )
+}
 
 #[tauri::command]
 pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
@@ -305,6 +396,48 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
                 agent.status = "stopped".into();
                 agent.tmux_window_id = None;
             }
+        }
+    }
+
+    // Current-work summary line (aperture-nr65b). One `bd` spawn per poll
+    // cycle, not one per agent — see resolve_current_tasks. Only meaningful
+    // for a running agent; a stopped agent's fields are cleared rather than
+    // left showing stale work from before it stopped.
+    //
+    // resolve_current_tasks distinguishes "query failed" (None — suppress
+    // the summary line entirely, same as before this feature shipped) from
+    // "query succeeded, this assignee just has nothing in_progress" (a real,
+    // common state that must render as "idle," not as missing data). The
+    // sentinel for idle is current_task_id = Some("") with no title — see
+    // the doc comment on AgentDef::current_task_id in state.rs.
+    let current_tasks = resolve_current_tasks();
+    for agent in app_state.agents.values_mut() {
+        if agent.status != "running" {
+            agent.current_task_id = None;
+            agent.current_task_title = None;
+            agent.current_task_extra_count = None;
+            continue;
+        }
+        match &current_tasks {
+            None => {
+                // bd query failed this cycle — no data, render nothing extra.
+                agent.current_task_id = None;
+                agent.current_task_title = None;
+                agent.current_task_extra_count = None;
+            }
+            Some(tasks) => match tasks.get(&agent.name) {
+                Some(task) => {
+                    agent.current_task_id = Some(task.id.clone());
+                    agent.current_task_title = Some(task.title.clone());
+                    agent.current_task_extra_count = Some(task.extra_count);
+                }
+                // Query succeeded; this agent has no in_progress bead — idle.
+                None => {
+                    agent.current_task_id = Some(String::new());
+                    agent.current_task_title = None;
+                    agent.current_task_extra_count = Some(0);
+                }
+            },
         }
     }
 

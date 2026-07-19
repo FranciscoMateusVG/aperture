@@ -56,3 +56,48 @@ export function dotTooltip(state: DotState, agent: AgentDef): string {
   const seconds = Number.isNaN(firedAt) ? 0 : Math.round((Date.now() - firedAt) / 1000);
   return DOT_TOOLTIPS.stuck.replace("{N}", String(seconds));
 }
+
+// ── Current-work summary line (aperture-nr65b) ──
+//
+// Composes with the dot state above: booting/stuck describe why the agent
+// isn't reachable right now, and that's strictly more useful to the operator
+// than whatever bead title happened to be claimed before the agent went
+// quiet — so those two states override the work line entirely, same
+// principle as the dot itself (don't show a claim you can't back up).
+//
+// Backend contract (agents.rs::resolve_current_tasks + AgentDef in
+// state.rs): current_task_id is a three-state field —
+//   - undefined/null → no data (agent stopped, or the bd query failed this
+//     cycle) → render nothing, exactly like before this feature shipped.
+//   - "" (empty-string sentinel) → query succeeded, nothing claimed → idle.
+//   - non-empty → the claimed bead's id; current_task_title carries the
+//     title, current_task_extra_count the count of other in_progress beads
+//     beyond this one.
+
+export interface WorkSummary {
+  text: string;
+  tooltip: string;
+}
+
+export function deriveWorkSummary(agent: AgentDef, dotState: DotState): WorkSummary | null {
+  if (dotState === "booting") {
+    return { text: "Booting…", tooltip: "Kickoff sent, waiting to connect to the hub" };
+  }
+  if (dotState === "stuck") {
+    return { text: "Stuck", tooltip: "Not responding — check the tmux pane" };
+  }
+  if (agent.current_task_id == null) {
+    return null; // no data — same rendering as before this feature shipped
+  }
+  if (agent.current_task_id === "") {
+    return { text: "Idle", tooltip: "Online, no claimed task" };
+  }
+  const extra = agent.current_task_extra_count ?? 0;
+  const title = agent.current_task_title ?? "(untitled)";
+  return {
+    text: extra > 0 ? `${title} (+${extra} more)` : title,
+    tooltip: extra > 0
+      ? `${agent.current_task_id} — ${title}\n+${extra} more in_progress`
+      : `${agent.current_task_id} — ${title}`,
+  };
+}

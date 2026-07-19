@@ -299,11 +299,17 @@ html, body {
   to   { transform: rotate(360deg); }
 }
 
+/* ── Agent card ──
+   Two rows: .agent-mini__row (the original single-row layout — icon, name,
+   badge, model, config, toggle) and, below it, the optional current-work
+   summary line (aperture-nr65b). The row's own internal gap moved onto
+   .agent-mini__row so the two rows can sit closer together than the row's
+   own children do. */
 .agent-mini {
   --agent-color: var(--accent-orange);
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 3px;
   padding: 8px 10px;
   background: var(--bg-card);
   border: 1px solid var(--border);
@@ -311,6 +317,12 @@ html, body {
   border-radius: var(--radius);
   cursor: default;
   transition: border-color 0.15s, background 0.15s;
+}
+
+.agent-mini__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .agent-mini--running {
@@ -420,6 +432,22 @@ html, body {
   text-overflow: ellipsis;
   max-width: 120px;
   flex-shrink: 0;
+}
+
+/* ── Current-work summary line (aperture-nr65b) ──
+   Sits under .agent-mini__row, indented to align under the name rather
+   than the icon (22px icon column + 8px row gap = 30px). Deliberately
+   quieter than the name/model line — this is a glanceable subtitle, not a
+   second headline; the dot + tooltip already carry the "is this agent
+   reachable" signal, this line answers "reachable doing what." */
+.agent-mini__work {
+  padding-left: 30px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.85;
 }
 
 .agent-mini__toggle {
