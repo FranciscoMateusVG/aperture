@@ -55,8 +55,75 @@ pub fn boot_agent_headless(name: &str) -> Result<String, String> {
     )
 }
 
+/// aperture-3x136: GUI-launched apps inherit launchd's minimal PATH
+/// (/usr/bin:/bin:/usr/sbin:/sbin) — no volta, no homebrew, no npm-global.
+/// Every subprocess resolution downstream then degrades to hardcoded
+/// candidate lists that are machine-specific and incomplete: on a volta-only
+/// machine `node` resolves nowhere, so the WS hub silently ENOENT-looped and
+/// comms died fleet-wide (2026-07-19). Ask the user's login shell for its
+/// PATH once at startup and prepend it, so the app resolves binaries exactly
+/// like a terminal launch. Bounded by a 3s watchdog so a hung rc file cannot
+/// wedge app startup; on any failure we keep the inherited PATH.
+fn repair_gui_path() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("/bin/zsh")
+        .args(["-ilc", "printf %s \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[aperture] warn: PATH repair skipped (zsh spawn failed: {e})");
+            return;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("[aperture] warn: PATH repair skipped (login shell timed out)");
+                return;
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    let shell_path = out.trim();
+    if shell_path.is_empty() {
+        eprintln!("[aperture] warn: PATH repair skipped (login shell returned empty PATH)");
+        return;
+    }
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut merged: Vec<&str> = shell_path.split(':').filter(|p| !p.is_empty()).collect();
+    for p in current.split(':').filter(|p| !p.is_empty()) {
+        if !merged.contains(&p) {
+            merged.push(p);
+        }
+    }
+    std::env::set_var("PATH", merged.join(":"));
+    println!(
+        "[aperture] PATH repaired from login shell ({} entries)",
+        merged.len()
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Must run before anything that spawns subprocesses (BEADS init, poller,
+    // WS hub, codex app-servers) — they all resolve binaries via PATH.
+    repair_gui_path();
+
     let app_state = Arc::new(Mutex::new(config::default_state()));
 
     // Initialize BEADS database

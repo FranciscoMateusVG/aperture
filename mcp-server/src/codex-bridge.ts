@@ -27,7 +27,7 @@
  *   APERTURE_AGENTS_DIR — manifest tree (default ~/.claude/aperture)
  *   APERTURE_RUN_DIR    — socket dir    (default ~/.aperture/run)
  */
-import { closeSync, constants, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import WebSocket from "ws";
@@ -244,16 +244,14 @@ export class CodexBridgeClient {
     const result = (await this.request("thread/start", params)) as Record<string, unknown> | null;
     const direct = result?.threadId ?? result?.id;
     if (typeof direct === "string") {
-      this.bindToThread(direct, "thread_start");
-      this.publishThreadReady(direct);
+      this.bindToThread(direct, "thread_start"); // publishes thread-ready (3x136)
       return direct;
     }
     const wrapped = result?.thread;
     if (wrapped && typeof wrapped === "object") {
       const id = (wrapped as Record<string, unknown>).id;
       if (typeof id === "string") {
-        this.bindToThread(id, "thread_start");
-        this.publishThreadReady(id);
+        this.bindToThread(id, "thread_start"); // publishes thread-ready (3x136)
         return id;
       }
     }
@@ -399,6 +397,30 @@ export class CodexBridgeClient {
       this.hooks.broadcastPresence(this.agent, "join");
     }
     if (changed) this.hooks.log("codex_bound", { agent: this.agent, threadId, source });
+    // aperture-3x136: publish the pane handoff file on EVERY bind, not only on
+    // thread_start. When the hub restarts while app-servers survive, the
+    // bridge rebinds via thread_list — previously that path never wrote the
+    // file, so pane launch scripts timed out and exec'd `codex resume ""`.
+    if (changed || !existsSync(this.threadReadyPath())) this.publishThreadReady(threadId);
+    this.ensureThreadReadyLoop();
+  }
+
+  /**
+   * aperture-3x136: the launcher removes <agent>.thread-id before every pane
+   * (re)spawn and its wait gate expects the bridge to rewrite it. If the
+   * bridge is ALREADY bound when that happens (surviving app-server, watchdog
+   * re-kick), no bind event fires — so keep a small unref'd loop that
+   * republishes whenever the file is missing while a thread is bound.
+   */
+  private threadReadyTimer: NodeJS.Timeout | null = null;
+  private ensureThreadReadyLoop(): void {
+    if (this.threadReadyTimer) return;
+    this.threadReadyTimer = setInterval(() => {
+      if (this.threadId && !existsSync(this.threadReadyPath())) {
+        this.publishThreadReady(this.threadId);
+      }
+    }, 5000);
+    this.threadReadyTimer.unref?.();
   }
 
   /**
