@@ -155,6 +155,8 @@ All values (admin login, ENCRYPTION_KEY, AUTH_SECRET, DB password, machine-ident
 
 Zero app secrets touch Dokploy env fields.
 
+> ⚠️ **This `infisical run` ritual is the INTENDED reference pattern — it is NOT how every deployed app actually runs. VERIFY the app's real Dockerfile ENTRYPOINT before relying on it.** The **eunenem tenant does NOT use `infisical run`** (verified 2026-07-18, aperture-40twz): its `docker-entrypoint.sh` runs `pnpm db:migrate` then `exec pnpm start` — no `infisical run` anywhere. eunenem reads `process.env` populated by the **Dokploy compose env** (`docker-compose.platform.yml` `${VAR:-}` interpolation) plus a `tsx --env-file` file Dokploy writes. **For eunenem, the runtime source of truth for secrets is the Dokploy compose env, and its Infisical project is a staging store that is inert at runtime.** To change an eunenem secret: edit the Dokploy compose env (`compose.update`, §11-safe RMW) then redeploy — NOT Infisical. A var only reaches the container if the compose YAML `environment:` block interpolates it (`${VAR:-}` — layer-6a). Banked memory: `eunenem-secret-mechanism-dokploy-compose-env-not-infisical`.
+
 ### Working API Sequence (v0.146)
 
 ```bash
@@ -209,7 +211,7 @@ Full runbook: `pocketsoftware-terraform/AGENTS.md §9`.
 
 ### Connection Pattern
 
-Apps receive `DATABASE_URL` via Infisical injection (`infisical run -- <cmd>`). Internal host: `platform-postgres:5432` on `dokploy-network`. Zero app has superuser access.
+Apps receive `DATABASE_URL` on `process.env` — via `infisical run` for apps that use that pattern, or **directly from the Dokploy compose env for tenants that don't (e.g. eunenem — see §9's warning)**. Internal host: `platform-postgres:5432` on `dokploy-network`. Zero app has superuser access.
 
 ### No-Superuser Rule
 
@@ -355,7 +357,9 @@ Dokploy source (both envs): GitHub mirror `FranciscoMateusVG/eunenem-engine`.
 
 **Release ritual**: push `staging` → API-deploy staging compose → verify `/healthz` + smoke → promote `staging`→`main` (`git push --force-with-lease`) → API-deploy prod compose. Deploys are ALWAYS API-triggered (gotcha 18 — autoDeploy structurally impossible here).
 
-Key facts: shared MinIO bucket `eunenem-perfil-fotos` (operator decision, both envs, in replication list); Infisical project `eunenem` (projectId `0fb98f6f-e31f-4a91-9b3e-39c59f130d5d`, 29 keys/env, source of truth); legacy-users bridge file at `/etc/dokploy/compose/<appName>/files/legacy-1.0-users.json` per env (3,855 users — NOT in git, insurance in OCI `xerox-eunenem-final`); product catalog ships in the repo; `STRIPE_PUBLISHABLE_KEY` is a BUILD ARG (gotcha 36); Kuma monitors `eunenem-staging` + `eunenem-prod` on `/healthz`; GlitchTip project `eunenem` (SDK wiring pending, bead `aperture-sm4el`).
+**Secret mechanism (verified 2026-07-18, aperture-40twz):** eunenem-prod (composeId `DpC6QS660XffZBAbh7qHo`) reads secrets from the **Dokploy compose env** — NOT `infisical run` (its entrypoint has none; see §9 warning). **Runtime source of truth = the Dokploy compose env**; the Infisical project `eunenem` (projectId `0fb98f6f-e31f-4a91-9b3e-39c59f130d5d`) is a **staging store, inert at runtime**. To change/rotate a secret: `compose.update` the Dokploy env (§11-safe RMW) + redeploy — and the compose YAML `environment:` block must interpolate the var (`${VAR:-}`, layer-6a) or it never reaches the container. Precedent: the 8 `INTER_*` were unwired until PR #27.
+
+Key facts: shared MinIO bucket `eunenem-perfil-fotos` (operator decision, both envs, in replication list); legacy-users bridge file at `/etc/dokploy/compose/<appName>/files/legacy-1.0-users.json` per env (3,855 users — NOT in git, insurance in OCI `xerox-eunenem-final`); product catalog ships in the repo; `STRIPE_PUBLISHABLE_KEY` is a BUILD ARG (gotcha 36); Kuma monitors `eunenem-staging` + `eunenem-prod` on `/healthz`; GlitchTip project `eunenem` (SDK wiring pending, bead `aperture-sm4el`).
 
 ---
 
