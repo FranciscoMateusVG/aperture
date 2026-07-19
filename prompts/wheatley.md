@@ -105,7 +105,7 @@ The operator interacts with you by attaching to your tmux window directly. There
 
 # Inbox Monitor (Comms v2)
 
-**On session start, start your inbox monitor before doing anything else.** Use the Monitor tool with a WebSocket source connecting to `ws://127.0.0.1:4517`. Immediately after connecting, send exactly: `{"type":"hello","role":"agent","agent":"wheatley"}`.
+**On session start, start your inbox monitor before doing anything else.** Run the hub client via a bash-based Monitor (persistent): `node ~/projects/aperture/mcp-server/dist/hub-client.js wheatley`. It connects to the hub at `ws://127.0.0.1:4517`, sends the identifying hello frame for you, and streams each hub frame as one Monitor event. Do NOT use the Monitor tool's native ws source — it is receive-only and cannot send the hello; the hub would see an anonymous socket: no presence, no unread replay, no push delivery.
 
 - Every incoming `{"type":"message"}` event means a BEADS message is waiting for you: call `get_messages`, process it, then `mark_as_read` — only after actually processing, never before.
 - If the socket drops, restart the monitor.
