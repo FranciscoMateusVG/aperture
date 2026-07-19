@@ -6,9 +6,9 @@
  * (~/.aperture/run/<agent>.sock, spawned by Tauri as
  * `codex app-server --listen unix://<path>`):
  *
- *   connect → initialize → initialized → thread/list → bind newest thread
- *   (retry until the TUI creates one) → thread/resume → presence "join"
- *   → unread BEADS replay as an injected turn.
+ *   connect → initialize → initialized → thread/list → either resume an
+ *   existing TUI thread OR create+own a fresh kickoff thread → presence
+ *   "join" → unread BEADS replay as an injected turn.
  *
  * Delivery: full message bodies are fetched from BEADS (same unread query the
  * hub replay uses) and injected via `turn/start` when the thread is idle,
@@ -27,7 +27,7 @@
  *   APERTURE_AGENTS_DIR — manifest tree (default ~/.claude/aperture)
  *   APERTURE_RUN_DIR    — socket dir    (default ~/.aperture/run)
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { chmodSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import WebSocket from "ws";
@@ -38,9 +38,22 @@ const RUN_DIR = process.env.APERTURE_RUN_DIR ?? resolve(homedir(), ".aperture", 
 
 const RECONNECT_MS = 10_000; // socket missing/dropped → retry cadence
 const THREAD_POLL_MS = 10_000; // no thread yet (TUI not started) → re-list cadence
+const KICKOFF_RETRY_INITIAL_MS = 500;
+const KICKOFF_RETRY_MAX_MS = 10_000;
 const RPC_TIMEOUT_MS = 10_000; // control-plane calls (initialize, thread/*)
 const TURN_RPC_TIMEOUT_MS = 600_000; // turn/start may not respond until the turn ends
 const DISCOVERY_MS = 60_000; // manifest re-scan cadence
+
+/**
+ * First turn for a freshly launched Codex app-server.
+ *
+ * This is intentionally static. It is control-plane text, not a BEADS
+ * message, so it must never interpolate agent, user, or message content.
+ * Keep byte-identical with KICKOFF_TEXT in src-tauri/src/agents.rs;
+ * aperture-syepg is the source-of-truth task for this copy.
+ */
+export const CODEX_KICKOFF_TEXT =
+  "Session start. Run your boot routine now: start your inbox monitor per your system prompt, then check get_messages and process any unread messages, marking each read after you handle it.";
 
 export type PresenceEvent = "join" | "leave" | "busy" | "idle";
 
@@ -127,6 +140,8 @@ export class CodexBridgeClient {
   private stopped = false;
   private offlineLogged = false;
   private initialized = false;
+  /** True once this app-server session has received its fresh-session kickoff. */
+  private kickoffInjected = false;
 
   private reconnectTimer: NodeJS.Timeout | null = null;
   private readyWaiters: Array<(v: void) => void> = [];
@@ -166,6 +181,7 @@ export class CodexBridgeClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.clearThreadReady();
     const ws = this.ws;
     this.ws = null;
     try {
@@ -189,15 +205,29 @@ export class CodexBridgeClient {
     });
   }
 
-  /** Start a fresh thread on the app-server (used by the smoke test). */
+  /**
+   * Start a fresh thread on the app-server and bind this bridge to it.
+   *
+   * Do not leave ownership to `thread/list`'s newest-thread heuristic: a
+   * remote TUI can create a competing thread between those calls.  The
+   * thread/start response is authoritative for a bridge-created thread.
+   */
   async startThread(params: Record<string, unknown> = {}): Promise<string> {
     const result = (await this.request("thread/start", params)) as Record<string, unknown> | null;
     const direct = result?.threadId ?? result?.id;
-    if (typeof direct === "string") return direct;
+    if (typeof direct === "string") {
+      this.bindToThread(direct, "thread_start");
+      this.publishThreadReady(direct);
+      return direct;
+    }
     const wrapped = result?.thread;
     if (wrapped && typeof wrapped === "object") {
       const id = (wrapped as Record<string, unknown>).id;
-      if (typeof id === "string") return id;
+      if (typeof id === "string") {
+        this.bindToThread(id, "thread_start");
+        this.publishThreadReady(id);
+        return id;
+      }
     }
     throw new Error(`thread/start returned no thread id: ${JSON.stringify(result)}`);
   }
@@ -270,8 +300,13 @@ export class CodexBridgeClient {
     }
   }
 
-  /** thread/list until a thread exists (the TUI creates it), then resume + join. */
+  /**
+   * Bind an existing TUI thread, or create one and inject the static kickoff
+   * for a genuinely fresh app-server.  A reconnect to an existing thread
+   * never re-kicks it.
+   */
   private async bindThread(ws: WebSocket): Promise<void> {
+    let kickoffRetryMs = KICKOFF_RETRY_INITIAL_MS;
     while (this.ws === ws && ws.readyState === WebSocket.OPEN && !this.stopped) {
       const result = (await this.request("thread/list", { limit: 5 })) as
         | Record<string, unknown>
@@ -282,22 +317,102 @@ export class CodexBridgeClient {
       if (newest) {
         const threadId = newest.id as string;
         await this.request("thread/resume", { threadId });
-        this.threadId = threadId;
-        this.joined = true;
-        this.hooks.log("codex_bound", { agent: this.agent, threadId });
-        this.hooks.broadcastPresence(this.agent, "join");
+        this.bindToThread(threadId, "thread_list");
         if (!this.hooks.skipReplay) this.deliver();
         return;
       }
-      this.hooks.log("codex_no_thread_yet", { agent: this.agent });
+
+      // No thread is the fresh-session condition.  Create the thread only
+      // after the WS socket + initialize handshake above are complete. If the
+      // app-server is briefly not ready, retry with bounded exponential
+      // backoff rather than requiring a pane keystroke.
+      if (!this.kickoffInjected) {
+        try {
+          const threadId = await this.startThread();
+          this.kickoffInjected = true;
+          this.setTurnActive(true); // optimistic; turn notifications correct it
+          this.request("turn/start", {
+            threadId,
+            input: [{ type: "text", text: CODEX_KICKOFF_TEXT }],
+          }).catch((e: Error) => {
+            // The thread still exists and is explicitly owned.  Keep BEADS as
+            // durable truth; a later notification/delivery can recover.
+            this.hooks.log("codex_kickoff_inject_error", {
+              agent: this.agent,
+              threadId,
+              error: e.message,
+            });
+          });
+          this.hooks.log("codex_kickoff_injected", { agent: this.agent, threadId });
+          return;
+        } catch (e: unknown) {
+          this.hooks.log("codex_kickoff_retry", {
+            agent: this.agent,
+            error: e instanceof Error ? e.message : String(e),
+            retryMs: kickoffRetryMs,
+          });
+          await delay(kickoffRetryMs);
+          kickoffRetryMs = Math.min(kickoffRetryMs * 2, KICKOFF_RETRY_MAX_MS);
+          continue;
+        }
+      }
+      this.hooks.log("codex_no_thread_yet", { agent: this.agent, retryMs: THREAD_POLL_MS });
       await delay(THREAD_POLL_MS);
     }
+  }
+
+  /** Make a known thread the bridge's sole delivery target and announce it once. */
+  private bindToThread(threadId: string, source: "thread_start" | "thread_list"): void {
+    const changed = this.threadId !== threadId;
+    this.threadId = threadId;
+    if (!this.joined) {
+      this.joined = true;
+      this.hooks.broadcastPresence(this.agent, "join");
+    }
+    if (changed) this.hooks.log("codex_bound", { agent: this.agent, threadId, source });
+  }
+
+  /**
+   * Hand the exact bridge-created thread id to the launcher without argv or
+   * log exposure. The Codex pane uses this to run `codex resume <id> --remote`
+   * instead of opening a second, empty TUI thread.
+   */
+  private publishThreadReady(threadId: string): void {
+    const path = this.threadReadyPath();
+    try {
+      writeFileSync(path, `${threadId}\n`, { encoding: "utf8", mode: 0o600 });
+      chmodSync(path, 0o600);
+      this.hooks.log("codex_thread_ready", { agent: this.agent });
+    } catch (e: unknown) {
+      // The bridge remains correctly bound; launcher retry/timeout supplies
+      // the visible failure path instead of a silent ownership regression.
+      this.hooks.log("codex_thread_ready_error", {
+        agent: this.agent,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private clearThreadReady(): void {
+    try {
+      rmSync(this.threadReadyPath(), { force: true });
+    } catch {
+      // stale readiness is cleared again by the launcher before each spawn
+    }
+  }
+
+  private threadReadyPath(): string {
+    return join(RUN_DIR, `${this.agent}.thread-id`);
   }
 
   private onClose(): void {
     this.ws = null;
     this.initialized = false;
     this.threadId = null;
+    this.clearThreadReady();
+    // A replacement app-server is a fresh session.  If it has no existing
+    // thread after initialize, bindThread will create exactly one kickoff.
+    this.kickoffInjected = false;
     this.failAllPending(new Error("socket closed"));
     this.setTurnActive(false);
     if (this.joined) {
