@@ -23,11 +23,16 @@ LOG_DIR="${APERTURE_STUB_LOG_DIR:-/tmp/aperture-boot-harness}"
 mkdir -p "$LOG_DIR"
 
 {
+    # Append + pid header: the stub can be invoked more than once per run
+    # (and the codex twin IS invoked twice — app-server child + pane), so
+    # '>' would clobber the earlier invocation's evidence. The run dir is
+    # fresh per smoke-boot run, so append never leaks across runs.
+    echo "# --- invocation pid=$$ ---"
     printf '%s\n' "$@"
     # Env lines are '#'-prefixed so argv-diff tooling can filter them out.
     echo "# env PATH=$PATH"
     echo "# env PWD=$PWD"
-} > "$LOG_DIR/claude-argv.txt"
+} >> "$LOG_DIR/claude-argv.txt"
 
 # Agent name: env wins, else parse the --name flag the claude launcher passes.
 AGENT_NAME="${APERTURE_STUB_AGENT_NAME:-}"

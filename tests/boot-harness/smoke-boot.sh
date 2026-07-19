@@ -87,10 +87,23 @@ fi
 echo "✅ hub listening on 127.0.0.1:$PORT"
 
 # ── (c) start the observer ──
+# Hub-join expectations differ by mode (review finding, aperture-xt16e):
+# in the REAL system the codex PANE process never talks to the hub — the
+# hub's codex-bridge binds to the app-server and broadcasts the join. The
+# codex stub faithfully reproduces that silence, so a codex-smoke join is
+# only observable in l3 (real codex + bridge) or a future l2 with a fake
+# app-server (see stubs/codex TODO). Faking a pane-side hello would make
+# the l2 green meaningless for codex. In l2, codex coverage = pane-side
+# artifacts asserted after the observer verdict (section e2 below).
+OBSERVER_EXPECT=(--expect-agent claude-smoke)
+if [ "$MODE" = "l3" ]; then
+    OBSERVER_EXPECT+=(--expect-agent codex-smoke)
+    # TODO(aperture-17amw): once bridge-bind lands, add:
+    #   OBSERVER_EXPECT+=(--require-bridge-bind codex-smoke)
+fi
 node "$HERE/observer.mjs" \
     --port "$PORT" \
-    --expect-agent claude-smoke \
-    --expect-agent codex-smoke \
+    "${OBSERVER_EXPECT[@]}" \
     --timeout-s "$TIMEOUT_S" \
     --hub-log "$RUN_DIR/hub.log" \
     --out "$RUN_DIR/results.json" \
@@ -115,7 +128,11 @@ if [ "$subscribed" != "1" ]; then
     echo "❌ observer never subscribed within 10s — see $RUN_DIR/observer.log"
     exit 1
 fi
-echo "🔍 observer watching for claude-smoke + codex-smoke (timeout ${TIMEOUT_S}s)"
+if [ "$MODE" = "l3" ]; then
+    echo "🔍 observer watching for claude-smoke + codex-smoke (timeout ${TIMEOUT_S}s)"
+else
+    echo "🔍 observer watching for claude-smoke join; codex-smoke verified via pane artifacts (timeout ${TIMEOUT_S}s)"
+fi
 
 # ── (d) SPAWN SECTION ──────────────────────────────────────────────────────
 # TODO(aperture-syepg): headless boot entry point not yet available. When
@@ -157,6 +174,35 @@ set -e
 OBS_PID=""
 
 if [ "$OBS_EXIT" = "0" ]; then
+    # ── (e2) l2 codex pane-side proof ──
+    # The codex stub never joins the hub (faithful to the real pane), so l2
+    # codex coverage is: the spawn path invoked the stub with a --remote
+    # unix:// socket and the argv evidence exists. POLL rather than
+    # instant-check: the observer goes green on claude's join alone, which
+    # carries zero synchronization for the codex side — under CPU load the
+    # codex stub can lag its file writes by hundreds of ms (observed flake:
+    # concurrent cargo build starved the stub past an instant check).
+    if [ "$MODE" = "l2" ]; then
+        codex_proof=0
+        for _ in $(seq 1 40); do
+            if [ -s "$APERTURE_STUB_LOG_DIR/codex-argv.txt" ] \
+                && [ -s "$APERTURE_STUB_LOG_DIR/codex-sock.txt" ]; then
+                codex_proof=1
+                break
+            fi
+            sleep 0.25
+        done
+        if [ "$codex_proof" != "1" ]; then
+            echo "❌ l2 codex proof missing after 10s:"
+            [ -s "$APERTURE_STUB_LOG_DIR/codex-argv.txt" ] \
+                || echo "   - no codex-argv.txt (codex stub never invoked)"
+            [ -s "$APERTURE_STUB_LOG_DIR/codex-sock.txt" ] \
+                || echo "   - no codex-sock.txt (no --remote unix:// socket in pane argv)"
+            echo "   artifacts: $RUN_DIR"
+            exit 1
+        fi
+        echo "✅ l2 codex pane proof: socket $(tail -1 "$APERTURE_STUB_LOG_DIR/codex-sock.txt")"
+    fi
     echo "✅ boot verification green (MODE=$MODE)"
     echo ""
     echo "── time-to-hello (ms) ──"

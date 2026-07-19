@@ -29,13 +29,21 @@ LOG_DIR="${APERTURE_STUB_LOG_DIR:-/tmp/aperture-boot-harness}"
 mkdir -p "$LOG_DIR"
 
 {
+    # Append + pid header: this stub is invoked TWICE per L2 run through the
+    # real spawn path — once as the supervised app-server child
+    # (`codex app-server --listen unix://…`, via codex_appserver.rs honoring
+    # APERTURE_CODEX_BIN) and once as the tmux pane (`codex --remote …`).
+    # '>' would clobber the first invocation's evidence.
+    echo "# --- invocation pid=$$ ---"
     printf '%s\n' "$@"
     # Env lines are '#'-prefixed so argv-diff tooling can filter them out.
     echo "# env PATH=$PATH"
     echo "# env PWD=$PWD"
-} > "$LOG_DIR/codex-argv.txt"
+} >> "$LOG_DIR/codex-argv.txt"
 
-# Parse --remote unix://<sock> from argv.
+# Parse --remote unix://<sock> from argv (pane invocation only — the
+# app-server invocation has --listen, not --remote, and must not clobber
+# the pane's recorded socket with an empty value).
 SOCK=""
 prev=""
 for arg in "$@"; do
@@ -45,7 +53,9 @@ for arg in "$@"; do
     fi
     prev="$arg"
 done
-echo "$SOCK" > "$LOG_DIR/codex-sock.txt"
+if [ -n "$SOCK" ]; then
+    echo "$SOCK" >> "$LOG_DIR/codex-sock.txt"
+fi
 
 # Simulate the long-lived TUI pane: sleep until SIGTERM/SIGINT.
 trap 'exit 0' TERM INT

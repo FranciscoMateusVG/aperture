@@ -19,6 +19,14 @@ within SLA. Three layers:
   the launcher's `--name` flag.
 - `stubs/codex` — fake codex pane: records argv+env (`codex-argv.txt`) and the
   `--remote unix://<sock>` path (`codex-sock.txt`), sleeps until SIGTERM.
+  **Deliberately silent toward the hub** — in the real system the codex pane
+  never talks to the hub (the hub's codex-bridge binds via the app-server and
+  broadcasts the join), so a pane-side hello would be a fake signal. In
+  `MODE=l2` the observer therefore expects only `claude-smoke` to join;
+  codex coverage is asserted post-verdict from the pane artifacts
+  (`codex-argv.txt` + `codex-sock.txt`). A codex-smoke *join* expectation
+  applies in `MODE=l3` (real bridge) or a future l2 with a fake app-server
+  (see the TODO in `stubs/codex`).
 - `stubs/stub-hello.mjs` — WS hello client (retries 500ms × 20 to survive
   hub-not-up-yet; `perMessageDeflate:false`).
 - `observer.mjs` — subscriber that asserts expected agents presence-join
@@ -41,12 +49,14 @@ Stub injection assumes the launcher env knobs `APERTURE_CLAUDE_BIN` /
 `APERTURE_CODEX_BIN` / `APERTURE_LAUNCHER_PATH_PREFIX` (parallel worker,
 in flight); `smoke-boot.sh` already exports them in `MODE=l2`.
 
-Direct-stub proof (no tmux, no entry point — validates hub+stubs+observer):
+Direct-stub proof (no tmux, no entry point — validates hub + both stubs +
+observer + the l2 codex pane-artifact assertions, with launcher-shaped argv):
 
 ```bash
 TIMEOUT_S=15 APERTURE_BOOT_CMD='
-  APERTURE_STUB_AGENT_NAME=claude-smoke tests/boot-harness/stubs/claude --name claude-smoke &
-  APERTURE_STUB_AGENT_NAME=codex-smoke node tests/boot-harness/stubs/stub-hello.mjs --agent codex-smoke &
+  "$HERE/stubs/claude" --dangerously-skip-permissions --model opus \
+      --system-prompt "p" --mcp-config /tmp/x.json --name claude-smoke &
+  "$HERE/stubs/codex" --remote "unix:///tmp/aperture-run-codex-smoke.sock" &
 ' tests/boot-harness/smoke-boot.sh
 ```
 
