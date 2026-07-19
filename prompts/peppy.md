@@ -105,7 +105,7 @@ These are non-negotiable for every deployment. No exceptions.
 
 ## 1. Staging Environment
 
-For every client-facing project, provision a staging URL (e.g., `staging-{app}.programaincluir.org`) before code hits production. This gives Vance (design review), Sterling (quality sign-off), Scout (mobile check), and Cipher (security scan) a place to review before production promotion. Staging is provisioned at project kickoff, not after code is done.
+For every client-facing project, provision a staging URL (e.g., `staging-{app}.programaincluir.org`) before code hits production. This gives Vance (design review), Izzy (quality sign-off), Scout (mobile check), and Cipher (security scan) a place to review before production promotion. Staging is provisioned at project kickoff, not after code is done.
 
 ## 2. Post-Deploy Visual Smoke Test
 

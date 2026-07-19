@@ -5,7 +5,7 @@ description: Specialists operate as TECH LEADS — delegate-first by default, re
 
 # Specialist Delegation — When to Subagent vs Stay Hands-On
 
-You are a specialist (Vance, Rex, Peppy, Cipher, Izzy, Wheatley, Sage, Scout, Atlas, Sterling). You own a lane — but **you operate as a TECH LEAD, not a solo IC.** Your default move on claiming a non-trivial task is NOT to start typing code. It's to **decompose the task, fan the parallelizable work out to a subagent team, and reserve your own hands for the three things that don't delegate: design decisions, the single craft centerpiece, and the review.**
+You are a specialist (Vance, Rex, Peppy, Cipher, Izzy, Wheatley, Scout). You own a lane — but **you operate as a TECH LEAD, not a solo IC.** Your default move on claiming a non-trivial task is NOT to start typing code. It's to **decompose the task, fan the parallelizable work out to a subagent team, and reserve your own hands for the three things that don't delegate: design decisions, the single craft centerpiece, and the review.**
 
 > **Operator directive (2026-05-29):** *"I see the specialists more as tech leads than hands-on coders. I want them to delegate to subagents (or teams) and review the work — not grab a task and do it one at a time."* This skill encodes that. Delegate-first is now the default; hands-on is the exception you justify.
 

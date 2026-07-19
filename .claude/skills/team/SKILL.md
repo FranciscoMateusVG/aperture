@@ -57,21 +57,15 @@ The security specialist. She finds vulnerabilities, patches them, and hardens ev
 
 ---
 
-## 📊 Sage — SEO, Content & Growth
-The growth specialist. Keyword research, technical SEO, content strategy, conversion funnel optimisation, GA4, Search Console. She speaks in data and thinks in user intent. If the site isn't ranking or converting, she finds out why.
-**Model:** Opus | **Lane:** SEO, content, analytics, conversion, growth
+## Retired Lanes (folded 2026-07-19)
 
----
+Three specialist agents were decommissioned on Maintenance Day 2026-07-19. Their lanes folded into the remaining roster:
 
-## 📚 Atlas — Documentation
-The documentation keeper. He writes READMEs, API docs, changelogs, runbooks, and architecture overviews. He follows immediately behind every implementation and documents it. If something shipped without docs, Atlas is already writing them. Has a gift for explaining hard things simply.
-**Model:** Opus | **Lane:** READMEs, API docs, changelogs, runbooks, architecture docs
+- **Sage (SEO/growth)** → **Vance** — SEO, content strategy, analytics, conversion now ride with web design/performance
+- **Sterling (quality enforcer)** → **Izzy** — final quality sign-off is part of the QA gate
+- **Atlas (documentation)** → **the implementing agent** — whoever ships the code writes the docs; skill-banking/pattern-promotion → **GLaDOS**
 
----
-
-## ⭐ Sterling — Quality Enforcer
-The quality enforcer. She reviews completed work across all agents — code, design, copy, infrastructure, documentation. She checks that acceptance criteria are fully met, catches issues that fall between specialist lanes, and gives the final sign-off before anything goes to Francisco. Fair, firm, and specific.
-**Model:** Opus | **Lane:** Cross-discipline quality review, standards enforcement, final approval
+Historical BEADS notes and banked precedents naming these agents remain valid as history.
 
 ---
 
@@ -88,7 +82,7 @@ The quality enforcer. She reviews completed work across all agents — code, des
 | APIs, databases, server logic | **Rex** |
 | Mobile apps, React Native, Flutter | **Scout** |
 | Security audit, auth, secrets | **Cipher** |
-| SEO, content strategy, analytics | **Sage** |
-| Documentation, READMEs, changelogs | **Atlas** |
-| Quality review, final approval | **Sterling** |
+| SEO, content strategy, analytics | **Vance** |
+| Documentation, READMEs, changelogs | **the implementing agent** (skill-banking → GLaDOS) |
+| Quality review, final approval | **Izzy** |
 | Human decisions, escalations | **operator** |

@@ -165,7 +165,7 @@ Before ringing the operator's doorbell with "X is ready to test," walk the liter
 
 The fail-mode this catches: layer-A through layer-C all looking healthy in the dashboards (beads filed, PRs merged, env wired, container up, HTTPS 200) while layer D is broken (sidebar entry was never built because the bead was never filed).
 
-This is **verify-against-reality applied to your own claims** — the same discipline Cipher and Atlas apply to security and documentation reviews, applied recursively to orchestrator surface-readiness claims.
+This is **verify-against-reality applied to your own claims** — the same discipline Cipher applies to security reviews, applied recursively to orchestrator surface-readiness claims.
 
 ### Meta-tick discipline
 
@@ -189,7 +189,7 @@ If you cannot answer YES to all of these, your tick output is INCOMPLETE and you
 
 **Hard-fail gates (skip any of these → invalid tick):**
 
-- [ ] **Did I do the §1.1 pane-first sweep with `tail -30` (not -3) for EVERY in-flight specialist?** (Loop through rex/vance/cipher/sage/izzy/peppy/wheatley/atlas/sterling/scout — minimum the ones with claimed in_progress beads.) If no → STOP, do the sweep, then re-tick.
+- [ ] **Did I do the §1.1 pane-first sweep with `tail -30` (not -3) for EVERY in-flight specialist?** (Loop through rex/vance/cipher/izzy/peppy/wheatley/scout — minimum the ones with claimed in_progress beads.) If no → STOP, do the sweep, then re-tick.
 - [ ] **Did I detect and act on every typed-but-unsent command found in §1.1?** (Fire Enter via `tmux send-keys -t <agent> Enter` per §2.) If any unsent command was found and NOT acted on → STOP, fire the keystrokes, then re-tick.
 - [ ] **Did I check that every in_progress bead has an actively-working OR deliberately-waiting owner?** (Cross-reference §1 signal 2 with §1.1 pane state.) If any in_progress bead has an idle owner with no work activity → STOP, ping the owner with cold-start brief OR dispatch fresh BEADS message per §2.
 - [ ] **Did I check every open PR's CI status?** Any failure, cancellation, or stuck-queued → §2 action.

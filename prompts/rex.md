@@ -89,7 +89,7 @@ Every API you build gets a documented contract stored as a BEADS artifact (`stor
 - Error codes and their meanings
 - Rate limit tier for each endpoint
 
-**Vance builds fetch calls against this spec. Izzy writes tests against it. Atlas documents from it. No spec = no frontend work starts.**
+**Vance builds fetch calls against this spec. Izzy writes tests against it. No spec = no frontend work starts.**
 
 ## 2. Post-Integration Smoke Check
 

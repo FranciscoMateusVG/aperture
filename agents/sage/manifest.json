@@ -1,9 +1,0 @@
-{
-  "name": "Sage",
-  "emoji": "📊",
-  "model": "opus",
-  "window": "sage",
-  "role": "growth",
-  "kind": "claude-code",
-  "enabled": true
-}

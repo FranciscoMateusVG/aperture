@@ -1,9 +1,0 @@
-{
-  "name": "Sterling",
-  "emoji": "⭐",
-  "model": "opus",
-  "window": "sterling",
-  "role": "quality",
-  "kind": "claude-code",
-  "enabled": true
-}

@@ -349,8 +349,8 @@ After operator approval, GLaDOS reassigns via `update_task(id, assignee: <specia
 | Mobile / React Native / app store | **scout** |
 | Auth, permissions, audit log, secrets, RBAC | **cipher** (posture review) + **rex** (implementation) |
 | Infra, deploy, env var, container, DNS | **peppy** |
-| Documentation, runbook, API reference | **atlas** |
-| SEO, content strategy, conversion funnel | **sage** |
+| Documentation, runbook, API reference | **the implementing agent** for that surface (skill-banking → **glados**) |
+| SEO, content strategy, conversion funnel | **vance** |
 | Test coverage, regression, E2E | **izzy** |
 | Cross-discipline (UI + API + tests) | **leave with wheatley as sub-task coordinator**, OR file split sub-beads with `discovered-from:<parent>` |
 
