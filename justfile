@@ -240,14 +240,37 @@ status:
 
 # ============== Boot verification harness (aperture-xt16e) ==============
 
-# L2/L3 boot smoke: hub + observer + agent spawn. mode=l2 (stub CLIs, default) or l3 (real).
-# NOTE: exits 3 (BLOCKED) until the headless boot entry point lands (aperture-syepg),
-# unless APERTURE_BOOT_CMD is set — see tests/boot-harness/README.md.
+# L2/L3 boot smoke: hub + observer + agent spawn through the REAL headless
+# path (aperture-boot → boot_agent_process → tmux → launcher → CLIs).
+# mode=l2 (stub CLIs, default) or l3 (real binaries). Auto-rebuilds a stale
+# mcp-server dist and auto-builds aperture-boot if missing — see
+# tests/boot-harness/README.md.
 smoke-boot mode="l2":
     #!/usr/bin/env bash
     set -euo pipefail
     echo "🔍 Boot verification smoke (MODE={{mode}})"
     MODE={{mode}} tests/boot-harness/smoke-boot.sh
+
+# Thundering-herd boot smoke (failure mode #6): boots claude-smoke +
+# codex-smoke + n fleet agents in ONE aperture-boot invocation; observer
+# asserts every claude join and results.json records per-agent time-to-hello.
+smoke-boot-fleet n="7" mode="l2":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "🔍 Boot verification fleet smoke (MODE={{mode}} FLEET={{n}})"
+    FLEET={{n}} MODE={{mode}} tests/boot-harness/smoke-boot.sh
+
+# Always-fresh MCP test entry point: rebuild dist, then run all three suites
+# (hub protocol, hub replay, codex bind-order). Guards against the stale-dist
+# false-failure class — never run the suites against an outdated build.
+test-mcp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd mcp-server
+    pnpm build
+    pnpm run test:hub
+    pnpm run test:replay
+    pnpm run test:codex-bind
 
 # Hub protocol unit tests (test file owned by mcp-server test worker)
 test-hub:

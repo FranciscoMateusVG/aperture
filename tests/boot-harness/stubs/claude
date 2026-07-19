@@ -52,4 +52,8 @@ if [ -z "$AGENT_NAME" ]; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec node "$HERE/stub-hello.mjs" --agent "$AGENT_NAME"
+# APERTURE_REAL_NODE (smoke-boot.sh): `node` may be a volta shim that spawns
+# the real node as a child and does not forward SIGTERM — exec'ing the shim
+# would orphan stub-hello when the pane/job is killed. Use the resolved
+# binary when the harness provides it.
+exec "${APERTURE_REAL_NODE:-node}" "$HERE/stub-hello.mjs" --agent "$AGENT_NAME"

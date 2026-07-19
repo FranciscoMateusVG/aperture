@@ -1,0 +1,9 @@
+{
+  "name": "claude-smoke",
+  "emoji": "🧪",
+  "model": "opus",
+  "window": "claude-smoke",
+  "role": "smoke-test",
+  "kind": "claude-code",
+  "enabled": true
+}
