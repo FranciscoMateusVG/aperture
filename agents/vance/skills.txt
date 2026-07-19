@@ -5,3 +5,4 @@ worktree-discipline
 specialist-delegation
 playwright-gotchas
 turbopack-gotchas
+zod-recursive-validation-gotchas
