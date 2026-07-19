@@ -51,6 +51,15 @@ fn default_enabled() -> bool {
 }
 
 fn aperture_root() -> String {
+    // APERTURE_AGENTS_DIR (aperture-syepg) overrides the registry root. The
+    // boot-verification harness (aperture-xt16e) points this at a stub registry
+    // for isolation; the node codex-bridge already honors the same var with the
+    // same default. Ignored when unset/empty → real ~/.claude/aperture.
+    if let Ok(dir) = std::env::var("APERTURE_AGENTS_DIR") {
+        if !dir.is_empty() {
+            return dir;
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     format!("{}/.claude/aperture", home)
 }

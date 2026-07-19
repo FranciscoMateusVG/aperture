@@ -8,6 +8,25 @@
 //! resolves env knobs (APERTURE_CLAUDE_BIN, APERTURE_CODEX_BIN,
 //! APERTURE_LAUNCHER_PATH_PREFIX) and passes plain values in.
 
+/// Static first-turn kickoff (comms v2, aperture-syepg). Appended as a
+/// positional argv to the `claude` launch on FRESH sessions so turn 1 runs at
+/// spawn — the agent starts its inbox Monitor + hub hello with zero manual
+/// keystrokes. Passed as argv DATA via a single shell-quoted token, never
+/// interpolated with user/BEADS content (Cipher constraint).
+///
+/// MUST stay byte-identical to the Codex-side constant `KICKOFF_TEXT` in
+/// `mcp-server/src/codex-bridge.ts` (aperture-17amw). Source of truth: the
+/// aperture-syepg bead. If you edit this, edit both halves.
+pub const KICKOFF_TEXT: &str = "Session start. Run your boot routine now: start your inbox monitor per your system prompt, then check get_messages and process any unread messages, marking each read after you handle it.";
+
+/// Wrap a string as a single POSIX-shell-quoted token: literal, no expansion.
+/// Embedded single quotes are escaped via the `'\''` idiom so the launcher
+/// construction stays safe if `KICKOFF_TEXT` ever changes (Izzy L1 quoting
+/// torture, aperture-xt16e). Today's static text has no quotes/dollars/newlines.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Build the bash launcher script for a Claude agent pane.
 ///
 /// * `claude_bin` — binary to exec; the default call site passes "claude"
@@ -29,7 +48,6 @@ pub fn build_claude_launcher(
     name: &str,
     fresh_session: bool,
 ) -> String {
-    let _ = fresh_session; // no output change until aperture-syepg lands
     let path_line = match path_prefix {
         Some(prefix) => format!(
             r#"export PATH="{}:/opt/homebrew/bin:/usr/local/bin:$PATH""#,
@@ -37,12 +55,23 @@ pub fn build_claude_launcher(
         ),
         None => r#"export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH""#.to_string(),
     };
+    // aperture-syepg: a FRESH session appends the static kickoff as a single
+    // shell-quoted positional AFTER --name (alongside --system-prompt), so turn
+    // 1 fires at spawn. Empirically verified 2026-07-19: a positional prompt
+    // here keeps the TUI interactive (does NOT imply print-then-exit), in both
+    // trusted and untrusted dirs. Resume/continue sessions pass false and omit
+    // it (they already have a conversation; re-kicking would double-fire).
+    let kickoff = if fresh_session {
+        format!(" {}", shell_single_quote(KICKOFF_TEXT))
+    } else {
+        String::new()
+    };
     format!(
         r#"#!/bin/bash
 {path_line}
 cd "{project_dir}"
 PROMPT=$(cat "{prompt_path}")
-exec {claude_bin} --dangerously-skip-permissions --model {model} --system-prompt "$PROMPT" --mcp-config {mcp_config_path} --name {name}
+exec {claude_bin} --dangerously-skip-permissions --model {model} --system-prompt "$PROMPT" --mcp-config {mcp_config_path} --name {name}{kickoff}
 "#
     )
 }
@@ -67,6 +96,16 @@ pub fn build_codex_launcher(
         None => r#"export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.npm-global/bin:$PATH""#
             .to_string(),
     };
+    // aperture-syepg/17amw: the exact-thread-id handoff file lives beside the
+    // socket (<run>/<name>.sock → <run>/<name>.thread-id). The codex-bridge
+    // (Rex, PR #34) atomically writes it mode-0600 after it binds the
+    // kickoff thread; we derive the path here so the pure builder stays a
+    // function of its 4 args (no new param — the test contract leaves the file
+    // path unpinned).
+    let thread_id_file = sock_path
+        .strip_suffix(".sock")
+        .map(|base| format!("{base}.thread-id"))
+        .unwrap_or_else(|| format!("{sock_path}.thread-id"));
     format!(
         r#"#!/bin/bash
 export NVM_DIR="$HOME/.nvm"
@@ -76,7 +115,15 @@ export CODEX_HOME="{codex_home}"
 # Wait for the supervised app-server (codex_appserver.rs) to bring the
 # socket up before attaching — its spawn thread runs concurrently.
 for _ in $(seq 1 40); do [ -S "{sock_path}" ] && break; sleep 0.25; done
-exec {codex_bin} --remote "unix://{sock_path}"
+# aperture-syepg/17amw: bare `codex --remote` opens a NEW EMPTY TUI that never
+# attaches to the bridge-created kickoff thread (verified in isolated
+# CODEX_HOME). Wait for the codex-bridge to publish the thread id (exact-id
+# handoff, up to 60s), then RESUME that thread so turn 1 (the kickoff) is live
+# in the pane.
+THREAD_ID_FILE="{thread_id_file}"
+for _ in $(seq 1 240); do [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
+THREAD_ID=$(cat "$THREAD_ID_FILE" 2>/dev/null)
+exec {codex_bin} resume "$THREAD_ID" --remote "unix://{sock_path}"
 "#
     )
 }
@@ -253,7 +300,7 @@ mod tests {
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 cd "/Users/x/projects/aperture"
 PROMPT=$(cat "/tmp/aperture-prompt-atlas.md")
-exec claude --dangerously-skip-permissions --model opus --system-prompt "$PROMPT" --mcp-config /tmp/aperture-mcp-atlas.json --name atlas
+exec claude --dangerously-skip-permissions --model opus --system-prompt "$PROMPT" --mcp-config /tmp/aperture-mcp-atlas.json --name atlas 'Session start. Run your boot routine now: start your inbox monitor per your system prompt, then check get_messages and process any unread messages, marking each read after you handle it.'
 "#
         );
     }
@@ -298,7 +345,15 @@ export CODEX_HOME="/tmp/aperture-codex-vex"
 # Wait for the supervised app-server (codex_appserver.rs) to bring the
 # socket up before attaching — its spawn thread runs concurrently.
 for _ in $(seq 1 40); do [ -S "/Users/x/.aperture/run/vex.sock" ] && break; sleep 0.25; done
-exec codex --remote "unix:///Users/x/.aperture/run/vex.sock"
+# aperture-syepg/17amw: bare `codex --remote` opens a NEW EMPTY TUI that never
+# attaches to the bridge-created kickoff thread (verified in isolated
+# CODEX_HOME). Wait for the codex-bridge to publish the thread id (exact-id
+# handoff, up to 60s), then RESUME that thread so turn 1 (the kickoff) is live
+# in the pane.
+THREAD_ID_FILE="/Users/x/.aperture/run/vex.thread-id"
+for _ in $(seq 1 240); do [ -s "$THREAD_ID_FILE" ] && break; sleep 0.25; done
+THREAD_ID=$(cat "$THREAD_ID_FILE" 2>/dev/null)
+exec codex resume "$THREAD_ID" --remote "unix:///Users/x/.aperture/run/vex.sock"
 "#
         );
     }
@@ -308,7 +363,7 @@ exec codex --remote "unix:///Users/x/.aperture/run/vex.sock"
         let s = build_codex_launcher("codex", None, "/tmp/ch", "/run/a.sock");
         assert!(s.contains(r#"export CODEX_HOME="/tmp/ch""#));
         assert!(s.contains(r#"for _ in $(seq 1 40); do [ -S "/run/a.sock" ] && break; sleep 0.25; done"#));
-        assert!(s.contains(r#"exec codex --remote "unix:///run/a.sock""#));
+        assert!(s.contains(r#"exec codex resume "$THREAD_ID" --remote "unix:///run/a.sock""#));
     }
 
     /// Byte-identity pin for the codex config.toml template.
@@ -386,7 +441,7 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
     #[test]
     fn codex_bin_knob_substitutes() {
         let s = build_codex_launcher("/tmp/fake/codex-stub", None, "/tmp/ch", "/run/a.sock");
-        assert!(s.contains(r#"exec /tmp/fake/codex-stub --remote "unix:///run/a.sock""#));
+        assert!(s.contains(r#"exec /tmp/fake/codex-stub resume "$THREAD_ID" --remote "unix:///run/a.sock""#));
         assert!(!s.contains("exec codex "));
     }
 
@@ -696,7 +751,6 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
     /// and identical regardless of agent/model/paths — zero interpolation of
     /// user or BEADS content. (Shape confirmed with Peppy's empirical test.)
     #[test]
-    #[ignore = "un-ignore when aperture-syepg lands"]
     fn kickoff_fresh_session_appends_static_positional_prompt() {
         let a = build_claude_launcher(
             "claude", None, "/proj-a", "/tmp/pa.md", "opus", "/tmp/ma.json", "atlas", true,
@@ -728,7 +782,6 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
     /// Resume/continue sessions (fresh_session = false) must NOT append the
     /// kickoff positional argument.
     #[test]
-    #[ignore = "un-ignore when aperture-syepg lands"]
     fn kickoff_resume_session_omits_positional_prompt() {
         let s = build_claude_launcher(
             "claude", None, "/proj", "/tmp/p.md", "opus", "/tmp/m.json", "atlas", false,
@@ -753,7 +806,6 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
     // ------------------------------------------------------------------
 
     #[test]
-    #[ignore = "un-ignore when aperture-syepg/17amw lands"]
     fn codex_pane_resumes_bridge_thread_behind_wait_gate() {
         let s = build_codex_launcher("codex", None, "/tmp/ch", "/run/a.sock");
         assert!(

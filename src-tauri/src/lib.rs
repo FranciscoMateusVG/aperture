@@ -23,6 +23,36 @@ fn get_version() -> serde_json::Value {
     })
 }
 
+/// Headless boot entry point (aperture-syepg). Boots ONE registered agent by
+/// name through the real spawn path (tmux window + launcher + Claude kickoff /
+/// Codex resume-gate) with no Tauri GUI and no AppState mutex — that is what
+/// makes it callable from CI. The launcher env knobs (APERTURE_CLAUDE_BIN /
+/// APERTURE_CODEX_BIN / APERTURE_LAUNCHER_PATH_PREFIX) and the registry
+/// override (APERTURE_AGENTS_DIR) apply identically to the GUI path.
+/// APERTURE_TMUX_SESSION optionally targets an isolated tmux session (default:
+/// the configured "aperture" session — which must already exist, as
+/// `tmux_create_window` does not create it). Backs the boot-verification
+/// harness (aperture-xt16e) and the watchdog re-kick (aperture-wul6m). Returns
+/// the new tmux window id.
+pub fn boot_agent_headless(name: &str) -> Result<String, String> {
+    let state = config::default_state();
+    let agent = state
+        .agents
+        .get(name)
+        .ok_or_else(|| format!("agent '{}' not found in registry (check APERTURE_AGENTS_DIR)", name))?;
+    let tmux_session = std::env::var("APERTURE_TMUX_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.tmux_session.clone());
+    agents::boot_agent_process(
+        agent,
+        tmux_session,
+        state.mcp_server_path.clone(),
+        state.mcp_sentry_server_path.clone(),
+        state.project_dir.clone(),
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = Arc::new(Mutex::new(config::default_state()));
