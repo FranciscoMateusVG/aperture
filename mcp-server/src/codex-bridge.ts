@@ -344,6 +344,7 @@ export class CodexBridgeClient {
             });
           });
           this.hooks.log("codex_kickoff_injected", { agent: this.agent, threadId });
+          if (!this.hooks.skipReplay) this.deliver();
           return;
         } catch (e: unknown) {
           this.hooks.log("codex_kickoff_retry", {
