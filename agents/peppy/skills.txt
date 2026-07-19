@@ -7,3 +7,4 @@ worktree-discipline
 specialist-delegation
 pocketsoftware-infra
 spec-deviation-discipline
+research-artifact-placement

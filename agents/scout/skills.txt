@@ -6,3 +6,4 @@ specialist-delegation
 playwright-gotchas
 turbopack-gotchas
 spec-deviation-discipline
+research-artifact-placement

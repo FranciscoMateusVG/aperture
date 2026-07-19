@@ -12,3 +12,4 @@ scope-from-artifact
 pocketsoftware-infra
 agent-liveness
 spec-deviation-discipline
+research-artifact-placement

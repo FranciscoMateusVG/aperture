@@ -5,3 +5,4 @@ worktree-discipline
 specialist-delegation
 zod-recursive-validation-gotchas
 spec-deviation-discipline
+research-artifact-placement

@@ -7,3 +7,4 @@ verify-user-path
 audit-route-contract
 playwright-gotchas
 spec-deviation-discipline
+research-artifact-placement

@@ -7,3 +7,4 @@ playwright-gotchas
 turbopack-gotchas
 zod-recursive-validation-gotchas
 spec-deviation-discipline
+research-artifact-placement

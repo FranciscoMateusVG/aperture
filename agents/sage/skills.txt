@@ -4,3 +4,4 @@ beads
 worktree-discipline
 specialist-delegation
 spec-deviation-discipline
+research-artifact-placement
