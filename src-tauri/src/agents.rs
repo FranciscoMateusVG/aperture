@@ -248,6 +248,16 @@ pub fn boot_agent_process(
         let beads_dir = format!("{}/.aperture/.beads", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
         fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
 
+        // Codex discovers skills from $CODEX_HOME/skills. Mirror the same
+        // manifest-selected runtime links that Claude Code receives under
+        // ~/.claude/aperture/<agent>/skills; CODEX_HOME is per-agent and /tmp
+        // is recreated after reboot, so this must happen at every launch.
+        let codex_skill_count = crate::agent_loader::populate_codex_skill_home(&name, &codex_home)?;
+        eprintln!(
+            "[aperture] linked {} native Codex skills for '{}'",
+            codex_skill_count, name
+        );
+
         // aperture-kc7lb: Codex reads its ChatGPT login from $CODEX_HOME/auth.json.
         // The per-agent CODEX_HOME lives in /tmp (wiped on reboot) and is created
         // fresh above, so without seeding it from the operator's canonical

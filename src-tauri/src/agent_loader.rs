@@ -16,6 +16,7 @@ use crate::state::AgentDef;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 /// Per-agent metadata loaded from `~/.claude/aperture/<agent>/manifest.json`.
 ///
@@ -201,4 +202,176 @@ pub fn load_agent_skills(agent_name: &str) -> Vec<(String, String)> {
 
     skills.sort_by(|a, b| a.0.cmp(&b.0));
     skills
+}
+
+/// Link an agent's manifest-selected Aperture skills into its isolated Codex
+/// home. Codex reads `$CODEX_HOME/skills`, while Claude Code reads the runtime
+/// registry directly; keeping the same selected links in both places prevents
+/// the injected prompt from being the only source of an agent's skills.
+///
+/// Only skills already linked through the registry's `shared/` directory are
+/// accepted. That prevents a malformed per-agent runtime folder from causing
+/// Codex to load an arbitrary directory as a skill.
+pub fn populate_codex_skill_home(agent_name: &str, codex_home: &str) -> Result<usize, String> {
+    let root = aperture_root();
+    link_codex_skills(
+        &Path::new(&root).join(agent_name).join("skills"),
+        &Path::new(&root).join("shared"),
+        &Path::new(codex_home).join("skills"),
+    )
+}
+
+fn link_codex_skills(
+    agent_skills_dir: &Path,
+    shared_skills_dir: &Path,
+    codex_skills_dir: &Path,
+) -> Result<usize, String> {
+    if !agent_skills_dir.exists() {
+        return Ok(0);
+    }
+
+    fs::create_dir_all(codex_skills_dir).map_err(|e| {
+        format!(
+            "could not create Codex skill directory {}: {}",
+            codex_skills_dir.display(),
+            e
+        )
+    })?;
+
+    let mut linked = 0;
+    for entry in fs::read_dir(agent_skills_dir).map_err(|e| {
+        format!(
+            "could not read agent skill directory {}: {}",
+            agent_skills_dir.display(),
+            e
+        )
+    })? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+
+        let source = entry.path();
+        if !fs::metadata(&source).map(|m| m.is_dir()).unwrap_or(false) {
+            continue;
+        }
+
+        let shared_source = shared_skills_dir.join(&name);
+        let resolved_source = fs::canonicalize(&source).map_err(|e| e.to_string())?;
+        let resolved_shared = fs::canonicalize(&shared_source).map_err(|e| {
+            format!(
+                "agent skill '{}' is not present in shared registry {}: {}",
+                name.to_string_lossy(),
+                shared_skills_dir.display(),
+                e
+            )
+        })?;
+        // Equality with the canonical shared entry is the registry boundary:
+        // runtime links may resolve onward to the repo's canonical skill body.
+        if resolved_source != resolved_shared {
+            return Err(format!(
+                "refusing Codex skill '{}' outside the shared Aperture registry",
+                name.to_string_lossy()
+            ));
+        }
+
+        let destination = codex_skills_dir.join(&name);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::remove_file(&destination).map_err(|e| e.to_string())?;
+            }
+            Ok(_) => {
+                // Preserve Codex's built-in directories (for example `.system`)
+                // and avoid replacing any non-Aperture content on a name clash.
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&resolved_shared, &destination).map_err(|e| {
+            format!(
+                "could not link Codex skill {}: {}",
+                destination.display(),
+                e
+            )
+        })?;
+        #[cfg(not(unix))]
+        return Err("Codex skill linking requires a Unix filesystem".into());
+
+        linked += 1;
+    }
+
+    Ok(linked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_codex_skills;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aperture-agent-loader-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_links_only_registry_selected_skills() {
+        let root = temp_dir("codex-skills");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        let skill = shared.join("beads");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "beads skill").unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        std::os::unix::fs::symlink("../../shared/beads", selected.join("beads")).unwrap();
+
+        // A built-in is not an Aperture skill and must survive the assembly.
+        fs::create_dir_all(codex_skills.join(".system")).unwrap();
+
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            1
+        );
+        assert!(codex_skills.join("beads").is_symlink());
+        assert_eq!(
+            fs::read_to_string(codex_skills.join("beads/SKILL.md")).unwrap(),
+            "beads skill"
+        );
+        assert!(codex_skills.join(".system").is_dir());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_rejects_agent_skill_outside_shared_registry() {
+        let root = temp_dir("codex-skills-reject");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        let untrusted = root.join("untrusted");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        fs::create_dir_all(&untrusted).unwrap();
+        fs::write(untrusted.join("SKILL.md"), "not an Aperture skill").unwrap();
+        std::os::unix::fs::symlink("../../untrusted", selected.join("malicious")).unwrap();
+
+        let error = link_codex_skills(&selected, &shared, &codex_skills).unwrap_err();
+        assert!(error.contains("not present in shared registry"));
+        assert!(!codex_skills.join("malicious").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
