@@ -166,6 +166,10 @@ pub fn boot_agent_process(
 
     // Create a dedicated tmux window for this agent
     let window_id = tmux::tmux_create_window(tmux_session, name.clone())?;
+    // From this point onward every failure must remove the already-created
+    // window. Otherwise the watchdog sees a half-booted agent and respawns it
+    // repeatedly, leaving orphan panes behind.
+    let boot_result = (|| -> Result<String, String> {
 
     // Ensure agent's mailbox directory exists
     let mailbox_dir = format!("{}/.aperture/mailbox", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
@@ -247,6 +251,16 @@ pub fn boot_agent_process(
 
         let beads_dir = format!("{}/.aperture/.beads", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
         fs::create_dir_all(&codex_home).map_err(|e| e.to_string())?;
+
+        // Codex discovers skills from $CODEX_HOME/skills. Mirror the same
+        // manifest-selected runtime links that Claude Code receives under
+        // ~/.claude/aperture/<agent>/skills; CODEX_HOME is per-agent and /tmp
+        // is recreated after reboot, so this must happen at every launch.
+        let codex_skill_count = crate::agent_loader::populate_codex_skill_home(&name, &codex_home)?;
+        eprintln!(
+            "[aperture] linked {} native Codex skills for '{}'",
+            codex_skill_count, name
+        );
 
         // aperture-kc7lb: Codex reads its ChatGPT login from $CODEX_HOME/auth.json.
         // The per-agent CODEX_HOME lives in /tmp (wiped on reboot) and is created
@@ -417,7 +431,15 @@ pub fn boot_agent_process(
         }
     });
 
-    Ok(window_id)
+    Ok(window_id.clone())
+    })();
+
+    if boot_result.is_err() {
+        let _ = tmux::tmux_kill_window(window_id);
+        codex_appserver::stop_app_server(&name);
+    }
+
+    boot_result
 }
 
 #[tauri::command]
