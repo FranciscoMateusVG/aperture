@@ -166,6 +166,10 @@ pub fn boot_agent_process(
 
     // Create a dedicated tmux window for this agent
     let window_id = tmux::tmux_create_window(tmux_session, name.clone())?;
+    // From this point onward every failure must remove the already-created
+    // window. Otherwise the watchdog sees a half-booted agent and respawns it
+    // repeatedly, leaving orphan panes behind.
+    let boot_result = (|| -> Result<String, String> {
 
     // Ensure agent's mailbox directory exists
     let mailbox_dir = format!("{}/.aperture/mailbox", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
@@ -427,7 +431,15 @@ pub fn boot_agent_process(
         }
     });
 
-    Ok(window_id)
+    Ok(window_id.clone())
+    })();
+
+    if boot_result.is_err() {
+        let _ = tmux::tmux_kill_window(window_id);
+        codex_appserver::stop_app_server(&name);
+    }
+
+    boot_result
 }
 
 #[tauri::command]

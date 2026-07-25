@@ -14,7 +14,7 @@
 
 use crate::state::AgentDef;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -226,82 +226,194 @@ fn link_codex_skills(
     shared_skills_dir: &Path,
     codex_skills_dir: &Path,
 ) -> Result<usize, String> {
-    if !agent_skills_dir.exists() {
+    if let Err(e) = fs::create_dir_all(codex_skills_dir) {
+        eprintln!(
+            "[aperture] warning: could not create Codex skill directory {}: {}",
+            codex_skills_dir.display(),
+            e
+        );
         return Ok(0);
     }
 
-    fs::create_dir_all(codex_skills_dir).map_err(|e| {
-        format!(
-            "could not create Codex skill directory {}: {}",
-            codex_skills_dir.display(),
-            e
-        )
-    })?;
-
     let mut linked = 0;
-    for entry in fs::read_dir(agent_skills_dir).map_err(|e| {
-        format!(
-            "could not read agent skill directory {}: {}",
-            agent_skills_dir.display(),
-            e
-        )
-    })? {
-        let entry = entry.map_err(|e| e.to_string())?;
+    let mut active_links = HashSet::new();
+    let entries: Vec<_> = match fs::read_dir(agent_skills_dir) {
+        Ok(entries) => entries.collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "[aperture] warning: could not read agent skill directory {}: {}",
+                agent_skills_dir.display(),
+                e
+            );
+            Vec::new()
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("[aperture] warning: skipping unreadable skill entry: {}", e);
+                continue;
+            }
+        };
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
+        let display_name = name.to_string_lossy();
+        if display_name.starts_with('.') {
             continue;
         }
 
         let source = entry.path();
-        if !fs::metadata(&source).map(|m| m.is_dir()).unwrap_or(false) {
-            continue;
+        match fs::metadata(&source) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                eprintln!(
+                    "[aperture] warning: skipping Codex skill '{}': selected entry is not a directory",
+                    display_name
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[aperture] warning: skipping Codex skill '{}': cannot resolve selected entry: {}",
+                    display_name, e
+                );
+                continue;
+            }
         }
 
         let shared_source = shared_skills_dir.join(&name);
-        let resolved_source = fs::canonicalize(&source).map_err(|e| e.to_string())?;
-        let resolved_shared = fs::canonicalize(&shared_source).map_err(|e| {
-            format!(
-                "agent skill '{}' is not present in shared registry {}: {}",
-                name.to_string_lossy(),
-                shared_skills_dir.display(),
-                e
-            )
-        })?;
+        let resolved_source = match fs::canonicalize(&source) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "[aperture] warning: skipping Codex skill '{}': cannot canonicalize selected entry: {}",
+                    display_name, e
+                );
+                continue;
+            }
+        };
+        let resolved_shared = match fs::canonicalize(&shared_source) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "[aperture] warning: skipping Codex skill '{}': not present in shared registry {}: {}",
+                    display_name,
+                    shared_skills_dir.display(),
+                    e
+                );
+                continue;
+            }
+        };
         // Equality with the canonical shared entry is the registry boundary:
         // runtime links may resolve onward to the repo's canonical skill body.
         if resolved_source != resolved_shared {
-            return Err(format!(
-                "refusing Codex skill '{}' outside the shared Aperture registry",
-                name.to_string_lossy()
-            ));
+            eprintln!(
+                "[aperture] warning: skipping Codex skill '{}': selected entry resolves outside the shared Aperture registry",
+                display_name
+            );
+            continue;
         }
 
         let destination = codex_skills_dir.join(&name);
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                fs::remove_file(&destination).map_err(|e| e.to_string())?;
+                if let Err(e) = fs::remove_file(&destination) {
+                    eprintln!(
+                        "[aperture] warning: skipping Codex skill '{}': cannot replace existing link: {}",
+                        display_name, e
+                    );
+                    continue;
+                }
             }
             Ok(_) => {
                 // Preserve Codex's built-in directories (for example `.system`)
                 // and avoid replacing any non-Aperture content on a name clash.
+                eprintln!(
+                    "[aperture] warning: skipping Codex skill '{}': destination {} is non-symlink content",
+                    display_name,
+                    destination.display()
+                );
                 continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                eprintln!(
+                    "[aperture] warning: skipping Codex skill '{}': cannot inspect destination: {}",
+                    display_name, e
+                );
+                continue;
+            }
         }
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&resolved_shared, &destination).map_err(|e| {
-            format!(
-                "could not link Codex skill {}: {}",
+        if let Err(e) = std::os::unix::fs::symlink(&resolved_shared, &destination) {
+            eprintln!(
+                "[aperture] warning: skipping Codex skill '{}': could not create link {}: {}",
+                display_name,
                 destination.display(),
                 e
-            )
-        })?;
+            );
+            continue;
+        }
         #[cfg(not(unix))]
-        return Err("Codex skill linking requires a Unix filesystem".into());
+        {
+            eprintln!(
+                "[aperture] warning: skipping Codex skill '{}': native skill linking requires a Unix filesystem",
+                display_name
+            );
+            continue;
+        }
 
+        active_links.insert(name);
         linked += 1;
+    }
+
+    // Reconcile revocations on every launch. Only remove links that Aperture
+    // can prove it owns: their target is inside the shared registry. Codex
+    // built-ins and user-installed links pointing elsewhere are preserved.
+    let shared_root = fs::canonicalize(shared_skills_dir).ok();
+    if let Ok(destinations) = fs::read_dir(codex_skills_dir) {
+        for destination in destinations.flatten() {
+            let name = destination.file_name();
+            if active_links.contains(&name) {
+                continue;
+            }
+            let path = destination.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let owned = fs::read_link(&path)
+                .ok()
+                .map(|target| {
+                    let absolute_target = if target.is_absolute() {
+                        target
+                    } else {
+                        codex_skills_dir.join(target)
+                    };
+                    shared_root
+                        .as_ref()
+                        .map(|root| absolute_target.starts_with(root))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if owned {
+                match fs::remove_file(&path) {
+                    Ok(()) => eprintln!(
+                        "[aperture] removed revoked Codex skill link '{}'",
+                        name.to_string_lossy()
+                    ),
+                    Err(e) => eprintln!(
+                        "[aperture] warning: could not remove revoked Codex skill link '{}': {}",
+                        name.to_string_lossy(),
+                        e
+                    ),
+                }
+            }
+        }
     }
 
     Ok(linked)
@@ -368,9 +480,133 @@ mod tests {
         fs::write(untrusted.join("SKILL.md"), "not an Aperture skill").unwrap();
         std::os::unix::fs::symlink("../../untrusted", selected.join("malicious")).unwrap();
 
-        let error = link_codex_skills(&selected, &shared, &codex_skills).unwrap_err();
-        assert!(error.contains("not present in shared registry"));
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            0
+        );
         assert!(!codex_skills.join("malicious").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_skips_real_directory_and_preserves_boot_harness_shape() {
+        let root = temp_dir("codex-skills-real-dir");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        fs::create_dir_all(selected.join("smoke")).unwrap();
+        fs::write(selected.join("smoke/SKILL.md"), "harness skill").unwrap();
+
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            0
+        );
+        assert!(!codex_skills.join("smoke").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_removes_revoked_owned_links_only() {
+        let root = temp_dir("codex-skills-revoke");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        let retained = shared.join("retained");
+        let revoked = shared.join("revoked");
+        let external = root.join("external");
+        for skill in [&retained, &revoked, &external] {
+            fs::create_dir_all(skill).unwrap();
+            fs::write(skill.join("SKILL.md"), "skill").unwrap();
+        }
+        fs::create_dir_all(&selected).unwrap();
+        fs::create_dir_all(&codex_skills).unwrap();
+        std::os::unix::fs::symlink("../../shared/retained", selected.join("retained")).unwrap();
+        std::os::unix::fs::symlink(fs::canonicalize(&revoked).unwrap(), codex_skills.join("revoked"))
+            .unwrap();
+        std::os::unix::fs::symlink(fs::canonicalize(&external).unwrap(), codex_skills.join("external"))
+            .unwrap();
+
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            1
+        );
+        assert!(codex_skills.join("retained").is_symlink());
+        assert!(!codex_skills.join("revoked").exists());
+        assert!(codex_skills.join("external").is_symlink());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_preserves_non_symlink_destination_clash() {
+        let root = temp_dir("codex-skills-clash");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        fs::create_dir_all(shared.join("beads")).unwrap();
+        fs::write(shared.join("beads/SKILL.md"), "beads skill").unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        std::os::unix::fs::symlink("../../shared/beads", selected.join("beads")).unwrap();
+        fs::create_dir_all(codex_skills.join("beads")).unwrap();
+        fs::write(codex_skills.join("beads/local.txt"), "keep").unwrap();
+
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            0
+        );
+        assert_eq!(
+            fs::read_to_string(codex_skills.join("beads/local.txt")).unwrap(),
+            "keep"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_destination_setup_failure_is_non_fatal() {
+        let root = temp_dir("codex-skills-destination-file");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        fs::create_dir_all(shared.join("beads")).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        std::os::unix::fs::symlink("../../shared/beads", selected.join("beads")).unwrap();
+        fs::create_dir_all(root.join("codex")).unwrap();
+        fs::write(&codex_skills, "not a directory").unwrap();
+
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            0
+        );
+        assert_eq!(fs::read_to_string(&codex_skills).unwrap(), "not a directory");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_removes_all_owned_links_when_selection_disappears() {
+        let root = temp_dir("codex-skills-empty-selection");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        let revoked = shared.join("revoked");
+        fs::create_dir_all(&revoked).unwrap();
+        fs::create_dir_all(&codex_skills).unwrap();
+        std::os::unix::fs::symlink(fs::canonicalize(&revoked).unwrap(), codex_skills.join("revoked"))
+            .unwrap();
+
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            0
+        );
+        assert!(!codex_skills.join("revoked").exists());
 
         let _ = fs::remove_dir_all(root);
     }
