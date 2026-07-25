@@ -346,8 +346,13 @@ fn link_codex_skills(
             }
         }
 
+        // Link to the registry path (shared/<name>), NOT the canonicalized
+        // repo body: (a) re-pointing shared/ after a repo move heals live
+        // agents at access time instead of leaving baked-path danglers, and
+        // (b) the reconciliation sweep below can identify Aperture-owned
+        // links by their textual parent even when the target is dangling.
         #[cfg(unix)]
-        if let Err(e) = std::os::unix::fs::symlink(&resolved_shared, &destination) {
+        if let Err(e) = std::os::unix::fs::symlink(&shared_source, &destination) {
             eprintln!(
                 "[aperture] warning: skipping Codex skill '{}': could not create link {}: {}",
                 display_name,
@@ -394,10 +399,15 @@ fn link_codex_skills(
                     } else {
                         codex_skills_dir.join(target)
                     };
-                    shared_root
-                        .as_ref()
-                        .map(|root| absolute_target.starts_with(root))
-                        .unwrap_or(false)
+                    // Aperture-created links target shared/<name> verbatim, so
+                    // the textual parent match identifies them even when the
+                    // target dangles. The canonical-prefix check additionally
+                    // catches any link resolving inside the shared registry.
+                    absolute_target.parent() == Some(shared_skills_dir)
+                        || shared_root
+                            .as_ref()
+                            .map(|root| absolute_target.starts_with(root))
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false);
             if owned {
@@ -585,6 +595,49 @@ mod tests {
             0
         );
         assert_eq!(fs::read_to_string(&codex_skills).unwrap(), "not a directory");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Production-shape regression: in the real runtime tree, shared/<name>
+    /// is itself a symlink onward to the repo's skill body. The revocation
+    /// sweep must recognize links created through that shape as
+    /// Aperture-owned — canonical-prefix alone fails there because the
+    /// created link's canonical target lives under the repo, not shared/.
+    #[test]
+    #[cfg(unix)]
+    fn codex_skill_home_revokes_links_it_created_through_symlinked_registry() {
+        let root = temp_dir("codex-skills-symlinked-registry");
+        let repo_skill = root.join("repo-skills/beads");
+        let shared = root.join("shared");
+        let selected = root.join("rex/skills");
+        let codex_skills = root.join("codex/skills");
+        fs::create_dir_all(&repo_skill).unwrap();
+        fs::write(repo_skill.join("SKILL.md"), "beads body").unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        std::os::unix::fs::symlink(&repo_skill, shared.join("beads")).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        std::os::unix::fs::symlink("../../shared/beads", selected.join("beads")).unwrap();
+
+        // Launch 1: selected -> linked, readable through the chain.
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            1
+        );
+        assert!(codex_skills.join("beads").is_symlink());
+        assert_eq!(
+            fs::read_to_string(codex_skills.join("beads/SKILL.md")).unwrap(),
+            "beads body"
+        );
+
+        // Revocation: selection removed. Launch 2 must remove the link this
+        // function created on launch 1.
+        fs::remove_file(selected.join("beads")).unwrap();
+        assert_eq!(
+            link_codex_skills(&selected, &shared, &codex_skills).unwrap(),
+            0
+        );
+        assert!(!codex_skills.join("beads").exists());
 
         let _ = fs::remove_dir_all(root);
     }
