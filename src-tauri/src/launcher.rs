@@ -164,6 +164,7 @@ pub struct CodexConfigParams<'a> {
 pub fn build_codex_config_toml(p: &CodexConfigParams) -> String {
     format!(
         r#"model = "{bare_model}"
+model_reasoning_effort = "high"
 model_instructions_file = "{prompt_dest}"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
@@ -404,6 +405,7 @@ exec codex resume "$THREAD_ID" --remote "unix:///Users/x/.aperture/run/vex.sock"
         assert_eq!(
             s,
             r#"model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
 model_instructions_file = "/tmp/aperture-codex-vex/prompt.md"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
@@ -430,6 +432,7 @@ env = { AGENT_NAME = "vex", AGENT_ROLE = "builder", AGENT_MODEL = "codex/gpt-5.3
         let s = build_codex_config_toml(&sample_codex_params());
         let t: toml::Table = s.parse().expect("config.toml must be valid TOML");
         assert_eq!(t["model"].as_str(), Some("gpt-5.3-codex"));
+        assert_eq!(t["model_reasoning_effort"].as_str(), Some("high"));
         assert_eq!(
             t["model_instructions_file"].as_str(),
             Some("/tmp/aperture-codex-vex/prompt.md")
