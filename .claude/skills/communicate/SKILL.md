@@ -253,6 +253,19 @@ Before claiming "X is missing" or "X was never built," verify against the CANONI
 
 If your local was last `git pull`'d more than ~1 hour ago, treat it as stale and `git fetch` before any claim about main's contents. The same recursion applies that Cipher and Atlas codified: "verify against reality" needs to be applied at the RIGHT artifact layer — local-stale-clone is not the reality you're claiming about.
 
+### 7.4 Specialist agents: route operator-judgment questions through GLaDOS — don't block on your own pane
+
+**Banked precedent (2026-07-27, eunenem product-catalog spec, aperture-26wof):** Wheatley hit a genuine ambiguity mid-recon (what does "product lists" mean — kits, categories, or both?) and surfaced it with a local interactive multi-choice prompt that blocked his own turn on his own tmux pane. That design assumes someone is physically attached to *his* window at that exact moment — nobody is, by default. The operator only learned the question existed because they separately asked GLaDOS "is Wheatley stuck?" and GLaDOS deep-peeked his pane manually (per `agent-liveness`). Had that prompt not come, the question could have sat blocked indefinitely with nothing signaling either GLaDOS or the operator that input was needed.
+
+**The rule, if you are a specialist agent (not GLaDOS):** operator-judgment questions go to GLaDOS via `send_message`, not to a local blocking UI element in your own pane. GLaDOS's pane is the one surface the operator is expected to actually read (§7 above); yours is not.
+
+- Hit a genuine ambiguity that needs the operator's product/strategic judgment → `send_message(to: "glados", message: "<the question + the candidate answers>")`. Note it in the bead ("blocked on operator input via GLaDOS") and pivot to other work if you have any, or wait.
+- Do NOT use an interactive multi-choice/selector tool that blocks your own turn waiting for a keypress in your own pane. That pattern only resolves if the operator happens to be attached to YOUR window — not the default assumption anywhere else in this skill.
+- GLaDOS relaying the operator's answer back (BEADS message, or occasionally a keystroke relay into an already-open prompt) is the real signal to proceed — not a keystroke that silently arrives with no BEADS trail behind it.
+- Exception: if the operator has, in fact, directly attached to your pane and is actively interacting with an on-screen prompt (per `agent-liveness §4` — "mid-composition text from operator, do NOT send keys"), that's a live human already there, and it takes precedence. This exception is about not corrupting a human's live input if they showed up — not a license to design your workflow around them showing up.
+
+This is the specialist-side mirror of `aperture:agent-liveness` (GLaDOS's discipline for reading YOUR pane) — the operator's attention is a scarce, GLaDOS-mediated resource. Design your workflow assuming you'll never have direct access to it, not assuming you might.
+
 ---
 
 ## 8. Codex Agents
