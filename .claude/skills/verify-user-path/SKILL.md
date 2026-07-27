@@ -91,6 +91,21 @@ Each drawer contains: email + password + CPF + BetterAuth `user_id` + `volunteer
 
 **Rotation:** Ping Peppy if credentials seem compromised OR the password expires. Don't hand-rotate without coordination — the user_id/volunteer_id stay stable; only the password changes; drawer updates after. Each walker rotates independently.
 
+### Production browser-session hygiene (mandatory)
+
+The shared `playwright-mini` launcher runs Playwright MCP in `--isolated` mode. Do not remove that flag or supply a persistent storage state for a production walk. A production session must never survive into another agent's walk.
+
+Before any production action:
+
+1. Navigate to the canonical production origin and call `/api/auth/get-session` with credentials included.
+2. The session result **must be null**. If it is not null, record identity metadata only (expected/observed email or user ID, role, and whether impersonation is active), call `/api/auth/sign-out`, then call `/api/auth/get-session` again.
+3. Fail closed unless the second result is null. Do not continue under an inherited session, even when it appears to be the expected role.
+4. Authenticate only as the allowlisted walker identity and role named in the BEADS walk plan. A real customer-account walk requires explicit operator authorization and a one-off isolated browser context.
+
+Run cleanup as a `finally` step after every production walk: sign out, verify `/api/auth/get-session` returns null, then call `browser_close`. If cleanup or the final null-session check fails, the walk is incomplete and must be reported as blocked.
+
+BEADS evidence records only the canonical origin, expected and observed identity metadata, role, impersonation state, and the preflight/final null-session results. Never store raw passwords, cookies, session tokens, authorization headers, or localStorage values.
+
 ### Layer B — Perform the actual user action
 
 Click the button. Submit the form. Upload the file. Trigger the AI. Whatever the feature IS — do it as a user would.
