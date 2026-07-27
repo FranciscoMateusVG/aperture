@@ -704,12 +704,27 @@ export function startCodexBridges(hooks: BridgeHooks): CodexBridgeManager {
   const bridges = new Map<string, CodexBridgeClient>();
 
   const scan = (): void => {
-    for (const agent of discoverCodexAgents()) {
+    const codexAgents = new Set(discoverCodexAgents());
+    // Add newly-codex agents.
+    for (const agent of codexAgents) {
       if (bridges.has(agent)) continue;
       const client = new CodexBridgeClient(agent, join(RUN_DIR, `${agent}.sock`), hooks);
       bridges.set(agent, client);
       hooks.log("codex_bridge_added", { agent, sock: client.sockPath });
       client.start();
+    }
+    // Prune agents whose effective model flipped AWAY from codex/ since the
+    // last scan (e.g. the launcher restarted them as a claude-code session
+    // and rewrote agent-config.json). Without this, the stale bridge lingers
+    // forever and handleNotify keeps routing that agent's messages down the
+    // codex path (notify_codex → dead ENOENT app-server socket) instead of
+    // to their live Monitor WebSocket — silently killing push delivery for
+    // the rest of the hub's lifetime. (aperture-avlz2)
+    for (const agent of bridges.keys()) {
+      if (codexAgents.has(agent)) continue;
+      bridges.get(agent)?.stop();
+      bridges.delete(agent);
+      hooks.log("codex_bridge_removed", { agent, reason: "no_longer_codex" });
     }
   };
 
