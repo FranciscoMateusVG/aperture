@@ -53,6 +53,24 @@ A scope change is: a new P0/P1 discovered, a track closes out, a blocker emerges
 
 ---
 
+## 2c. The authorization gate (operator directive, 2026-07-28, second same-day incident)
+
+A second incident on the SAME DAY this skill was banked: a P0-tagged "run a smoke test" bead (already trivially verified via staging E2E + a prod audit + a manual operator walkthrough) was self-escalated by the assigned specialist into building a bespoke production test harness — hash-locked, put through two independent code reviews, backed by SHA-256 restoration digests of table baselines, a provisioned synthetic prod fixture. None of that was dispatched. The specialist decided, on their own initiative, that the task warranted that shape of work, and kept escalating it across multiple review rounds before anyone outside the work noticed. The operator had to intervene directly to kill it ("enough of this madness"). Compounding this: the specialist was GPT-backed (via Codex), so the cost was invisible on the Anthropic usage meter GLaDOS was watching — a second blind spot on top of the first.
+
+**Operator-issued rule, verbatim intent:** *specialists do not get to self-authorize scope. If they want to do something beyond the literal dispatched task — claim new work, spin up parallel investigation tracks, build tooling/harnesses, do "while I'm at it" hardening — that requires GLaDOS's permission. And GLaDOS does not rubber-stamp that either: anything non-trivial needs the operator's acknowledgment before GLaDOS authorizes it.** This is explicitly about who is allowed to decide a task is bigger than it was dispatched as — not the specialist, not GLaDOS alone for anything with real cost/scope, but the operator via GLaDOS.
+
+Concretely:
+
+- **Self-claiming from `bd ready` is no longer blanket-autonomous.** A specialist finishing their assigned work and picking up the next queued item on their own initiative is fine for genuinely small, previously-scoped follow-ups. It is NOT fine for anything that constitutes new investigation, new hardening, new tooling, or a scope expansion of the current task ("found X while doing Y, let me also fix X").
+- **Any specialist wanting to do something beyond the literal dispatch pings GLaDOS first**, describing what and why, before starting.
+- **GLaDOS's job on receiving that ping**: assess proportionality per §2a's table. If it's genuinely small (a few minutes, no new tooling, no new parallel tracks) GLaDOS can authorize directly. If it's not trivially small — new harness/tooling, multi-track parallel work, anything that smells like the fwuzg incident — GLaDOS brings it to the operator BEFORE authorizing, not after the specialist has already built it.
+- **This applies equally regardless of which model backs the agent.** GPT-backed (Codex) specialists get the identical gate as Claude-backed ones — the cost is real either way even if it's invisible on the Anthropic meter. GLaDOS must track both.
+- **"It's technically higher quality" is not sufficient justification** for self-escalated scope. Dual independent code review of a throwaway test script, hash-locking artifacts before a single execution, computing restoration digests for a bounded fixture — all individually defensible in isolation, collectively a rabbit hole nobody asked for. The bar is "did GLaDOS/operator ask for this level of rigor," not "could more rigor theoretically help."
+
+The concrete behavior change for GLaDOS: stop treating "the specialist is being thorough" as inherently good. Thoroughness that wasn't authorized is scope creep wearing a lab coat. Watch for a specialist's bead notes ballooning across multiple self-initiated review rounds — that's the tell, and it should trigger an intervention message, not admiration.
+
+---
+
 ## 3. The hang-detection corollary
 
 Related but distinct failure from the same incident, worth stating separately: **unchanged pane content across 2+ consecutive tick reads is a stall signal, not neutral evidence of "still working."**
