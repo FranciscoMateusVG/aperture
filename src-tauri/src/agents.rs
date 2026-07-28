@@ -294,6 +294,10 @@ pub fn boot_agent_process(
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);
+        // Codex has no SessionStart/PreCompact hook system (unlike Claude
+        // Code — see .claude/settings.json), so the shared bd-memory bank
+        // must be mirrored into the static prompt manually here.
+        let prompt_content = inject_bd_memory(prompt_content, &beads_dir, &name);
         // Comms Layer v2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
         // unread messages are replayed by the aperture-bus codex-bridge over
         // the app-server socket; nothing is prepended to the prompt here.
@@ -625,6 +629,60 @@ pub fn inject_skills(mut prompt: String, agent_name: &str) -> String {
     );
     for (skill_name, content) in skills {
         prompt.push_str(&format!("\n\n---\n# Skill: {}\n\n{}", skill_name, content));
+    }
+    prompt
+}
+
+/// Claude Code agents get the shared `bd remember` memory bank for free via
+/// the `SessionStart`/`PreCompact` hooks in `.claude/settings.json`, which
+/// run `bd prime` and inject its output into context automatically. Codex
+/// has no equivalent hook system — it only reads a static
+/// `model_instructions_file` written once at boot — so without this, every
+/// Codex-backed agent (Rex/Scout/Cipher as of 2026-07) boots with zero
+/// memory context even though `bd` itself is fully wired for them (same
+/// BEADS_DIR/BD_ACTOR env as Claude agents get). Manually shell out to the
+/// same `bd prime` command and append its output, so both backends see the
+/// identical memory bank at boot. Failure here must not fail agent boot —
+/// worst case the agent starts without memories, same as before this fix.
+pub fn inject_bd_memory(mut prompt: String, beads_dir: &str, agent_name: &str) -> String {
+    let output = std::process::Command::new("bd")
+        .arg("prime")
+        .env("BEADS_DIR", beads_dir)
+        .env("BD_ACTOR", agent_name)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.trim().is_empty() {
+                eprintln!(
+                    "[aperture] warning: `bd prime` returned empty output for '{}'",
+                    agent_name
+                );
+            } else {
+                eprintln!(
+                    "[aperture] injected bd prime memory bank ({} bytes) for '{}'",
+                    text.len(),
+                    agent_name
+                );
+                prompt.push_str(&format!(
+                    "\n\n---\n# Beads Memory Bank (bd prime, mirrored for Codex — no hook system)\n\n{}",
+                    text
+                ));
+            }
+        }
+        Ok(out) => {
+            eprintln!(
+                "[aperture] warning: `bd prime` exited non-zero for '{}': {}",
+                agent_name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[aperture] warning: failed to run `bd prime` for '{}': {}",
+                agent_name, e
+            );
+        }
     }
     prompt
 }
