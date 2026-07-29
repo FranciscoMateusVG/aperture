@@ -1,11 +1,58 @@
 ---
 name: aperture-beads
-description: Complete BEADS task discipline for Aperture agents — authoring, project labels, and full lifecycle (claim → work → artifact → close). Use any time you create, claim, update, query, or close a task; choose priority/type; apply project labels; store artifacts. Triggers on bd create, query_tasks, update_task, store_artifact, close_task, mark_as_read.
+description: Complete BEADS task discipline for Aperture agents — authoring, project labels, and full lifecycle (claim → work → artifact → close). Task CREATION is GLaDOS-only and operator-acknowledged (§0, no exceptions, including P0s) — every other agent claims, works, updates, and closes existing beads but never files new ones. Use any time you create, claim, update, query, or close a task; choose priority/type; apply project labels; store artifacts. Triggers on bd create, query_tasks, update_task, store_artifact, close_task, mark_as_read.
 ---
 
 # BEADS Discipline
 
 The canonical guide for every interaction with BEADS in Aperture. Covers the full life of a task: how to file one well, how to tag it, how to work it, how to close it. If you're touching `bd` or any of the MCP `*_task` tools, this is the reference.
+
+---
+
+## 0. Creation Gate — Only GLaDOS Files, Only With Operator Ack (NON-NEGOTIABLE)
+
+**Operator directive, 2026-07-29.** Bead creation is not an execution-layer action. It's a direction-layer decision — "does this deserve to exist as tracked work at all" — and direction lives with the operator and GLaDOS, nobody else.
+
+> **Operator + GLaDOS are the brains and the direction. Specialist agents get shit done. That's the whole split.**
+
+### The rule
+
+- **Only GLaDOS calls `create_task` / `bd create`.** No other agent — Wheatley, Peppy, Izzy, Vance, Rex, Scout, Cipher, none of them — files a new bead, ever. Not for a follow-up, not for a `discovered-from` child, not for "just noting this for later."
+- **GLaDOS does not create a bead without the operator's explicit acknowledgment first.** No exceptions. This includes live, actively-exploitable security P0 findings — operator-confirmed 2026-07-29: even a P0 waits for ack before the bead exists.
+- This is a hard rule, not a "use judgment" rule. If you're a specialist and you're about to reach for `create_task` — stop. Message GLaDOS instead.
+
+### What this does NOT restrict
+
+Everything else about the BEADS lifecycle stays open to every agent, exactly as documented in §4:
+
+- `query_tasks` / `search_tasks` — find and read work
+- `update_task(claim: true)` — claim an *existing* bead
+- `update_task(notes: ...)` — log progress on an *existing* bead
+- `store_artifact` — attach deliverables
+- `close_task` — close on PR-open, per the normal invariant
+
+The gate is specifically on **bringing a new bead into existence.** Working an existing one is unaffected.
+
+### How a specialist gets something tracked
+
+1. Find something worth tracking (a bug, a follow-up, a real piece of scoped work)? **Message GLaDOS** — `send_message(to: "glados", message: "...")` — with a proposed title, why it matters, and what "done" looks like. Do not call `create_task` yourself.
+2. GLaDOS runs it against the raised filing bar below. If it clears, GLaDOS brings it to the operator for ack — batched where sensible, not one doorbell-ring per candidate.
+3. Only after the operator acknowledges does GLaDOS file it — with the project label, per the usual discipline in §1–§2.
+4. If the operator says no, or GLaDOS judges it doesn't clear the bar, it doesn't get filed. It's fine for it to just not exist. Not everything worth noticing is worth tracking.
+
+For a live security P0: ring the operator's doorbell immediately per `aperture:communicate` — urgency of *response* and gating of *bead creation* are separate concerns. The finding gets escalated in real time regardless; the bead itself still waits for ack.
+
+### The raised filing bar (why most findings should NOT become a bead)
+
+Banked from a real incident (2026-07-29): the board accumulated 300+ open beads, most of them cosmetic nits, speculative "candidate" explorations, and parked decisions (`[operator-decides]`, `v1.1 OPTION: ...`) that were never going to be prioritized over real work. They didn't help — they buried the real P0s and P1s under noise, and gave specialists a plausible-looking-but-wrong item to self-start on instead of what actually mattered. GLaDOS bulk-closed all 307 of them in one pass. The lesson: **filing has to cost something, or it will be used for everything.**
+
+A candidate only clears the bar if ALL of these hold:
+
+- **It's scoped.** A concrete unit of work, not a vague "consider X" or an open-ended exploration.
+- **It's actionable soon.** Someone would plausibly claim and finish it in the near term — not "maybe relevant if we ever revisit this surface."
+- **It isn't better served by a note.** Cosmetic findings, "while I was in there I noticed," speculative options, and exploratory candidates belong in the *existing* task's notes (or nowhere) — not as their own row. See §1 "When NOT to file" for the full list.
+
+If a specialist proposes something that doesn't clear this bar, GLaDOS's answer is "noted, not filed" — not a rubber stamp.
 
 ---
 
@@ -83,6 +130,8 @@ Use `blocked-by` aggressively. `bd ready` only shows tasks with no open blockers
 - Work you'll finish inside your current message (< 5 min, single small edit)
 - Planning discussions before the operator signs off (file when the plan is approved, not while it's being debated)
 - Quick clarification questions — those go through `send_message`, not BEADS
+- Cosmetic nits, "while I was in there I noticed," and speculative/parked options (`[operator-decides]`, `v1.1 OPTION`, `[Exploratory]`) with no near-term claimant — note them in the relevant existing task instead of proposing a new one. See §0's raised filing bar.
+- Anything you (a non-GLaDOS agent) are tempted to file yourself — you don't file, period. See §0.
 
 ---
 
@@ -416,6 +465,9 @@ After closing, send a short completion report. See `aperture:communicate` for st
 | Embed literal `</tag>` in a text field | Truncates the call, breaks the next one |
 | File a task to track 2 minutes of in-flight work | Process overhead > work; just do it |
 | Create new project labels without operator sign-off | Drifts the taxonomy into noise |
+| Any non-GLaDOS agent calling `create_task` / `bd create` | Violates the §0 creation gate — route the proposal through GLaDOS instead |
+| GLaDOS filing a bead before the operator has acknowledged it | Violates §0 — no exceptions, including live P0 security findings (escalate immediately, but the bead still waits for ack) |
+| Filing every finding as its own bead "to be safe" | This is exactly what produced the 300+-bead noise incident (§0) — run it against the raised filing bar first |
 
 ---
 
@@ -453,6 +505,8 @@ send_message(to: "glados", message: "task-456 closed. Filter scoped down — nav
 ---
 
 ## 7. Filing a New Task — Complete Example
+
+**Reminder: this section is GLaDOS's reference, not yours, unless you are GLaDOS.** Per §0, only GLaDOS calls `create_task`/`bd create`, and only after the operator has acknowledged. If you're a specialist reading this because you want to file something, stop — `send_message(to: "glados", ...)` with your proposal instead.
 
 ```bash
 bd create "Add rate-limit middleware to /api/otel/v1/traces" \
