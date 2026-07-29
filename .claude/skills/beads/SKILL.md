@@ -208,17 +208,20 @@ An epic bead has a different shape from a task bead. Required fields:
 
 Do NOT backfill children at filing time unless you actually know them. An epic with imagined children is worse than an epic with no children — they rot fast.
 
-### Dependency wiring (CRITICAL — read carefully)
+### Dependency wiring (CRITICAL — read carefully, verified against the actual CLI 2026-07-29)
 
 The intuitive shape ("children are `blocked-by` the epic") is **wrong** — it creates a circular dep. The epic only closes when children close; children can't start until the epic closes; deadlock.
 
+**⚠️ Older versions of this doc said to wire the epic as `blocked-by:<child>` via `bd dep add`/`bd create --deps`. That is WRONG for the current `bd` CLI — it rejects it outright: `Error: epics can only block other epics, not tasks`. The actual mechanism is structural parent-child, set via `--parent` on the child, NOT a dependency edge on the epic.**
+
 The correct wiring:
 
-- **Children carry `--deps discovered-from:<epic-id>`** at filing time. Soft provenance link. Does NOT block work. Lets the graph render the parent/child relationship.
-- **The epic carries `--deps blocked-by:<child1>,<child2>,...`** — manually updated as children are filed. Auto-blocks the epic from closing while any member is still open.
+- **`bd create <child> --deps discovered-from:<epic-id>`** at filing time (this part is unchanged) — soft provenance link, does not block work, lets the graph render the relationship.
+- **`bd update <child-id> --parent <epic-id>`** — this is what actually gates the epic. It reparents the child under the epic structurally. `bd close <epic-id>` will refuse with `cannot close epic <id>: N open child issue(s)` until every parented child is closed (or you pass `--force` to override, which you should almost never do).
+- If a child already carries a `discovered-from` edge to the epic and you try to `--parent` it to the same epic, `bd` errors (`dependency already exists with type "discovered-from"`) — remove the discovered-from edge first (`bd dep remove <child> <epic-id>`), then set `--parent`. You cannot have both edge types between the same pair.
 - Children remain freely claimable, freely workable, and close on their own PR-open events (same close-discipline as any task).
 
-Worked example:
+Worked example (bd CLI, verified 2026-07-29 on aperture-vsr9k + 3 children):
 
 ```bash
 # 1. File the epic, no children yet
@@ -232,19 +235,20 @@ bd create "Incluir Novas Features — autonomous Notion intake pipeline" \
 # 2. File a child task during scoping
 bd create "Build Notion-API → BEADS sync worker" \
   --type task --priority 1 --label project:incluir \
-  --deps discovered-from:aperture-abcd \
   --json
 # → returns child id: e.g. aperture-efgh
+bd label add aperture-efgh project:incluir
 
-# 3. Update the epic to be blocked-by the new child
-bd update aperture-abcd --deps blocked-by:aperture-efgh
+# 3. Wire it under the epic — this is what actually gates the epic's close
+bd update aperture-efgh --parent aperture-abcd
+
+# (optional) sequential deps between siblings use plain bd dep add with bare IDs —
+# NOT a "blocked-by:X" string as a single positional arg, that silently fails to
+# persist. Positional order is (blocked-issue, blocking-issue):
+bd dep add aperture-ghij aperture-efgh   # ghij is blocked by efgh, default type "blocks"
 ```
 
-Alternative form using `bd dep add` (equivalent — same edge in graph):
-
-```bash
-bd dep add aperture-abcd blocked-by:aperture-efgh
-```
+Verify the gate actually holds before trusting it — `bd close <epic-id> -r "test"` should refuse with an open-children error while any child is open. If it doesn't refuse, the wiring didn't take.
 
 ### Ownership inside an epic
 
