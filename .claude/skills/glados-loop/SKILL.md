@@ -70,7 +70,14 @@ STOP CONDITIONS (any one true → CronDelete the job):
 - All in-flight epics closed AND all in-flight specialists idle/clean
 - Operator explicitly says "stop the loop" / "kill the cron" / "we're done"
 
-**"idle/clean" is NOT self-certifying — banked precedent 2026-07-31, operator escalation ("repeated negligence... you lack grit of getting things done").** GLaDOS killed an overnight loop reasoning "both agents genuinely at rest, nothing further expected" — but a reviewing agent had an open HOLD verdict requiring the other agent to pick up a punch list, and nothing was watching to nudge that pickup. Agents do NOT self-resume unfinished work absent a trigger (same mechanic as §4/watch-protocol's "deferred to /clear ≠ self-resuming"); a quiet pane is not evidence the underlying goal reached a terminal state. Before declaring "idle/clean" and killing the loop, explicitly check: is there an open review verdict (HOLD/FAIL/blocked) anyone hasn't acted on yet? An unclosed punch list? A sent-but-unactioned message? If yes to any, the tracked goal is NOT done — the loop stays alive (loosen the interval if you like, per §3, but do not fully stop) until the ACTUAL terminal signal fires: a real PASS/merged/closed, or the operator explicitly says stop. When in doubt, loosen, don't kill.
+**"idle/clean" is NOT self-certifying — banked precedent 2026-07-31, operator escalation ("repeated negligence... you lack grit of getting things done").** GLaDOS killed an overnight loop reasoning "both agents genuinely at rest, nothing further expected" — but a reviewing agent had an open HOLD verdict requiring the other agent to pick up a punch list, and nothing was watching to nudge that pickup. The bead for that work was `in_progress` the entire time — the check that would have caught this ALREADY EXISTS (watch-protocol §1 signal 2 + §7 hard-fail item 3), it just wasn't run before the stop decision. Agents do NOT self-resume unfinished work absent a trigger (same mechanic as §4/watch-protocol's "deferred to /clear ≠ self-resuming"); a quiet pane is not evidence the underlying goal reached a terminal state.
+
+**MECHANICAL gate before ANY "idle/clean" stop-loop decision (not a judgment call):**
+1. `bd list --status=in_progress` (or `bd show <id>` for the specific tracked bead(s)) for every agent named in this loop's ACTIVE SPECIALISTS section. **Any hit = do not stop, full stop.** A bead sitting `in_progress` is definitionally unfinished work regardless of how quiet the pane looks.
+2. If all relevant beads are closed/no-longer-in_progress, THEN check for a dangling verdict: has the last review message between two specialists on this thread been superseded by a PASS/resolution, or does it still read HOLD/FAIL/blocked?
+3. Only if BOTH gates are clear does "idle/clean" hold. Loosen the interval instead of killing when quiet-but-not-yet-terminal (per §3).
+
+The tracked goal ends on a real terminal signal (PASS/merged/closed) or the operator explicitly saying stop — never on a snapshot read of pane activity alone.
 
 OUTPUT SHAPE (per watch-protocol §5 + §7 decision tree):
 - ≤5 bullets if anything moved or any action was taken
