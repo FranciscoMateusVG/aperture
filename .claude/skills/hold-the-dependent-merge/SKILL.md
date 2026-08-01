@@ -71,6 +71,7 @@ Before you fire `gh pr merge --auto` on a PR, ask:
    - **Option A (race-tolerant pair):** verify FE degradation per the precondition above. If degradation is graceful, you can still `--auto` and accept a usable-window race — but document the expected window in the dependent's PR body for operator visibility.
    - **Option B (race-intolerant pair):** **do not `--auto`.** Wait for the prereq to merge. Once it's merged, you can either (a) trigger the dependent's merge manually with `gh pr merge --squash` or (b) `--auto` the dependent knowing the race is now uncontested.
 4. **In either case**, monitor the prereq's CI + deploy. The window opens the moment the dependent merges and closes the moment the prereq is live on prod.
+5. **The hold must be STRUCTURAL, not prose (3rd-provenance correction, PR #676).** In repos with a bot that auto-enables merge for trusted actors on CI-green (monorepo-incluir's auto-merge workflow), "I just won't enable --auto myself" and "I wrote DO-NOT-AUTO-MERGE in the PR body" are BOTH insufficient — the workflow parses CI status, not body text, and it enables the merge for you. The only reliable holds are structural: **open the dependent PR as a DRAFT** (`gh pr create --draft`; drafts are excluded from auto-merge) and mark it ready only after the prereq merges, OR don't open the PR until the prereq lands. A prose warning is documentation for humans; it gates nothing.
 
 The decision cost is 30 seconds at merge-trigger time. The cost of skipping it is the 404 window the banked provenances show: minutes of wrong-data UI for tolerable-degradation pairs; hard outage for intolerable pairs.
 
@@ -91,6 +92,7 @@ The decision cost is 30 seconds at merge-trigger time. The cost of skipping it i
 |---|---|---|---|---|
 | `aperture-lvoo` (Wheatley) | monorepo-incluir #233 (BE, Rex) + #234 (FE, Vance) | FE merged first via `--auto`; admin user-info forms 404'd | Several minutes (until #233 deployed) | Hard 404 (not banked as graceful at the time) |
 | `aperture-ftuy` (Vance) | monorepo-incluir #323 (BE, Rex) + #324 (FE, Vance) | FE merged first via `--auto`; Estatísticas tab showed zeros | ~minutes | Graceful (FE fell back to `[]` per surface-fetch-errors discipline) |
+| `aperture-zdikg` (Vance) | monorepo-incluir #676 (FE, Vance) + unpushed BE PR1 (Rex, aperture-8xwc5) | FE author did NOT enable --auto and wrote a DO-NOT-AUTO-MERGE body header — the repo's auto-merge BOT enabled + merged it anyway on CI-green (prose is not a gate) | Open-ended (until BE PR1 ships) | Graceful by design (cold-cache fetch failure → pre-feature render, cohort-less header, no banner; degradation was runtime-verified pre-merge and held in prod) |
 
 **Class-diagnosis credit:**
 - **Wheatley** banked the original `aperture-lvoo` lesson — first provenance + named the pattern.
