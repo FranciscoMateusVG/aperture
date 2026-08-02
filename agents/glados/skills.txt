@@ -1,28 +1,27 @@
+# RESIDENT SET ONLY (aperture-auane, 2026-08-02). Skills here get their FULL
+# body force-injected into the boot system prompt on every session — this
+# list should stay small. Everything else GLaDOS used to carry resident
+# (deploy-workflow, incluir-intake-to-bead, scope-from-artifact,
+# pocketsoftware-infra, spec-deviation-discipline, research-artifact-placement,
+# e2e-catches-what-lower-cant, dont-model-phantom-cases,
+# observability-as-evidence, surface-fetch-errors, read-shape-not-line,
+# walk-the-route, name-the-blast-radius, hold-the-dependent-merge,
+# two-id-spaces, filed-p2-becomes-prereq, grep-before-spec,
+# stacked-pr-verification) was cut. Confirmed empirically (not assumed) that
+# Claude Code's native Skill-tool discovery is independent of this file — it
+# scans project + user-level .claude/skills/ on its own, so every cut skill
+# stays fully invocable on demand, it just isn't force-loaded at boot.
+# Before re-adding anything here, ask: does this need to be active on
+# literally every turn, or would "invoke it when relevant" (which the
+# using-superpowers mandate already requires) cover it? If the latter,
+# it belongs in .claude/skills/ discoverable-only, not here.
 communicate
 team
 beads
-deploy-workflow
-subagents
 worktree-discipline
+specialist-delegation
 watch-protocol
 glados-loop
-specialist-delegation
-incluir-intake-to-bead
-scope-from-artifact
-pocketsoftware-infra
 agent-liveness
-spec-deviation-discipline
-research-artifact-placement
-e2e-catches-what-lower-cant
-dont-model-phantom-cases
-observability-as-evidence
-surface-fetch-errors
-read-shape-not-line
-walk-the-route
-name-the-blast-radius
-hold-the-dependent-merge
-two-id-spaces
-filed-p2-becomes-prereq
-grep-before-spec
-stacked-pr-verification
+subagents
 cost-proportional-orchestration

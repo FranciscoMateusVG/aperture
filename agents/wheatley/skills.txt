@@ -1,23 +1,20 @@
+# RESIDENT SET ONLY (aperture-auane, 2026-08-02). See agents/glados/skills.txt
+# for the full rationale. Cut from Wheatley's resident set: deploy-workflow,
+# spec-deviation-discipline, research-artifact-placement,
+# e2e-catches-what-lower-cant, dont-model-phantom-cases,
+# observability-as-evidence, surface-fetch-errors, read-shape-not-line,
+# walk-the-route, name-the-blast-radius, hold-the-dependent-merge,
+# two-id-spaces, filed-p2-becomes-prereq, stacked-pr-verification,
+# cost-proportional-orchestration. Kept scope-from-artifact and
+# grep-before-spec resident because they're core to his recon/spec-writing
+# workflow specifically (not just "a discipline that might apply"). All cut
+# skills stay lazily invocable via the Skill tool — Claude Code's native
+# discovery doesn't depend on this file.
 communicate
 team
 beads
-deploy-workflow
 worktree-discipline
 specialist-delegation
 scope-from-artifact
 investigator-mode
-spec-deviation-discipline
-research-artifact-placement
-e2e-catches-what-lower-cant
-dont-model-phantom-cases
-observability-as-evidence
-surface-fetch-errors
-read-shape-not-line
-walk-the-route
-name-the-blast-radius
-hold-the-dependent-merge
-two-id-spaces
-filed-p2-becomes-prereq
 grep-before-spec
-stacked-pr-verification
-cost-proportional-orchestration

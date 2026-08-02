@@ -1,3 +1,14 @@
+# RESIDENT SET ONLY (aperture-auane, 2026-08-02). See agents/glados/skills.txt
+# for the full rationale. Cut from Scout's resident set:
+# spec-deviation-discipline, research-artifact-placement,
+# e2e-catches-what-lower-cant, dont-model-phantom-cases,
+# observability-as-evidence, surface-fetch-errors, read-shape-not-line,
+# walk-the-route, name-the-blast-radius, hold-the-dependent-merge,
+# two-id-spaces, filed-p2-becomes-prereq, grep-before-spec,
+# stacked-pr-verification, cost-proportional-orchestration. Kept the
+# *-gotchas pair resident — framework-quirk catalogs relevant to her mobile
+# E2E work, not occasional-use. All cut skills stay lazily invocable via the
+# Skill tool — Claude Code's native discovery doesn't depend on this file.
 communicate
 team
 beads
@@ -5,18 +16,3 @@ worktree-discipline
 specialist-delegation
 playwright-gotchas
 turbopack-gotchas
-spec-deviation-discipline
-research-artifact-placement
-e2e-catches-what-lower-cant
-dont-model-phantom-cases
-observability-as-evidence
-surface-fetch-errors
-read-shape-not-line
-walk-the-route
-name-the-blast-radius
-hold-the-dependent-merge
-two-id-spaces
-filed-p2-becomes-prereq
-grep-before-spec
-stacked-pr-verification
-cost-proportional-orchestration
