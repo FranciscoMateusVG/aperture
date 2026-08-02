@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { MailboxStore } from "./store.js";
 import { MessageQueue } from "./message-queue.js";
-import { createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead, extractTaskId } from "./beads.js";
+import { formatUpdateAck, formatCloseAck, createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead, extractTaskId } from "./beads.js";
 import { notifyHub } from "./hub-notify.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
@@ -242,7 +242,20 @@ server.tool(
         addLabels: add_labels,
         removeLabels: remove_labels,
       });
-      return { content: [{ type: "text", text: result }] };
+      // Compact ack — do NOT echo the full record back (context-efficiency:
+      // the echo rode the entire accumulated notes history on every mutation).
+      const ack = formatUpdateAck(id, result, {
+        claim,
+        status,
+        description,
+        notes,
+        replaceNotes: replace_notes,
+        assignee,
+        addLabels: add_labels,
+        removeLabels: remove_labels,
+        actor: AGENT_NAME ?? undefined,
+      });
+      return { content: [{ type: "text", text: ack }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
@@ -259,7 +272,8 @@ server.tool(
   async ({ id, reason }) => {
     try {
       const result = await closeTask(id, reason);
-      return { content: [{ type: "text", text: result }] };
+      // Compact ack — close fires exactly when notes history is at its maximum.
+      return { content: [{ type: "text", text: formatCloseAck(id, result, reason) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
@@ -268,7 +282,7 @@ server.tool(
 
 server.tool(
   "query_tasks",
-  `Query BEADS tasks. Modes: 'list' (active tasks), 'ready' (unblocked), 'show' (full detail for single task by ID). In 'list' mode this defaults to YOUR own assigned tasks — pass assignee:"*" for any. Defaults to summary fields with description/notes truncated to 200 chars — pass fields:"full" for everything. Use project:"aperture" to filter by the project:aperture label. Done/closed tasks excluded by default; pass include_done:true for historical data. 'show' mode ignores all filters and returns full detail.`,
+  `Query BEADS tasks. Modes: 'list' (active tasks), 'ready' (unblocked), 'show' (single task by ID). In 'list' mode this defaults to YOUR own assigned tasks — pass assignee:"*" for any. List/ready default to summary fields (description/notes truncated to 200 chars). 'show' defaults to the 'detail' tier: full meta + acceptance criteria, description capped at 4k chars, notes capped to the LAST 3k chars (recent history), dependencies summarized — pass fields:"full" for the complete untruncated record when genuinely resuming exact bead state. Use project:"aperture" to filter by the project:aperture label. Done/closed tasks excluded by default; pass include_done:true for historical data.`,
   {
     mode: z.enum(["list", "ready", "show"]).describe("Query mode"),
     id: z.string().optional().describe("Task ID (required for 'show' mode)"),
@@ -277,7 +291,7 @@ server.tool(
     assignee: z.string().optional().describe("Filter by assignee. Defaults to YOU in 'list' mode. Pass '*' for any assignee. Ignored in 'ready' mode."),
     priority_max: z.number().min(0).max(4).optional().describe("Keep tasks with priority ≤ this value (0=highest, 4=backlog)."),
     label: z.string().optional().describe("Filter by an arbitrary label."),
-    fields: z.enum(["summary", "full"]).optional().describe("Projection mode. 'summary' (default) returns id,title,status,priority,assignee,owner,labels + truncated description/notes. 'full' returns everything. Use 'show' mode for a single task's full detail."),
+    fields: z.enum(["summary", "detail", "full"]).optional().describe("Projection tier. 'summary' (list/ready default): id,title,status,priority,assignee,owner,labels + 200-char description/notes. 'detail' (show default): full meta, description head-capped 4k, notes TAIL-capped 3k, dependencies summarized. 'full': complete untruncated record — use only when genuinely resuming exact bead state."),
   },
   async ({ mode, id, include_done, project, assignee, priority_max, label, fields }) => {
     try {
@@ -309,8 +323,9 @@ server.tool(
   },
   async ({ task_id, type, value }) => {
     try {
-      const result = await storeArtifact(task_id, type, value);
-      return { content: [{ type: "text", text: `Artifact stored: ${type}:${value}\n${result}` }] };
+      await storeArtifact(task_id, type, value);
+      // Compact ack — previously appended the full bd update echo after this line.
+      return { content: [{ type: "text", text: `Artifact stored on ${task_id}: ${type}:${value}` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }

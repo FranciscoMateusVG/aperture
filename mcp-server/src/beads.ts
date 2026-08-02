@@ -160,6 +160,12 @@ const SUMMARY_FIELDS = ["id", "title", "status", "priority", "assignee", "owner"
 const TRUNCATED_FIELDS = ["description", "notes"] as const;
 const TRUNCATE_AT = 200;
 
+// Detail tier (show mode default) — see docs/context-efficiency-spec-jingp.md.
+// Show is a deliberate single-task lookup: the caller needs the full work brief
+// (description, acceptance) but NOT the unbounded append-only notes history.
+const DETAIL_DESCRIPTION_CAP = 4000; // head-truncate: descriptions are authored-once briefs
+const DETAIL_NOTES_TAIL = 3000; // TAIL-truncate: notes are chronological, recent end matters
+
 function summarizeTask(t: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const f of SUMMARY_FIELDS) {
@@ -181,7 +187,117 @@ function summarizeTask(t: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
-export type QueryFields = "summary" | "full";
+/**
+ * Detail projection for show mode: full meta + acceptance, capped description
+ * (head), capped notes (TAIL — chronological log, the recent end is what a
+ * resuming agent needs), and dependencies summarized to the 200-char tier
+ * (show embeds FULL records of every dependency otherwise — a child of a fat
+ * epic inherits the epic's entire weight on every show).
+ */
+function detailTask(t: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...t };
+  let truncated = false;
+
+  const desc = t.description;
+  if (typeof desc === "string" && desc.length > DETAIL_DESCRIPTION_CAP) {
+    out.description =
+      desc.slice(0, DETAIL_DESCRIPTION_CAP) +
+      `…[description truncated: ${DETAIL_DESCRIPTION_CAP} of ${desc.length} chars — fields:"full" for complete]`;
+    truncated = true;
+  }
+
+  const notes = t.notes;
+  if (typeof notes === "string" && notes.length > DETAIL_NOTES_TAIL) {
+    const entryCount = notes.split("\n").filter((l) => l.trim().length > 0).length;
+    out.notes =
+      `[notes truncated: showing last ${DETAIL_NOTES_TAIL} of ${notes.length} chars (${entryCount} total entries) — fields:"full" for complete history]\n` +
+      notes.slice(-DETAIL_NOTES_TAIL);
+    truncated = true;
+  }
+
+  // bd show embeds FULL records in BOTH directions: dependencies (what this
+  // bead blocks on) and dependents (what depends on it). Summarize both —
+  // measured 16.5KB of dependents riding along on a single Hermes bead.
+  for (const key of ["dependencies", "dependents"] as const) {
+    const arr = t[key];
+    if (Array.isArray(arr) && arr.length > 0) {
+      out[key] = arr.map((d) => {
+        if (!d || typeof d !== "object") return d;
+        const dep = d as Record<string, unknown>;
+        const summarized = summarizeTask(dep);
+        if (dep.dependency_type !== undefined) summarized.dependency_type = dep.dependency_type;
+        return summarized;
+      });
+      truncated = true; // related-record bodies were projected away
+    }
+  }
+
+  if (truncated) out._truncated = true;
+  return out;
+}
+
+/**
+ * Tolerantly parse a bd --json mutation echo (object or single-element array)
+ * into a task record. Used to build compact acks without echoing the record.
+ */
+export function parseTaskRecord(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(raw);
+    const rec = Array.isArray(parsed) ? parsed[0] : parsed;
+    if (rec && typeof rec === "object") return rec as Record<string, unknown>;
+  } catch {
+    // fall through
+  }
+  return undefined;
+}
+
+export interface UpdateAckParts {
+  claim?: boolean;
+  status?: string;
+  description?: string;
+  notes?: string;
+  replaceNotes?: boolean;
+  assignee?: string;
+  addLabels?: string[];
+  removeLabels?: string[];
+  actor?: string;
+}
+
+/**
+ * Compact ack for update_task — the mark_as_read pattern. The writer already
+ * knows what they wrote; echoing the full accumulated record back (measured
+ * 4,259 bytes for a one-line note append on a YOUNG bead, scales with record
+ * size) was pure waste. See docs/context-efficiency-spec-jingp.md §(b).
+ */
+export function formatUpdateAck(id: string, raw: string, parts: UpdateAckParts): string {
+  const rec = parseTaskRecord(raw);
+  const changes: string[] = [];
+  if (parts.claim) changes.push(`claimed by ${parts.actor ?? getActor()}`);
+  if (parts.status) changes.push(`status → ${parts.status}`);
+  if (parts.description) changes.push(`description replaced (${parts.description.length} chars)`);
+  if (parts.notes) {
+    changes.push(
+      parts.replaceNotes
+        ? `notes REPLACED (${parts.notes.length} chars)`
+        : `note appended (${parts.notes.length} chars)`,
+    );
+  }
+  if (parts.assignee) changes.push(`assignee → ${parts.assignee}`);
+  if (parts.addLabels?.length) changes.push(`labels +[${parts.addLabels.join(",")}]`);
+  if (parts.removeLabels?.length) changes.push(`labels -[${parts.removeLabels.join(",")}]`);
+  const status = typeof rec?.status === "string" ? rec.status : "updated";
+  return `Updated ${id} (${status}): ${changes.join("; ") || "no changes specified"}`;
+}
+
+/** Compact ack for close_task. */
+export function formatCloseAck(id: string, raw: string, reason: string): string {
+  const rec = parseTaskRecord(raw);
+  const status = typeof rec?.status === "string" ? rec.status : "closed";
+  const preview = reason.length > 120 ? reason.slice(0, 120) + "…" : reason;
+  return `Closed ${id} (${status}): ${preview}`;
+}
+
+export type QueryFields = "summary" | "detail" | "full";
 
 export interface QueryOptions {
   includeDone?: boolean;
@@ -232,8 +348,22 @@ export async function queryTasks(
   options?: QueryOptions,
 ): Promise<string> {
   if (mode === "show" && id) {
-    // Always return full detail for a single task — no filtering, no projection
-    return runBd(["show", id, "--json"]);
+    // Show defaults to the "detail" tier: full meta + acceptance, capped
+    // description (4k head), capped notes (3k TAIL), dependencies summarized.
+    // fields:"full" restores the historical unconditional dump; "summary" gives
+    // the cheap 200-char tier. See docs/context-efficiency-spec-jingp.md.
+    const raw = await runBd(["show", id, "--json"]);
+    if (options?.fields === "full") return raw;
+    try {
+      const parsed = JSON.parse(raw);
+      const arr: Record<string, unknown>[] = Array.isArray(parsed) ? parsed : [parsed];
+      const projected = arr.map((t) =>
+        options?.fields === "summary" ? summarizeTask(t) : detailTask(t),
+      );
+      return JSON.stringify(Array.isArray(parsed) ? projected : projected[0]);
+    } catch {
+      return raw;
+    }
   }
 
   const baseArgs: string[] = mode === "ready" ? ["ready", "--json"] : ["list", "--json"];

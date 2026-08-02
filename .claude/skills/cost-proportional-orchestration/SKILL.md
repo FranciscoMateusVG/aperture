@@ -69,6 +69,16 @@ Concretely:
 
 The concrete behavior change for GLaDOS: stop treating "the specialist is being thorough" as inherently good. Thoroughness that wasn't authorized is scope creep wearing a lab coat. Watch for a specialist's bead notes ballooning across multiple self-initiated review rounds — that's the tell, and it should trigger an intervention message, not admiration.
 
+### 2d. Information-gathering proportionality
+
+The §2a sizing table applies to READING, not just agent count: size the read to the
+question, not to the available corpus. Investigation dispatches and inline recon
+default to skeleton-first (grep structure, then deep-read only what's flagged) —
+the full discipline, brief-authoring rules, and the banked 148k-token Hermes worked
+example live in `aperture:subagents` §12 ("Scope the Brief: Gather Cheap, Escalate
+Targeted"). An exhaustive-read mandate in a dispatch brief is the information-layer
+version of the 7-agent fan-out on a CRUD task.
+
 ---
 
 ## 3. The hang-detection corollary

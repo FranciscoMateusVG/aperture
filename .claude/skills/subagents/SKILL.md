@@ -201,3 +201,65 @@ This matters when the work involves **potentially-blocking external I/O**:
 **Watch the hidden tells:** you're about to type `ssh`, `gh ... --log`, `gh run view ... --log-failed`, `curl https://<long-URL>`, `kubectl wait`, `pg_dump`, `docker exec ... psql -c "<aggregate>"`. Pause. Subagent it.
 
 **This is not a contradiction with §8 "don't delegate tiny tasks."** Tiny != fast. A one-line ssh call is small in code but unbounded in time. Time-unboundedness is the trigger for fault isolation, not code size.
+
+---
+
+## 12. Scope the Brief: Gather Cheap, Escalate Targeted
+
+Investigation dispatches — and your own inline recon — default to **skeleton-first**:
+grep headers, signatures, status lines, titles + first paragraphs. Deep-read ONLY the
+specific artifact Phase 1 flags as load-bearing for the actual question. "Read
+everything in full / be exhaustive" is an anti-default: it must be justified by the
+question, never by thoroughness anxiety.
+
+**The two-phase shape:**
+
+1. **Phase 1 — gather cheap.** Enumerate + skim structure: `ls` + `wc -l`, `rg -n` for
+   headers/signatures/return statements, doc titles, status lines. Cost scales with
+   STRUCTURE, not content.
+2. **Phase 2 — escalate targeted.** Deep-read only the items Phase 1 flagged. Escalation
+   is cheap and encouraged when a flag fires; blanket deep-reads are the waste.
+
+**Brief-authoring rules (for the dispatcher):**
+
+- State the QUESTION the dispatch must answer, not the corpus it must consume.
+  ✅ "Return a one-line summary of each design doc's purpose"
+  ❌ "Read all 5 design docs in full, don't truncate for brevity"
+- Match depth mandate to output size. A deliverable of N one-liners NEVER justifies
+  N full-document reads.
+- The phrases "in full", "exhaustively", "don't truncate" are red flags in a brief.
+  Keep them only when the deliverable IS the full content (a migration touching every
+  line, a byte-level audit).
+- Give the subagent an output budget ("report in ≤ 30 lines"). Output budgets
+  discipline input gathering.
+
+**Reconciliation with investigator-mode's depth mandate:** investigator-mode §3 says
+"enumerate ALL instances, don't stop at the first." That is a COVERAGE rule for
+Phase 1 — enumerate the full checklist cheaply — not a mandate to deep-read every
+item. Enumerate everything; deep-read selectively. The two disciplines compose:
+breadth at the skeleton layer, depth only where flagged.
+
+**Worked example (banked 2026-08-02, the Hermes dispatch):** a project-history
+research subagent was dispatched with an explicit "read all 5 design docs in full,
+do not truncate for brevity" brief — for a task whose deliverable was a short list
+of one-line summaries. Cost: **148,614 tokens, 51 tool calls, 6.7 minutes.**
+Titles + first paragraphs would have produced the identical deliverable for roughly
+5–10k tokens. ~15× overspend, purchased by one sentence in the brief.
+
+**Counter-example (same repo, same week):** the aperture-jingp MCP-payload audit —
+10 source files, 2,323 lines to check for an unbounded-payload pattern. Method:
+skeleton greps + two targeted reads + two one-line empirical probes. Found the known
+bug, three sibling instances, and one previously-unknown amplification finding, in
+~8 tool calls.
+
+**Forward-friction check (at brief-writing time, or before your own recon):**
+
+1. What QUESTION does this investigation answer? One sentence.
+2. What is the smallest artifact set that answers it? (Headers? One function body?)
+3. Does the brief mandate reading anything the question doesn't need?
+4. Does the output size justify the input mandate?
+5. About to write "in full / exhaustive / don't truncate"? Justify it or delete it.
+
+*Cross-link:* `aperture:cost-proportional-orchestration` §2d applies the same
+proportionality logic at orchestration-sizing time. Provenance: aperture-lquj5
+(Context Efficiency epic), spec docs/context-efficiency-spec-jingp.md.
