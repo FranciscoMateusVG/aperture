@@ -204,10 +204,63 @@ pub fn load_agent_skills(agent_name: &str) -> Vec<(String, String)> {
     skills
 }
 
+/// Read the optional resident-skill list at
+/// `~/.claude/aperture/<agent>/resident.txt` (aperture-i7bg0). One skill name
+/// per line; `#` comments and blank lines are stripped — the same line
+/// convention `just setup` uses for the repo's `skills.txt`. The runtime copy
+/// is a symlink created by `just setup` from `agents/<name>/resident.txt`.
+///
+/// Returns `None` when the file does not exist. Callers treat that as "no
+/// resident/lazy split configured" and keep injecting every skill body, so
+/// the rollout is opt-in per agent with zero behavior change for agents
+/// without the file. Note `Some(vec![])` (a file of only comments/blanks) is
+/// distinct: it means "inject no skill bodies at all".
+pub fn load_agent_resident_list(agent_name: &str) -> Option<Vec<String>> {
+    let path = format!("{}/{}/resident.txt", aperture_root(), agent_name);
+    read_resident_list(Path::new(&path))
+}
+
+fn read_resident_list(path: &Path) -> Option<Vec<String>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            // Present-but-unreadable degrades to "no split configured": a
+            // permissions hiccup must widen injection back to all skills,
+            // never silently strip an agent down to zero.
+            eprintln!(
+                "[aperture] warning: could not read {}: {} — injecting all skills",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    Some(parse_skill_lines(&text))
+}
+
+/// Shared line convention for `skills.txt` / `resident.txt`: strip `#`
+/// comments (inline or full-line), trim whitespace, drop blank lines.
+fn parse_skill_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("").trim();
+            (!line.is_empty()).then(|| line.to_string())
+        })
+        .collect()
+}
+
 /// Link an agent's manifest-selected Aperture skills into its isolated Codex
 /// home. Codex reads `$CODEX_HOME/skills`, while Claude Code reads the runtime
 /// registry directly; keeping the same selected links in both places prevents
 /// the injected prompt from being the only source of an agent's skills.
+///
+/// This directory also feeds Codex's native progressive-disclosure catalog:
+/// at session start Codex injects only a `## Skills` index (name +
+/// description + SKILL.md path) and reads full bodies lazily on demand. That
+/// is what lets `inject_codex_skills` (agents.rs) trim prompt.md to the
+/// resident subset from `resident.txt` — every non-resident skill stays
+/// reachable through the links made here, ALWAYS the full `skills.txt` set.
 ///
 /// Only skills already linked through the registry's `shared/` directory are
 /// accepted. That prevents a malformed per-agent runtime folder from causing
@@ -431,7 +484,7 @@ fn link_codex_skills(
 
 #[cfg(test)]
 mod tests {
-    use super::link_codex_skills;
+    use super::{link_codex_skills, parse_skill_lines, read_resident_list};
     use std::fs;
     use std::path::PathBuf;
 
@@ -444,6 +497,52 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn resident_list_absent_file_returns_none() {
+        let root = temp_dir("resident-absent");
+        assert!(read_resident_list(&root.join("resident.txt")).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resident_list_strips_comments_and_blank_lines() {
+        let root = temp_dir("resident-parse");
+        let path = root.join("resident.txt");
+        fs::write(
+            &path,
+            "# resident core (aperture-i7bg0)\ncommunicate\n\nbeads   # always-active\n   team\n#\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_resident_list(&path).unwrap(),
+            vec!["communicate", "beads", "team"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A present file that parses to nothing is Some(empty), NOT None —
+    /// "inject no skill bodies" is a valid configuration, distinct from
+    /// "no split configured".
+    #[test]
+    fn resident_list_comments_only_file_is_some_empty() {
+        let root = temp_dir("resident-empty");
+        let path = root.join("resident.txt");
+        fs::write(&path, "# nothing resident yet\n\n").unwrap();
+        assert_eq!(read_resident_list(&path).unwrap(), Vec::<String>::new());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_line_convention_matches_justfile_skills_txt_parsing() {
+        // Mirrors `sed 's/#.*//' | xargs` + skip-empty from the `just setup`
+        // recipe: inline comments cut, surrounding whitespace trimmed.
+        assert_eq!(
+            parse_skill_lines("beads # discipline\n  worktree-discipline  \n\n# all comment\n"),
+            vec!["beads", "worktree-discipline"]
+        );
+        assert_eq!(parse_skill_lines(""), Vec::<String>::new());
     }
 
     #[test]
