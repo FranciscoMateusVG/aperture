@@ -293,7 +293,10 @@ pub fn boot_agent_process(
         // Copy prompt into codex_home so the path is always correct.
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
-        let prompt_content = inject_skills(prompt_content, &name);
+        // Resident/lazy split (aperture-i7bg0): only resident.txt skills get
+        // full bodies in prompt.md; the rest ride Codex's native catalog
+        // populated from $CODEX_HOME/skills above.
+        let prompt_content = inject_codex_skills(prompt_content, &name);
         // Codex has no SessionStart/PreCompact hook system (unlike Claude
         // Code — see .claude/settings.json), so the shared bd-memory bank
         // must be mirrored into the static prompt manually here.
@@ -610,7 +613,7 @@ pub fn update_agent_model(
 /// order (see `agent_loader::load_agent_skills`). The on-disk layout is built
 /// by `just setup`; the canonical sources live in the repo at
 /// `agents/<name>/skills.txt` and `.claude/skills/<name>/`.
-pub fn inject_skills(mut prompt: String, agent_name: &str) -> String {
+pub fn inject_skills(prompt: String, agent_name: &str) -> String {
     let skills = crate::agent_loader::load_agent_skills(agent_name);
     if skills.is_empty() {
         eprintln!(
@@ -627,6 +630,53 @@ pub fn inject_skills(mut prompt: String, agent_name: &str) -> String {
         agent_name,
         names
     );
+    append_skill_bodies(prompt, skills)
+}
+
+/// Codex variant of `inject_skills`, honoring the optional resident/lazy
+/// split (aperture-i7bg0). Codex natively surfaces a lazy `## Skills`
+/// catalog from `$CODEX_HOME/skills` — the same directory
+/// `populate_codex_skill_home` links on every launch — and reads a skill's
+/// full SKILL.md on demand when a task matches its description. So full-body
+/// prompt injection is only needed for the small "resident" subset of
+/// always-active behavioral norms listed in
+/// `~/.claude/aperture/<agent>/resident.txt`.
+///
+/// When resident.txt is absent, ALL skill bodies are injected exactly as
+/// before — rollout is opt-in per agent, zero behavior change without the
+/// file. Resident names with no matching skill dir are warned about and
+/// skipped (warn-don't-fail). Claude agents never take this path; their lazy
+/// pool is Claude Code's own `.claude/skills` discovery.
+pub fn inject_codex_skills(prompt: String, agent_name: &str) -> String {
+    let Some(resident) = crate::agent_loader::load_agent_resident_list(agent_name) else {
+        // No resident.txt — inject every skill body, today's behavior.
+        return inject_skills(prompt, agent_name);
+    };
+    let skills = crate::agent_loader::load_agent_skills(agent_name);
+    for name in &resident {
+        if !skills.iter().any(|(n, _)| n == name) {
+            eprintln!(
+                "[aperture] warn: resident.txt for '{}' names unknown skill \
+                 '{}' (not under ~/.claude/aperture/{}/skills/) — skipped",
+                agent_name, name, agent_name
+            );
+        }
+    }
+    let total = skills.len();
+    let resident_skills: Vec<(String, String)> = skills
+        .into_iter()
+        .filter(|(name, _)| resident.iter().any(|r| r == name))
+        .collect();
+    eprintln!(
+        "[aperture] codex skills for '{}': {} resident injected, {} lazy (native catalog)",
+        agent_name,
+        resident_skills.len(),
+        total - resident_skills.len()
+    );
+    append_skill_bodies(prompt, resident_skills)
+}
+
+fn append_skill_bodies(mut prompt: String, skills: Vec<(String, String)>) -> String {
     for (skill_name, content) in skills {
         prompt.push_str(&format!("\n\n---\n# Skill: {}\n\n{}", skill_name, content));
     }

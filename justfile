@@ -73,6 +73,14 @@ setup:
         ln -sfn "$manifest" "$agent_root/manifest.json"
         ln -sfn "$prompt_src" "$agent_root/prompt.md"
 
+        # Optional resident.txt (aperture-i7bg0): Codex agents with this file
+        # only get the listed skills' bodies force-injected into prompt.md;
+        # the rest stay lazy via Codex's native $CODEX_HOME/skills catalog.
+        # Absent file = all skills injected (today's behavior), so never fail.
+        if [ -f "$agent_dir/resident.txt" ]; then
+            ln -sfn "$agent_dir/resident.txt" "$agent_root/resident.txt"
+        fi
+
         # Wire up each requested skill as a symlink into shared/.
         skill_list=""
         if [ -f "$skills_txt" ]; then
