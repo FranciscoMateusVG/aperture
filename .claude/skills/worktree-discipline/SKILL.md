@@ -1,5 +1,5 @@
 ---
-name: aperture-worktree-discipline
+name: worktree-discipline
 description: Git worktree convention for any agent editing a shared repo. Use when claiming a task that involves code changes — monorepo-incluir, aperture itself, beads-galaxy, or any other repo where multiple agents may work concurrently. Triggers on task claims that involve editing a shared codebase.
 ---
 

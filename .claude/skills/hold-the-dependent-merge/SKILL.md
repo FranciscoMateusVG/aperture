@@ -1,6 +1,6 @@
 ---
 name: hold-the-dependent-merge
-description: When PR A depends on PR B (e.g., A's frontend calls a route B's backend adds), hold `gh pr merge --auto` on A until B has merged. `--auto-merge` does NOT respect cross-PR ordering — the dependent's faster CI beats the prereq's slower CI, the dependent ships first, and the frontend calls a route that doesn't exist on prod yet. Use any time you're about to fire `--auto` on a PR that depends on another open PR; any time you're shipping stacked FE+BE work where the FE consumes a new route the BE adds. Triggers on stacked PR, `gh pr merge --auto`, dependent PR, prereq PR, FE+BE merge race, 404 window, route doesn't exist on prod, `gh pr merge --squash --auto`, CI race condition between stacked PRs.
+description: When PR A depends on PR B, hold `gh pr merge --auto` on A until B merges — auto-merge ignores cross-PR ordering, so the dependent's faster CI ships it first and the frontend calls a route that doesn't exist on prod yet. Use before firing `--auto` on any PR depending on another open PR, especially stacked FE+BE work. Triggers on stacked PR, dependent/prereq PR, FE+BE merge race, 404 window, CI race between stacked PRs.
 ---
 
 # Hold the Dependent Merge

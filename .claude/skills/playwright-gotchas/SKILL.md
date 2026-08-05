@@ -1,6 +1,6 @@
 ---
 name: playwright-gotchas
-description: Playwright E2E gotchas banked by Aperture testing agents — small framework quirks that cost ~10 minutes each to re-derive in the moment. Use any time you're writing or debugging Playwright tests (`*.spec.ts`, `playwright.config.ts`, anything under `e2e/`), especially when a test "should pass" but hangs, errors on something unrelated to the assertion, or asserts the wrong layer of behaviour. Triggers on `@playwright/test`, `page.goto`, `page.click`, `navigator.clipboard` in tests, `aria-disabled` interactions, `context.grantPermissions`, hanging actionability checks, `notFound()` route tests, "test is timing out and I don't know why."
+description: Playwright E2E gotchas banked by Aperture testing agents — quirks that cost ~10 minutes each to re-derive. Use when writing or debugging `*.spec.ts`, `playwright.config.ts`, or anything under `e2e/`, especially when a test hangs or asserts the wrong layer. Triggers on `navigator.clipboard` in tests, `aria-disabled` interactions, `context.grantPermissions`, hanging actionability checks, `notFound()` route tests, "test is timing out and I don't know why".
 ---
 
 # Playwright Gotchas

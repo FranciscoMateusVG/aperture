@@ -1,6 +1,6 @@
 ---
 name: two-id-spaces
-description: In incluir's data model, a volunteer has TWO identifiers — `users.id` (auth/session identity, BetterAuth) and `volunteers.id` (program participation PK). API contracts MUST declare which ID space they expect at every boundary. Frontends generally have `user.id` from session; `volunteer.id` requires a lookup. Use any time you're designing or consuming an API contract whose parameters, response fields, or join semantics could plausibly reference either user-auth identity OR volunteer-domain identity. Triggers on `users.id`, `volunteers.id`, `user_id`, `volunteerId`, BetterAuth session, volunteers join, "ID-space mismatch", `/api/users` vs `/api/volunteers`, `lastLogin` vs `last_attendance`, FE sends user.id BE expects volunteer.id, 404 from POST body, "wrong scope".
+description: Incluir volunteers have TWO identifiers — `users.id` (BetterAuth session identity) and `volunteers.id` (program participation PK). API contracts must declare which ID space every boundary expects; frontends hold `user.id`, `volunteer.id` needs a lookup. Use when designing or consuming contracts that could reference either identity. Triggers on `user_id`, `volunteerId`, BetterAuth session, `/api/users` vs `/api/volunteers`, ID-space mismatch, FE sends user.id but BE expects volunteer.id.
 ---
 
 # Two ID Spaces

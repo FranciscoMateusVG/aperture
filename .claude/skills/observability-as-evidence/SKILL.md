@@ -1,6 +1,6 @@
 ---
 name: observability-as-evidence
-description: A discipline for reasoning from observability data — traces, logs, metrics, span enrichments. Each enriched field represents ONE specific subsystem's view of the world; reasoning about another subsystem's behaviour from it is a category error. Use any time you're triaging from a Tempo trace, Loki log, Grafana panel, or any enriched observability output — especially before drawing a conclusion that depends on which subsystem a field came from. Triggers on Tempo trace, span enrichment, span attribute, Loki log labels, `user.role`, BetterAuth, institutional permissions, authz from observability, recon from traces, "bonus finding worth confirming," cross-subsystem inference, enriched field provenance.
+description: Reasoning discipline for observability data — each enriched field represents ONE subsystem's view; inferring another subsystem's behaviour from it is a category error. Use when triaging from a Tempo trace, Loki log, or Grafana panel, especially before conclusions that depend on a field's provenance. Triggers on span enrichment, span attributes, Loki labels, `user.role`, BetterAuth vs institutional permissions, authz-from-observability, cross-subsystem inference.
 ---
 
 # Observability as Evidence

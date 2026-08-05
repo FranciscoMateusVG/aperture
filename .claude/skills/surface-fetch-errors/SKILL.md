@@ -1,6 +1,6 @@
 ---
 name: surface-fetch-errors
-description: Server Actions, client→server fetch wrappers, and any layer that catches a network/API failure must surface the error — never silently fall back to empty/default values. Empty-state UI is for "API said no data," not for "API errored." Use any time you're writing or reviewing a `try/catch` around a fetch call, a Server Action that returns a result, page-level handling of action results, or an empty-state UI message. Triggers on Server Action, fetch wrapper, `try/catch` around fetch, empty-array fallback, `return []`, empty-state copy, `Nenhum X encontrado`, `getThings()`, action result shape, `result.success`, silent error swallowing, deceptive empty state, error-vs-empty discrimination, tagged-union result, `error.tsx`, error toast on fetch failure.
+description: Server Actions and fetch wrappers that catch a network/API failure must surface the error — never silently fall back to empty/default values. Empty-state UI means "API said no data", not "API errored". Use when writing or reviewing try/catch around fetch, Server Action result shapes, or empty-state copy. Triggers on empty-array fallback, `return []`, `Nenhum X encontrado`, `result.success`, silent error swallowing, deceptive empty state, tagged-union result, `error.tsx`, error toast on fetch failure.
 ---
 
 # Surface Fetch Errors

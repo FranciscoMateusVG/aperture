@@ -1,6 +1,6 @@
 ---
 name: walk-the-route
-description: A triage discipline — when persistent UI symptoms survive 2+ frontend fixes, the bug is upstream of the frontend. Walk the backend route the page actually calls (its middleware gates, parameters, and response shape) instead of trying another frontend fix. Use any time you've shipped multiple frontend fixes for the same customer-facing symptom and the symptom persists; any time a UI surface shows wrong-shaped data after a backend route migration; any time you're about to try "one more frontend tweak." Triggers on persistent UI symptom after fix, "screenshot still shows," "tried another frontend fix," wrong data from API, FE/BE contract mismatch, case-mismatch lastLogin / last_login, wrong endpoint scope, requireAdmin vs requireVolunteer, snake_case / camelCase translation, mapUser, "expected 298 saw 3," operator demanded verify-against-reality.
+description: When a UI symptom survives 2+ frontend fixes, the bug is upstream — walk the backend route the page actually calls (middleware gates, parameters, response shape) instead of another frontend tweak. Use after repeated frontend fixes for the same symptom, or when a surface shows wrong-shaped data after a backend route migration. Triggers on "screenshot still shows", FE/BE contract mismatch, lastLogin vs last_login case mismatch, requireAdmin vs requireVolunteer, snake_case/camelCase translation, wrong endpoint scope.
 ---
 
 # Walk The Route

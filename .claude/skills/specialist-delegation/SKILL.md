@@ -1,6 +1,6 @@
 ---
 name: specialist-delegation
-description: Specialists operate as TECH LEADS — delegate-first by default, reserving hands for design decisions + the single craft centerpiece + reviewing every worker's output. Covers subagent fan-out (the default) vs Agent Teams (only when workers must talk to each other), and parallelizing tracks instead of serializing. Use any time you're about to claim a BEADS task, when deciding how to decompose + fan out work, mid-cycle when context tightens, or when you receive a "wait for X then do Y" dispatch. Triggers on claim time, "should I do this myself or dispatch," delegate-first decomposition, subagent-vs-team choice, context budget >60%, parallelizable scoped work, multi-file fan-outs, and "wait-then-do" framing that may hide independent tracks.
+description: Specialists operate as tech leads — delegate-first, keeping only design decisions, the single craft centerpiece, and review of every worker's output. Use when claiming a BEADS task, deciding how to decompose and fan out work, when context budget passes 60%, or on "wait for X then do Y" dispatches that hide independent tracks. Triggers on subagent fan-out vs Agent Teams, delegate-first decomposition, parallelizable scoped work, multi-file fan-outs.
 ---
 
 # Specialist Delegation — When to Subagent vs Stay Hands-On

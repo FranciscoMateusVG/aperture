@@ -1,6 +1,6 @@
 ---
 name: zod-recursive-validation-gotchas
-description: Patterns and gotchas for applying global invariants (depth caps, fan-out caps, tree-level constraints) to recursive Zod schemas. Use any time you're writing or reviewing a `z.lazy(() => z.union([...]))` schema, adding a depth or fan-out cap to a tree-shaped Zod type, or thinking about how a validation error should be presented to the user. Triggers on `z.lazy`, `superRefine`, `.refine`, recursive Zod, depth cap, fan-out cap, tree validation, `ctx.addIssue`, `validateDepth`, "audience invalid" / "expression invalid" generic Zod errors, accidentally-quadratic validation, AudienceExpression-style schemas.
+description: Patterns for applying global invariants (depth caps, fan-out caps, tree-level constraints) to recursive Zod schemas. Use when writing or reviewing `z.lazy` union schemas, adding depth/fan-out caps to tree-shaped types, or shaping validation errors for users. Triggers on `z.lazy`, `superRefine`, `.refine`, `ctx.addIssue`, recursive Zod, generic "audience invalid" errors, accidentally-quadratic validation, AudienceExpression-style schemas.
 ---
 
 # Zod Recursive Validation Gotchas

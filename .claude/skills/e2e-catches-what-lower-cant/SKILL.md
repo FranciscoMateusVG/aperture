@@ -1,6 +1,6 @@
 ---
 name: e2e-catches-what-lower-cant
-description: A class of bug — silent corruption / silent omission — that unit and integration tests structurally cannot catch because the test apparatus bypasses the failure-prone surface. Only end-to-end tests exercising the real prod composition path with byte-level assertions surface them. Use when designing test coverage for a new feature, when triaging a "tests passed but prod broke" bug, when deciding whether unit + integration coverage is "enough," or when an E2E catches something the lower layers missed. Triggers on composition-root gap, "tests pass but feature 404s in prod," test apparatus mismatch, dependency injection masking, string-string roundtrip, BOM strip, silent encoding loss, "why didn't unit tests catch this," `injectIntoTestApp`, fake adapter, `InMemoryX`, response.text() roundtrip, byte-level assertion.
+description: Silent corruption/omission bugs that unit and integration tests structurally cannot catch because the test apparatus bypasses the failure-prone surface; only E2E on the real prod composition path with byte-level assertions surfaces them. Use when designing test coverage, triaging "tests passed but prod broke", or judging whether unit+integration is enough. Triggers on composition-root gap, dependency-injection masking, BOM strip, silent encoding loss, `injectIntoTestApp`, fake adapter, `InMemoryX`, response.text() roundtrip, byte-level assertion.
 ---
 
 # E2E Catches What Lower Tests Can't

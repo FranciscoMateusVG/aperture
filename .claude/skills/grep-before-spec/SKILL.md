@@ -1,6 +1,6 @@
 ---
 name: grep-before-spec
-description: When drafting a recon-phase architecture proposal, grep-confirm whether the codebase already has the infrastructure you're about to propose adding. Design-spec drift from code-reality is a recon-phase failure that ships as implementation-phase rework. Any architecture proposal that adds infra MUST include a grep-receipt that the codebase doesn't already have it. Use any time you're writing a recon doc, scoping bead, design sketch, or epic vision that proposes new infrastructure (clients, adapters, middleware, rate limiters, queues, integrations). Triggers on "add Redis", "follow mailer pattern", "new adapter", "from scratch", design sketch authoring, scoping bead writing, recon doc drafting, "let's introduce X" without grep-receipt.
+description: Before proposing new infrastructure in a recon-phase architecture doc, grep-confirm the codebase doesn't already have it — every infra-adding proposal must include a grep-receipt. Design-spec drift from code-reality ships as implementation rework. Use when writing recon docs, scoping beads, design sketches, or epic visions that add clients, adapters, middleware, rate limiters, queues, or integrations. Triggers on "add Redis", "new adapter", "from scratch", "let's introduce X" without grep-receipt.
 ---
 
 # Grep Before Spec

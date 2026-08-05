@@ -1,6 +1,6 @@
 ---
 name: verify-user-path
-description: Manual user-path verification before sign-off. NON-NEGOTIABLE for Sterling, Izzy, and any agent gating a feature's promotion to "done" or "ready for operator." Triggers on any sign-off claim, any "Gate 7" review, any "approved" comment, any "ready for review" status, any close-on-PR-open invariant fire for user-facing features. The discipline: open the production URL in a browser, walk the user path, submit/click/use the actual feature, verify the network response, verify the DB/audit/log trail. CI green is necessary but NOT sufficient.
+description: Manual user-path verification before sign-off — NON-NEGOTIABLE for Sterling, Izzy, and any agent gating a feature's promotion to "done" or "ready for operator". Open the production URL in a browser, walk the user path, use the actual feature, verify the network response and the DB/audit/log trail — CI green is necessary but NOT sufficient. Triggers on any sign-off claim, "Gate 7" review, "approved" comment, "ready for review" status, close-on-PR-open for user-facing features.
 ---
 
 # Verify User Path — Manual Walk Before Sign-Off

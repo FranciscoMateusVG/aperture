@@ -1,6 +1,6 @@
 ---
 name: sentry-query
-description: Query Sentry for production error/issue data via REST API + curl while the official MCP work (aperture-t3q9) lands. Use when an operator surfaces a Sentry issue URL ("https://xerox-to-xerox.sentry.io/issues/<id>/"), when you need the exception type / stack trace / affected users for a reported bug, when you're triaging an incident and need to read the latest event payload, or when you're filtering issues by environment / user / release. Triggers on "sentry", "sentry issue", "sentry.io", "xerox-to-xerox.sentry", "issue 7479…", "stack trace from prod", "what's the error", "exception in prod", "affected users", "Sentry triage", "Sentry event", "SENTRY_AUTH_TOKEN", ".sentryclirc".
+description: Query Sentry production error/issue data via REST API + curl (until the official MCP lands). Use when an operator drops a Sentry issue URL, when you need exception type / stack trace / affected users for a reported bug, or when filtering issues by environment, user, or release. Triggers on "sentry", "sentry.io", "xerox-to-xerox.sentry", "stack trace from prod", "exception in prod", "affected users", SENTRY_AUTH_TOKEN, .sentryclirc.
 ---
 
 # Sentry Query — Bridge skill (curl + REST API)

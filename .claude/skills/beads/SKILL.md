@@ -1,5 +1,5 @@
 ---
-name: aperture-beads
+name: beads
 description: Complete BEADS task discipline for Aperture agents — authoring, project labels, and full lifecycle (claim → work → artifact → close). Task CREATION is GLaDOS-only and operator-acknowledged (§0, no exceptions, including P0s) — every other agent claims, works, updates, and closes existing beads but never files new ones. Use any time you create, claim, update, query, or close a task; choose priority/type; apply project labels; store artifacts. Triggers on bd create, query_tasks, update_task, store_artifact, close_task, mark_as_read.
 ---
 
