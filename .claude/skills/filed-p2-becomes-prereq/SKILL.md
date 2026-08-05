@@ -1,6 +1,6 @@
 ---
 name: filed-p2-becomes-prereq
-description: An earlier security/audit/cleanup follow-up filed as "P2 nice-to-have" consistently turns out to be a hard prereq when the next feature on the same surface ships. The discipline has two sides — file follow-ups at the right priority (bug-author), and audit accumulated follow-ups before designing on a touched surface (feature-designer). Use any time you're filing a follow-up bead, designing a new feature on a surface with outstanding follow-ups, or noticing that a "P2 we'll get to it" item is now blocking active work. Triggers on follow-up bead, P2 nice-to-have, "we'll get to it later", "blocks B2", "blocks the next feature", surface-level technical debt, security follow-up not-yet-prereq, audit-log gap that just became gate, "I thought this was P2 but actually."
+description: Security/audit/cleanup follow-ups filed as "P2 nice-to-have" consistently become hard prereqs when the next feature on the same surface ships. File follow-ups at the right priority, and audit accumulated follow-ups before designing on a touched surface. Use when filing a follow-up bead or scoping a feature on a surface with outstanding follow-ups. Triggers on P2 nice-to-have, "we'll get to it later", "blocks the next feature", audit-log gap that became a gate.
 ---
 
 # Filed P2 Becomes Prereq

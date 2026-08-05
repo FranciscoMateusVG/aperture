@@ -1,5 +1,5 @@
 ---
-name: aperture-communicate
+name: communicate
 description: Inter-agent communication patterns for Aperture. Use when sending messages to other agents, reporting task status to GLaDOS, requesting infra work from Peppy, or writing status reports. Triggers on agent messaging, status reports, task handoffs, and infra requests.
 ---
 

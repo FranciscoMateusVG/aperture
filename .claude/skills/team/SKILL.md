@@ -1,5 +1,5 @@
 ---
-name: aperture-team
+name: team
 description: Complete Aperture team roster. Use when you need to know who's on the team, what each agent does, and who to contact for what. Load this on session start to know your colleagues.
 ---
 

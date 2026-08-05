@@ -1,6 +1,6 @@
 ---
 name: name-the-blast-radius
-description: When a PR adds OR changes a production-runtime contract — auth matcher, response shape, API endpoint, dispatch protocol, middleware behaviour, audience matcher, anything that affects how the system behaves at runtime in prod — the PR body must explicitly name the change. Reviewers and operators should be able to read the PR body and know what production capabilities changed, without diffing files. Use any time you're authoring a PR description, reviewing a PR, or noticing that the diff contains more "secondary" changes than the PR body discloses. Triggers on PR-body authoring, runtime-contract change, response-shape migration, snake_case / camelCase translation, new audience matcher, new auth matcher, middleware change, dispatch protocol, undisclosed migration, silent shape change, "the PR body didn't mention X."
+description: A PR that adds or changes a production-runtime contract — auth matcher, response shape, API endpoint, middleware, dispatch protocol — must name the change explicitly in its PR body; readers should know what prod capabilities changed without diffing files. Use when authoring or reviewing PR descriptions, or when a diff carries more "secondary" changes than the body discloses. Triggers on runtime-contract change, response-shape migration, snake_case/camelCase translation, new auth/audience matcher, undisclosed migration, silent shape change.
 ---
 
 # Name the Blast Radius

@@ -1,6 +1,6 @@
 ---
 name: stacked-pr-verification
-description: Pre-merge contract-pinning discipline for stacked PRs — how to verify a dependent PR against its parent's ACTUAL code before the parent merges, not against the spec doc and not after the parent lands. Use when you are building a frontend/consumer PR that depends on a backend/producer PR still open in review, when running parallel tracks (specialist-delegation §9), or any time you are about to rebase a stacked branch onto a just-merged parent. Triggers on stacked PR, parallel-track prep, "wait for X then rebase Y", pre-rebase verification, contract drift between paired PRs, silent-404-before-it-ships.
+description: Contract-pinning for stacked PRs — verify a dependent PR against its parent's ACTUAL code before the parent merges, not against the spec doc and not after landing. Use when building a consumer PR that depends on a producer PR still in review, running parallel tracks, or before rebasing onto a just-merged parent. Triggers on stacked PR, "wait for X then rebase Y", pre-rebase verification, contract drift between paired PRs, silent-404-before-it-ships.
 ---
 
 # Stacked-PR Verification

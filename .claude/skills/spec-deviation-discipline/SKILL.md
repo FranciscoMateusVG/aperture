@@ -1,6 +1,6 @@
 ---
 name: spec-deviation-discipline
-description: When implementing from a spec, audit the spec against the system's existing invariants before you start coding. If the spec's prescribed mechanism conflicts with an invariant, deviate to a mechanism that satisfies both intent and invariant — and document the deviation. Use any time you receive a written specification (bead description, design doc, threat model, ticket acceptance criteria, operator brief) and are about to translate it into code. Triggers on bead implementation, spec-to-code translation, "the bead says X but Y conflicts," "trust the spec vs verify the spec," internal-spec-inconsistency, mechanical spec-following, "the spec proposed N options."
+description: Audit a spec against the system's existing invariants before coding. If the spec's mechanism conflicts with an invariant, deviate to satisfy both intent and invariant — and document the deviation. Use when translating any written spec (bead description, design doc, threat model, acceptance criteria) into code. Triggers on spec-to-code translation, "the bead says X but Y conflicts", trust-vs-verify the spec, internal spec inconsistency, mechanical spec-following.
 ---
 
 # Spec-Deviation Discipline

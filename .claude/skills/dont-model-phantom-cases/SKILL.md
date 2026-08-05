@@ -1,6 +1,6 @@
 ---
 name: dont-model-phantom-cases
-description: A code-design discipline — type contracts, response shapes, UI branches, and runtime conditionals should match the cardinality of cases that can actually occur today, not phantom future cases that might occur after some hypothetical design change. Use any time you're designing a return shape, a discriminated union, a branching conditional, a toast variant set, an error type hierarchy, or any other code surface that enumerates "possible cases." Triggers on type contract design, return shape, discriminated union, toast variants, error enum, branching logic, "in case we change the X later," "to be robust for future," dead branch, unreachable case, defensive over-modeling.
+description: Type contracts, response shapes, UI branches, and conditionals should match the cardinality of cases that can occur today — not phantom future cases. Use when designing a return shape, discriminated union, branching conditional, toast variant set, or error type hierarchy. Triggers on "in case we change X later", "robust for the future", dead branch, unreachable case, defensive over-modeling, error enum, toast variants.
 ---
 
 # Don't Model Phantom Cases

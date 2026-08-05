@@ -1,6 +1,6 @@
 ---
 name: research-artifact-placement
-description: Where does a research artifact live — checked into the repo alongside the code it describes, or shipped as a skill in the aperture registry? Use any time you produce or commission a research artifact (recon doc, coverage map, route inventory, selector table, threat model, design contract, SEO audit, ADR-style design note) and have to decide where to put it. Triggers on "where should this doc go," "should this be a skill or a markdown file," "I wrote a recon doc," surface-map, coverage-map, route inventory, selector table, threat model, design reference, "is this a skill," generated artifact placement.
+description: Decide where a research artifact lives — checked into the repo beside the code it describes, or shipped as a skill in the aperture registry. Use when you produce or commission a recon doc, coverage map, route inventory, selector table, threat model, or ADR-style design note. Triggers on "where should this doc go", "skill or markdown file", surface-map, generated artifact placement.
 ---
 
 # Research Artifact Placement

@@ -1,6 +1,6 @@
 ---
 name: turbopack-gotchas
-description: Turbopack vs tsc divergence gotchas banked by Aperture agents — runtime/bundler-enforced constraints that the TypeScript compiler accepts cleanly, so `pnpm typecheck` is green and `next build` blows up. Use any time you're writing or debugging Next.js code that touches `"use server"` directives, server actions, server components, or anything Turbopack bundles. Triggers on `"use server"`, `"use client"`, server actions, `next build` errors that don't reproduce under `tsc --noEmit`, "tsc is green but the build is red", "Server Actions must be async functions", `Ecmascript file had an error`, server-action module organization.
+description: Turbopack vs tsc divergence gotchas — bundler-enforced constraints tsc accepts, so typecheck is green but `next build` fails. Use when writing or debugging Next.js code touching "use server", "use client", server actions, or server components. Triggers on `next build` errors that don't reproduce under `tsc --noEmit`, "Server Actions must be async functions", `Ecmascript file had an error`, server-action module organization.
 ---
 
 # Turbopack Gotchas
