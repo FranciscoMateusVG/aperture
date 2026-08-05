@@ -1,0 +1,9 @@
+# RESIDENT SET (aperture-i7bg0) — full bodies force-injected into prompt.md.
+# Everything else in skills.txt stays available lazily via Codex's native
+# $CODEX_HOME/skills catalog (name+description at boot, body read on demand).
+# Residency = always-active behavioral norms; reference/gotcha skills stay lazy.
+communicate
+team
+beads
+worktree-discipline
+specialist-delegation
