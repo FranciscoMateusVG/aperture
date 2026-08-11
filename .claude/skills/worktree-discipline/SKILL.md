@@ -103,6 +103,22 @@ GLaDOS spot-checks worktree hygiene on a rolling basis:
 
 Light-touch enforcement, not a witch hunt. The goal is to keep shared repos clean and predictable.
 
+### 6.1 On a squash-merging repo, commit-message matching is a broken index — diff content, not titles
+
+**Banked 2026-08-10 (Peppy, monorepo-incluir hygiene sweep, aperture-544mm).** During a worktree sweep, an unpushed local branch (`pr-742-final`, 2 commits, no remote) looked like real loss exposure: the bead it was named after had already shipped and deployed, but one of the two commits — `"fix(volunteers): align memory assignment windows"` — didn't appear anywhere in the merged PR's title or description. That absence read as "this never shipped, might be a real gap."
+
+It wasn't. GitHub's squash-merge rewrites the merge commit's message from the PR's *first* commit (or the PR title) — it does not preserve every constituent commit's message verbatim in a way that's greppable from the outside. The second commit's content was fully present in the squashed merge commit; it just wasn't *named* there. A title-based search will never find it, no matter how carefully you grep.
+
+**The only reliable test: diff the branch's content against the merged head, not its commit messages against the PR description.**
+
+```bash
+git diff <suspect-commit-or-branch-tip> <merged-head-sha>
+```
+
+Zero lines of output = the content is already on `main`, byte-for-byte — safe to discard regardless of how orphaned the commit message looked. Non-empty output = real, distinct content that didn't ship — needs a push or an explicit discard decision, not a silent delete.
+
+This is the same root cause as the "clean + not merged by ancestry" caution elsewhere in this skill (a worktree whose branch was never actually merged via `git merge`/fast-forward looks "unmerged" to ancestry-based checks even when a squash-merge landed its content) — but this note is the actual resolution step: a content diff turns a scary-looking orphan into a confirmed-safe delete in about ninety seconds, instead of leaving you stuck at "flag it and move on."
+
 ---
 
 ## 7. Other Repos
