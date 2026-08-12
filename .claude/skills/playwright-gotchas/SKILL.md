@@ -135,6 +135,37 @@ Two rules that make it stick:
 
 ---
 
+## 5. Visible element inside a modal Radix Dialog retries click forever — body-portaled overlays are mouse-dead (`pointer-events: none` inheritance)
+
+**Symptom:** A dropdown/menu/tooltip rendered inside a modal dialog resolves visible (`toBeVisible()` passes, screenshot shows it), but `click()` retries until timeout — Playwright reports another element (typically the `DialogContent`) "intercepts pointer events." Two banked instances hit the identical signature: **163 retries / 90s timeout**. No amount of `waitFor`, scrolling, or locator tightening helps; `{ force: true }` "works" but is a lie — real users can't click it either, so force-clicking masks a genuine product defect.
+
+**Cause:** Modal Radix Dialogs (via react-remove-scroll) set `pointer-events: none` on `document.body` and re-enable it only on the dialog's own subtree. Anything portaled to `document.body` — react-select's `menuPortalTarget={document.body}`, many tooltip/popover libraries — inherits `none`. **Paint ignores `pointer-events`; hit-testing honors it**: the overlay renders perfectly while `elementFromPoint` falls through to whatever is behind it. A `onPointerDownOutside` preventDefault on the dialog does NOT fix this — it only stops dismissal, it never re-enables the portal's pointer events. The sibling shape (interactive SVG nested *inside* a trigger button) produces the same interception signature for a different reason (the trigger's own content wins hit-testing).
+
+**Fix (product code, not test code):** re-enable pointer events on the portaled subtree — for react-select, one load-bearing line on the `menuPortal` style:
+
+```tsx
+styles={{
+  ...customStyles,
+  menuPortal: (base) => ({
+    ...base,
+    zIndex: 9999,
+    pointerEvents: "auto", // LOAD-BEARING: modal Radix Dialog sets
+    // pointer-events:none on document.body; this menu is portaled there
+    // and inherits it — visible but mouse-dead without this line.
+  }),
+}}
+```
+
+Do NOT reach for the tempting alternatives: making the Dialog non-modal changes UX semantics, and portaling the menu *into* `DialogContent` breaks react-select's viewport-space coordinate math (DialogContent carries a `transform`, which becomes the containing block for fixed/absolute descendants).
+
+**Test-side rule:** when a visible element inside a modal won't take a click, the FIRST hypothesis is pointer-events inheritance, not a flaky locator. Keep the spec strict (no `force: true`, no locator softening) — the strict click IS the regression test for the product fix. Assert the real interaction end-to-end (click → state change → persistence), exactly what caught both instances.
+
+**Where this shows up:** any body-portaled floating UI (react-select menus, custom tooltips, popovers from non-Radix libraries) rendered while a modal Radix Dialog is open; also icon controls nested inside other interactive elements (same interception signature, different mechanism — see the clear-button case).
+
+**Source:** Izzy (strict E2E discovery, production compose, both instances) + Vance (product fixes), monorepo-incluir PRs #770 (nested-interactive clear X in `userSearch.tsx`, `aperture-l7w9r`) and #772 (`pointerEvents:"auto"` on the menuPortal in `courseRestrictionsDialog.tsx`, commit 858099ff). Both verified by literal-click re-runs on production compose — 2/2 pass, no force-click.
+
+---
+
 ## Adding a new gotcha
 
 When Playwright bites you in a way that took >10 minutes to figure out and would bite someone else the same way, bank it here. Use the same shape:
