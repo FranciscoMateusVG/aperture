@@ -166,6 +166,46 @@ Do NOT reach for the tempting alternatives: making the Dialog non-modal changes 
 
 ---
 
+## 6. `boundingBox()` samples entry animations — poll to geometric settle before asserting element sizes
+
+**Symptom:** A size assertion (`boundingBox().height >= 44` for touch targets, width checks, position checks) fails with a value ~2-10% *smaller* than the CSS declares — e.g. a `min-h-[46px]` control "renders" 43.96px. The readings **vary between runs and between nodes in the same run** (42.03–42.56 for one node; ratios 0.950 vs 0.956 for two nodes measured together). Escalating the declared size doesn't converge: bumping 44→46px just moves the measured value to 46×0.955 ≈ 43.9 — still "under."
+
+**Cause:** `boundingBox()` returns the box at the instant of the call — it does NOT await animation settle (only `click()`'s actionability check waits for stability). Radix/shadcn dialogs and popovers enter with `zoom-in-95`: content starts at `transform: scale(0.95)` and eases to 1.0 over ~200ms. Measuring "immediately after open" samples mid-easing, so every px value in the subtree reads ×0.95–0.99 depending on timing. The tell-tale signatures, in diagnostic order:
+
+1. **Ratio ≈ the animation's start scale** (0.95 for `zoom-in-95`).
+2. **Variance across runs for the same node** — a static cause (root font-size, zoom, CSS transform) gives a constant ratio; only a time-varying cause gives a range.
+3. **Different ratios for different nodes in the same run** — impossible for any static page-wide scale.
+
+Beware plausible-but-wrong static explanations. In the banked incident the ~0.955 ratio was twice misattributed: first to root-font rem scaling (px classes shrank too — refuted), then to "Tailwind v4 normalizes arbitrary values" (build was Tailwind v3.4.3, and the emitted CSS contained `min-height:46px` verbatim — refuted at the artifact layer). Check the emitted CSS in `.next/static/**/*.css` before believing any build-time transformation theory.
+
+**Fix (harness side):** poll the actual clickable node until its geometry is stable across consecutive frames, THEN assert. Do not weaken the threshold; do not add a fixed sleep (flaky under load).
+
+```ts
+// Poll until settled: two consecutive identical boundingBoxes.
+async function settledBox(locator: Locator) {
+  let prev = await locator.boundingBox();
+  await expect
+    .poll(async () => {
+      const cur = await locator.boundingBox();
+      const stable =
+        prev && cur && Math.abs(cur.height - prev.height) < 0.01 &&
+        Math.abs(cur.width - prev.width) < 0.01;
+      prev = cur;
+      return stable;
+    }, { timeout: 2000 })
+    .toBe(true);
+  return prev!;
+}
+```
+
+Prefer polling real default-motion behavior over globally forcing `reducedMotion: 'reduce'` — polling exercises the production animation AND proves the settled target. (Forcing reduced motion is a valid separate spec: it tests your `prefers-reduced-motion` support.)
+
+**Where this shows up:** any size/position assertion on content inside a Radix Dialog, AlertDialog, Popover, Tooltip, or dropdown that uses tailwindcss-animate entry effects (`zoom-in-*`, `slide-in-*`); any component library with scale-based mount transitions; screenshot comparisons taken immediately after open.
+
+**Source:** Izzy (strict touch-target gate, production compose) + Vance (hypothesis from ratio variance + artifact-layer CSS audit), monorepo-incluir atomic branch b7d0c361 (`aperture-h7406`). Settled re-measure confirmed 45.41–46.00px on nodes that had "measured" 42–43.9px mid-animation; 20/20 suite green after the harness moved to settle-polling. Two px-bump escalations (44→46→proposed 48) were avoided by diagnosing the measurement instead of chasing it.
+
+---
+
 ## Adding a new gotcha
 
 When Playwright bites you in a way that took >10 minutes to figure out and would bite someone else the same way, bank it here. Use the same shape:
