@@ -131,7 +131,26 @@ server.tool(
     try {
       const result = await getUnreadMessages(AGENT_NAME!);
       const messages = JSON.parse(result);
-      if (!Array.isArray(messages) || messages.length === 0) {
+      // A non-array body is NOT "no messages" — it means the query did not
+      // return what we expect, and reporting it as empty is indistinguishable
+      // from a genuinely empty inbox. That conflation is dangerous: an agent
+      // sits idle believing nothing is queued while real directives wait.
+      // Only a real empty array counts as an empty inbox.
+      if (!Array.isArray(messages)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `ERROR: unexpected bd response shape for get_messages — expected a JSON array, got ${
+                  messages === null ? "null" : typeof messages
+                }. This is NOT an empty inbox; messages may be queued. Re-run, or fall back to: bd list --type message --status open`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (messages.length === 0) {
         return { content: [{ type: "text", text: "No unread messages." }] };
       }
       const formatted = messages.map((m: any) => {
