@@ -18,11 +18,47 @@ function bdEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * Render argv for a diagnostic message WITHOUT leaking free-text content.
+ *
+ * bd invocations carry task notes, descriptions and message bodies as
+ * arguments. Those can contain credentials or customer data, and this string
+ * ends up in an error surfaced to the calling agent, so long values are
+ * replaced by a length marker. Short values (subcommands, ids, flags, query
+ * expressions) are kept verbatim — they are what makes a failure diagnosable.
+ */
+const ARGV_INLINE_MAX = 120;
+
+export function redactArgv(args: string[]): string {
+  const rendered = args.map((a, i) =>
+    // args[0] is the subcommand — always safe and always useful.
+    i === 0 || a.length <= ARGV_INLINE_MAX ? a : `<redacted ${a.length}b>`,
+  );
+  return JSON.stringify(rendered);
+}
+
 export function runBd(args: string[]): Promise<string> {
+  const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     execFile(BD_PATH, args, { env: bdEnv(), timeout: 30000 }, (err, stdout, stderr) => {
       if (err) {
-        reject(new Error(stderr || err.message));
+        // Surface enough to diagnose the NEXT occurrence from evidence rather
+        // than re-deriving it: which invocation, how it exited, how long it
+        // ran (a ~30000ms duration with killed=true is the execFile timeout),
+        // and stderr. Previously this reported `stderr || err.message`, which
+        // discarded the exit code and duration whenever stderr was non-empty.
+        const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+        const detail = [
+          `bd invocation failed after ${Date.now() - startedAt}ms`,
+          `argv: ${redactArgv([BD_PATH, ...args])}`,
+          `exit: ${e.code ?? "n/a"}`,
+          e.signal ? `signal: ${e.signal}` : undefined,
+          e.killed ? "killed: true (execFile timeout is 30000ms)" : undefined,
+          stderr?.trim() ? `stderr: ${stderr.trim()}` : "stderr: (empty)",
+        ]
+          .filter(Boolean)
+          .join(" | ");
+        reject(new Error(detail));
       } else {
         resolve(stdout.trim());
       }
