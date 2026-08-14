@@ -206,6 +206,31 @@ Prefer polling real default-motion behavior over globally forcing `reducedMotion
 
 ---
 
+## 7. jsdom green is NOT evidence for focus/composition claims — the divergence catalogue
+
+**Symptom:** A rendered jsdom test (RTL + user-event) passes a keyboard/focus/menu assertion, but the identical interaction fails deterministically in a real browser — or vice versa. Worse: a whole suite stays green across a product fix AND its pre-fix revert (false-green — it pins nothing).
+
+**Cause:** jsdom + user-event simulate focus, tab order, and event delivery with their own models, which diverge from real browser + real component-library composition in at least SIX documented ways (all from one surface, the Visibilidade combobox saga, monorepo-incluir PR #794, beads 5gaph/qeraa/kmuiv/4fkma, ten QA rounds):
+
+1. **Tab order without the trap**: jsdom's user.tab() computed a tab order that ignored Radix FocusScope — real Tab landed on the DialogContent root (`role=dialog tabindex=-1`), never the button jsdom reached.
+2. **Portal event delivery**: keydown events on inputs inside a Radix Portal (body-appended) never reached React handlers in jsdom — React root-container delegation doesn't span body portals there. The handler test was silently vacuous until the Portal was removed from the wrapper.
+3. **user-event's tab simulation fights handler focus()**: after a keydown handler calls focus(), user.keyboard("{Tab}") runs its OWN tab-order move and overrides it.
+4. **FocusScope confounds every in-trap signal**: it preventDefaults BOTH Tab directions (so fireEvent's return can't be attributed to your handler) and wraps Shift+Tab onto your own target element (so a focus spy can't discriminate caller).
+5. **Library-internal input state**: react-select's visible input cleared on blur/menu-close in the real composition in ways neither a controlled `inputValue` prop nor an `onInputChange` return-value covered in every path — and native `fill('')` produced input events that a synthetic-layer mirror missed entirely.
+6. **Effect-flush races are real-browser-fast**: an intent flag cleared only in a useEffect left an ~11ms window that Playwright's real event speed hit 3/3 deterministically — jsdom's act() batching never exposed it.
+
+**Fix (a discipline, not a line of code):**
+- **Authority layering**: pure-logic machine tests < bare-render handler-contract pins < Dialog-wrapped rendered tests < REAL Playwright against the production composition. Each layer pins only what it can attribute; label each test's honest scope in a comment; the real-browser gate is the ONLY authority for end-to-end keyboard/focus claims.
+- **Bare-render handler-contract pins** for jsdom: assert YOUR handler's contract (fireEvent return = your preventDefault; a focus/state spy = your routing) OUTSIDE the confounding trap — never document.activeElement inside it.
+- **Problem-shaped regressions, proven bidirectionally**: when a fix lands, the new test must FAIL on the pre-fix commit (check the component out at the old SHA and run) and pass on the fix. A suite that passes both ways pins nothing — QA proved a 7/7 suite false-green exactly this way.
+- **Design lessons that ended the saga**: sync state from NATIVE events (onInputCapture on a wrapper — catches keyboard/paste/cut/IME/Playwright fill below any library mediation); derive UI gates from EVERY state that renders what they gate (an alert rendered by `retryPending` means `retryPending` belongs in the menu gate); clear intent flags SYNCHRONOUSLY in the event path, never only in effects.
+
+**Where this shows up:** any keyboard/focus/menu assertion involving Radix Dialog/FocusScope, portals, react-select or other libraries with internal input state, or intent flags cleared in effects. If your assertion involves `document.activeElement` inside a focus trap in jsdom — stop, it is not evidence.
+
+**Source:** Izzy (ten rounds of strict real-browser gating, trace-driven postmortems, the false-green catch) + Vance (fixes, handler-contract pin pattern, bidirectional RED/GREEN proof), monorepo-incluir PR #794 (final head dc7c7c08), beads aperture-5gaph/qeraa/kmuiv/4fkma, 2026-08-13/14. Final authority run: isolated production-compose 2/2 first-attempt, no retries.
+
+---
+
 ## Adding a new gotcha
 
 When Playwright bites you in a way that took >10 minutes to figure out and would bite someone else the same way, bank it here. Use the same shape:
