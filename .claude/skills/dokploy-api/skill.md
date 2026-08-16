@@ -395,24 +395,29 @@ PR the change, merge, auto-deploy fires, container rebuilds with the wire-throug
 
 ## 13. Canonical prod public subdomains (incluir stack)
 
-The hono-fed Next.js multi-app stack on prod uses **short subdomain prefixes** that don't always match the app folder name. When constructing layer-8 verify probes (`curl https://<host>/...`), use the table below — using the long form (e.g. `gestao-de-pessoas-new`) hits a Traefik 404 and wastes a probe.
+**Corrected 2026-08-16** — the previous table had drifted; verified against the live Dokploy `domain` table.
+
+The Incluir Main App compose (`_A6rI-GEm9oF8ysIojm0O`) has **exactly one** bound public host. All the per-app `*-new.*` subdomains that used to be listed here are **retired** — they no longer exist in the `domain` table. Every prod app on this compose is reached through the single host below.
 
 | App folder | Container suffix | **Public subdomain** | Verify probe |
 |------------|------------------|----------------------|-------------|
-| `apps/frontend` (legacy admin/student) | `frontend-1` | **`new.programaincluir.org`** | `curl -I https://new.programaincluir.org/home/admin` |
-| `apps/secretaria` | `secretaria-1` | **`secretaria-new.programaincluir.org`** | `curl -I https://secretaria-new.programaincluir.org/alunos/buscar` |
-| `apps/gestao-de-pessoas` | `gestao-de-pessoas-1` | **`gestao-new.programaincluir.org`** ⚠️ (short form) | `curl -I https://gestao-new.programaincluir.org/voluntarios/buscar` |
-| `apps/coordenador` | `coordenador-1` | `coordenador-new.programaincluir.org` (verify before use) | — |
-| `apps/financeiro` | `financeiro-1` | `financeiro-new.programaincluir.org` (verify before use) | — |
-| `apps/hono-app` | `hono-app-1` | NOT publicly routed — accessed via the per-app Next.js proxies above | — |
+| `apps/frontend` (main app entrypoint) | `frontend-1` (serviceName `frontend`, port 3000) | **`app.programaincluir.org`** | `curl -I https://app.programaincluir.org/home/admin` |
+| `apps/secretaria` | `secretaria-1` | not separately routed — reach via `app.programaincluir.org` | — |
+| `apps/gestao-de-pessoas` | `gestao-de-pessoas-1` | not separately routed — reach via `app.programaincluir.org` | — |
+| `apps/coordenador` | `coordenador-1` | not separately routed — reach via `app.programaincluir.org` | — |
+| `apps/financeiro` | `financeiro-1` | not separately routed — reach via `app.programaincluir.org` | — |
+| `apps/hono-app` | `hono-app-1` | NOT publicly routed — accessed via the Next.js proxy above | — |
 
-**Gotcha banked 2026-05-26**: orchestrator briefed Peppy with `gestao-de-pessoas-new.programaincluir.org` for the #431 verify chain. Real Traefik host is the short form `gestao-new.programaincluir.org`. Peppy caught it and re-probed; verify chain came back green. Container names use the full app folder name (`gestao-de-pessoas-1`), but Dokploy's domain config maps the short prefix.
+**RETIRED hosts** (removed, not mistyped — if you saw these in an older copy of this table, they are gone):
+`new.programaincluir.org`, `secretaria-new.programaincluir.org`, `gestao-new.programaincluir.org`, `coordenador-new.programaincluir.org`, `financeiro-new.programaincluir.org`. Probing any of them is a wasted probe.
 
-**Discovery procedure** when you don't know an app's subdomain:
+⚠️ **`secretaria.programaincluir.org` is NOT the main app.** It is bound to a different compose (`zg6mgJNJlOaYggUXWy95m`, the "Secretaria Test" service). Never use it to verify a change deployed to the main app compose — it will answer, and it will answer with the wrong build. A separate set of `zz-iso-*` hosts likewise lives on its own isolated compose.
+
+**Discovery procedure — run this FIRST, before constructing any verify probe.** This mapping demonstrably drifts (this table has already gone stale once), so treat the live `domain` table as the source of truth and this section as a cache:
 ```bash
 # List all Traefik hosts on the active compose
 ssh xerox 'docker exec dokploy-postgres.1.zos6qj3u1fm7t10d72r5yzpc0 psql -U dokploy -d dokploy -t -c \
   "SELECT host FROM domain WHERE \"composeId\" = '\''_A6rI-GEm9oF8ysIojm0O'\'' ORDER BY host;"'
 ```
 
-This returns every public host bound to the active Incluir Main App compose. Always run this discovery once at the start of a verify chain if the URL isn't already banked above.
+This returns every public host bound to the active Incluir Main App compose. If what it returns disagrees with the table above, the table is stale — trust the query and update this section.
