@@ -182,6 +182,8 @@ A task that genuinely spans projects gets the **primary** project label. Cross-p
 
 Most BEADS work is filed as `type: task`. But some work — multi-session initiatives, project briefs, things that touch more than one specialist agent — is bigger than a task. That is an **epic**: a container bead that holds a body of work together. This section says when to file one, what shape it takes, and how the parent/child wiring actually works.
 
+**Before filing a project-kickoff epic, run `aperture:prior-art-check` first** — a cheap sweep (local projects grep, git remote check, BEADS closed-history search) for whether the "new project" you're about to file is actually new. Banked from the raul-fitt incident (2026-08-23): GLaDOS nearly re-dispatched three months of already-verified work because a "new project" request was taken at face value and a design-tool link the operator handed over turned out to be a stale snapshot that had silently diverged from real, already-shipped local work. Run the sweep before `create_task`, not after a specialist has already spec'd against the wrong ground truth.
+
 ### When to file an epic
 
 File `--type epic` when AT LEAST ONE of these is true:
