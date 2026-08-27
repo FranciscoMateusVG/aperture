@@ -185,3 +185,20 @@ Find `<last-parent-commit-sha>` via `git log --oneline` on your branch — it's 
 **Prevention pattern**: when you must stack on an open PR, record the last-parent-commit SHA at branch-creation time in your BEADS notes. Future-you (or another agent recovering the worktree) doesn't have to dig through git log to find it.
 
 **Even better prevention**: don't base on the parent's branch at all. Base on `origin/main` and just include the parent's expected changes as local-only deltas that you'll drop at rebase time. More work upfront, no rebase trap.
+
+---
+
+## 9. Shared worktree, multiple agents, same bead — one pen per file set
+
+Splitting one bead into parallel slices across agents (or subagents) that share a single worktree is a legitimate pattern — but it silently breaks if two slices touch the same files at the same time. There's no branch isolation inside a shared worktree; a live edit from one agent can get overwritten by another mid-read, with no error, no conflict marker, nothing. The only reason it surfaced was one agent's own trust-but-verify catching a claimed test-pass that had, in fact, never actually run green (the live-edit collision silently mutated the file between the claim and the check).
+
+**Banked precedent (2026-08-27, aperture-4f1vw, monorepo-incluir):** Rex split a bead into parallel slices in a shared worktree, including a frontend hydration slice touching `ReportChatClient.tsx`/`reports-api.ts`. He separately handed the *same* file scope to Vance as a follow-up slice. Both ended up editing the same files concurrently in the same worktree — Vance's own type-error fix got silently overwritten, and a diff she was mid-reviewing changed size under her while she was reading it. She caught it only because she was independently re-verifying a claimed "6/6 tests PASS" and found the suite had never actually run green — the live collision was corrupting state between the claim and the check.
+
+**The rule:** before two agents (or two slices of the same bead) touch a shared worktree, the file sets must not overlap in time. Concretely:
+
+- **Announce the file set you're claiming in the bead notes** before editing — not after. "Taking ReportChatClient.tsx + reports-api.ts" as a note, not just an implied scope from a task description.
+- **One pen per file set at a time.** If two slices need to touch the same file, they run sequentially, not concurrently — whoever's turn it is finishes and gates green, then the next agent starts from that clean state.
+- **When a scope handoff happens** ("I built X, but also asked Y to build the same surface" — the exact shape of the 4f1vw collision), the orchestrator resolves it immediately: one agent cedes the file set, the other proceeds. Don't let both keep editing while the question is open.
+- **A claimed test-pass on a file that was concurrently edited by someone else is not trustworthy** — re-verify after any suspected collision, don't take the earlier claim at face value even if it was made in good faith. The claim may have been true at the moment it was made and false by the time anyone reads it.
+
+This is the shared-worktree-specific corollary to the swarm's general trust-but-verify discipline (`specialist-delegation` §6): the diff you're reviewing can change out from under you if the worktree isn't exclusively yours for that file set.
