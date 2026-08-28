@@ -231,6 +231,32 @@ Prefer polling real default-motion behavior over globally forcing `reducedMotion
 
 ---
 
+## toBeVisible() passes on overflow-clipped elements
+
+**Symptom:** a dropdown/popover assertion passes in Playwright (`toBeVisible()` green) but the element is genuinely invisible to a real user — clipped by an ancestor's `overflow` and unreachable by tap/click.
+
+**Cause:** `toBeVisible()` checks CSS visibility properties (`display`, `visibility`, `opacity`, zero-size) but does NOT check whether the element is actually clipped out of the visible viewport by an ancestor's `overflow: hidden`/`auto`. A container with `overflow-x: auto` implicitly forces `overflow-y: auto` too (a CSS quirk — `overflow-x`/`overflow-y` can't independently be `visible` if the other axis is scrollable), which silently clips a dropdown positioned to expand vertically. The element is present, has nonzero size, and is technically "visible" by Playwright's definition — but a real user cannot see or reach it.
+
+**Fix:** for any dropdown/popover/menu assertion, use a hit-test instead of `toBeVisible()`:
+
+```ts
+// Honest assertion — proves the element is actually reachable at that point
+const box = await dropdown.boundingBox();
+const hit = await page.evaluate(([x, y]) => {
+  const el = document.elementFromPoint(x, y);
+  return el?.closest('[data-testid="dropdown"]') != null;
+}, [box.x + box.width / 2, box.y + box.height / 2]);
+expect(hit).toBe(true);
+```
+
+`elementFromPoint` returns what's actually rendered at that coordinate — if an ancestor's overflow clips the dropdown, a sibling or the clipping container itself will be hit instead, and the test correctly fails.
+
+**Where this shows up:** any dropdown/popover/tooltip that expands beyond its trigger's immediate container, especially inside a horizontally-scrollable region (`overflow-x: auto`) where the y-axis clip is implicit and easy to miss in review.
+
+**Source:** Vance, eunenem-engine PR #79 (aperture-acr3t, mobile popover-not-showing bug), 2026-08-28. Root cause was exactly this pattern — a horizontal-scroll container's implicit vertical clip — and the bug had been shipping invisibly because the existing test suite asserted `toBeVisible()` and passed.
+
+---
+
 ## Adding a new gotcha
 
 When Playwright bites you in a way that took >10 minutes to figure out and would bite someone else the same way, bank it here. Use the same shape:
