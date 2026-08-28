@@ -397,6 +397,14 @@ close_task(
 
 The `reason` should be a sentence or two summarising what was actually done — not "done" or "completed". Future agents may read this.
 
+#### Edge case — the bead's OWN acceptance criteria names a QA gate as the closing condition
+
+The PR-open rule above is the DEFAULT. It is not absolute. **When a bead's `acceptance` field explicitly names a QA gate as the completion condition** (e.g. "Izzy walks the full journey before this ships", "Izzy re-gates before this closes") — that acceptance text overrides the default. The bead closes on the QA verdict, not on PR-open, regardless of how green your own gates look.
+
+**Banked precedent (2026-08-28, three separate specialists — Rex, Wheatley, Vance — hit this exact gap in one session):** all three closed a bead citing their own shipped PR / passing local gates, while the bead's own acceptance criteria said "Izzy re-gates / walks the journey before this ships." In each case Izzy's real re-gate came back with a genuine finding the specialist's own testing had missed (a prompt-cap edge case, a curriculum-scope violation, an a11y contrast miss) — proving the QA step wasn't ceremony, it was catching real gaps. GLaDOS caught the premature close each time, reopened, and the specialist self-corrected without pushback once it was pointed out — the instinct to apply the general PR-open rule is strong and needs an explicit override, not just good faith.
+
+**The rule:** before closing any bead, re-read its own `acceptance` field. If it names a specific reviewer/gate as the closing condition, honor that literally — don't let the general PR-open convention silently supersede a more specific instruction the bead itself carries. When in doubt, leave it `in_progress` and let the reviewer close it (or ping the orchestrator to close it on the verdict).
+
 #### Edge case — auto-closed PRs (stacked-PR pattern on monorepo-incluir)
 
 If your PR gets **CLOSED** by GitHub (not MERGED) before any merge happened, the BEADS task is **NOT** done. The close-on-PR-open invariant is about *your PR being open and ready for review* — it doesn't apply to a PR GitHub auto-killed.
