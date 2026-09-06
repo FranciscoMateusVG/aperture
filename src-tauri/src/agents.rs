@@ -298,9 +298,11 @@ pub fn boot_agent_process(
         // populated from $CODEX_HOME/skills above.
         let prompt_content = inject_codex_skills(prompt_content, &name);
         // Codex has no SessionStart/PreCompact hook system (unlike Claude
-        // Code — see .claude/settings.json), so the shared bd-memory bank
-        // must be mirrored into the static prompt manually here.
-        let prompt_content = inject_bd_memory(prompt_content, &beads_dir, &name);
+        // Code — see .claude/settings.json), so the same boot seam the
+        // SessionStart hook runs (scripts/aperture-prime.sh boot: workflow
+        // preamble + memory INDEX, never the full bank) is mirrored into the
+        // static prompt manually here.
+        let prompt_content = inject_bd_memory(prompt_content, &project_dir, &beads_dir, &name);
         // Comms Layer v2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
         // unread messages are replayed by the aperture-bus codex-bridge over
         // the app-server socket; nothing is prepended to the prompt here.
@@ -842,57 +844,74 @@ fn append_skill_bodies(mut prompt: String, skills: Vec<(String, String)>) -> Str
     prompt
 }
 
-/// Claude Code agents get the shared `bd remember` memory bank for free via
-/// the `SessionStart`/`PreCompact` hooks in `.claude/settings.json`, which
-/// run `bd prime` and inject its output into context automatically. Codex
-/// has no equivalent hook system — it only reads a static
+/// Section header appended to a Codex prompt.md by [`inject_bd_memory`].
+/// Names the seam so an agent reading its own prompt knows the full bank is
+/// intentionally absent and where to get it (aperture-bus `recall` tools).
+pub const BD_MEMORY_INDEX_HEADER: &str =
+    "# Beads Memory Index (aperture-prime.sh boot — full bank is never injected; use recall/recall_full)";
+
+/// Claude Code agents get BEADS context for free via the `SessionStart` /
+/// `PreCompact` hooks in `.claude/settings.json`, which run
+/// `scripts/aperture-prime.sh boot|precompact` (context diet, aperture-trgpo:
+/// `bd prime` workflow preamble + a ~25 KiB memory INDEX — never the ~373 KiB
+/// bank). Codex has no equivalent hook system — it only reads a static
 /// `model_instructions_file` written once at boot — so without this, every
 /// Codex-backed agent (Rex/Scout/Cipher as of 2026-07) boots with zero
 /// memory context even though `bd` itself is fully wired for them (same
-/// BEADS_DIR/BD_ACTOR env as Claude agents get). Manually shell out to the
-/// same `bd prime` command and append its output, so both backends see the
-/// identical memory bank at boot. Failure here must not fail agent boot —
-/// worst case the agent starts without memories, same as before this fix.
-pub fn inject_bd_memory(mut prompt: String, beads_dir: &str, agent_name: &str) -> String {
-    let output = std::process::Command::new("bd")
-        .arg("prime")
+/// BEADS_DIR/BD_ACTOR env as Claude agents get). Shell out to the SAME boot
+/// seam and append its output, so both backends see identical context.
+///
+/// Failure here must not fail agent boot. Unlike the pre-diet version, a
+/// failure appends a visible `[memory index unavailable: <reason>]` line
+/// under the header instead of nothing, so a Codex agent can tell "no index"
+/// from "no memories" and fall back to `recall` explicitly.
+pub fn inject_bd_memory(mut prompt: String, project_dir: &str, beads_dir: &str, agent_name: &str) -> String {
+    let script = format!("{}/scripts/aperture-prime.sh", project_dir);
+    let output = std::process::Command::new(&script)
+        .arg("boot")
         .env("BEADS_DIR", beads_dir)
         .env("BD_ACTOR", agent_name)
         .output();
-    match output {
+    let body = match output {
         Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
             if text.trim().is_empty() {
                 eprintln!(
-                    "[aperture] warning: `bd prime` returned empty output for '{}'",
+                    "[aperture] warning: `aperture-prime.sh boot` returned empty output for '{}'",
                     agent_name
                 );
+                "[memory index unavailable: aperture-prime.sh boot returned empty output]".to_string()
             } else {
                 eprintln!(
-                    "[aperture] injected bd prime memory bank ({} bytes) for '{}'",
+                    "[aperture] injected aperture-prime boot block ({} bytes) for '{}'",
                     text.len(),
                     agent_name
                 );
-                prompt.push_str(&format!(
-                    "\n\n---\n# Beads Memory Bank (bd prime, mirrored for Codex — no hook system)\n\n{}",
-                    text
-                ));
+                text
             }
         }
         Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = stderr.trim();
             eprintln!(
-                "[aperture] warning: `bd prime` exited non-zero for '{}': {}",
-                agent_name,
-                String::from_utf8_lossy(&out.stderr)
+                "[aperture] warning: `aperture-prime.sh boot` exited non-zero for '{}': {} {}",
+                agent_name, out.status, stderr
             );
+            format!(
+                "[memory index unavailable: aperture-prime.sh boot exited {}{}]",
+                out.status,
+                if stderr.is_empty() { String::new() } else { format!(" — {}", stderr) }
+            )
         }
         Err(e) => {
             eprintln!(
-                "[aperture] warning: failed to run `bd prime` for '{}': {}",
-                agent_name, e
+                "[aperture] warning: failed to run `{}` for '{}': {}",
+                script, agent_name, e
             );
+            format!("[memory index unavailable: failed to run {}: {}]", script, e)
         }
-    }
+    };
+    prompt.push_str(&format!("\n\n---\n{}\n\n{}", BD_MEMORY_INDEX_HEADER, body));
     prompt
 }
 
@@ -1021,5 +1040,105 @@ mod tests {
         assert_eq!(find_running_window(&windows, "izzy").unwrap().window_id, "@izzy");
         assert_eq!(find_running_window(&windows, "scout").unwrap().window_id, "@scout");
         assert!(find_running_window(&windows, "ghost").is_none());
+    }
+
+    // ---- aperture-trgpo: inject_bd_memory runs the boot seam, never bd prime ----
+
+    /// A throwaway project_dir with a fake `scripts/aperture-prime.sh` whose
+    /// body is `script` (a `#!/bin/sh` shebang is prepended). Cleaned up on drop.
+    struct FakeProject {
+        dir: std::path::PathBuf,
+    }
+    impl FakeProject {
+        fn with_script(tag: &str, script: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!(
+                "aperture-inject-bd-memory-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("scripts")).unwrap();
+            let path = dir.join("scripts/aperture-prime.sh");
+            fs::write(&path, format!("#!/bin/sh\n{}\n", script)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            FakeProject { dir }
+        }
+        fn empty(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "aperture-inject-bd-memory-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            FakeProject { dir }
+        }
+        fn path(&self) -> &str {
+            self.dir.to_str().unwrap()
+        }
+    }
+    impl Drop for FakeProject {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn inject_bd_memory_appends_boot_seam_output_under_new_header() {
+        // The stub echoes its mode and the env the seam relies on, so the
+        // test proves (a) `boot` is the argument, (b) BEADS_DIR/BD_ACTOR
+        // still flow through, (c) the captured stdout lands verbatim.
+        let p = FakeProject::with_script(
+            "ok",
+            "echo \"MARKER mode=$1 actor=$BD_ACTOR beads=$BEADS_DIR\"",
+        );
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        assert!(out.starts_with("PROMPT\n\n---\n"), "prompt body must be preserved: {out}");
+        assert!(out.contains(BD_MEMORY_INDEX_HEADER), "new header missing: {out}");
+        assert!(
+            out.contains("MARKER mode=boot actor=rex beads=/tmp/fake-beads"),
+            "stub output not appended / wrong mode or env: {out}"
+        );
+        assert!(!out.contains("Beads Memory Bank (bd prime"), "old bd-prime header must be gone");
+        assert!(!out.contains("[memory index unavailable"), "success path must not print the fallback");
+    }
+
+    #[test]
+    fn inject_bd_memory_header_is_the_index_header_not_bd_prime() {
+        assert_eq!(
+            BD_MEMORY_INDEX_HEADER,
+            "# Beads Memory Index (aperture-prime.sh boot — full bank is never injected; use recall/recall_full)"
+        );
+    }
+
+    #[test]
+    fn inject_bd_memory_missing_script_appends_visible_fallback() {
+        let p = FakeProject::empty("missing");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        assert!(out.starts_with("PROMPT"));
+        assert!(out.contains(BD_MEMORY_INDEX_HEADER));
+        assert!(
+            out.contains("[memory index unavailable: failed to run "),
+            "missing script must leave a visible marker, not silence: {out}"
+        );
+        assert!(out.contains("scripts/aperture-prime.sh"), "reason must name the script: {out}");
+    }
+
+    #[test]
+    fn inject_bd_memory_nonzero_exit_appends_fallback_with_stderr_reason() {
+        let p = FakeProject::with_script("fail", "echo 'boom' >&2; exit 3");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        assert!(out.contains(BD_MEMORY_INDEX_HEADER));
+        assert!(out.contains("[memory index unavailable: aperture-prime.sh boot exited"), "{out}");
+        assert!(out.contains("boom"), "stderr reason must be surfaced: {out}");
+    }
+
+    #[test]
+    fn inject_bd_memory_empty_output_appends_fallback() {
+        let p = FakeProject::with_script("empty", "exit 0");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        assert!(out.contains(BD_MEMORY_INDEX_HEADER));
+        assert!(out.contains("[memory index unavailable: aperture-prime.sh boot returned empty output]"), "{out}");
     }
 }
