@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { MailboxStore } from "./store.js";
 import { MessageQueue } from "./message-queue.js";
-import { formatUpdateAck, formatCloseAck, createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead, extractTaskId } from "./beads.js";
+import { formatUpdateAck, formatCloseAck, createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, formatUnreadMessages, UNREAD_LIMIT, markMessageRead, extractTaskId } from "./beads.js";
 import { notifyHub } from "./hub-notify.js";
 import { presenceReport, describePresence, type PresenceReport } from "./presence-snapshot.js";
 
@@ -146,7 +146,7 @@ server.tool(
 
 server.tool(
   "get_messages",
-  "Get all unread messages for you from the BEADS message bus.",
+  `Get your unread messages from the BEADS message bus, oldest first. At most ${UNREAD_LIMIT} per call — when the reply ends with a "Showing the ${UNREAD_LIMIT} most recent…" notice, mark those read and call again to drain the rest.`,
   {},
   async () => {
     try {
@@ -174,12 +174,8 @@ server.tool(
       if (messages.length === 0) {
         return { content: [{ type: "text", text: "No unread messages." }] };
       }
-      const formatted = messages.map((m: any) => {
-        const titleMatch = m.title?.match(/\[(.+?)->(.+?)\]/);
-        const from = titleMatch?.[1] ?? "unknown";
-        return `[${m.id}] From ${from}: ${m.description ?? "(no content)"}`;
-      }).join("\n\n");
-      return { content: [{ type: "text", text: formatted }] };
+      // Sorted oldest-first + cap notice when the batch hit UNREAD_LIMIT.
+      return { content: [{ type: "text", text: formatUnreadMessages(messages) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
@@ -379,7 +375,7 @@ server.tool(
 
 server.tool(
   "query_tasks",
-  `Query BEADS tasks. Modes: 'list' (active tasks), 'ready' (unblocked), 'show' (single task by ID). In 'list' mode this defaults to YOUR own assigned tasks — pass assignee:"*" for any. List/ready default to summary fields (description/notes truncated to 200 chars). 'show' defaults to the 'detail' tier: full meta + acceptance criteria, description capped at 4k chars, notes capped to the LAST 3k chars (recent history), dependencies summarized — pass fields:"full" for the complete untruncated record when genuinely resuming exact bead state. Use project:"aperture" to filter by the project:aperture label. Done/closed tasks excluded by default; pass include_done:true for historical data.`,
+  `Query BEADS tasks. Modes: 'list' (active tasks), 'ready' (unblocked), 'show' (single task by ID). In 'list' mode this defaults to YOUR own assigned tasks — pass assignee:"*" for any. List/ready default to summary fields (description/notes truncated to 200 chars). 'show' defaults to the 'detail' tier: full meta + acceptance criteria, description capped at 4k chars, notes capped to the LAST 3k chars (recent history), dependencies summarized — pass fields:"full" for the complete untruncated record when genuinely resuming exact bead state. Use project:"aperture" to filter by the project:aperture label. Done/closed tasks excluded by default; pass include_done:true for historical data. Results are CAPPED: 'list' returns at most 50 tasks and 'ready' at most 10 by default (bd's own limits) — pass limit (1-500) to raise the cap when a filtered query might exceed it.`,
   {
     mode: z.enum(["list", "ready", "show"]).describe("Query mode"),
     id: z.string().optional().describe("Task ID (required for 'show' mode)"),
@@ -389,8 +385,9 @@ server.tool(
     priority_max: z.number().min(0).max(4).optional().describe("Keep tasks with priority ≤ this value (0=highest, 4=backlog)."),
     label: z.string().optional().describe("Filter by an arbitrary label."),
     fields: z.enum(["summary", "detail", "full"]).optional().describe("Projection tier. 'summary' (list/ready default): id,title,status,priority,assignee,owner,labels + 200-char description/notes. 'detail' (show default): full meta, description head-capped 4k, notes TAIL-capped 3k, dependencies summarized. 'full': complete untruncated record — use only when genuinely resuming exact bead state."),
+    limit: z.number().int().min(1).max(500).optional().describe("Max tasks to return (1-500). Default: bd's own cap — 50 for 'list', 10 for 'ready'. Ignored in 'show' mode."),
   },
-  async ({ mode, id, include_done, project, assignee, priority_max, label, fields }) => {
+  async ({ mode, id, include_done, project, assignee, priority_max, label, fields, limit }) => {
     try {
       // Default to caller's own tasks in list mode unless they ask for "*".
       const effectiveAssignee =
@@ -402,6 +399,7 @@ server.tool(
         priorityMax: priority_max,
         label,
         fields,
+        limit,
       });
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
@@ -431,7 +429,7 @@ server.tool(
 
 server.tool(
   "search_tasks",
-  `Search BEADS tasks. Defaults to summary fields with description/notes truncated — pass fields:"full" for everything. Use project:"aperture" to filter by the project:aperture label. Done/closed tasks excluded by default. Unlike query_tasks, this does NOT auto-filter by assignee — pass assignee explicitly if you need it.`,
+  `Search BEADS tasks. Defaults to summary fields with description/notes truncated — pass fields:"full" for everything. Use project:"aperture" to filter by the project:aperture label. Done/closed tasks excluded by default. Unlike query_tasks, this does NOT auto-filter by assignee — pass assignee explicitly if you need it. Results are CAPPED at 50 tasks by default (bd's own limit) — pass limit (1-500) to raise the cap when a filtered search might exceed it.`,
   {
     label: z.string().optional().describe("Filter by label."),
     project: z.string().optional().describe("Filter by project label (e.g. 'aperture' matches tasks tagged project:aperture)."),
@@ -439,8 +437,9 @@ server.tool(
     priority_max: z.number().min(0).max(4).optional().describe("Keep tasks with priority ≤ this value (0=highest, 4=backlog)."),
     include_done: z.boolean().optional().describe("Include done/closed tasks (default: false)."),
     fields: z.enum(["summary", "full"]).optional().describe("Projection mode. 'summary' (default) returns id,title,status,priority,assignee,owner,labels + truncated description/notes. 'full' returns everything."),
+    limit: z.number().int().min(1).max(500).optional().describe("Max tasks to return (1-500). Default: bd's own cap of 50."),
   },
-  async ({ label, project, assignee, priority_max, include_done, fields }) => {
+  async ({ label, project, assignee, priority_max, include_done, fields, limit }) => {
     try {
       const result = await searchTasks({
         label,
@@ -449,6 +448,7 @@ server.tool(
         priorityMax: priority_max,
         includeDone: include_done,
         fields,
+        limit,
       });
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {

@@ -180,6 +180,8 @@ Aperture skills are markdown files under `.claude/skills/<skill>/SKILL.md`. As o
 
 The repo holds canonical sources (`agents/<name>/{manifest.json, skills.txt}`, `prompts/<name>.md`, `.claude/skills/<skill>/`). Run `just setup` to (re)build the runtime tree from those sources — it's idempotent. Adding/removing a skill or agent never requires a recompile; only `just setup`.
 
+To see what each agent actually carries at boot, run `just skills-matrix`: it walks the same sources (plus the runtime model overrides in `~/.aperture/agent-config.json`) and prints, per agent, which skills are **resident** (full body force-injected into the boot prompt) vs **lazy** (name+description only, body read on demand — Codex agents via `resident.txt`, Claude agents via native `.claude/skills/` discovery), with byte sizes, a skill × agent grid, and any skills that are unassigned or referenced but missing. `just skills-matrix --json` emits the same data as one JSON object for tooling.
+
 | Skill | Purpose |
 |-------|---------|
 | `communicate` | Inter-agent messaging patterns, status reports |

@@ -37,7 +37,7 @@ replaced — by every run).
    actual listener), rebuild `mcp-server/dist` if missing or older than any
    `src/*.ts` (stale-dist false-failure guard).
 2. **Registry** — `APERTURE_AGENTS_DIR` points at `registry/` (stub agents
-   `claude-smoke` model `opus`, `codex-smoke` model `codex/gpt-5`). The real
+   `claude-smoke` model `opus`, `codex-smoke` model `codex/gpt-6-astra`). The real
    load path (`agent_loader.rs`) requires, per agent:
    `manifest.json` (serde-required fields: `name`, `model`, `window`, `role`;
    `kind`/`enabled`/`emoji` optional) + `prompt.md`; `skills/<s>/SKILL.md`

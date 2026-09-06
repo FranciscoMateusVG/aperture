@@ -23,15 +23,15 @@ use std::path::Path;
 /// The fields tagged `#[allow(dead_code)]` are not yet read by the runtime but
 /// are validated at parse time — serde will reject a manifest that's missing
 /// `model`, `window`, or `role`. They're kept on the struct so adding UI
-/// features (per-agent emoji, alternate tmux window names, explicit codex
-/// kind switching) doesn't require a schema change.
+/// features (alternate tmux window names, explicit codex kind switching)
+/// doesn't require a schema change. `emoji` is passed through to the
+/// launcher card (aperture-84bby).
 #[derive(Debug, Deserialize)]
 pub struct AgentManifest {
     /// Display name (e.g. "GLaDOS"). The directory name is the canonical key.
     #[allow(dead_code)]
     pub name: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub emoji: String,
     pub model: String,
     #[allow(dead_code)]
@@ -141,6 +141,9 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
         // in manifest.json is currently informational; the launcher renders
         // it via the frontend if/when it wants pretty labels.
         let key = dir_name.to_lowercase();
+        // Empty string → None so the frontend's `agent.emoji || fallback`
+        // and the serialized JSON both read "no emoji" the same way.
+        let emoji = Some(manifest.emoji.trim().to_string()).filter(|e| !e.is_empty());
         agents.insert(
             key.clone(),
             AgentDef {
@@ -150,6 +153,7 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
                 prompt_file: prompt_path.to_string_lossy().to_string(),
                 tmux_window_id: None,
                 status: "stopped".into(),
+                emoji,
                 attention: false,
                 attention_reason: None,
                 turn_state: None,

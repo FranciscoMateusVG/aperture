@@ -1,4 +1,5 @@
 import { commands } from "../services/tauri-commands";
+import { escapeHtml } from "../utils/html";
 
 // Bottom-of-launcher version line. Shows semver + short git SHA + UTC build
 // date so the operator can verify a reinstall actually picked up the latest
@@ -26,13 +27,4 @@ export async function createFooter(container: HTMLElement): Promise<void> {
     // crash the launcher — just leave the footer empty.
     console.warn("Footer: failed to load version metadata", e);
   }
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

@@ -9,6 +9,10 @@ pub struct AgentDef {
     pub prompt_file: String,
     pub tmux_window_id: Option<String>,
     pub status: String,
+    /// Manifest `emoji` (aperture-84bby). `None` when the manifest omits it
+    /// or leaves it empty; the launcher card then falls back to its own map.
+    #[serde(default)]
+    pub emoji: Option<String>,
     /// Notification badge — set when the agent calls
     /// `send_message(to: "operator", ...)`. The operator clears it by clicking
     /// the agent in the launcher. There is no chat panel; the agent's actual

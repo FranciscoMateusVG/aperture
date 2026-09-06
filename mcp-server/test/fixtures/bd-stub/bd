@@ -3,8 +3,9 @@
 # test/hub-replay.test.mjs to pin the WS hub's replay-on-reconnect behavior
 # (aperture-xt16e) without touching hub code or a real BEADS store.
 #
-# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages, ~line 326):
-#   bd query 'type=message AND status=open AND title="->RECIPIENT]"' --json -n 0
+# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages; -n 200 = UNREAD_LIMIT,
+#           aperture-84bby — bounded replay, was -n 0):
+#   bd query 'type=message AND status=open AND title="->RECIPIENT]"' --json -n 200
 #     → prints the JSON array in $BD_STUB_DIR/unread-RECIPIENT.json, or [] if
 #       that file is absent.
 #
@@ -39,8 +40,8 @@ if [[ "${BD_STUB_FAIL:-}" == "1" ]]; then
   exit 1
 fi
 
-# The one recognized shape: query <getUnreadMessages-query> --json -n 0
-if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" == "0" ]]; then
+# The one recognized shape: query <getUnreadMessages-query> --json -n 200
+if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" == "200" ]]; then
   query="$2"
   re='^type=message AND status=open AND title="->(.+)\]"$'
   if [[ "$query" =~ $re ]]; then

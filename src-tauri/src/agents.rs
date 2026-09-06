@@ -725,15 +725,32 @@ pub fn clear_attention(
     Ok(())
 }
 
+/// Claude aliases the launcher's model picker offers. The frontend catalog
+/// (src/components/AgentConfigModal.ts `CLAUDE_MODELS`) is the source of
+/// truth for what the UI shows; this array must match it exactly, and the
+/// `picker_and_validator_agree` test below parses that file to enforce it.
+/// Codex models are accepted by prefix (`codex/<anything non-empty>`) — the
+/// picker lists a curated few, the validator deliberately allows the whole
+/// family. A bare `codex/` is rejected: it would boot `codex --model ""`.
+const CLAUDE_MODEL_ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+pub fn is_valid_model(model: &str) -> bool {
+    CLAUDE_MODEL_ALIASES.contains(&model)
+        || model.strip_prefix("codex/").is_some_and(|m| !m.is_empty())
+}
+
 #[tauri::command]
 pub fn update_agent_model(
     name: String,
     model: String,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
-    let valid = matches!(model.as_str(), "opus" | "sonnet" | "haiku" | "fable") || model.starts_with("codex/");
-    if !valid {
-        return Err(format!("Invalid model '{}'. Must be opus/sonnet/haiku/fable or codex/<model>", model));
+    if !is_valid_model(&model) {
+        return Err(format!(
+            "Invalid model '{}'. Must be one of {} or codex/<model>",
+            model,
+            CLAUDE_MODEL_ALIASES.join("/")
+        ));
     }
 
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
@@ -891,6 +908,7 @@ mod tests {
             prompt_file: String::new(),
             tmux_window_id: None,
             status: "running".into(),
+            emoji: None,
             attention: false,
             attention_reason: None,
             turn_state: None,
@@ -901,6 +919,52 @@ mod tests {
             dot_state_since: None,
             kickoff_fired_at: None,
         }
+    }
+
+    // ---- aperture-84bby: picker <-> validator alignment ----
+
+    /// The Claude aliases the picker offers, parsed from the frontend source
+    /// at test time: every `value: "<alias>"` inside the `CLAUDE_MODELS`
+    /// literal (stops at the first `]`). Codex entries live in a separate
+    /// literal and are covered by the prefix rule, not by this list.
+    fn picker_claude_aliases() -> Vec<String> {
+        let src = include_str!("../../src/components/AgentConfigModal.ts");
+        let start = src
+            .find("const CLAUDE_MODELS = [")
+            .expect("AgentConfigModal.ts: CLAUDE_MODELS literal not found");
+        let body = &src[start..];
+        let end = body.find(']').expect("CLAUDE_MODELS literal not closed");
+        body[..end]
+            .split("value: \"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn picker_and_validator_agree() {
+        let mut picker = picker_claude_aliases();
+        assert!(!picker.is_empty(), "picker parse returned nothing");
+        let mut validator: Vec<String> = CLAUDE_MODEL_ALIASES.iter().map(|s| s.to_string()).collect();
+        picker.sort();
+        validator.sort();
+        assert_eq!(
+            picker, validator,
+            "AgentConfigModal.ts CLAUDE_MODELS and agents.rs CLAUDE_MODEL_ALIASES drifted"
+        );
+    }
+
+    #[test]
+    fn validator_accepts_every_picker_alias_and_codex_prefix() {
+        for alias in picker_claude_aliases() {
+            assert!(is_valid_model(&alias), "picker offers {alias} but validator rejects it");
+        }
+        assert!(is_valid_model("codex/gpt-5.6-sol"));
+        assert!(is_valid_model("codex/anything-new"));
+        assert!(!is_valid_model("codex/"));
+        assert!(!is_valid_model("gpt-5.6-sol"));
+        assert!(!is_valid_model("claude-opus-4"));
+        assert!(!is_valid_model(""));
     }
 
     // ---- aperture-ull4y: attention_reason precedence ----
