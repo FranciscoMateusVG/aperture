@@ -21,8 +21,16 @@
       {
         "hooks": [
           {
-            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh precompact",
-            "type": "command"
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh standing 1"
+          },
+          {
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh standing 2"
+          },
+          {
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh pointer"
           }
         ],
         "matcher": ""
@@ -32,8 +40,20 @@
       {
         "hooks": [
           {
-            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh boot",
-            "type": "command"
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh preamble"
+          },
+          {
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh standing 1"
+          },
+          {
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh standing 2"
+          },
+          {
+            "type": "command",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh pointer"
           }
         ],
         "matcher": ""

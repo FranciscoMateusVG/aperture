@@ -193,6 +193,8 @@ send_message(glados) → report completion
 
 **Finding:** `query_tasks(mode: "ready")` unblocked; `mode: "list"` your active tasks (defaults to your assignee; `assignee: "*"` for any); `mode: "show", id` one task (`fields: "full"` for the untruncated record); `search_tasks(label: ...)`. Always check for existing tasks before proposing new ones.
 
+> Specialist scope (operator directive 2026-09-06): ready/list/search sweeps are GLaDOS's job; specialists fetch only their assigned bead. See the constitution skill.
+
 **Claiming:** `update_task(id, claim: true)` then `status: "in_progress"` — before you start, so two agents don't pick up the same task.
 
 **During:** `update_task(id, notes: "...")` when something notable happens — a discovery, a blocker, a scope change. Not every 5 minutes.
