@@ -1,0 +1,191 @@
+[
+  {
+    "query": "ws-hub EADDRINUSE exit behaviour",
+    "expect_key": "aperture-hub-self-heal-pr-46-ws-hub",
+    "kind": "identifier",
+    "note": "error code unique to the hub self-heal entry"
+  },
+  {
+    "query": "what did aperture-919c3 change",
+    "expect_key": "hermes-bot-ro-widened-all-tables-2026-09-06",
+    "kind": "identifier",
+    "note": "bead id unique to the hermes_bot_ro widening"
+  },
+  {
+    "query": "COPYFILE_DISABLE tar",
+    "expect_key": "macos-bsd-tar-injects-appledouble-sidecar-files-by",
+    "kind": "identifier",
+    "note": "env var unique to the AppleDouble tar entry"
+  },
+  {
+    "query": "aperture-7gi5z runner",
+    "expect_key": "monitoring-gap-self-hosted-github-actions-runner-offline",
+    "kind": "identifier",
+    "note": "bead id unique to the runner-offline monitoring gap"
+  },
+  {
+    "query": "aperture-882yu Stripe",
+    "expect_key": "stripe-pix-on-eunen-m-2-0-sandbox",
+    "kind": "identifier",
+    "note": "bead id unique to the Stripe PIX sandbox finding"
+  },
+  {
+    "query": "certificados route base path #578",
+    "expect_key": "certificados-c1-578-hono-route-base-path-is",
+    "kind": "identifier",
+    "note": "PR number unique to the certificados route entry"
+  },
+  {
+    "query": "ai.hermes.gateway.plist removed",
+    "expect_key": "openclaw-cutover-from-hermes-2026-08-08",
+    "kind": "identifier",
+    "note": "launchd label unique to the openclaw cutover"
+  },
+  {
+    "query": "EXPO_PUBLIC_OPENAI_API_KEY exposure",
+    "expect_key": "openai-shared-key-expo-public-exposure-2026-08-28",
+    "kind": "identifier",
+    "note": "env var unique to the shared-key exposure adjudication"
+  },
+  {
+    "query": "aperture-75oxh ancestry",
+    "expect_key": "squash-merge-breaks-git-ancestry-use-bead-status",
+    "kind": "identifier",
+    "note": "bead id unique to the squash-merge ancestry entry"
+  },
+  {
+    "query": "im:history scope for DMs",
+    "expect_key": "slack-socketmode-dm-message-im-event-subscription-2026-07-31",
+    "kind": "identifier",
+    "note": "Slack OAuth scope unique to the socket-mode DM gotcha"
+  },
+  {
+    "query": "Peppy process slip: acted on inbound BEADS message without mark_as_read",
+    "expect_key": "process-slip-peppy-2026-08-10",
+    "kind": "conflict",
+    "note": "third/fourth instance entry supersedes the first-two-instances entry",
+    "must_not_rank": "process-slip-peppy-2026-08-10-happened-twice"
+  },
+  {
+    "query": "PR head stuck on stale commit, merge drops pushed work #560 #561",
+    "expect_key": "pr-head-stuck-stale-merge-loses-commits",
+    "kind": "conflict",
+    "note": "fuller P0 write-up supersedes the first note on the same incident",
+    "must_not_rank": "pr-head-stuck-not-push-failed"
+  },
+  {
+    "query": "Aperture GUI launch PATH starvation installed .app from Finder launchd",
+    "expect_key": "aperture-gui-launch-path-starvation-aperture-3x136-fixed",
+    "kind": "conflict",
+    "note": "fixed entry supersedes the root-cause note",
+    "must_not_rank": "aperture-gui-path-starvation-root-cause-aperture-3x136"
+  },
+  {
+    "query": "eunenem prod URL topology xeroxtoxerox app.eunenem.com pocketsoftware",
+    "expect_key": "eunenem-staging-url-changed-2026-06-24-eunenem",
+    "kind": "conflict",
+    "note": "2026-07-28 correction supersedes the dual-homing claim",
+    "must_not_rank": "eunenem-staging-prod-dual-homed-2026-07-08"
+  },
+  {
+    "query": "eunenem-engine fresh worktree pnpm install root vs apps/eunenem-server",
+    "expect_key": "eunenem-engine-worktree-install-recipe-corrected-supersedes",
+    "kind": "conflict",
+    "note": "corrected two-install recipe supersedes the single-install note",
+    "must_not_rank": "eunenem-engine-repo-is-not-a-pnpm-workspace"
+  },
+  {
+    "query": "incluir prod backup cron MinIO cadence daily or weekly",
+    "expect_key": "incluir-prod-backup-cadence-minio-is-weekly-sundays",
+    "kind": "conflict",
+    "note": "cadence correction supersedes the original build note",
+    "must_not_rank": "incluir-prod-backup-built-2026-07-17-aperture"
+  },
+  {
+    "query": "WAHA MCP improvement phases shipped Peppy Wheatley plan",
+    "expect_key": "waha-mcp-all-phases-shipped-2026-08-08",
+    "kind": "conflict",
+    "note": "all-phases entry supersedes the phase-A-only entry",
+    "must_not_rank": "waha-mcp-phase-a-ack-unread-shipped-2026-08-08"
+  },
+  {
+    "query": "hermes lane 2 status single source of truth boundary Peppy",
+    "expect_key": "hermes-lane-2-status-2026-07-31-consolidated",
+    "kind": "conflict",
+    "note": "consolidated status supersedes the progress delta",
+    "must_not_rank": "hermes-lane-2-progress-2026-07-31b"
+  },
+  {
+    "query": "eunenem-server env vars read via tsx --env-file Dokploy compose env .env",
+    "expect_key": "eunenem-env-var-reaches-process-env-via-envfile-not-compose-block",
+    "kind": "conflict",
+    "note": "verified 07-18 mechanism supersedes the 06-28 partial read-path note",
+    "must_not_rank": "eunenem-server-env-var-read-path-correct-runtime"
+  },
+  {
+    "query": "backticks in prose passed to a double-quoted shell argument",
+    "expect_key": "backticks-in-shell-args-execute-2026-08-28",
+    "kind": "lexical",
+    "note": "direct lexical hit"
+  },
+  {
+    "query": "zero-result query is not evidence of absence",
+    "expect_key": "a-zero-result-query-is-not-evidence-of",
+    "kind": "lexical",
+    "note": "direct lexical hit"
+  },
+  {
+    "query": "Next.js standalone on Dokploy 502 healthy container hostname network",
+    "expect_key": "next-js-standalone-on-dokploy-502-from-a",
+    "kind": "lexical",
+    "note": "direct lexical hit"
+  },
+  {
+    "query": "compact agents proactively at 60% context",
+    "expect_key": "glados-compact-at-60-proactive",
+    "kind": "lexical",
+    "note": "standing rule lexical hit"
+  },
+  {
+    "query": "bd update --notes replaces the notes field",
+    "expect_key": "cli-bd-update-id-notes-replaces-the-notes",
+    "kind": "lexical",
+    "note": "direct lexical hit"
+  },
+  {
+    "query": "Reanimated withSpring damping stiffness under-damped",
+    "expect_key": "reanimated-4-withspring-underdamp-trap",
+    "kind": "lexical",
+    "note": "direct lexical hit"
+  },
+  {
+    "query": "Portuguese diacritics render as boxes with the webfont",
+    "expect_key": "pt-br-accented-characters-live-in-the-google",
+    "kind": "paraphrase",
+    "note": "asks which font subset carries pt-BR accents without naming Google Fonts or latin"
+  },
+  {
+    "query": "container listed as running for ages but its healthcheck fails and nothing restarts it",
+    "expect_key": "docker-up-n-months-unhealthy-masks-a-dead",
+    "kind": "paraphrase",
+    "note": "human phrasing of the Up-but-unhealthy trap"
+  },
+  {
+    "query": "connection to the oracle server never returns a prompt",
+    "expect_key": "xerox-ssh-hangs-via-the-xerox-alias-tailscale",
+    "kind": "paraphrase",
+    "note": "asks about the hang without ssh/xerox/tailscale"
+  },
+  {
+    "query": "the wrapper that shrinks command results mangles the formatter's report and invents OOM failures",
+    "expect_key": "rtk-proxy-corrupts-biome-pnpm-output",
+    "kind": "paraphrase",
+    "note": "no rtk/biome/pnpm/proxy/output in the query"
+  },
+  {
+    "query": "I investigated on my laptop but the service actually lives on the mini",
+    "expect_key": "verify-which-host-before-diagnosing",
+    "kind": "paraphrase",
+    "note": "wrong-host diagnosis in plain words"
+  }
+]
