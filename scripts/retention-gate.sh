@@ -66,6 +66,20 @@ else
     cn=$((cn+1))
     if [ -f "$CSKILL" ] && grep -qF -- "$rule" "$CSKILL"; then cok=$((cok+1)); CVERIFIED="${CVERIFIED:+$CVERIFIED, }$id"; else echo "MISSING in constitution/SKILL.md: $id"; fail=1; fi
   done < <(grep '^| C-' "$CDEC")
+  # Provenance must point at real sources, not at itself: every `<skill>` §N cited in the Source column
+  # must exist as .claude/skills/<skill>/SKILL.md with a "## N." heading (bd memories / prompts are not checked).
+  pn=0; pok=0
+  while IFS= read -r line; do
+    src=$(printf '%s' "$line" | awk -F' \\| ' '{print $3}')
+    for skill in $(printf '%s' "$src" | grep -oE '`[a-z0-9-]+` §' | tr -d '`§ ' | sort -u); do
+      f="$REPO/.claude/skills/$skill/SKILL.md"; pn=$((pn+1))
+      if [ ! -f "$f" ]; then echo "constitution provenance: no such skill $skill"; fail=1; continue; fi
+      secs=$(printf '%s' "$src" | grep -oE "\`$skill\` §[0-9]+(, §[0-9]+)*" | grep -oE '§[0-9]+' | tr -d '§' | sort -u)
+      miss=0; for n in $secs; do grep -qE "^## $n\." "$f" || { echo "constitution provenance: $skill has no section §$n"; miss=1; }; done
+      [ $miss -eq 0 ] && pok=$((pok+1)) || fail=1
+    done
+  done < <(grep '^| C-' "$CDEC")
+  echo "retention-gate[constitution] provenance: $pok/$pn cited skill sections exist"
   echo "retention-gate[constitution] verified ids: ${CVERIFIED:-none}"
   echo "retention-gate[constitution]: $cok/$cn C rules resident in constitution/SKILL.md"
 fi
