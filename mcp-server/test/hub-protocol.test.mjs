@@ -19,6 +19,14 @@
 //           the {type:"presence", agent, event:"join", ts} snapshot frame
 //        b. codex bridge turn state → "busy"/"idle", `since` moves only on a
 //           transition; app-server socket loss → leave; ack outcome "codex"
+//  10. presence_hint (aperture-trgpo) — producer frame {type:"presence_hint", event}
+//        a. busy → subscriber frame + presence.json busy; repeat busy → NO frame,
+//           since unchanged, ack applied:false; idle → frame + flip
+//        b. hint for an agent with no Monitor socket → ignored (not_present), no
+//           frame, no presence entry (a hint never creates presence)
+//        c. hint carrying a foreign `agent` field → rejected (agent_mismatch), no ack
+//        d. leave after busy → presence entry deleted
+//        e. hint for a codex-bridged agent → ignored (codex_bridged)
 //
 // Run: node --test test/hub-protocol.test.mjs   (from mcp-server/, after pnpm build)
 // Or:  pnpm test:hub
@@ -58,6 +66,9 @@ const TOKENS = {
   glados: "03".repeat(32),
   "dup-test": "04".repeat(32),
   dup2: "05".repeat(32),
+  // aperture-trgpo: the codex-bridged agent needs a token too, so a producer
+  // (hook hint client) can authenticate as it.
+  cbx: "06".repeat(32),
 };
 
 /**
@@ -813,6 +824,236 @@ test("presence snapshot (codex bridge): busy/idle set state, since moves only on
     );
     assert.deepEqual(hub.readPresence().agents, {}, "leave deletes the codex agent from the snapshot");
     closeAll(subscriber, producer);
+  } finally {
+    await closeServer();
+    hub.stop();
+  }
+});
+
+// ── j. presence_hint (aperture-trgpo) ───────────────────────────────────────
+
+test("presence_hint: busy → frame + snapshot busy; repeat busy → no frame, since kept; idle → flip; leave deletes", async () => {
+  const hub = await spawnHub();
+  try {
+    const subscriber = await connect(hub.port);
+    await authenticate(hub, subscriber, "subscriber");
+    const presenceFrames = recordFrames(subscriber);
+
+    const agent = await connect(hub.port);
+    const joinPromise = waitFor(
+      subscriber,
+      (m) => m.type === "presence" && m.agent === "izzy-test" && m.event === "join",
+      "presence join for izzy-test",
+    );
+    await authenticate(hub, agent, "agent", "izzy-test");
+    await joinPromise;
+    const online = hub.readPresence().agents["izzy-test"];
+    assert.equal(online.state, "online", "join → 'online' before any hint");
+
+    // The hook client authenticates as a PRODUCER for the same principal.
+    const hinter = await connect(hub.port);
+    await authenticate(hub, hinter, "producer", "izzy-test");
+
+    // a. busy hint → subscriber frame + snapshot flip + ack applied:true.
+    await sleep(20);
+    const busyFrame = waitFor(
+      subscriber,
+      (m) => m.type === "presence" && m.agent === "izzy-test" && m.event === "busy",
+      "presence busy frame",
+    );
+    const busyAck = waitFor(hinter, (m) => m.type === "ok" && m.hint === "busy", "busy ack");
+    hinter.send(JSON.stringify({ type: "presence_hint", event: "busy" }));
+    assert.deepEqual(
+      await busyAck,
+      { type: "ok", hint: "busy", applied: true },
+      "first busy hint is acked {type:'ok', hint:'busy', applied:true}",
+    );
+    const frame = await busyFrame;
+    assert.deepEqual(Object.keys(frame).sort(), ["agent", "event", "ts", "type"], "busy frame is the legacy presence shape");
+    const busy = hub.readPresence().agents["izzy-test"];
+    assert.equal(busy.state, "busy", "hint busy → snapshot state 'busy'");
+    assert.ok(busy.since > online.since, "online→busy transition moved since");
+    await hub.waitForEvent(
+      (e) => e.event === "presence_hint" && e.agent === "izzy-test" && e.hint === "busy" && e.applied === true,
+      "presence_hint log (applied)",
+    );
+
+    // Repeated busy (every PreToolUse fires one): NO subscriber frame, NO log
+    // line, since untouched — but still acked so the hook client can exit.
+    await sleep(20);
+    const framesBefore = presenceFrames.filter((m) => m.type === "presence" && m.agent === "izzy-test").length;
+    const logsBefore = hub.stderrEvents.filter((e) => e.event === "presence" && e.agent === "izzy-test").length;
+    const repeatAck = waitFor(hinter, (m) => m.type === "ok" && m.hint === "busy", "repeat busy ack");
+    hinter.send(JSON.stringify({ type: "presence_hint", event: "busy" }));
+    assert.deepEqual(
+      await repeatAck,
+      { type: "ok", hint: "busy", applied: false },
+      "repeat busy hint is acked applied:false",
+    );
+    await sleep(200);
+    assert.equal(
+      presenceFrames.filter((m) => m.type === "presence" && m.agent === "izzy-test").length,
+      framesBefore,
+      "repeat busy hint produced NO additional subscriber frame",
+    );
+    assert.equal(
+      hub.stderrEvents.filter((e) => e.event === "presence" && e.agent === "izzy-test").length,
+      logsBefore,
+      "repeat busy hint produced NO additional presence log line",
+    );
+    assert.deepEqual(hub.readPresence().agents["izzy-test"], busy, "repeat busy leaves state + since untouched");
+
+    // idle hint → frame + flip, since moves.
+    await sleep(20);
+    const idleFrame = waitFor(
+      subscriber,
+      (m) => m.type === "presence" && m.agent === "izzy-test" && m.event === "idle",
+      "presence idle frame",
+    );
+    const idleAck = waitFor(hinter, (m) => m.type === "ok" && m.hint === "idle", "idle ack");
+    hinter.send(JSON.stringify({ type: "presence_hint", event: "idle" }));
+    assert.deepEqual(await idleAck, { type: "ok", hint: "idle", applied: true }, "idle hint acked applied:true");
+    await idleFrame;
+    const idle = hub.readPresence().agents["izzy-test"];
+    assert.equal(idle.state, "idle", "hint idle → snapshot state 'idle'");
+    assert.ok(idle.since > busy.since, "busy→idle transition moved since");
+
+    // d. Monitor socket closes after a hint → leave still deletes the entry
+    // (a hint must not pin the agent in the map past its socket).
+    const leaveFrame = waitFor(
+      subscriber,
+      (m) => m.type === "presence" && m.agent === "izzy-test" && m.event === "leave",
+      "presence leave frame",
+    );
+    agent.close();
+    await leaveFrame;
+    assert.deepEqual(hub.readPresence().agents, {}, "leave after hints deletes the agent from the snapshot");
+    closeAll(subscriber, hinter);
+  } finally {
+    hub.stop();
+  }
+});
+
+test("presence_hint for an agent with NO Monitor socket is ignored: no frame, no presence entry, not_present logged", async () => {
+  const hub = await spawnHub();
+  try {
+    const subscriber = await connect(hub.port);
+    await authenticate(hub, subscriber, "subscriber");
+    const presenceFrames = recordFrames(subscriber);
+
+    // glados is authenticated as a producer but has no agent socket → offline.
+    const hinter = await connect(hub.port);
+    await authenticate(hub, hinter, "producer", "glados");
+    const ack = waitFor(hinter, (m) => m.type === "ok" && m.hint === "busy", "ignored ack");
+    hinter.send(JSON.stringify({ type: "presence_hint", event: "busy" }));
+    assert.deepEqual(await ack, { type: "ok", hint: "busy", applied: false }, "ignored hint still acked applied:false");
+    await hub.waitForEvent(
+      (e) => e.event === "presence_hint_ignored" && e.reason === "not_present" && e.agent === "glados",
+      "presence_hint_ignored not_present log",
+    );
+
+    await sleep(200);
+    assert.deepEqual(presenceFrames, [], "subscriber saw NO presence frame — a hint never creates presence");
+    assert.deepEqual(hub.readPresence().agents, {}, "no presence entry was created for glados");
+    assert.equal(
+      hub.stderrEvents.some((e) => e.event === "presence" && e.agent === "glados"),
+      false,
+      "no presence log line for glados",
+    );
+    closeAll(subscriber, hinter);
+  } finally {
+    hub.stop();
+  }
+});
+
+test("presence_hint carrying a foreign `agent` field is rejected: agent_mismatch logged, no state change, no ack", async () => {
+  const hub = await spawnHub();
+  try {
+    const subscriber = await connect(hub.port);
+    await authenticate(hub, subscriber, "subscriber");
+
+    const agent = await connect(hub.port);
+    const joinPromise = waitFor(
+      subscriber,
+      (m) => m.type === "presence" && m.agent === "izzy-test" && m.event === "join",
+      "presence join for izzy-test",
+    );
+    await authenticate(hub, agent, "agent", "izzy-test");
+    await joinPromise;
+    const presenceFrames = recordFrames(subscriber);
+    const online = hub.readPresence().agents["izzy-test"];
+
+    // glados (producer) tries to flip izzy-test busy by naming it in the frame.
+    const mallory = await connect(hub.port);
+    await authenticate(hub, mallory, "producer", "glados");
+    const malloryFrames = recordFrames(mallory);
+    mallory.send(JSON.stringify({ type: "presence_hint", event: "busy", agent: "izzy-test" }));
+    await hub.waitForEvent(
+      (e) => e.event === "presence_hint_rejected" && e.reason === "agent_mismatch" && e.agent === "glados",
+      "presence_hint_rejected agent_mismatch log",
+    );
+
+    // Invalid event value from a legitimate principal is rejected too.
+    const hinter = await connect(hub.port);
+    await authenticate(hub, hinter, "producer", "izzy-test");
+    const hinterFrames = recordFrames(hinter);
+    hinter.send(JSON.stringify({ type: "presence_hint", event: "sleeping" }));
+    await hub.waitForEvent(
+      (e) => e.event === "presence_hint_rejected" && e.reason === "bad_event" && e.agent === "izzy-test",
+      "presence_hint_rejected bad_event log",
+    );
+
+    await sleep(200);
+    assert.deepEqual(presenceFrames, [], "subscriber saw no presence frame from rejected hints");
+    assert.deepEqual(malloryFrames, [], "rejected (agent_mismatch) hint gets no ack");
+    assert.deepEqual(hinterFrames, [], "rejected (bad_event) hint gets no ack");
+    assert.deepEqual(hub.readPresence().agents["izzy-test"], online, "izzy-test is still 'online' with its original since");
+    assert.equal(hub.proc.exitCode, null, "hub still alive");
+    closeAll(subscriber, agent, mallory, hinter);
+  } finally {
+    hub.stop();
+  }
+});
+
+test("presence_hint for a codex-bridged agent is ignored: the bridge owns turn state", async () => {
+  const hub = await spawnHub({ codexAgent: "cbx" });
+  const server = new FakeAppServer(join(hub.runDir, "cbx.sock"), { threads: [{ id: "t-1" }] });
+  let serverClosed = false;
+  const closeServer = async () => {
+    if (serverClosed) return;
+    serverClosed = true;
+    await server.close();
+  };
+  try {
+    await server.start();
+    await hub.waitForEvent((e) => e.event === "codex_bound" && e.agent === "cbx", "codex_bound", 5000);
+    await hub.waitForEvent(
+      (e) => e.event === "presence" && e.agent === "cbx" && e.presence === "join",
+      "codex join log",
+    );
+    const online = hub.readPresence().agents.cbx;
+
+    const subscriber = await connect(hub.port);
+    await authenticate(hub, subscriber, "subscriber");
+    const presenceFrames = recordFrames(subscriber);
+
+    const hinter = await connect(hub.port);
+    await authenticate(hub, hinter, "producer", "cbx");
+    const ack = waitFor(hinter, (m) => m.type === "ok" && m.hint === "busy", "codex-bridged ack");
+    hinter.send(JSON.stringify({ type: "presence_hint", event: "busy" }));
+    assert.deepEqual(await ack, { type: "ok", hint: "busy", applied: false }, "codex-bridged hint acked applied:false");
+    await hub.waitForEvent(
+      (e) => e.event === "presence_hint_ignored" && e.reason === "codex_bridged" && e.agent === "cbx",
+      "presence_hint_ignored codex_bridged log",
+    );
+    await sleep(200);
+    assert.equal(
+      presenceFrames.filter((m) => m.agent === "cbx" && m.event !== "join").length,
+      0,
+      "no busy/idle frame reached the subscriber from the hint",
+    );
+    assert.deepEqual(hub.readPresence().agents.cbx, online, "codex agent state untouched by the hint");
+    closeAll(subscriber, hinter);
   } finally {
     await closeServer();
     hub.stop();
