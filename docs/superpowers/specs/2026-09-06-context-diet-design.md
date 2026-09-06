@@ -1,6 +1,6 @@
 # Context Diet v1 — indexed lazy memory + constitutional core (GLaDOS first, fleet-wide by construction)
 
-**Bead:** aperture-trgpo (v3.2 scope). **Author:** Wheatley. **Status:** v1.1 — revised per GLaDOS review (6 corrections); pending GLaDOS re-review + operator yes. Units: KiB throughout; tokens ≈ bytes ÷ 4.
+**Bead:** aperture-trgpo (v3.2 scope). **Author:** Wheatley. **Status:** v1.2 — v1.1 + QA-remediation corrections (aperture-3kavd HOLD #1–#5: credential procedure, bead-id matcher, Codex token-path assembly, honest lexical-v1 retrieval scope with separate @3/@5 gating). Operator-approved lexical v1 2026-09-06. Units: KiB throughout; tokens ≈ bytes ÷ 4.
 
 ## The numbers (measured 2026-09-06)
 
@@ -33,7 +33,10 @@ Backfill = a reviewed PR editing the sidecar only. Hermes consolidation = **new*
 - `recall_full({key, max_bytes≤8192})` → `{key, body (redacted, truncated with notice), bytes_total, tags, supersedes, superseded_by}`.
 - `recall_stats()` → counts by project/tag, superseded count, redacted count, cache age. No bodies.
 - **Cache:** `~/.aperture/run/memory-index.json` keyed by sha256(`bd memories --json` + sidecar). Every call re-hashes (~20 ms); mismatch → rebuild. Sidecar edit or new memory therefore invalidates immediately. Targets: cold build < 1.5 s, warm `recall` < 50 ms, `recall_full` < 20 ms.
-- **Golden set (30):** ≥ 8 exact identifiers (bead ids, PR numbers, hostnames, env-var names), ≥ 6 retraction/old-vs-current conflicts (expected answer is the *current* key; the superseded one must not rank), ≥ 4 paraphrases with no lexical overlap, remainder lexical. recall@5 ≥ 0.90; conflicts pass at 100%.
+- **Retrieval is lexical in v1** (BM25 over key+body + exact-id rank). Queries with **zero shared content tokens** are **unsupported** — the gate reports them, never counts them as passed. Semantic/embedding retrieval is v4 scope (operator decision 2026-09-06: keyword/ID-based v1, "ok so go on").
+- **Golden set (34 = 30 gated + 4 reported-only):** 10 exact identifiers (bead ids, PR numbers, hostnames, env-var names), 9 retraction/old-vs-current conflicts (expected answer is the *current* key; the superseded one must not rank), 6 lexical, 5 `paraphrase-lexical` (low-overlap paraphrases; measured 5–7 shared tokens with the target, mostly stopwords + 1–2 content words — **not** zero-overlap, and labelled so in the fixture), and 4 `zero-overlap` (measured 0 shared content tokens, len ≥ 3, stopwords removed) that are **reported as unsupported and not gated**.
+- **Two truths, gated separately:** the explicit `recall` tool (k=5) and the automatic hook (k=3, what the user actually sees). Thresholds: recall@3 ≥ 0.90 and recall@5 ≥ 0.90 over gated kinds; conflicts 100% at both k. The identifier and conflict subsets are additionally run through the **real hook binary** (`dist/memory-recall.js`, top-3): identifier ≥ 0.90, conflicts 100%.
+- **Measured at 87c2d87+ (2026-09-06, real bank):** recall@5 = 30/30 (1.000); recall@3 = 29/30 (0.967 — one `paraphrase-lexical` query ranks 4th); hook truth: identifier 10/10, conflict 9/9; zero-overlap 0/4 (unsupported, as expected). 29/30 at k=3 is the honest number, not "perfect".
 
 ### 5. Injection seams — two explicit modes, no full-bank fallback (GLaDOS #2)
 `scripts/aperture-prime.sh <boot|precompact>`:
@@ -50,7 +53,9 @@ A **separate** hook script `dist/memory-recall.js` on `UserPromptSubmit` prints 
 |---|---|
 | assembled boot prompt: Codex `prompt.md` bytes; Claude = system prompt + boot hook output | ≤ 120 KiB (from 535.5) + token estimate printed |
 | PreCompact re-injection | ≤ 30 KiB |
-| recall@5 on the golden set / conflict subset | ≥ 0.90 / 100% |
+| recall@3 (hook truth) and recall@5 (tool truth) on gated golden kinds / conflict subset at both k | ≥ 0.90 and ≥ 0.90 / 100% (measured: 0.967 / 1.000 / 100%) |
+| hook truth — real `dist/memory-recall.js` top-3 on identifier / conflict subsets | ≥ 0.90 / 100% (measured 10/10, 9/9) |
+| zero-overlap queries (semantic) | **unsupported in v1** — reported by the gate, never gated (measured 0/4) |
 | standing-rule retention | 25 named DECISION rules present verbatim in resident output (grep test) |
 | secret exclusion | seeded fixtures absent from all 5 surfaces + cache |
 | latency | cold < 1.5 s, warm recall < 50 ms |

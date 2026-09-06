@@ -161,31 +161,60 @@
   {
     "query": "Portuguese diacritics render as boxes with the webfont",
     "expect_key": "pt-br-accented-characters-live-in-the-google",
-    "kind": "paraphrase",
-    "note": "asks which font subset carries pt-BR accents without naming Google Fonts or latin"
+    "kind": "paraphrase-lexical",
+    "note": "low-overlap lexical paraphrase (query tokens shared with target key+body: 5/8, mostly stopwords + 1-2 content words) — measured 2026-09-06; NOT zero-overlap. asks which font subset carries pt-BR accents without naming Google Fonts or latin",
+    "lexical_overlap": "5/8"
   },
   {
     "query": "container listed as running for ages but its healthcheck fails and nothing restarts it",
     "expect_key": "docker-up-n-months-unhealthy-masks-a-dead",
-    "kind": "paraphrase",
-    "note": "human phrasing of the Up-but-unhealthy trap"
+    "kind": "paraphrase-lexical",
+    "note": "low-overlap lexical paraphrase (query tokens shared with target key+body: 7/14, mostly stopwords + 1-2 content words) — measured 2026-09-06; NOT zero-overlap. human phrasing of the Up-but-unhealthy trap",
+    "lexical_overlap": "7/14"
   },
   {
     "query": "connection to the oracle server never returns a prompt",
     "expect_key": "xerox-ssh-hangs-via-the-xerox-alias-tailscale",
-    "kind": "paraphrase",
-    "note": "asks about the hang without ssh/xerox/tailscale"
+    "kind": "paraphrase-lexical",
+    "note": "low-overlap lexical paraphrase (query tokens shared with target key+body: 5/8, mostly stopwords + 1-2 content words) — measured 2026-09-06; NOT zero-overlap. asks about the hang without ssh/xerox/tailscale",
+    "lexical_overlap": "5/8"
   },
   {
     "query": "the wrapper that shrinks command results mangles the formatter's report and invents OOM failures",
     "expect_key": "rtk-proxy-corrupts-biome-pnpm-output",
-    "kind": "paraphrase",
-    "note": "no rtk/biome/pnpm/proxy/output in the query"
+    "kind": "paraphrase-lexical",
+    "note": "low-overlap lexical paraphrase (query tokens shared with target key+body: 6/13, mostly stopwords + 1-2 content words) — measured 2026-09-06; NOT zero-overlap. no rtk/biome/pnpm/proxy/output in the query",
+    "lexical_overlap": "6/13"
   },
   {
     "query": "I investigated on my laptop but the service actually lives on the mini",
     "expect_key": "verify-which-host-before-diagnosing",
-    "kind": "paraphrase",
-    "note": "wrong-host diagnosis in plain words"
+    "kind": "paraphrase-lexical",
+    "note": "low-overlap lexical paraphrase (query tokens shared with target key+body: 6/10, mostly stopwords + 1-2 content words) — measured 2026-09-06; NOT zero-overlap. wrong-host diagnosis in plain words",
+    "lexical_overlap": "6/10"
+  },
+  {
+    "query": "empty search output was mistaken for proof nothing happened",
+    "expect_key": "a-zero-result-query-is-not-evidence-of",
+    "kind": "zero-overlap",
+    "note": "zero shared content tokens (len>=3, stopwords removed) with target key+body, measured 2026-09-06. UNSUPPORTED by v1 lexical retrieval (BM25 + exact ids): reported by recall-gate, never gated. Semantic retrieval is v4 scope."
+  },
+  {
+    "query": "listing says alive yet requests go unanswered and no one intervenes",
+    "expect_key": "docker-up-n-months-unhealthy-masks-a-dead",
+    "kind": "zero-overlap",
+    "note": "zero shared content tokens (len>=3, stopwords removed) with target key+body, measured 2026-09-06. UNSUPPORTED by v1 lexical retrieval (BM25 + exact ids): reported by recall-gate, never gated. Semantic retrieval is v4 scope."
+  },
+  {
+    "query": "terminal session to the cloud box stalls with nothing printed",
+    "expect_key": "xerox-ssh-hangs-via-the-xerox-alias-tailscale",
+    "kind": "zero-overlap",
+    "note": "zero shared content tokens (len>=3, stopwords removed) with target key+body, measured 2026-09-06. UNSUPPORTED by v1 lexical retrieval (BM25 + exact ids): reported by recall-gate, never gated. Semantic retrieval is v4 scope."
+  },
+  {
+    "query": "opening a shell on the rented server freezes indefinitely",
+    "expect_key": "xerox-ssh-hangs-via-the-xerox-alias-tailscale",
+    "kind": "zero-overlap",
+    "note": "zero shared content tokens (len>=3, stopwords removed) with target key+body, measured 2026-09-06. UNSUPPORTED by v1 lexical retrieval (BM25 + exact ids): reported by recall-gate, never gated. Semantic retrieval is v4 scope."
   }
 ]
