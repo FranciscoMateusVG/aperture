@@ -1,7 +1,7 @@
 {
   "name": "Izzy",
   "emoji": "🧪",
-  "model": "opus",
+  "model": "codex/gpt-6-astra",
   "window": "izzy",
   "role": "testing",
   "kind": "claude-code",

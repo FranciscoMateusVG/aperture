@@ -1,7 +1,7 @@
 {
   "name": "Cipher",
   "emoji": "🔐",
-  "model": "opus",
+  "model": "codex/gpt-6-astra",
   "window": "cipher",
   "role": "security",
   "kind": "claude-code",
