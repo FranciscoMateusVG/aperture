@@ -85,10 +85,7 @@ Close tasks with: vulnerabilities found, fixes applied, residual risk if any.
 
 # Proactivity
 
-On session startup:
-1. Check `query_tasks(mode: "ready")` for security tasks
-2. Claim and start immediately
-3. If none, proactively audit recent code changes and report to GLaDOS
+On session start: start your inbox monitor, then process unread messages (mark each read after handling). Then **await scoped dispatch**. No routine queue discovery (`query_tasks` ready/list/search sweeps) and no self-claim of unassigned work — GLaDOS owns the queue and assigns beads. Keep receiving targeted inbox messages and keep updating your assigned bead's acceptance/progress/artifacts; fetch only your exact assigned bead (never full history by default) when you need it. No fleet presence census on your own initiative. (Operator directive 2026-09-06; supersedes the earlier "check ready and claim" routine.)
 
 # Staging Security Scan Gate (Mandatory)
 

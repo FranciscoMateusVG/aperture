@@ -362,19 +362,12 @@ pub fn boot_agent_process(
         )
         .map_err(|e| e.to_string())?;
 
-        // Read prompt and inject agent-specific skills.
-        // Claude-backed agents inject every skills.txt body: for them,
-        // skills.txt IS the resident set (aperture-auane) and lazy skills
-        // ride Claude Code's native .claude/skills discovery. resident.txt
-        // is a Codex-path concept (aperture-i7bg0) and is NOT consulted
-        // here — warn loudly rather than let it be silently ignored.
-        if crate::agent_loader::load_agent_resident_list(&name).is_some() {
-            eprintln!(
-                "[aperture] warning: agent '{}' has a resident.txt but runs on a Claude model; \
-                 resident.txt is only honored on the Codex path. Trim agents/{}/skills.txt instead.",
-                name, name
-            );
-        }
+        // Read prompt and inject agent-specific skills. Resident/lazy split
+        // parity with the Codex path (aperture-g4hku): when resident.txt
+        // exists only the listed skills' bodies are force-injected; without
+        // it every skills.txt body is injected (aperture-auane behavior).
+        // Everything else stays lazily invocable through Claude Code's
+        // native .claude/skills discovery.
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);
@@ -769,12 +762,60 @@ pub fn update_agent_model(
     Ok(())
 }
 
-/// Read every skill under `~/.claude/aperture/<agent>/skills/` and append its
-/// contents to the prompt. Skills are loaded in deterministic alphabetical
-/// order (see `agent_loader::load_agent_skills`). The on-disk layout is built
-/// by `just setup`; the canonical sources live in the repo at
-/// `agents/<name>/skills.txt` and `.claude/skills/<name>/`.
+/// Claude variant of skill injection, honoring the optional resident/lazy
+/// split (aperture-g4hku — parity with [`inject_codex_skills`]). When
+/// `~/.claude/aperture/<agent>/resident.txt` exists, only the listed skills'
+/// bodies are appended to the prompt; the rest of skills.txt stays lazily
+/// invocable through Claude Code's own `.claude/skills` discovery. When the
+/// file is absent, every skill under `<agent>/skills/` is injected — the
+/// pre-parity behavior (aperture-auane), so agents without a resident.txt are
+/// unaffected. Resident names with no matching skill dir are warned about
+/// and skipped, exactly as on the Codex path.
+///
+/// Skills are loaded in deterministic alphabetical order (see
+/// `agent_loader::load_agent_skills`). The on-disk layout is built by
+/// `just setup`; the canonical sources live in the repo at
+/// `agents/<name>/{skills.txt,resident.txt}` and `.claude/skills/<name>/`.
 pub fn inject_skills(prompt: String, agent_name: &str) -> String {
+    match crate::agent_loader::load_agent_resident_list(agent_name) {
+        Some(resident) => inject_resident_skills(
+            prompt,
+            agent_name,
+            &resident,
+            "claude",
+            "native .claude/skills discovery",
+        ),
+        None => inject_all_skills(prompt, agent_name),
+    }
+}
+
+/// Codex variant of skill injection, honoring the optional resident/lazy
+/// split (aperture-i7bg0). Codex natively surfaces a lazy `## Skills`
+/// catalog from `$CODEX_HOME/skills` — the same directory
+/// `populate_codex_skill_home` links on every launch — and reads a skill's
+/// full SKILL.md on demand when a task matches its description. So full-body
+/// prompt injection is only needed for the small "resident" subset of
+/// always-active behavioral norms listed in
+/// `~/.claude/aperture/<agent>/resident.txt`.
+///
+/// When resident.txt is absent, ALL skill bodies are injected exactly as
+/// before — rollout is opt-in per agent, zero behavior change without the
+/// file. Resident names with no matching skill dir are warned about and
+/// skipped (warn-don't-fail). Since aperture-g4hku the Claude path
+/// ([`inject_skills`]) applies the same rule; only the lazy pool differs.
+pub fn inject_codex_skills(prompt: String, agent_name: &str) -> String {
+    match crate::agent_loader::load_agent_resident_list(agent_name) {
+        Some(resident) => {
+            inject_resident_skills(prompt, agent_name, &resident, "codex", "native catalog")
+        }
+        // No resident.txt — inject every skill body, today's behavior.
+        None => inject_all_skills(prompt, agent_name),
+    }
+}
+
+/// Append every skill body under `~/.claude/aperture/<agent>/skills/` — the
+/// no-resident.txt fallback shared by both backends.
+fn inject_all_skills(prompt: String, agent_name: &str) -> String {
     let skills = crate::agent_loader::load_agent_skills(agent_name);
     if skills.is_empty() {
         eprintln!(
@@ -794,27 +835,18 @@ pub fn inject_skills(prompt: String, agent_name: &str) -> String {
     append_skill_bodies(prompt, skills)
 }
 
-/// Codex variant of `inject_skills`, honoring the optional resident/lazy
-/// split (aperture-i7bg0). Codex natively surfaces a lazy `## Skills`
-/// catalog from `$CODEX_HOME/skills` — the same directory
-/// `populate_codex_skill_home` links on every launch — and reads a skill's
-/// full SKILL.md on demand when a task matches its description. So full-body
-/// prompt injection is only needed for the small "resident" subset of
-/// always-active behavioral norms listed in
-/// `~/.claude/aperture/<agent>/resident.txt`.
-///
-/// When resident.txt is absent, ALL skill bodies are injected exactly as
-/// before — rollout is opt-in per agent, zero behavior change without the
-/// file. Resident names with no matching skill dir are warned about and
-/// skipped (warn-don't-fail). Claude agents never take this path; their lazy
-/// pool is Claude Code's own `.claude/skills` discovery.
-pub fn inject_codex_skills(prompt: String, agent_name: &str) -> String {
-    let Some(resident) = crate::agent_loader::load_agent_resident_list(agent_name) else {
-        // No resident.txt — inject every skill body, today's behavior.
-        return inject_skills(prompt, agent_name);
-    };
+/// Append only the bodies of the skills named in `resident` (the parsed
+/// resident.txt), shared by both backends. Unknown names are warned about and
+/// skipped; `backend` / `lazy_via` only label the log line.
+fn inject_resident_skills(
+    prompt: String,
+    agent_name: &str,
+    resident: &[String],
+    backend: &str,
+    lazy_via: &str,
+) -> String {
     let skills = crate::agent_loader::load_agent_skills(agent_name);
-    for name in &resident {
+    for name in resident {
         if !skills.iter().any(|(n, _)| n == name) {
             eprintln!(
                 "[aperture] warn: resident.txt for '{}' names unknown skill \
@@ -829,10 +861,12 @@ pub fn inject_codex_skills(prompt: String, agent_name: &str) -> String {
         .filter(|(name, _)| resident.iter().any(|r| r == name))
         .collect();
     eprintln!(
-        "[aperture] codex skills for '{}': {} resident injected, {} lazy (native catalog)",
+        "[aperture] {} skills for '{}': {} resident injected, {} lazy ({})",
+        backend,
         agent_name,
         resident_skills.len(),
-        total - resident_skills.len()
+        total - resident_skills.len(),
+        lazy_via
     );
     append_skill_bodies(prompt, resident_skills)
 }
@@ -1195,5 +1229,144 @@ mod tests {
         let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", None);
         assert!(out.contains(BD_MEMORY_INDEX_HEADER));
         assert!(out.contains("[memory index unavailable: aperture-prime.sh boot returned empty output]"), "{out}");
+    }
+    // ---- aperture-g4hku: resident.txt parity between the Claude and Codex paths ----
+
+    /// Serializes tests that point APERTURE_AGENTS_DIR at a throwaway
+    /// registry: the loaders read the env var on every call, so parallel
+    /// tests must not race on it.
+    static REGISTRY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A throwaway `~/.claude/aperture`-shaped registry holding one agent
+    /// with real (non-symlinked) `skills/<name>/SKILL.md` dirs and an
+    /// optional resident.txt. Cleaned up on drop.
+    struct FakeRegistry {
+        dir: std::path::PathBuf,
+        agent: String,
+    }
+    impl FakeRegistry {
+        fn new(tag: &str, skills: &[(&str, &str)], resident: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "aperture-resident-parity-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            let agent = format!("agent-{}", tag);
+            for (name, body) in skills {
+                let skill_dir = dir.join(&agent).join("skills").join(name);
+                fs::create_dir_all(&skill_dir).unwrap();
+                fs::write(skill_dir.join("SKILL.md"), body).unwrap();
+            }
+            fs::create_dir_all(dir.join(&agent)).unwrap();
+            if let Some(text) = resident {
+                fs::write(dir.join(&agent).join("resident.txt"), text).unwrap();
+            }
+            FakeRegistry { dir, agent }
+        }
+        /// Run `f` with APERTURE_AGENTS_DIR pointing at this registry,
+        /// restoring the previous value afterwards.
+        fn with<T>(&self, f: impl FnOnce(&str) -> T) -> T {
+            let _guard = REGISTRY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prev = std::env::var_os("APERTURE_AGENTS_DIR");
+            std::env::set_var("APERTURE_AGENTS_DIR", &self.dir);
+            let out = f(&self.agent);
+            match prev {
+                Some(v) => std::env::set_var("APERTURE_AGENTS_DIR", v),
+                None => std::env::remove_var("APERTURE_AGENTS_DIR"),
+            }
+            out
+        }
+    }
+    impl Drop for FakeRegistry {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const THREE_SKILLS: &[(&str, &str)] = &[
+        ("alpha", "ALPHA-BODY"),
+        ("beta", "BETA-BODY"),
+        ("gamma", "GAMMA-BODY"),
+    ];
+
+    #[test]
+    fn claude_inject_skills_with_resident_txt_injects_only_resident_bodies() {
+        let reg = FakeRegistry::new("claude-resident", THREE_SKILLS, Some("beta\n"));
+        let out = reg.with(|agent| inject_skills("PROMPT".into(), agent));
+        assert!(out.starts_with("PROMPT"));
+        assert!(out.contains("# Skill: beta\n\nBETA-BODY"), "{out}");
+        assert!(!out.contains("ALPHA-BODY"), "alpha is lazy, must not be injected: {out}");
+        assert!(!out.contains("GAMMA-BODY"), "gamma is lazy, must not be injected: {out}");
+        assert!(!out.contains("# Skill: alpha") && !out.contains("# Skill: gamma"), "{out}");
+    }
+
+    #[test]
+    fn claude_inject_skills_without_resident_txt_injects_every_skill() {
+        let reg = FakeRegistry::new("claude-all", THREE_SKILLS, None);
+        let out = reg.with(|agent| inject_skills("PROMPT".into(), agent));
+        for (name, body) in THREE_SKILLS {
+            assert!(out.contains(&format!("# Skill: {}\n\n{}", name, body)), "{out}");
+        }
+        // Deterministic alphabetical order is preserved.
+        let a = out.find("# Skill: alpha").unwrap();
+        let b = out.find("# Skill: beta").unwrap();
+        let g = out.find("# Skill: gamma").unwrap();
+        assert!(a < b && b < g, "{out}");
+    }
+
+    #[test]
+    fn claude_inject_skills_skips_unknown_resident_name_and_keeps_the_rest() {
+        // "ghost" has no skills/<ghost>/SKILL.md → warned (stderr) and
+        // skipped; the other resident entries still inject.
+        let reg = FakeRegistry::new(
+            "claude-unknown",
+            THREE_SKILLS,
+            Some("# resident core\nbeta\nghost\ngamma  # inline comment\n"),
+        );
+        let out = reg.with(|agent| inject_skills("PROMPT".into(), agent));
+        assert!(out.contains("# Skill: beta\n\nBETA-BODY"), "{out}");
+        assert!(out.contains("# Skill: gamma\n\nGAMMA-BODY"), "{out}");
+        assert!(!out.contains("ghost"), "{out}");
+        assert!(!out.contains("ALPHA-BODY"), "{out}");
+    }
+
+    /// A present-but-empty resident.txt means "inject no bodies" on both
+    /// backends (Some(vec![]) is distinct from None — see agent_loader).
+    #[test]
+    fn claude_inject_skills_comments_only_resident_txt_injects_nothing() {
+        let reg = FakeRegistry::new("claude-empty", THREE_SKILLS, Some("# nothing resident yet\n\n"));
+        let out = reg.with(|agent| inject_skills("PROMPT".into(), agent));
+        assert_eq!(out, "PROMPT", "{out}");
+    }
+
+    #[test]
+    fn codex_and_claude_paths_produce_identical_prompts_for_the_same_registry() {
+        // With resident.txt: both trim to the resident subset.
+        let reg = FakeRegistry::new("parity-resident", THREE_SKILLS, Some("alpha\ngamma\n"));
+        let (claude, codex) = reg.with(|agent| {
+            (
+                inject_skills("PROMPT".into(), agent),
+                inject_codex_skills("PROMPT".into(), agent),
+            )
+        });
+        assert_eq!(claude, codex);
+        assert!(codex.contains("ALPHA-BODY") && codex.contains("GAMMA-BODY"), "{codex}");
+        assert!(!codex.contains("BETA-BODY"), "{codex}");
+
+        // Without resident.txt: both inject everything (Codex path unchanged).
+        let reg = FakeRegistry::new("parity-all", THREE_SKILLS, None);
+        let (claude, codex) = reg.with(|agent| {
+            (
+                inject_skills("PROMPT".into(), agent),
+                inject_codex_skills("PROMPT".into(), agent),
+            )
+        });
+        assert_eq!(claude, codex);
+        for (_, body) in THREE_SKILLS {
+            assert!(codex.contains(body), "{codex}");
+        }
     }
 }

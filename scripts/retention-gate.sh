@@ -51,4 +51,24 @@ for label in BOOT PRE; do
 done
 echo "retention-gate[standing] designated keys (separate set from DECISION rows): $(printf '%s, ' "${STANDING[@]}" | sed 's/, $//')"
 echo "retention-gate[standing]: boot $sboot/$sn, precompact $spre/$sn designated standing statements resident"
+# constitution: every C-n rule sentence in constitution/DECISIONS.md must be present VERBATIM in the
+# resident constitution/SKILL.md, and the pilot agent (peppy) must carry `constitution` in resident.txt
+# (aperture-g4hku). Robust to the skill not existing yet: skip visibly while the lead writes it.
+CDEC="$REPO/.claude/skills/constitution/DECISIONS.md"
+CSKILL="$REPO/.claude/skills/constitution/SKILL.md"
+if [ ! -f "$CDEC" ]; then
+  echo "retention-gate[constitution]: not present yet ($CDEC missing) — skipped"
+else
+  cn=0; cok=0; CVERIFIED=""
+  while IFS= read -r line; do
+    id=$(printf '%s' "$line" | awk -F' \\| ' '{print $1}' | sed 's/^| *//; s/ *$//')
+    rule=$(printf '%s' "$line" | awk -F' \\| ' '{print $2}')
+    cn=$((cn+1))
+    if [ -f "$CSKILL" ] && grep -qF -- "$rule" "$CSKILL"; then cok=$((cok+1)); CVERIFIED="${CVERIFIED:+$CVERIFIED, }$id"; else echo "MISSING in constitution/SKILL.md: $id"; fail=1; fi
+  done < <(grep '^| C-' "$CDEC")
+  echo "retention-gate[constitution] verified ids: ${CVERIFIED:-none}"
+  echo "retention-gate[constitution]: $cok/$cn C rules resident in constitution/SKILL.md"
+fi
+grep -qx 'constitution' "$REPO/agents/peppy/resident.txt" 2>/dev/null || { echo "constitution not in agents/peppy/resident.txt"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

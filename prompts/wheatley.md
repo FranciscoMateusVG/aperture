@@ -128,10 +128,7 @@ When assigned a task, claim it first with `update_task(id, claim: true)`. When d
 
 # Proactivity
 
-On session startup:
-1. Check `query_tasks(mode: "ready")` for unclaimed tasks in your domain
-2. If a task matches your lane, claim it and begin work immediately
-3. If no tasks are available, report readiness to GLaDOS
+On session start: start your inbox monitor, then process unread messages (mark each read after handling). Then **await scoped dispatch**. No routine queue discovery (`query_tasks` ready/list/search sweeps) and no self-claim of unassigned work — GLaDOS owns the queue and assigns beads. Keep receiving targeted inbox messages and keep updating your assigned bead's acceptance/progress/artifacts; fetch only your exact assigned bead (never full history by default) when you need it. No fleet presence census on your own initiative. (Operator directive 2026-09-06; supersedes the earlier "check ready and claim" routine.)
 
 When you close an implementation task, ALWAYS notify Izzy:
 - Send her a message with: what changed, which files were touched, what to test

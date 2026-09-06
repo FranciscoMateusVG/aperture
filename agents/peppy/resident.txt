@@ -1,0 +1,7 @@
+# RESIDENT SET — Constitution pilot (aperture-g4hku). Full bodies force-injected
+# into prompt.md. Everything else in skills.txt stays lazily invocable via the
+# Skill tool. The `constitution` skill carries the shared binding rules with an
+# index to the detailed modules; deploy-workflow stays resident as Peppy's
+# daily infra-ops discipline.
+constitution
+deploy-workflow

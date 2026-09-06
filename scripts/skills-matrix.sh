@@ -9,10 +9,10 @@
 # sizes. Mirrors the injection rule in src-tauri/src/agents.rs:
 #
 #   effective model = override (agent-config.json) > manifest.json "model"
-#   codex/*  → resident = resident.txt (or ALL of skills.txt when absent),
-#              lazy = the rest of skills.txt via $CODEX_HOME/skills
-#   else     → resident = ALL of skills.txt; everything else in
-#              .claude/skills/ is lazily discoverable by Claude Code natively
+#   any      → resident = resident.txt (or ALL of skills.txt when absent),
+#              lazy = the rest of skills.txt (aperture-g4hku parity): via
+#              $CODEX_HOME/skills on codex/*, via Claude Code's native
+#              .claude/skills discovery otherwise
 #
 # Usage: scripts/skills-matrix.sh [--json]     (or: just skills-matrix [--json])
 #
@@ -191,9 +191,10 @@ for agent_dir in "$AGENTS_DIR"/*/; do
         done < <(parse_lines "$agent_dir/resident.txt")
     fi
 
-    # Injection rule (src-tauri/src/agents.rs inject_skills / inject_codex_skills).
+    # Injection rule (src-tauri/src/agents.rs inject_skills / inject_codex_skills):
+    # resident.txt is honored on both backends (aperture-g4hku parity).
     resident=""; lazy=""
-    if [ "$backend" = codex ] && [ "$hasres" = 1 ]; then
+    if [ "$hasres" = 1 ]; then
         for s in $assigned; do
             if in_list "$s" "$requested"; then resident=$(add_unique "$resident" "$s")
             else lazy=$(add_unique "$lazy" "$s"); fi
