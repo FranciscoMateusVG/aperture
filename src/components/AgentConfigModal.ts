@@ -2,10 +2,11 @@ import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
 
 // value = what the CLI accepts; label = what the operator sees.
-// Claude aliases resolve to the current generation (fable → Fable 5, sonnet → Sonnet 5, opus → Opus 4.8).
+// Claude aliases resolve to the current generation (fable → Fable 5, sonnet → Sonnet 5, haiku → Haiku 4.5, opus → Opus 4.8).
 const CLAUDE_MODELS = [
   { value: "fable", label: "fable 5" },
   { value: "sonnet", label: "sonnet 5" },
+  { value: "haiku", label: "haiku 4.5" },
   { value: "opus", label: "opus 4.8" },
 ] as const;
 // GPT-5.6 celestial family (live catalog 2026-07-19)
@@ -15,6 +16,17 @@ const CODEX_MODELS = [
   { value: "codex/gpt-5.6-luna", label: "gpt-5.6-luna" },
 ] as const;
 const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS].map(m => m.value);
+
+// Agent name and the two model strings land in innerHTML for the restart
+// prompt — escape them. Everything else in the template is a closed set.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 export interface AgentConfigModal {
   open: (agent: AgentDef) => void;
@@ -53,6 +65,14 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
           </select>
         </div>
       </div>
+      <div class="agent-config-modal__restart hidden">
+        <span class="agent-config-modal__restart-text"></span>
+        <span class="agent-config-modal__restart-status"></span>
+        <div class="agent-config-modal__restart-actions">
+          <button class="agent-config-modal__restart-later">Later</button>
+          <button class="agent-config-modal__restart-now">Restart now</button>
+        </div>
+      </div>
       <div class="agent-config-modal__footer">
         <span class="agent-config-modal__status"></span>
         <button class="agent-config-modal__save">Save</button>
@@ -69,10 +89,37 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
   const saveBtn = overlay.querySelector<HTMLButtonElement>(".agent-config-modal__save")!;
   const closeBtn = overlay.querySelector<HTMLButtonElement>(".agent-config-modal__close")!;
   const statusEl = overlay.querySelector<HTMLElement>(".agent-config-modal__status")!;
+  const footerEl = overlay.querySelector<HTMLElement>(".agent-config-modal__footer")!;
+  const restartEl = overlay.querySelector<HTMLElement>(".agent-config-modal__restart")!;
+  const restartTextEl = overlay.querySelector<HTMLElement>(".agent-config-modal__restart-text")!;
+  const restartStatusEl = overlay.querySelector<HTMLElement>(".agent-config-modal__restart-status")!;
+  const restartNowBtn = overlay.querySelector<HTMLButtonElement>(".agent-config-modal__restart-now")!;
+  const laterBtn = overlay.querySelector<HTMLButtonElement>(".agent-config-modal__restart-later")!;
 
   function close() {
     overlay.classList.remove("agent-config-modal--visible");
     currentAgent = null;
+  }
+
+  // The save footer and the restart prompt are mutually exclusive: the
+  // prompt swaps in after a successful save on a running agent, and open()
+  // always puts the footer back.
+  function hideRestartPrompt() {
+    restartEl.classList.add("hidden");
+    footerEl.classList.remove("hidden");
+    restartTextEl.textContent = "";
+    restartStatusEl.textContent = "";
+  }
+
+  function showRestartPrompt(agent: AgentDef, oldModel: string, newModel: string) {
+    restartTextEl.innerHTML =
+      `Saved. <strong>${escapeHtml(agent.name)}</strong> is still running on ` +
+      `<code>${escapeHtml(oldModel)}</code> — restart now to apply <code>${escapeHtml(newModel)}</code>?`;
+    restartStatusEl.textContent = "";
+    restartNowBtn.disabled = false;
+    laterBtn.disabled = false;
+    footerEl.classList.add("hidden");
+    restartEl.classList.remove("hidden");
   }
 
   function open(agent: AgentDef) {
@@ -82,6 +129,7 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
     select.value = (ALL_MODELS as readonly string[]).includes(agent.model) ? agent.model : "sonnet";
     statusEl.textContent = "";
     saveBtn.disabled = false;
+    hideRestartPrompt();
     overlay.classList.add("agent-config-modal--visible");
   }
 
@@ -91,20 +139,59 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
   });
 
   saveBtn.addEventListener("click", async () => {
-    if (!currentAgent) return;
+    // Snapshot: close() nulls currentAgent, and the await below may outlive
+    // the modal if the operator dismisses it mid-save.
+    const agent = currentAgent;
+    if (!agent) return;
     const model = select.value;
+    if (model === agent.model) {
+      close();
+      return;
+    }
     saveBtn.disabled = true;
     statusEl.textContent = "Saving…";
     try {
-      await commands.updateAgentModel(currentAgent.name, model);
-      statusEl.textContent = "Saved!";
-      setTimeout(() => {
-        close();
-        onSave();
-      }, 500);
+      await commands.updateAgentModel(agent.name, model);
     } catch (err) {
       statusEl.textContent = `Error: ${err}`;
       saveBtn.disabled = false;
+      return;
+    }
+    // update_agent_model only persists (agents.rs) — a running agent keeps
+    // the old model until its next boot, so offer the restart here.
+    if (agent.status === "running") {
+      statusEl.textContent = "";
+      showRestartPrompt(agent, agent.model, model);
+      return;
+    }
+    statusEl.textContent = "Saved — applies on next start.";
+    setTimeout(() => {
+      close();
+      onSave();
+    }, 500);
+  });
+
+  laterBtn.addEventListener("click", () => {
+    close();
+    onSave();
+  });
+
+  restartNowBtn.addEventListener("click", async () => {
+    const agent = currentAgent;
+    if (!agent) return;
+    restartNowBtn.disabled = true;
+    laterBtn.disabled = true;
+    restartStatusEl.textContent = "Restarting…";
+    try {
+      await commands.restartAgent(agent.name);
+      if (currentAgent === agent) close();
+      onSave();
+    } catch (err) {
+      // Only touch the modal if it's still showing this agent.
+      if (currentAgent !== agent) return;
+      restartStatusEl.textContent = `Error: ${err}`;
+      restartNowBtn.disabled = false;
+      laterBtn.disabled = false;
     }
   });
 

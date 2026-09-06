@@ -299,6 +299,40 @@ html, body {
   to   { transform: rotate(360deg); }
 }
 
+/* ── Error strip (aperture-ull4y) ──
+   One-line, red-tinted, above the list. Shows either "backend unreachable
+   since HH:MM:SS" (held for as long as list_agents keeps failing) or the
+   latest start/stop/restart failure (auto-clears after 15s). No dismiss —
+   the strip clears itself when the condition does. */
+.agent-list__strip {
+  margin-bottom: 8px;
+  padding: 5px 8px;
+  border: 1px solid rgba(231, 76, 60, 0.45);
+  border-left: 3px solid var(--accent-red);
+  border-radius: var(--radius);
+  background: rgba(231, 76, 60, 0.12);
+  color: var(--accent-red);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-list__strip--lifecycle {
+  /* A single failed op is a lighter warning than a dead backend. */
+  border-color: rgba(230, 162, 60, 0.45);
+  border-left-color: var(--accent-amber);
+  background: rgba(230, 162, 60, 0.12);
+  color: var(--accent-amber);
+}
+
+/* Backend unreachable: the cards below are the last known state, not live. */
+.agent-list--stale .agent-mini {
+  opacity: 0.45;
+  transition: opacity 0.3s;
+}
+
 /* ── Agent card ──
    Two rows: .agent-mini__row (the original single-row layout — icon, name,
    badge, model, config, toggle) and, below it, the optional current-work
@@ -401,7 +435,8 @@ html, body {
 
 @media (prefers-reduced-motion: reduce) {
   .agent-mini__presence--booting,
-  .agent-mini__presence--stuck {
+  .agent-mini__presence--stuck,
+  .agent-mini__state--busy {
     animation: none;
   }
 }
@@ -505,6 +540,121 @@ html, body {
 .agent-mini__config:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+/* ── Attention badge (aperture-ull4y) ──
+   Split by reason: message (operator doorbell) vs crash (watchdog 3-strike
+   latch). The bare `●` form is the pre-reason backend's generic badge. */
+.agent-mini__badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--accent-orange);
+  cursor: help;
+}
+
+.agent-mini__badge--message {
+  font-size: 12px;
+  color: var(--accent-blue);
+}
+
+.agent-mini__badge--crash {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-red);
+}
+
+.agent-mini--crash {
+  border-left-color: var(--accent-red);
+}
+
+/* ── Turn-state chip (aperture-ull4y) ──
+   One word next to the model string. Colour follows the presence-dot
+   vocabulary (green = trust it, amber = wait, red = look). `busy` is the
+   only calm-state chip that moves: a slow pulse says "generating right
+   now" without competing with the booting/stuck dot animations. */
+.agent-mini__state {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 8px;
+  font-family: monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.agent-mini__state--online,
+.agent-mini__state--idle {
+  color: var(--accent-green);
+  background: rgba(46, 204, 113, 0.12);
+}
+
+.agent-mini__state--busy {
+  color: var(--accent-green);
+  background: rgba(46, 204, 113, 0.18);
+  animation: state-pulse-busy 1.6s ease-in-out infinite;
+}
+
+.agent-mini__state--booting {
+  color: var(--accent-amber);
+  background: rgba(230, 162, 60, 0.14);
+}
+
+.agent-mini__state--stuck {
+  color: var(--accent-red);
+  background: rgba(231, 76, 60, 0.16);
+}
+
+.agent-mini__state--spawned {
+  color: var(--accent-grey);
+  background: rgba(90, 90, 114, 0.25);
+}
+
+@keyframes state-pulse-busy {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* In-flight lifecycle op (aperture-ull4y): takes the chip's slot. */
+.agent-mini__pending {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: monospace;
+  font-size: 9px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.agent-mini__restart {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, opacity 0.15s;
+  flex-shrink: 0;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.agent-mini__restart:hover {
+  color: var(--text-primary);
+  opacity: 0.8;
+}
+
+.agent-mini__toggle:disabled,
+.agent-mini__restart:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 /* ── Agent Config Modal ── */
@@ -1874,4 +2024,69 @@ html, body {
 /* ── Hidden utility ── */
 .hidden {
   display: none !important;
+}
+
+/* aperture-ull4y: model-save restart prompt */
+.agent-config-modal__restart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-config-modal__restart-text {
+  font-size: 12px;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.agent-config-modal__restart-text code {
+  font-family: monospace;
+  color: var(--accent-blue);
+}
+
+.agent-config-modal__restart-status {
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-height: 14px;
+}
+
+.agent-config-modal__restart-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.agent-config-modal__restart-now,
+.agent-config-modal__restart-later {
+  border-radius: 4px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.agent-config-modal__restart-now {
+  background: var(--accent-blue);
+  color: #fff;
+  border: none;
+}
+
+.agent-config-modal__restart-later {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
+.agent-config-modal__restart-now:hover,
+.agent-config-modal__restart-later:hover {
+  opacity: 0.85;
+}
+
+.agent-config-modal__restart-now:disabled,
+.agent-config-modal__restart-later:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
