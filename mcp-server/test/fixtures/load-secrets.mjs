@@ -10,8 +10,9 @@ export function loadSecretsFixture(path = join(dirname(fileURLToPath(import.meta
   const secrets = {};
   for (const [name, v] of Object.entries(raw.secrets)) {
     if (!Array.isArray(v.text_parts)) throw new Error(`fixture secret ${name}: text_parts missing — the fixture must not carry contiguous literals`);
-    const { text_parts, ...rest } = v;
-    secrets[name] = { ...rest, text: text_parts.join("") };
+    const { text_parts, marker_parts, ...rest } = v;
+    secrets[name] = { ...rest, text: text_parts.join(""), ...(marker_parts ? { marker: marker_parts.join("") } : {}) };
   }
-  return { ...raw, secrets };
+  const { tagged_marker_parts, ...top } = raw;
+  return { ...top, secrets, ...(tagged_marker_parts ? { tagged_marker: tagged_marker_parts.join("") } : {}) };
 }
