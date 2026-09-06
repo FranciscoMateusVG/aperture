@@ -15,6 +15,23 @@ pub struct AgentDef {
     /// message body lives in their tmux scrollback.
     #[serde(default)]
     pub attention: bool,
+    /// Why the attention badge is lit (aperture-ull4y). `"message"` — the
+    /// agent rang the operator doorbell (poller.rs mailbox sweep).
+    /// `"crash"` — the watchdog latched red after exhausting re-kicks
+    /// (watchdog.rs 3-strike latch). `None` whenever `attention` is false.
+    /// The frontend renders a different badge per reason; `clear_attention`
+    /// clears both fields together.
+    #[serde(default)]
+    pub attention_reason: Option<String>,
+    /// Hub turn-state (aperture-ull4y): `"busy"` while the agent is mid-turn,
+    /// `"idle"` between turns, `None` when unknown (agent offline, hub
+    /// subscriber down, or no busy/idle frame seen since the last join).
+    /// Sourced from the ws-hub `busy`/`idle` presence broadcasts via the
+    /// watchdog subscriber — previously received and discarded. Carried on
+    /// the existing 3s `list_agents` poll; there is deliberately NO frontend
+    /// WebSocket (docs/presence-dots-spec.md, aperture-1iqpn).
+    #[serde(default)]
+    pub turn_state: Option<String>,
     /// Current-work summary line (aperture-nr65b). Resolved from BEADS on
     /// each `list_agents` poll — the top `in_progress` bead assigned to this
     /// agent, most-recently-claimed first. Three distinct states, all

@@ -10,6 +10,20 @@ export interface AgentDef {
    *  the agent's row in the launcher. There is no chat panel; the
    *  agent's actual message body lives in their tmux scrollback. */
   attention?: boolean;
+  /** Why the badge is lit (aperture-ull4y). "message" = operator doorbell
+   *  (poller mailbox sweep); "crash" = watchdog 3-strike latch. null/absent
+   *  whenever attention is false. Rendered as distinct badges. */
+  attention_reason?: "message" | "crash" | null;
+  /** Hub turn-state (aperture-ull4y): "busy" mid-turn, "idle" between turns,
+   *  null when unknown (offline, subscriber down, no frame since join).
+   *  From the ws-hub busy/idle broadcasts via the Rust watchdog, on the
+   *  existing 3s poll — no frontend WS (aperture-1iqpn). */
+  turn_state?: "busy" | "idle" | null;
+  /** FRONTEND-LOCAL, never sent by the backend: the lifecycle op currently
+   *  in flight for this agent, so the card can lock its buttons and show a
+   *  spinner across polls. Set by AgentList when it fires start/stop/restart,
+   *  cleared when the invoke settles. */
+  op_pending?: "starting" | "stopping" | "restarting" | null;
   /** ISO 8601 timestamp set by agents.rs the moment the post-launch kickoff
    *  turn is fired (aperture-syepg). Absent/null before kickoff fires (or
    *  on backends that don't populate it yet — the presence-dot derivation
@@ -25,10 +39,11 @@ export interface AgentDef {
    *  hub-presence.ts::deriveDotState). "online"/"stuck" NEVER come from a
    *  client-side guess — only from this field. */
   dot_state?: "spawned" | "booting" | "online" | "stuck" | null;
-  /** ISO 8601 timestamp of when the current dot_state began (kickoff time
-   *  for booting/stuck, hub-join time for online). Used only to render a
-   *  live "{N}s ago" counter — cosmetic display math, not a deadline
-   *  decision, so it's safe to compute client-side from this. */
+  /** ISO 8601 timestamp of when the current dot_state BEGAN — the state
+   *  transition time, NOT the poll tick (fixed in aperture-ull4y; it used to
+   *  be stamped with the tick time so "{N}s ago" always read ~0). Kickoff
+   *  time for booting/stuck, stable-online time for online. Cosmetic
+   *  display math only, safe to compute the counter client-side. */
   dot_state_since?: string | null;
   /** Current-work summary (aperture-nr65b). Three-state field, see
    *  hub-presence.ts::deriveWorkSummary for the full contract:

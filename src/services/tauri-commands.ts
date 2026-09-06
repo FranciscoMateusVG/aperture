@@ -17,6 +17,10 @@ export const commands = {
     invoke<void>("tmux_select_window", { windowId }),
   startAgent: (name: string) => invoke<void>("start_agent", { name }),
   stopAgent: (name: string) => invoke<void>("stop_agent", { name }),
+  /** Stop-if-running then boot (aperture-ull4y). Tolerates an agent that is
+   *  already stopped/crashed — the one case the stop→start two-click dance
+   *  could never handle. */
+  restartAgent: (name: string) => invoke<void>("restart_agent", { name }),
   listAgents: () => invoke<AgentDef[]>("list_agents"),
   updateAgentModel: (name: string, model: string) =>
     invoke<void>("update_agent_model", { name, model }),
