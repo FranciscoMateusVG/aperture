@@ -15,7 +15,8 @@ How Aperture agents communicate — progress, handoffs, coordination, operator c
 
 - `send_message(to: "agent", message: "...")` writes a BEADS message record.
 - Delivery is **push** via the aperture-bus hub. Claude agents receive events on their inbox monitor — a bash-based Monitor running `node ~/projects/aperture/mcp-server/dist/hub-client.js <your-name>` (persistent), which sends the identifying hello to `ws://127.0.0.1:4517` and streams each frame as an event. Codex agents receive injected turns via the app-server bridge. ⚠️ **Never use the Monitor tool's native ws source** — receive-only, can't send the hello, leaves you an anonymous socket the hub treats as offline (aperture-1qwty).
-- Recipient offline → nothing lost; the hub replays every unread message on reconnect.
+- Recipient offline → nothing lost; the hub replays every unread message on reconnect. `send_message`'s reply tells you the recipient's presence (offline / busy / idle); read it.
+- The monitor reconnects by itself after a hub blip (`HUB_RECONNECTING` → `HUB_RECONNECTED`). Restart it only if it EXITS: code 4000 = a newer monitor replaced you (don't start another); code 4001 = hello rejected (token/name).
 - A message is **read only when the recipient calls `mark_as_read` after processing it** — never on delivery. Process, then mark.
 
 **Why:** file-based messages got lost when agents were busy. BEADS messages persist, carry read/unread state, and replay until acknowledged.
@@ -29,6 +30,7 @@ How Aperture agents communicate — progress, handoffs, coordination, operator c
 | **`update_task`** | All task progress, completions, blockers, findings | "Found the bug — query filter was wrong. Fixed in usuarios/page.tsx" |
 | **`store_artifact`** | Deliverables, files created, URLs deployed | `type: "file", value: "src/auth.ts"` |
 | **`send_message`** | ALL agent-to-agent messages — pings, questions, FYIs, coordination | "Heads up, I changed the DB schema" |
+| **`get_presence`** | Who's online / busy / idle before dispatching or waiting on someone | `get_presence()` → "rex busy since 14:02" |
 | **`send_message(to: "operator")`** | **Doorbell only** — lights a badge on your launcher row; the operator attaches to your tmux and reads your scrollback. NOT a chat surface (§7). | "Need your GitHub credentials for this repo" |
 
 ---
@@ -63,7 +65,7 @@ Next step: [review needed? deploy? nothing?]
 
 `query_tasks(mode: "list")` for all tasks and status; `query_tasks(mode: "show", id)` for notes, artifacts, progress. Poll BEADS for specialist updates. Subagents (Agent tool) return their result directly and don't write to BEADS unless instructed. Agent messages arrive via the hub push (Monitor event for Claude, injected turn for Codex).
 
-**5.1 Presence.** The hub broadcasts `join`, `leave`, `busy`, `idle` for every connected agent (socket connected = present). This stream is GLaDOS's **primary liveness signal**; pane-peeking is a forensic fallback. Don't infer "dead" from silence when presence says otherwise.
+**5.1 Presence.** The hub broadcasts `join`, `leave`, `busy`, `idle` for every connected agent — to the **launcher** (dots + state chips). Agents, GLaDOS included, do not subscribe to that stream; they read the same facts with `get_presence` (online / busy / idle / offline, `unknown` when the hub is down). GLaDOS uses `get_presence` as her **primary liveness signal**; pane-peeking is a forensic fallback. Don't infer "dead" from silence when `get_presence` says busy/idle.
 
 ---
 
