@@ -136,7 +136,14 @@ print_index() {
 
 case "$MODE" in
     boot)
-        print_preamble
+        # Aperture agents (APERTURE_HUB_TOKEN_FILE set by the launcher) carry the resident
+        # `beads` skill, which documents every bd command the preamble repeats — skip it for
+        # them (≈4.7 KiB of boot budget). The operator's own plain sessions in this repo keep it.
+        if [ -n "${APERTURE_HUB_TOKEN_FILE:-}" ]; then
+            echo "[bd workflow preamble omitted for Aperture agents — the resident beads skill covers bd usage; run bd prime manually if needed]"
+        else
+            print_preamble
+        fi
         echo
         print_index boot
         ;;
