@@ -5,7 +5,7 @@
 // suite runs the REAL replay path: on agent hello, replayUnread() →
 // beads.ts getUnreadMessages() shells out to
 //
-//   bd query 'type=message AND status=open AND title="->AGENT]"' --json -n 0
+//   bd query 'type=message AND status=open AND title="->AGENT]"' --json -n 200
 //
 // and each returned row becomes one {type:"message", id, from, preview} frame
 // (from = first group of /\[(.+?)->(.+?)\]/ on title; preview = first 60 chars
@@ -210,7 +210,7 @@ const unreadQueryArgv = (agent) => [
   `type=message AND status=open AND title="->${agent}]"`,
   "--json",
   "-n",
-  "0",
+  "200", // UNREAD_LIMIT (aperture-84bby): bounded replay, was 0 (unlimited)
 ];
 
 function connect(port) {

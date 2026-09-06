@@ -342,31 +342,53 @@ export interface QueryOptions {
   assignee?: string; // "*" means no filter
   priorityMax?: number;
   label?: string;
+  /** Max rows to request from bd (`-n`). Unset = bd's own default (list 50, ready 10). */
+  limit?: number;
+}
+
+/** How much of bd's raw output an unparseable-output error quotes. */
+const SHAPE_ERROR_PREVIEW = 300;
+
+/**
+ * bd printed something that is not the JSON shape we asked for. Previously the
+ * callers returned the raw stdout unprojected on this path — which silently
+ * bypassed the summary/detail tiers and dumped whatever bd printed (a pager
+ * banner, a Dolt warning, a full pretty-printed table…) straight into the
+ * agent's context. Now it is an error: a short quote of the output plus the
+ * (redacted) argv is enough to diagnose without the dump.
+ */
+function bdShapeError(problem: string, raw: string, args: string[]): Error {
+  const preview = raw.length > SHAPE_ERROR_PREVIEW ? raw.slice(0, SHAPE_ERROR_PREVIEW) + "…" : raw;
+  return new Error(
+    `bd returned unexpected output (${problem}) | argv: ${redactArgv([BD_PATH, ...args])} | output (first ${SHAPE_ERROR_PREVIEW} chars of ${raw.length}): ${preview}`,
+  );
+}
+
+function parseJsonOrThrow(raw: string, args: string[]): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return bdShapeErrorThrow("not valid JSON", raw, args);
+  }
+}
+
+function bdShapeErrorThrow(problem: string, raw: string, args: string[]): never {
+  throw bdShapeError(problem, raw, args);
+}
+
+/** Parse bd list/ready/query stdout as a task array or throw a diagnosable error. */
+function parseTaskArray(raw: string, args: string[]): Record<string, unknown>[] {
+  const parsed = parseJsonOrThrow(raw, args);
+  if (!Array.isArray(parsed)) {
+    bdShapeErrorThrow(`expected a JSON array, got ${parsed === null ? "null" : typeof parsed}`, raw, args);
+  }
+  return parsed as Record<string, unknown>[];
 }
 
 function taskHasLabel(t: Record<string, unknown>, label: string): boolean {
   const labels = t.labels;
   if (!Array.isArray(labels)) return false;
   return labels.some((l) => typeof l === "string" && l === label);
-}
-
-function applyPostFilters(
-  tasks: Record<string, unknown>[],
-  options: QueryOptions | undefined,
-): Record<string, unknown>[] {
-  let out = tasks;
-  if (!options?.includeDone) {
-    out = out.filter((t) => t.status !== "done" && t.status !== "closed");
-  }
-  if (options?.project) {
-    const projectLabel = `project:${options.project}`;
-    out = out.filter((t) => taskHasLabel(t, projectLabel));
-  }
-  if (typeof options?.priorityMax === "number") {
-    const max = options.priorityMax;
-    out = out.filter((t) => typeof t.priority === "number" && (t.priority as number) <= max);
-  }
-  return out;
 }
 
 function projectFields(
@@ -376,6 +398,97 @@ function projectFields(
   if (fields === "full") return tasks;
   // default: summary
   return tasks.map(summarizeTask);
+}
+
+type ListMode = "list" | "ready";
+
+interface ListPlan {
+  args: string[];
+  /**
+   * priorityMax could not be pushed down to bd and must be applied here, after
+   * parsing. Only `bd ready` lacks `--priority-max` (verified bd 1.0.2: `bd list`
+   * has `--priority-max`, `bd ready` has only an exact-match `-p`).
+   */
+  postFilterPriorityMax?: number;
+  /** Client-side cap, only when the bd-side `-n` had to be disabled (see below). */
+  postLimit?: number;
+}
+
+/**
+ * Build the bd argv for list/ready, pushing every filter bd understands down
+ * to bd so the JSON is narrowed BEFORE we parse it.
+ *
+ * Filters and where they are applied (bd 1.0.2):
+ *   label / project  → `--label` (both modes)
+ *   assignee         → `--assignee` (list only; ready never auto-filters)
+ *   includeDone      → `--all` (list only). bd's default already excludes
+ *                      closed — verified: `bd list` returned statuses
+ *                      {open, in_progress}; `bd list --all` adds closed — so
+ *                      the old post-filter for the default case was redundant.
+ *                      `bd ready` is open-and-unblocked by definition: no
+ *                      `--all` flag exists and includeDone is meaningless there.
+ *   priorityMax      → `--priority-max` (list only). `bd ready` has no such
+ *                      flag, so ready keeps a post-filter — and in THAT case we
+ *                      must pass `-n 0`: bd applies its default limit (10 for
+ *                      ready) BEFORE we filter, so a bounded fetch would drop
+ *                      matching rows silently. Any caller `limit` is then
+ *                      applied client-side after the filter.
+ *   limit            → `-n` (both modes) unless the trap above forces `-n 0`.
+ */
+function planListQuery(mode: ListMode, options: QueryOptions | undefined): ListPlan {
+  const args: string[] = [mode, "--json"];
+  const plan: ListPlan = { args };
+
+  if (options?.label) {
+    args.push("--label", options.label);
+  }
+  // For project we also use the label flag (same machinery in bd).
+  if (options?.project) {
+    args.push("--label", `project:${options.project}`);
+  }
+  // assignee: "*" means any (skip filter). For ready mode we never auto-filter.
+  if (mode !== "ready" && options?.assignee && options.assignee !== "*") {
+    args.push("--assignee", options.assignee);
+  }
+  if (mode === "list" && options?.includeDone) {
+    args.push("--all");
+  }
+
+  const priorityMax = typeof options?.priorityMax === "number" ? options.priorityMax : undefined;
+  if (priorityMax !== undefined && mode === "list") {
+    args.push("--priority-max", String(priorityMax));
+  }
+
+  if (priorityMax !== undefined && mode === "ready") {
+    // Post-filter trap: fetch unbounded so bd's own limit cannot truncate
+    // before our filter runs; re-apply the caller's limit afterwards.
+    plan.postFilterPriorityMax = priorityMax;
+    plan.postLimit = options?.limit;
+    args.push("-n", "0");
+  } else if (typeof options?.limit === "number") {
+    args.push("-n", String(options.limit));
+  }
+
+  return plan;
+}
+
+async function runListQuery(mode: ListMode, options: QueryOptions | undefined): Promise<string> {
+  const plan = planListQuery(mode, options);
+  const raw = await runBd(plan.args);
+  let tasks = parseTaskArray(raw, plan.args);
+  if (options?.project) {
+    // Belt-and-braces alongside the --label push-down (kept from before).
+    const projectLabel = `project:${options.project}`;
+    tasks = tasks.filter((t) => taskHasLabel(t, projectLabel));
+  }
+  if (plan.postFilterPriorityMax !== undefined) {
+    const max = plan.postFilterPriorityMax;
+    tasks = tasks.filter((t) => typeof t.priority === "number" && (t.priority as number) <= max);
+  }
+  if (plan.postLimit !== undefined) {
+    tasks = tasks.slice(0, plan.postLimit);
+  }
+  return JSON.stringify(projectFields(tasks, options?.fields));
 }
 
 export async function queryTasks(
@@ -388,45 +501,21 @@ export async function queryTasks(
     // description (4k head), capped notes (3k TAIL), dependencies summarized.
     // fields:"full" restores the historical unconditional dump; "summary" gives
     // the cheap 200-char tier. See docs/context-efficiency-spec-jingp.md.
-    const raw = await runBd(["show", id, "--json"]);
-    if (options?.fields === "full") return raw;
-    try {
-      const parsed = JSON.parse(raw);
-      const arr: Record<string, unknown>[] = Array.isArray(parsed) ? parsed : [parsed];
-      const projected = arr.map((t) =>
-        options?.fields === "summary" ? summarizeTask(t) : detailTask(t),
-      );
-      return JSON.stringify(Array.isArray(parsed) ? projected : projected[0]);
-    } catch {
-      return raw;
+    const args = ["show", id, "--json"];
+    const raw = await runBd(args);
+    if (options?.fields === "full") return raw; // opt-in raw passthrough, by design
+    const parsed = parseJsonOrThrow(raw, args);
+    if (!parsed || typeof parsed !== "object") {
+      bdShapeErrorThrow(`expected a JSON object, got ${parsed === null ? "null" : typeof parsed}`, raw, args);
     }
+    const arr: Record<string, unknown>[] = Array.isArray(parsed) ? parsed : [parsed as Record<string, unknown>];
+    const projected = arr.map((t) =>
+      options?.fields === "summary" ? summarizeTask(t) : detailTask(t),
+    );
+    return JSON.stringify(Array.isArray(parsed) ? projected : projected[0]);
   }
 
-  const baseArgs: string[] = mode === "ready" ? ["ready", "--json"] : ["list", "--json"];
-
-  // Pass label filters to bd when we can — narrows the JSON before we parse.
-  if (options?.label) {
-    baseArgs.push("--label", options.label);
-  }
-  // For project we also use the label flag (same machinery in bd).
-  if (options?.project) {
-    baseArgs.push("--label", `project:${options.project}`);
-  }
-  // assignee: "*" means any (skip filter). For ready mode we never auto-filter.
-  if (mode !== "ready" && options?.assignee && options.assignee !== "*") {
-    baseArgs.push("--assignee", options.assignee);
-  }
-
-  const raw = await runBd(baseArgs);
-  try {
-    let tasks: Record<string, unknown>[] = JSON.parse(raw);
-    if (!Array.isArray(tasks)) return raw;
-    tasks = applyPostFilters(tasks, options);
-    tasks = projectFields(tasks, options?.fields);
-    return JSON.stringify(tasks);
-  } catch {
-    return raw;
-  }
+  return runListQuery(mode === "ready" ? "ready" : "list", options);
 }
 
 export async function storeArtifact(
@@ -441,29 +530,15 @@ export async function storeArtifact(
   return runBd(["update", taskId, "--append-notes", artifactLine, "--json"]);
 }
 
+/**
+ * search_tasks is `bd list` with every filter pushed down (see planListQuery).
+ * It differs from queryTasks("list") only in that the caller never defaults
+ * the assignee — that defaulting lives in index.ts.
+ */
 export async function searchTasks(
   options?: QueryOptions,
 ): Promise<string> {
-  const args = ["list", "--json"];
-  if (options?.label) {
-    args.push("--label", options.label);
-  }
-  if (options?.project) {
-    args.push("--label", `project:${options.project}`);
-  }
-  if (options?.assignee && options.assignee !== "*") {
-    args.push("--assignee", options.assignee);
-  }
-  const raw = await runBd(args);
-  try {
-    let tasks: Record<string, unknown>[] = JSON.parse(raw);
-    if (!Array.isArray(tasks)) return raw;
-    tasks = applyPostFilters(tasks, options);
-    tasks = projectFields(tasks, options?.fields);
-    return JSON.stringify(tasks);
-  } catch {
-    return raw;
-  }
+  return runListQuery("list", options);
 }
 
 // ── BEADS Message Bus ──
@@ -486,13 +561,65 @@ export async function createMessage(
 }
 
 /**
- * Query all unread (open) messages for a specific recipient.
- * Returns JSON array of message records.
+ * Cap on unread messages fetched per getUnreadMessages call.
+ *
+ * Previously `-n 0` (unbounded): after a long outage a backlog of hundreds of
+ * unread messages inlined every full body into ONE get_messages reply. Message
+ * bodies are the payload (they cannot be truncated), so the only lever is the
+ * row count. 200 keeps a worst-case reply bounded; the agent drains the rest by
+ * marking these read and calling again — formatUnreadMessages says so.
+ *
+ * Ordering (verified against bd 1.0.2): `bd query` returns NEWEST-first, and
+ * `--sort created -r` does not help because bd applies `-n` BEFORE `-r`
+ * (`--sort created -r -n 3` returned the 3 newest, merely reversed). So when a
+ * backlog exceeds the cap the slice is the 200 MOST RECENT messages, not the
+ * oldest. formatUnreadMessages re-sorts them oldest-first so the agent still
+ * processes each batch in chronological order. (`bd list --include-infra
+ * --type message --sort created -r -n N` does yield the true oldest N, but
+ * list applies different default hiding rules to infra/ephemeral beads — not
+ * worth the silent-drop risk for a subcommand swap.)
+ */
+export const UNREAD_LIMIT = 200;
+
+/**
+ * Query unread (open) messages for a specific recipient — at most UNREAD_LIMIT.
+ * Returns the raw bd JSON array (string); callers parse it.
  */
 export async function getUnreadMessages(recipient: string): Promise<string> {
   // Query all open messages, then filter by recipient in title
   // bd query title= does contains search, so title=->recipient matches [sender->recipient]
-  return runBd(["query", `type=message AND status=open AND title="->${recipient}]"`, "--json", "-n", "0"]);
+  return runBd([
+    "query",
+    `type=message AND status=open AND title="->${recipient}]"`,
+    "--json",
+    "-n",
+    String(UNREAD_LIMIT),
+  ]);
+}
+
+/** The line get_messages appends when the reply hit UNREAD_LIMIT. */
+export const UNREAD_CAP_NOTICE = `Showing the ${UNREAD_LIMIT} most recent unread messages (oldest first); older messages are still queued. Call get_messages again after marking these read.`;
+
+/**
+ * Render the get_messages reply body: one `[id] From sender: body` block per
+ * message, oldest first (see UNREAD_LIMIT for why we sort here), plus the cap
+ * notice when the batch is exactly UNREAD_LIMIT rows (i.e. bd may have had
+ * more). The caller has already rejected non-array and empty inputs.
+ */
+export function formatUnreadMessages(messages: Record<string, unknown>[]): string {
+  const created = (m: Record<string, unknown>): string =>
+    typeof m.created_at === "string" ? m.created_at : "";
+  const ordered = [...messages].sort((a, b) => created(a).localeCompare(created(b)));
+  const blocks = ordered.map((m) => {
+    const title = typeof m.title === "string" ? m.title : "";
+    const from = title.match(/\[(.+?)->(.+?)\]/)?.[1] ?? "unknown";
+    const body = typeof m.description === "string" ? m.description : "(no content)";
+    return `[${m.id}] From ${from}: ${body}`;
+  });
+  if (messages.length >= UNREAD_LIMIT) {
+    blocks.push(UNREAD_CAP_NOTICE);
+  }
+  return blocks.join("\n\n");
 }
 
 /**
