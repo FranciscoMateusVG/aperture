@@ -1,5 +1,5 @@
 ---
-name: aperture-dokploy-api
+name: dokploy-api
 description: Dokploy API reference for Aperture infrastructure operations. Use when making Dokploy API calls — creating databases, compose services, domains, or deploying. Triggers on Dokploy operations, API calls, database provisioning, and compose management.
 ---
 

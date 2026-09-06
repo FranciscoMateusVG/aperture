@@ -172,4 +172,4 @@ When recursive-Zod bites you (or you discover a new principle worth banking), us
 4. **Where this shows up** — the pattern of schema you'd find it in
 5. **Source** — agent name, PR + commit SHA, file
 
-Open a PR on the aperture repo. Ping Atlas for a second pair of eyes on the framing if helpful.
+Open a PR on the aperture repo. Ping GLaDOS to bank it as a skill precedent.

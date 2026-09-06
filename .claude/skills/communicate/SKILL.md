@@ -5,23 +5,20 @@ description: Inter-agent communication patterns for Aperture. Use when sending m
 
 # Aperture Communication Patterns
 
-This skill defines how Aperture agents communicate. Follow it whenever you report progress, hand off work, or coordinate with other agents.
+How Aperture agents communicate — progress, handoffs, coordination, operator contact. Incident write-ups and per-stack verify protocols live in `references/precedents.md`.
 
 ---
 
 ## 1. The Golden Rule
 
-**BEADS is the ONLY communication channel between agents.**
+**BEADS is the ONLY communication channel between agents.** Every message — task updates, pings, handoffs, questions, FYIs — goes through BEADS. No file-based side channel exists.
 
-Every message between agents — task updates, quick pings, handoffs, questions, FYIs — goes through BEADS. There is no exception. `send_message` to another agent does NOT exist as a separate file-based pattern anymore.
+- `send_message(to: "agent", message: "...")` writes a BEADS message record.
+- Delivery is **push** via the aperture-bus hub. Claude agents receive events on their inbox monitor — a bash-based Monitor running `node ~/projects/aperture/mcp-server/dist/hub-client.js <your-name>` (persistent), which sends the identifying hello to `ws://127.0.0.1:4517` and streams each frame as an event. Codex agents receive injected turns via the app-server bridge. ⚠️ **Never use the Monitor tool's native ws source** — receive-only, can't send the hello, leaves you an anonymous socket the hub treats as offline (aperture-1qwty).
+- Recipient offline → nothing lost; the hub replays every unread message on reconnect.
+- A message is **read only when the recipient calls `mark_as_read` after processing it** — never on delivery. Process, then mark.
 
-**How it works:**
-- You call `send_message(to: "agent", message: "...")` — this writes a BEADS message record
-- Delivery is **push**, via the aperture-bus hub: Claude agents receive events on their inbox monitor — a bash-based Monitor running `node ~/projects/aperture/mcp-server/dist/hub-client.js <your-name>` (persistent), which sends the identifying hello frame to the hub at `ws://127.0.0.1:4517` and streams each frame as an event. Codex agents receive injected turns via the app-server bridge. ⚠️ Never use the Monitor tool's native ws source for the inbox — it is receive-only, cannot send the hello, and leaves you as an anonymous socket the hub treats as offline (bug aperture-1qwty)
-- Recipient offline? Nothing is lost — on reconnect the hub replays every unread message
-- A message counts as **read only when the recipient explicitly calls `mark_as_read` after processing it** — never on delivery. If you receive a message, process it, then mark it read.
-
-**Why:** File-based messages got lost when agents were busy processing. BEADS messages are persistent, have read/unread state, and replay on reconnect until acknowledged.
+**Why:** file-based messages got lost when agents were busy. BEADS messages persist, carry read/unread state, and replay until acknowledged.
 
 ---
 
@@ -29,257 +26,128 @@ Every message between agents — task updates, quick pings, handoffs, questions,
 
 | Channel | Use for | Example |
 |---------|---------|---------|
-| **BEADS `update_task`** | All task progress, completions, blockers, findings | "Found the bug — query filter was wrong. Fixed in usuarios/page.tsx" |
-| **BEADS `store_artifact`** | Deliverables, files created, URLs deployed | `type: "file", value: "src/auth.ts"` |
-| **BEADS `send_message`** | ALL agent-to-agent messages — pings, questions, FYIs, coordination | "Heads up, I changed the DB schema" |
-| **`send_message(to: "operator")`** | **Doorbell only** — fires a notification badge on your row in the launcher. The operator then attaches to your tmux to read your scrollback. NOT a chat surface. | "Need your GitHub credentials for this repo" |
-
-**The only recipient that bypasses BEADS:** `operator` — and that's a notification badge, not a message inbox (see §7).
+| **`update_task`** | All task progress, completions, blockers, findings | "Found the bug — query filter was wrong. Fixed in usuarios/page.tsx" |
+| **`store_artifact`** | Deliverables, files created, URLs deployed | `type: "file", value: "src/auth.ts"` |
+| **`send_message`** | ALL agent-to-agent messages — pings, questions, FYIs, coordination | "Heads up, I changed the DB schema" |
+| **`send_message(to: "operator")`** | **Doorbell only** — lights a badge on your launcher row; the operator attaches to your tmux and reads your scrollback. NOT a chat surface (§7). | "Need your GitHub credentials for this repo" |
 
 ---
 
 ## 3. Task Communication Flow
 
-### Starting work
-```
-update_task(id: "task-id", claim: true)
-update_task(id: "task-id", status: "in_progress")
-```
-
-### Progress updates (when something notable happens)
-```
-update_task(
-  id: "task-id",
-  notes: "Found that the nav link already exists — only the filter needs changing"
-)
-```
-
-### Completion
-```
-store_artifact(task_id: "task-id", type: "file", value: "src/components/Auth.tsx")
-update_task(id: "task-id", status: "done", notes: "Implemented auth flow. Build passes. Tests green.")
-```
-
-### Blockers
-```
-update_task(
-  id: "task-id",
-  notes: "BLOCKED: Need DATABASE_URL for production. Waiting on operator."
-)
-```
-
-### Handoffs (e.g., builder → deployer)
-```
-update_task(
-  id: "task-id",
-  notes: "HANDOFF TO PEPPY: Ready for deploy. Repo: /projects/fitt, Branch: main, Port: 3000, Subdomain: fitt.programaincluir.org"
-)
-```
+| Moment | Call |
+|---|---|
+| Starting | `update_task(id, claim: true)` then `update_task(id, status: "in_progress")` |
+| Notable progress | `update_task(id, notes: "Nav link already exists — only the filter needs changing")` |
+| Blocked | `update_task(id, notes: "BLOCKED: Need DATABASE_URL for production. Waiting on operator.")` |
+| Handoff | `update_task(id, notes: "HANDOFF TO PEPPY: Ready for deploy. Repo: /projects/fitt, Branch: main, Port: 3000, Subdomain: fitt.programaincluir.org")` |
+| Completion | `store_artifact(task_id, type: "file", value: "src/components/Auth.tsx")` + `update_task(id, status: "done", notes: "Implemented auth flow. Build passes. Tests green.")` |
 
 ---
 
 ## 4. Status Report Format
 
-When completing a task, your BEADS notes should be structured enough for GLaDOS (or any agent) to understand what happened without asking follow-up questions:
+Completion notes must let GLaDOS (or any agent) understand what happened without follow-up questions:
 
 ```
 What I did: [1-3 bullet points of actual changes]
 Files touched: [list key files]
-Next step: [what happens now — review needed? deploy? nothing?]
+Next step: [review needed? deploy? nothing?]
 ```
 
-❌ Bad: `"done"`
-✅ Good: `"Updated SECRETARIA filter in admin/usuarios/page.tsx to show only CONVIDADO users. Build passes. Ready for review."`
+❌ `"done"` ✅ `"Updated SECRETARIA filter in admin/usuarios/page.tsx to show only CONVIDADO users. Build passes. Ready for review."`
 
 ---
 
 ## 5. Monitoring Delegated Work (for GLaDOS)
 
-GLaDOS tracks all delegated work through BEADS:
+`query_tasks(mode: "list")` for all tasks and status; `query_tasks(mode: "show", id)` for notes, artifacts, progress. Poll BEADS for specialist updates. Subagents (Agent tool) return their result directly and don't write to BEADS unless instructed. Agent messages arrive via the hub push (Monitor event for Claude, injected turn for Codex).
 
-```
-query_tasks(mode: "list")              — see all tasks and their status
-query_tasks(mode: "show", id: "...")   — read notes, artifacts, and progress
-```
-
-When you delegate to specialist agents, poll BEADS for their task updates. Subagents (Agent tool) return their result directly when done — they don't write to BEADS unless you instruct them to. Messages from agents arrive via BEADS — the hub pushes them to you as they land (Monitor event for Claude, injected turn for Codex).
-
-### 5.1 Presence
-
-The hub broadcasts presence events — `join`, `leave`, `busy`, `idle` — for every connected agent (socket connected = present, disconnect = leave). GLaDOS uses this stream as the **primary liveness signal**; pane-peeking remains a forensic fallback only. Don't infer "agent is dead" from silence when the presence stream says otherwise.
+**5.1 Presence.** The hub broadcasts `join`, `leave`, `busy`, `idle` for every connected agent (socket connected = present). This stream is GLaDOS's **primary liveness signal**; pane-peeking is a forensic fallback. Don't infer "dead" from silence when presence says otherwise.
 
 ---
 
 ## 6. Infra Handoff Requests to Peppy
 
-When you need Peppy to deploy, structure it as a BEADS task note:
+Structure deploy requests so no follow-up questions are needed:
 
 ```
-update_task(
-  id: "task-id",
-  notes: "DEPLOY HANDOFF TO PEPPY:
+update_task(id: "task-id", notes: "DEPLOY HANDOFF TO PEPPY:
   - Repo: /projects/my-app
   - Branch: main
   - Service: my-app
   - Port: 3000
   - Subdomain: myapp.programaincluir.org
   - Env vars: DATABASE_URL, ADMIN_SECRET
-  - Notes: Docker Compose, needs PostgreSQL"
-)
+  - Notes: Docker Compose, needs PostgreSQL")
 ```
-
-Peppy reads BEADS and picks up deploy tasks. The structured format means no follow-up questions needed.
 
 ---
 
 ## 7. Operator Communication
 
-**The Chat panel is gone.** There is no surface where the operator reads agent messages. The operator interacts with you ONLY by attaching to your tmux window and typing.
+**There is no chat panel.** The operator interacts with you ONLY by attaching to your tmux window and typing. **Reply in your terminal** — your normal turn output is what they read. `send_message(to: "operator", ...)` is a **doorbell**: it lights a badge, delivers no text, and is never a reply. Ring it sparingly — questions only the human can answer, major milestones, blockers needing human intervention.
 
-**How to reply when the operator messages you:**
-Respond in your terminal — print your answer as your normal turn output. The operator is reading the same tmux pane your work appears in.
-
-**How to alert the operator that you need them:**
-Call `send_message(to: "operator", message: "<short reason>")`. This **does not deliver text to a UI** — it only lights up a notification badge on your row in the launcher. The operator will see the badge, attach to your tmux window, and read whatever context is in your scrollback.
-
-So:
-- The substance of your communication lives in your terminal output.
-- `send_message(to: "operator", ...)` is a *doorbell*, not an inbox. Use it sparingly — only when something actually requires the operator's attention.
-- Do NOT use it to "reply." Replies go in your terminal.
-
-Use the doorbell for:
-- Questions only the human can answer
-- Critical status updates or completion of major milestones
-- Blockers that need human intervention
-
-**Default escalation path:** Try to solve it yourself → update BEADS with findings → if truly stuck, message GLaDOS via BEADS → last resort, ring the operator's doorbell.
+**Escalation path:** solve it yourself → update BEADS with findings → message GLaDOS via BEADS → last resort, ring the operator.
 
 ### 7.1 Evidence-attached doorbell rule — NON-NEGOTIABLE
 
-**Banked precedent: lz9y AI intake, 2026-05-23 — three premature "feature live" claims to operator in 90 minutes, each one wrong at a different layer.**
-
-When you tell the operator "X is ready" / "feature is live" / "you can test now" / "deploy complete" — your message MUST include **evidence attached**, not a promise. Evidence = the canonical verify command + its output (or a verbatim quote from the verify), not a description of what you intended to verify.
+"X is ready" / "feature is live" / "you can test now" / "deploy complete" MUST carry **evidence**, not a promise: the canonical verify command + its output. (Precedent: §7.1 lz9y — three wrong "live" claims in 90 minutes.)
 
 | ❌ Promise (banned) | ✅ Evidence (required) |
 |---|---|
 | "Container has the env var" | `docker exec X env \| grep VAR → VAR=true` |
-| "Feature is live, you can test" | `curl https://prod/feature → HTTP 200` + `grep /_next/static/chunks/*.js → "FLAG_NAME":"true"` + the URL operator should open |
-| "PR merged and deployed" | PR URL + merge timestamp + deploy SHA + container restart timestamp + `curl` of the new feature endpoint |
+| "Feature is live, you can test" | `curl https://prod/feature → HTTP 200` + `grep /_next/static/chunks/*.js → "FLAG_NAME":"true"` + the URL to open |
+| "PR merged and deployed" | PR URL + merge timestamp + deploy SHA + container restart timestamp + `curl` of the new endpoint |
 | "Backend endpoint works" | `curl -X POST https://api/route -d '{...}' → 200 {...}` |
-| "Sidebar entry visible" | bundle-grep for the flag value + a description of the role used + screenshot (or the assertion that the bundle inlined the value) |
+| "Sidebar entry visible" | bundle-grep for the flag value + the role used + screenshot (or the assertion the bundle inlined it) |
 
-If you can't produce the evidence, you don't ring the doorbell yet. You either:
-- Do the verify first, then ring with the output attached, OR
-- Ring with "X is *almost* ready — gate N of M still pending: [the missing verify]"
+No evidence → don't ring yet. Either verify first and ring with output attached, or ring with **"X is *almost* ready — gate N of M still pending: [the missing verify]"** — that framing is fine. Each false-positive ring burns doorbell credibility until the operator stops trusting the badge.
 
-**The "almost ready" framing is fine.** The banned shape is "X is ready" without evidence, because that ranks the operator's attention against a claim that may not hold. Each false-positive ring burns doorbell credibility; over a session, the operator stops trusting the badge.
+### 7.2 Multi-layer verify for "feature live"
 
-### 7.2 Multi-layer verify for "feature live" — the canonical chain
+> A feature isn't live until **every layer between source and user** is independently verified at the artifact that layer produces. Verify each at the layer's OWN artifact, not a dependency's.
 
-**The general principle (project-agnostic):**
+1. **Enumerate the layers** from source control to a user clicking: source merged; build artifact produced; build-time config baked (env inlined, flags compiled in); artifact distributed (registry/CDN/store/npm); runtime env configured; service running; gate logic resolves (auth, flag, role); user can reach the surface; user-visible behavior matches.
+2. **For EACH layer, the canonical probe** — the smallest check that interrogates that layer's own artifact.
+3. **Run every probe; attach every output to the doorbell.**
 
-> A feature isn't live until **every layer between source and user** is independently verified at the artifact that layer produces. Each layer is a separate failure surface; jointly they're sufficient, individually they're not. Verify each at the layer's OWN artifact, not at a dependency's artifact.
+**The trap:** verifying layer N+1 because it's cheaper and inferring layer N. **The most-skipped layer is build-time inlining** — wherever a value is baked into an artifact at build time, a runtime env-check is NOT the probe; the artifact is. (Examples: §7.2 anti-patterns.)
 
-For your specific project + feature kind, you need to:
-
-1. **Enumerate the layers** the feature passes through from source-control to a user clicking it. Common layer types:
-   - Source merged (PR / commit / release tag)
-   - Build artifact produced (compiled binary / built bundle / packaged container / published package)
-   - Build-time configuration baked (env vars inlined into the artifact, feature flags compiled in, native code linked)
-   - Artifact distributed (uploaded to registry / pushed to CDN / shipped to app store / published to npm)
-   - Runtime environment configured (env vars set, secrets mounted, config files placed, DNS pointed)
-   - Service running (process up, port listening, health endpoint green, app store live, package installed)
-   - Gate logic resolves correctly (auth check, feature flag, role check, A/B branch)
-   - User can reach the surface (URL responds / app opens / CLI command found)
-   - User-visible behavior matches expected (the actual artifact at the surface — UI element renders, response payload correct, command output correct)
-
-2. **For EACH layer, identify the canonical probe** — the smallest command/check that interrogates that layer's OWN artifact, not the one upstream of it.
-
-3. **Run every layer's probe; attach every output to the doorbell.**
-
-**The trap to avoid (recurring across many feature kinds):** verifying layer N+1 because it's cheaper, and inferring layer N. Examples of this anti-pattern:
-- Checking the env var is set on the running container (layer 5) and inferring the build-time-inlined client bundle has it (layer 3) — the container has the var but the already-built bundle doesn't. Banked 2026-05-23 (Next.js NEXT_PUBLIC_).
-- Checking the package is published to the registry (layer 4) and inferring downstream apps will resolve it (layer 8) — peer-deps or lockfiles can pin the old version.
-- Checking the container is running (layer 6) and inferring the route exists (layer 8) — a stale image can be running fine while missing the new route.
-- Checking the new column exists in the DB (layer 5) and inferring the code that uses it ships in the same deploy (layer 6) — schema + code can drift.
-- Checking the API responds (layer 8) and inferring the auth gate resolves correctly (layer 7) — a permissive default can mask a broken gate.
-
-### 7.2.1 Example protocol catalogue (extend per project)
-
-The general principle is universal; the specific probes are project-specific. Start from your project's existing patterns; add a protocol the first time you ship that kind of feature, refine it the next time. Three reference examples below — replace / extend with the protocols your stack actually needs.
-
-**Example A — Web app feature behind a flag (Next.js + Docker + Dokploy, monorepo-incluir):**
-1. PR merged → SHA + merge time
-2. Build args declared in Dockerfile → `grep "ARG NEXT_PUBLIC_FLAG" Dockerfile` (only NEXT_PUBLIC_ vars need build-arg wiring; server-only env vars skip this)
-3. Build args passed via docker-compose → `grep "build.args" docker-compose.yml | grep FLAG`
-4. Deploy completed → container restart timestamp
-5. Runtime env present (server-only flags) → `docker exec X env | grep FLAG`
-6. Build-time bake present (NEXT_PUBLIC_ flags) → `curl prod/_next/static/chunks/*.js | grep "FLAG":"true"` — the canonical layer-3 probe
-7. Route responds with auth → `curl prod/page → 200`
-8. Sidebar/nav surface renders → bundle-grep OR authenticated screenshot
-
-**Example B — Backend API endpoint (any HTTP service):**
-1. PR merged
-2. Deploy reached the running service (restart timestamp or revision id)
-3. Endpoint exists → `curl -I prod/api/route` → expected method-allowed status (not 404)
-4. Endpoint with auth → `curl -X POST -H "auth: ..." -d '...' prod/api/route` → expected payload shape
-5. Downstream side effects → live query of the DB / queue / log that should reflect the action
-
-**Example C — Library / SDK release (any package registry):**
-1. Version tag pushed
-2. Package published → registry shows the version (`npm view @org/pkg versions`, `cargo search`, `pip show`, etc.)
-3. Downstream consumer can resolve → in a fresh project: install the version, import a known-new symbol
-4. Downstream consumer's lockfile updated (peer-dep / engines / minimum-version constraint resolves correctly)
-5. Smoke test exercising the new symbol passes in the consumer
-
-**For your project's other feature kinds** — mobile app store release, native binary distribution, CLI tool, browser extension, scheduled job, message-queue consumer, IaC change, DNS change, etc. — file the protocol the FIRST time the feature kind ships, in this catalogue, with the same shape: layers + per-layer probe + canonical artifact. Future agents can then run the existing protocol instead of re-deriving it.
-
-### 7.2.2 The meta-rule for any feature kind
-
-> The verify chain for a feature must probe EVERY layer between source and user-visible behavior. The most-skipped layer is "build-time inlining" — anywhere a value gets baked into an artifact at build time, runtime env-check is NOT the right probe; the artifact itself is.
-
-If you don't have a protocol for the feature kind you just shipped, you're not ready to claim "live" — you're ready to author the protocol (in §7.2.1) and then run it. Future-you (and every other agent) gets the durable benefit.
+**Per-stack protocols** (Next.js flag behind Docker/Dokploy; backend endpoint; SDK release) live in `references/precedents.md` → §7.2.1 — run the existing one. No protocol for the feature kind you shipped? You're not ready to claim "live" — author it there first (layers + per-layer probe + canonical artifact), then run it.
 
 ### 7.3 Verify against ORIGIN/main, not your local checkout
 
-**Banked precedent: lz9y AI intake recon, 2026-05-23 — orchestrator grepped local working tree and concluded "frontend doesn't exist," then filed 3 duplicate beads as if greenfield. Vance's subagents caught the duplication, but only after wasted dispatches.**
+Before claiming "X is missing" or "X was never built," check canonical reality, not a stale mirror. (Precedent: §7.3 lz9y recon — three duplicate beads filed from a stale local grep.)
 
-Before claiming "X is missing" or "X was never built," verify against the CANONICAL reality, not a potentially-stale local mirror:
-
-- File-system claims → `git fetch && git ls-tree origin/main --name-only | grep X` (NOT `find ~/projects/X` on a possibly-stale local clone)
+- File-system claims → `git fetch && git ls-tree origin/main --name-only | grep X` (NOT `find` on a local clone)
 - Code-content claims → `git show origin/main:path/to/file` (NOT `cat` on local)
 - Deployed-state claims → curl the prod URL or `docker exec` on the live container (NOT the local dev server)
 - Bead-state claims → `bd list --status=open` after `bd dolt pull` (NOT a cached list from session start)
 
-If your local was last `git pull`'d more than ~1 hour ago, treat it as stale and `git fetch` before any claim about main's contents. The same recursion applies that Cipher and Atlas codified: "verify against reality" needs to be applied at the RIGHT artifact layer — local-stale-clone is not the reality you're claiming about.
+Local last pulled > ~1 hour ago → treat as stale; `git fetch` before any claim about main.
 
-### 7.4 Specialist agents: route operator-judgment questions through GLaDOS — don't block on your own pane
+### 7.4 Specialists: route operator-judgment questions through GLaDOS
 
-**Banked precedent (2026-07-27, eunenem product-catalog spec, aperture-26wof):** Wheatley hit a genuine ambiguity mid-recon (what does "product lists" mean — kits, categories, or both?) and surfaced it with a local interactive multi-choice prompt that blocked his own turn on his own tmux pane. That design assumes someone is physically attached to *his* window at that exact moment — nobody is, by default. The operator only learned the question existed because they separately asked GLaDOS "is Wheatley stuck?" and GLaDOS deep-peeked his pane manually (per `agent-liveness`). Had that prompt not come, the question could have sat blocked indefinitely with nothing signaling either GLaDOS or the operator that input was needed.
+**If you are a specialist:** operator-judgment questions go to GLaDOS via `send_message`, never to a blocking interactive prompt in your own pane. Her pane is the one surface the operator reads; yours is not. (Precedent: §7.4 eunenem 26wof — a question sat blocked on-screen, unnoticed.)
 
-**The rule, if you are a specialist agent (not GLaDOS):** operator-judgment questions go to GLaDOS via `send_message`, not to a local blocking UI element in your own pane. GLaDOS's pane is the one surface the operator is expected to actually read (§7 above); yours is not.
+- Genuine product/strategic ambiguity → `send_message(to: "glados", message: "<question + candidate answers>")`, note "blocked on operator input via GLaDOS" in the bead, pivot or wait.
+- Do NOT use a multi-choice/selector tool that blocks your turn waiting for a keypress in your pane — it resolves only if the operator happens to be attached to YOUR window.
+- GLaDOS relaying the answer (BEADS message, occasionally a keystroke relay into an open prompt) is the real go signal.
+- Exception: the operator is already attached to your pane and actively interacting with an on-screen prompt (`agent-liveness §4`) — a live human takes precedence. That's about not corrupting their input, not a license to design around them showing up.
 
-- Hit a genuine ambiguity that needs the operator's product/strategic judgment → `send_message(to: "glados", message: "<the question + the candidate answers>")`. Note it in the bead ("blocked on operator input via GLaDOS") and pivot to other work if you have any, or wait.
-- Do NOT use an interactive multi-choice/selector tool that blocks your own turn waiting for a keypress in your own pane. That pattern only resolves if the operator happens to be attached to YOUR window — not the default assumption anywhere else in this skill.
-- GLaDOS relaying the operator's answer back (BEADS message, or occasionally a keystroke relay into an already-open prompt) is the real signal to proceed — not a keystroke that silently arrives with no BEADS trail behind it.
-- Exception: if the operator has, in fact, directly attached to your pane and is actively interacting with an on-screen prompt (per `agent-liveness §4` — "mid-composition text from operator, do NOT send keys"), that's a live human already there, and it takes precedence. This exception is about not corrupting a human's live input if they showed up — not a license to design your workflow around them showing up.
-
-This is the specialist-side mirror of `aperture:agent-liveness` (GLaDOS's discipline for reading YOUR pane) — the operator's attention is a scarce, GLaDOS-mediated resource. Design your workflow assuming you'll never have direct access to it, not assuming you might.
+Mirror of `aperture:agent-liveness` (GLaDOS reading YOUR pane): the operator's attention is scarce and GLaDOS-mediated. Design assuming you never have direct access to it.
 
 ---
 
 ## 8. Codex Agents
 
-> **If you are a Codex agent** (your model starts with `codex/`), everything in this skill applies to you directly: Codex agents now call the aperture-bus MCP tools themselves — `send_message`, `get_messages`, `mark_as_read`, and the BEADS task tools. Inbound messages arrive as injected turns via the app-server bridge; process them, then acknowledge with `mark_as_read` like any other agent.
->
-> See the rewritten `codex-comms` skill for Codex-specific mechanics (bridge behavior, turn injection, MCP registration). The old `@@BEADS@@` pane-scraping protocol is **retired** — never emit that command-block pattern; it is no longer intercepted by anything.
+If your model starts with `codex/`, everything here applies directly: you call `send_message`, `get_messages`, `mark_as_read`, and the BEADS task tools yourself; inbound messages arrive as injected turns via the app-server bridge — process, then `mark_as_read`. Mechanics in `codex-comms`. The old `@@BEADS@@` pane-scraping protocol is **retired** — never emit it.
 
 ---
 
 ## 9. Don't Spam
 
-- Don't send the same update twice
-- Don't update BEADS every 5 minutes unless something changed
-- DO update BEADS if a task is taking longer than expected
-- DO update BEADS immediately if you're blocked — silence is worse than a blocker report
-- One BEADS update per significant milestone, not per line of code
+- Don't send the same update twice; don't update every 5 minutes unless something changed.
+- DO update when a task runs longer than expected; DO update immediately when blocked — silence is worse than a blocker report.
+- One BEADS update per significant milestone, not per line of code.

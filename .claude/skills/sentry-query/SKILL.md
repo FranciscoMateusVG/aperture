@@ -64,7 +64,7 @@ for p in json.load(sys.stdin):
 |---|---|---|---|
 | Incluir (Next.js + hono-app, single Sentry project) | `incluir` | `4511379852296192` | `javascript-nextjs` |
 
-> **Single-project setup as of 2026-05-13.** The whole monorepo currently reports under one `incluir` project — both the frontend Server Actions/SSR layer (node platform) and any future browser-SDK telemetry land in the same Sentry project, distinguished by the event's `platform` and `tags.runtime`. EuNeném v2 does **not** have a Sentry project yet; if/when it does, add a row here in the same PR that wires up the SDK.
+> **Single-project setup (last verified 2026-05-13 — re-check before relying on this).** The whole monorepo reported under one `incluir` project at that time — both the frontend Server Actions/SSR layer (node platform) and any future browser-SDK telemetry land in the same Sentry project, distinguished by the event's `platform` and `tags.runtime`. EuNeném v2 does **not** have a Sentry project yet; if/when it does, add a row here in the same PR that wires up the SDK.
 >
 > Re-run the lookup curl above whenever a new project is added and update this table via PR. The table is the canonical reference; if it disagrees with what the API returns, the API wins and the table is stale.
 

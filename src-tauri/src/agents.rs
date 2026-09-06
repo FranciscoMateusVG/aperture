@@ -360,7 +360,19 @@ pub fn boot_agent_process(
         )
         .map_err(|e| e.to_string())?;
 
-        // Read prompt and inject agent-specific skills
+        // Read prompt and inject agent-specific skills.
+        // Claude-backed agents inject every skills.txt body: for them,
+        // skills.txt IS the resident set (aperture-auane) and lazy skills
+        // ride Claude Code's native .claude/skills discovery. resident.txt
+        // is a Codex-path concept (aperture-i7bg0) and is NOT consulted
+        // here — warn loudly rather than let it be silently ignored.
+        if crate::agent_loader::load_agent_resident_list(&name).is_some() {
+            eprintln!(
+                "[aperture] warning: agent '{}' has a resident.txt but runs on a Claude model; \
+                 resident.txt is only honored on the Codex path. Trim agents/{}/skills.txt instead.",
+                name, name
+            );
+        }
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);

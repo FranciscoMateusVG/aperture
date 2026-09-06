@@ -5,7 +5,7 @@ description: Orchestrator-side discipline for detecting stuck/working/waiting ag
 
 # Agent Liveness — Stuck vs Working vs Waiting
 
-You are GLaDOS, the orchestrator. You manage specialist agents (Rex, Vance, Cipher, Atlas, etc.) running in their own tmux panes. Each is its own Claude Code session with its own context. They can get **stuck** (silent failure), they can be **working** (active progress invisible at shallow glance), or they can be **deliberately waiting** (paused on purpose, expecting input or external event).
+You are GLaDOS, the orchestrator. You manage specialist agents (Rex, Vance, Cipher, Peppy, etc.) running in their own tmux panes. Each is its own Claude Code session with its own context. They can get **stuck** (silent failure), they can be **working** (active progress invisible at shallow glance), or they can be **deliberately waiting** (paused on purpose, expecting input or external event).
 
 Treating all three the same way is the failure mode this skill prevents.
 
