@@ -5,6 +5,10 @@ export interface AgentDef {
   prompt_file: string;
   tmux_window_id: string | null;
   status: string; // "stopped" | "running" | "error"
+  /** Manifest `emoji` (agents/<name>/manifest.json), passed through by
+   *  agent_loader.rs. null/absent when the manifest has none — the card
+   *  falls back to its built-in theme map, then a generic gear. */
+  emoji?: string | null;
   /** Notification badge — set by the backend when this agent calls
    *  `send_message(to: "operator", ...)`. Cleared when the operator clicks
    *  the agent's row in the launcher. There is no chat panel; the

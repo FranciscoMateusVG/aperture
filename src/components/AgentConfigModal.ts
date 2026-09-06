@@ -1,32 +1,31 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
+import { escapeHtml } from "../utils/html";
 
 // value = what the CLI accepts; label = what the operator sees.
 // Claude aliases resolve to the current generation (fable → Fable 5, sonnet → Sonnet 5, haiku → Haiku 4.5, opus → Opus 4.8).
+//
+// This list is the single source of the Claude aliases the launcher offers.
+// The backend validator (agents.rs::is_valid_model) must accept exactly these;
+// its `picker_and_validator_agree` test parses the `value:` entries below at
+// test time, so adding/removing an alias here without updating the Rust side
+// fails `cargo test` rather than silently 400-ing on Save.
 const CLAUDE_MODELS = [
   { value: "fable", label: "fable 5" },
   { value: "sonnet", label: "sonnet 5" },
   { value: "haiku", label: "haiku 4.5" },
   { value: "opus", label: "opus 4.8" },
 ] as const;
-// GPT-5.6 celestial family (live catalog 2026-07-19)
+// GPT-5.6 celestial family (live catalog 2026-07-19); gpt-6-astra added
+// 2026-09-06 as the new default Codex model (source: operator's
+// ~/.codex/config.toml `model = "gpt-6-astra"`). First entry = default.
 const CODEX_MODELS = [
+  { value: "codex/gpt-6-astra", label: "gpt-6-astra" },
   { value: "codex/gpt-5.6-sol", label: "gpt-5.6-sol" },
   { value: "codex/gpt-5.6-terra", label: "gpt-5.6-terra" },
   { value: "codex/gpt-5.6-luna", label: "gpt-5.6-luna" },
 ] as const;
 const ALL_MODELS = [...CLAUDE_MODELS, ...CODEX_MODELS].map(m => m.value);
-
-// Agent name and the two model strings land in innerHTML for the restart
-// prompt — escape them. Everything else in the template is a closed set.
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 export interface AgentConfigModal {
   open: (agent: AgentDef) => void;

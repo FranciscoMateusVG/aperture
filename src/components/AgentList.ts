@@ -4,6 +4,7 @@ import { createAgentCard } from "./AgentCard";
 import type { CardLifecycle } from "./AgentCard";
 import { createAgentConfigModal } from "./AgentConfigModal";
 import { deriveDotState, deriveStateChip } from "../services/hub-presence";
+import { sortAgents } from "../services/roster";
 
 type PendingOp = NonNullable<AgentDef["op_pending"]>;
 
@@ -218,13 +219,7 @@ export function createAgentList(container: HTMLElement) {
       return;
     }
     setBackendUp();
-    const order = ["glados", "wheatley", "peppy", "izzy"];
-    agents.sort((a, b) => {
-      const ai = order.indexOf(a.name);
-      const bi = order.indexOf(b.name);
-      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
-    });
-    lastAgents = agents;
+    lastAgents = sortAgents(agents);
     render();
   }
 

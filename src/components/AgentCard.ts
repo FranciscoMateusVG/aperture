@@ -2,7 +2,11 @@ import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
 import { deriveDotState, dotTooltip, deriveWorkSummary, deriveStateChip } from "../services/hub-presence";
 import type { AgentConfigModal } from "./AgentConfigModal";
+import { escapeHtml } from "../utils/html";
 
+// Colour is launcher-owned (manifests carry no colour). The icon is only a
+// fallback: a manifest `emoji` wins when the backend passes one through
+// (agent_loader.rs), so a new agent gets its own glyph without a code change.
 const AGENT_THEME: Record<string, { icon: string; color: string }> = {
   glados:    { icon: "🤖", color: "#9b59b6" },  // purple   — orchestrator
   wheatley:  { icon: "💡", color: "#3498db" },  // blue     — planning & research
@@ -23,16 +27,9 @@ const DEFAULT_THEME = { icon: "⚙️", color: "#f39c12" };
 // including, transitively, user-submitted report titles via the AI-intake
 // pipeline (aperture:incluir-intake-to-bead). Unlike agent.name/agent.model
 // (constrained to a fixed manifest list), a bead title is free text, so it
-// gets escaped before landing in innerHTML. Everything else already
-// interpolated in this file's template comes from a closed, trusted set.
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
+// gets escaped (utils/html.ts) before landing in innerHTML. Everything else
+// already interpolated in this file's template comes from a closed, trusted
+// set.
 
 /** Lifecycle ops are owned by AgentList (aperture-ull4y): it holds the
  *  per-agent in-flight lock, merges it into `op_pending`, routes failures
@@ -64,6 +61,7 @@ export function createAgentCard(
 ): HTMLElement {
   const card = document.createElement("div");
   const theme = AGENT_THEME[agent.name] ?? DEFAULT_THEME;
+  const icon = agent.emoji || theme.icon;
   render();
 
   function render() {
@@ -127,7 +125,7 @@ export function createAgentCard(
     const disabled = pending ? " disabled" : "";
     card.innerHTML = `
       <div class="agent-mini__row">
-        <span class="agent-mini__icon">${theme.icon}${presenceDot}</span>
+        <span class="agent-mini__icon">${icon}${presenceDot}</span>
         <span class="agent-mini__name">${agent.name}</span>
         ${badge}
         ${stateSlot}
