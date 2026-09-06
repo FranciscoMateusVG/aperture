@@ -1,0 +1,13 @@
+# RESIDENT SET (aperture-trgpo, 2026-09-06) — full bodies force-injected into prompt.md.
+# Everything else in skills.txt stays available lazily via Codex's native
+# $CODEX_HOME/skills catalog (name+description at boot, body read on demand).
+# Residency = always-active behavioral norms; reference/gotcha skills stay lazy.
+# orchestrator-core is the rules-only merge of watch-protocol, glados-loop,
+# agent-liveness, cost-proportional-orchestration and subagents (DECISIONS.md
+# governs where they disagree); the five originals stay lazily invocable.
+communicate
+team
+beads
+worktree-discipline
+specialist-delegation
+orchestrator-core

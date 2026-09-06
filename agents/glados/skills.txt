@@ -1,27 +1,30 @@
-# RESIDENT SET ONLY (aperture-auane, 2026-08-02). Skills here get their FULL
-# body force-injected into the boot system prompt on every session — this
-# list should stay small. Everything else GLaDOS used to carry resident
-# (deploy-workflow, incluir-intake-to-bead, scope-from-artifact,
-# pocketsoftware-infra, spec-deviation-discipline, research-artifact-placement,
-# e2e-catches-what-lower-cant, dont-model-phantom-cases,
-# observability-as-evidence, surface-fetch-errors, read-shape-not-line,
-# walk-the-route, name-the-blast-radius, hold-the-dependent-merge,
-# two-id-spaces, filed-p2-becomes-prereq, grep-before-spec,
-# stacked-pr-verification) was cut. Confirmed empirically (not assumed) that
-# Claude Code's native Skill-tool discovery is independent of this file — it
-# scans project + user-level .claude/skills/ on its own, so every cut skill
-# stays fully invocable on demand, it just isn't force-loaded at boot.
-# Before re-adding anything here, ask: does this need to be active on
-# literally every turn, or would "invoke it when relevant" (which the
-# using-superpowers mandate already requires) cover it? If the latter,
-# it belongs in .claude/skills/ discoverable-only, not here.
+# RESIDENT SET ONLY (aperture-auane, 2026-08-02; trimmed again aperture-trgpo,
+# 2026-09-06). Skills here get their FULL body force-injected into the boot
+# system prompt on every session — this list should stay small. Everything
+# else GLaDOS used to carry resident (deploy-workflow, incluir-intake-to-bead,
+# scope-from-artifact, pocketsoftware-infra, spec-deviation-discipline,
+# research-artifact-placement, e2e-catches-what-lower-cant,
+# dont-model-phantom-cases, observability-as-evidence, surface-fetch-errors,
+# read-shape-not-line, walk-the-route, name-the-blast-radius,
+# hold-the-dependent-merge, two-id-spaces, filed-p2-becomes-prereq,
+# grep-before-spec, stacked-pr-verification) was cut on 2026-08-02.
+# 2026-09-06 (context diet, spec docs/superpowers/specs/2026-09-06-context-diet-
+# design.md §1): watch-protocol, glados-loop, agent-liveness,
+# cost-proportional-orchestration and subagents (86.8 KiB together) are
+# replaced by orchestrator-core (their rules-only, deduplicated merge; its
+# DECISIONS.md governs where the originals disagree). The five originals stay
+# lazily invocable — resident bytes go from 143.0 KiB to ~79.5 KiB.
+# Confirmed empirically (not assumed) that Claude Code's native Skill-tool
+# discovery is independent of this file — it scans project + user-level
+# .claude/skills/ on its own, so every cut skill stays fully invocable on
+# demand, it just isn't force-loaded at boot. Before re-adding anything here,
+# ask: does this need to be active on literally every turn, or would "invoke
+# it when relevant" (which the using-superpowers mandate already requires)
+# cover it? If the latter, it belongs in .claude/skills/ discoverable-only,
+# not here. On the Codex path resident.txt (same six) is the resident list.
 communicate
 team
 beads
 worktree-discipline
 specialist-delegation
-watch-protocol
-glados-loop
-agent-liveness
-subagents
-cost-proportional-orchestration
+orchestrator-core
