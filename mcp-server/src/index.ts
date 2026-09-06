@@ -8,6 +8,7 @@ import { MessageQueue } from "./message-queue.js";
 import { formatUpdateAck, formatCloseAck, createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, formatUnreadMessages, UNREAD_LIMIT, markMessageRead, extractTaskId } from "./beads.js";
 import { notifyHub } from "./hub-notify.js";
 import { presenceReport, describePresence, type PresenceReport } from "./presence-snapshot.js";
+import { buildIndex, recall, recallFull, recallStats, RECALL_K_MAX, RECALL_FULL_MAX_BYTES } from "./memory-index.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
 if (!AGENT_NAME) {
@@ -497,6 +498,120 @@ server.tool(
     try {
       const updated = updateObjectiveFile(id, { title, description, spec, status, priority, task_ids });
       return { content: [{ type: "text", text: `Objective ${id} updated. Status: ${updated.status}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// ── Memory recall (aperture-trgpo — context diet §4) ──
+//
+// Three read-only tools over the indexed memory bank. buildIndex() is called
+// uncached on every invocation ON PURPOSE: memory-index.ts owns the cache and
+// re-hashes bank+sidecar per call, so a new memory or a sidecar edit is picked
+// up immediately without a server restart. Every string these tools return
+// has already been through redact() inside memory-index.ts; secret-tagged
+// entries never reach this layer at all.
+
+const RECALL_INDEX_UNAVAILABLE = "ERROR: memory index unavailable";
+
+function formatAge(ageDays: number | null): string {
+  return ageDays === null ? "age?" : `${ageDays}d`;
+}
+
+function formatTags(tags: string[], standing: boolean): string {
+  const all = standing ? ["standing", ...tags] : tags;
+  return all.length ? all.join(",") : "-";
+}
+
+server.tool(
+  "recall",
+  "Search the BEADS memory bank (BM25 over key + body) and return a ranked list of matching memories — one line per hit: `key · score · age · tags · gist` — followed by a footer `total=N next_offset=M index_built_at=…`. Returns ≤12-word gists only, never bodies; call recall_full(key) for the text. Every gist is redacted (API keys, tokens, passwords, PEM blocks, drawer paths → [REDACTED]) and memories tagged secret are excluded entirely. Superseded memories are hidden unless include_superseded=true; standing decisions rank higher; entries older than 90 days rank lower. Errors with `ERROR: memory index unavailable: …` when bd or the index cannot be read — it never falls back to dumping the bank.",
+  {
+    query: z.string().min(2).describe("Free-text query — bead ids, hostnames, env var names and PR numbers match exactly; prose is ranked by BM25"),
+    k: z.number().int().min(1).max(RECALL_K_MAX).optional().describe(`Results per page, 1..${RECALL_K_MAX} (default 5)`),
+    offset: z.number().int().min(0).optional().describe("Skip this many ranked results (paging; use the footer's next_offset)"),
+    project: z.string().optional().describe("Only memories whose sidecar project matches (e.g. aperture, incluir)"),
+    tags: z.array(z.string()).optional().describe("Only memories carrying ALL of these sidecar tags"),
+    include_superseded: z.boolean().optional().describe("Also return memories that a newer memory supersedes (never reveals secret-tagged ones)"),
+  },
+  async ({ query, k, offset, project, tags, include_superseded }) => {
+    let idx;
+    try {
+      idx = await buildIndex();
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `${RECALL_INDEX_UNAVAILABLE}: ${e?.message ?? String(e)}` }], isError: true };
+    }
+    try {
+      const r = recall(idx, { query, k, offset, project, tags, include_superseded });
+      const lines = r.items.map((it) => {
+        const line = `${it.key} · ${it.score.toFixed(2)} · ${formatAge(it.ageDays)} · ${formatTags(it.tags, it.standing)} · ${it.gist}`;
+        return it.supersededBy ? `${line} (superseded by ${it.supersededBy})` : line;
+      });
+      if (lines.length === 0) lines.push("(no matches)");
+      lines.push(`total=${r.total} next_offset=${r.next_offset ?? "none"} index_built_at=${r.index_built_at}`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "recall_full",
+  "Return one memory's full body by key (from a recall hit or the boot index). Reply = a one-line header `key · bytes_total=N · truncated=yes|no · supersedes=… · superseded_by=…` then the body. The body is redacted (API keys, tokens, passwords, PEM blocks, drawer paths → [REDACTED]) and truncated to max_bytes with a trailing notice when longer. Memories tagged secret are never returned: unknown and secret-excluded keys both answer `ERROR: no such memory (or it is secret-excluded): <key>`.",
+  {
+    key: z.string().min(1).describe("Memory key, exactly as shown by recall or the boot index"),
+    max_bytes: z.number().int().min(256).max(RECALL_FULL_MAX_BYTES).optional().describe(`Truncate the body to this many bytes, 256..${RECALL_FULL_MAX_BYTES} (default ${RECALL_FULL_MAX_BYTES})`),
+  },
+  async ({ key, max_bytes }) => {
+    let idx;
+    try {
+      idx = await buildIndex();
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `${RECALL_INDEX_UNAVAILABLE}: ${e?.message ?? String(e)}` }], isError: true };
+    }
+    try {
+      const r = recallFull(idx, key, max_bytes);
+      if (r === null) {
+        return { content: [{ type: "text", text: `ERROR: no such memory (or it is secret-excluded): ${key}` }], isError: true };
+      }
+      const header = [
+        r.key,
+        `bytes_total=${r.bytesTotal}`,
+        `truncated=${r.truncated ? "yes" : "no"}`,
+        `supersedes=${r.supersedes.length ? r.supersedes.join(",") : "-"}`,
+        `superseded_by=${r.supersededBy ?? "-"}`,
+      ].join(" · ");
+      return { content: [{ type: "text", text: `${header}\n${r.body}` }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "recall_stats",
+  "Sanitised counts about the memory index, for audits: total vs live entries, standing decisions, superseded, secret-excluded, redacted spans, counts by project and by tag, index build time and cache age. Returns counts only — no bodies, no gists, and never the keys of secret-tagged memories.",
+  {},
+  async () => {
+    let idx;
+    try {
+      idx = await buildIndex();
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `${RECALL_INDEX_UNAVAILABLE}: ${e?.message ?? String(e)}` }], isError: true };
+    }
+    try {
+      const s = recallStats(idx);
+      const kv = (o: Record<string, number>) =>
+        Object.keys(o).length ? Object.entries(o).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join(" ") : "-";
+      const text = [
+        `total=${s.total} live=${s.live} standing=${s.standing} superseded=${s.superseded} secret_excluded=${s.secretExcluded} redacted_spans=${s.redactedSpans}`,
+        `index_built_at=${s.index_built_at} cache_age_seconds=${s.cache_age_seconds ?? "none"}`,
+        `by_project: ${kv(s.byProject)}`,
+        `by_tag: ${kv(s.byTag)}`,
+      ].join("\n");
+      return { content: [{ type: "text", text }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
