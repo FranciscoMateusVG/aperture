@@ -1,0 +1,2996 @@
+{
+    "a-zero-result-query-is-not-evidence-of": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "observability",
+            "discipline",
+            "security"
+        ],
+        "updated": "2026-08-13"
+    },
+    "absence-of-a-correlate-in-one-telemetry-layer": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "observability",
+            "discipline"
+        ],
+        "updated": "2026-08-13"
+    },
+    "agent-liveness-discipline-operator-directed-2026-05-23": {
+        "entities": [],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Operator-directed 2026-05-23. As orchestrator: (1) proactively deep-peek (tail -40, not -3) any agent on a claimed task that has not moved per tick visibility; (2) classify stuck vs working vs deliberately-waiting from scrollback, thinking indicator, context-bar motion and last self-message; (3) on API-error symptoms re-send the BEADS message (Anthropic drops silently); (4) on real hangs ask the operator for Ctrl+C; (5) NEVER re-ping an agent deliberately paused awaiting operator-only action. Never treat 'no motion' as 'fine'.",
+        "supersedes": [],
+        "tags": [
+            "process",
+            "watchdog",
+            "discipline"
+        ],
+        "updated": "2026-05-23"
+    },
+    "anti-phantom-nonce-gate-2026-06-25-glados": {
+        "entities": [
+            "#533",
+            "#543",
+            "#548",
+            "#547",
+            "#546"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "security",
+            "discipline"
+        ],
+        "updated": "2026-06-25"
+    },
+    "anti-phantom-nonce-replayable-verify-artifacts": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "security",
+            "discipline"
+        ],
+        "updated": "2026-06-26"
+    },
+    "aperture-codex-presence-dots-go-gray-because-compute": {
+        "entities": [
+            "#46",
+            "~/.aperture/run/"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "codex",
+            "watchdog"
+        ]
+    },
+    "aperture-gui-launch-path-starvation-aperture-3x136-fixed": {
+        "entities": [
+            "aperture-3x136",
+            "#46"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "aperture-gui-path-starvation-root-cause-aperture-3x136"
+        ],
+        "tags": [
+            "launcher",
+            "infra"
+        ],
+        "updated": "2026-07-19"
+    },
+    "aperture-gui-path-starvation-root-cause-aperture-3x136": {
+        "entities": [
+            "aperture-3x136",
+            "#46"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "launcher",
+            "infra"
+        ],
+        "updated": "2026-07-19"
+    },
+    "aperture-hub-self-heal-pr-46-ws-hub": {
+        "entities": [
+            "#46"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hub",
+            "comms"
+        ]
+    },
+    "aperture-operator-standing-decision-2026-07-19-aperture": {
+        "entities": [
+            "aperture-b6ofj"
+        ],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Operator standing decision 2026-07-19: aperture-b6ofj (incluir prod BETTER_AUTH_SECRET is the framework default placeholder; session tokens forgeable; account takeover confirmed by Cipher) is CLOSED as risk-accepted by operator order. Do not re-file, re-surface, or escalate it; the operator has explicitly deferred rotation. Cipher's evidence is banked in the bead history. Reopen only if the operator directly asks.",
+        "supersedes": [],
+        "tags": [
+            "security",
+            "credentials",
+            "process",
+            "incluir"
+        ],
+        "updated": "2026-07-19"
+    },
+    "aperture-session-handoff-2026-07-19-comms-boot": {
+        "entities": [
+            "aperture-pmzoc",
+            "aperture-1iqpn",
+            "#47",
+            "#46"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "comms",
+            "hub",
+            "process"
+        ],
+        "updated": "2026-07-19"
+    },
+    "backticks-in-shell-args-execute-2026-08-28": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "discipline"
+        ],
+        "updated": "2026-08-28"
+    },
+    "backup-cron-silent-failure-modes-2026-07-18": {
+        "entities": [
+            "/opt/homebrew/bin"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "observability",
+            "incluir"
+        ],
+        "updated": "2026-07-18"
+    },
+    "bd-dolt-status-gives-a-false-negative-from": {
+        "entities": [
+            "~/projects/aperture"
+        ],
+        "project": "beads-galaxy",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "dolt",
+            "beads"
+        ],
+        "updated": "2026-08-10"
+    },
+    "beads-store-artifact-mcp-tool-overwrites-the-entire": {
+        "entities": [
+            "aperture-4ufd"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "beads"
+        ],
+        "updated": "2026-05-10"
+    },
+    "build-time-vs-runtime-env-verify-at-artifact-not-process": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "discipline"
+        ],
+        "updated": "2026-05-23"
+    },
+    "cascade-discipline-reliability-through-redundancy-not-indivi": {
+        "entities": [
+            "aperture-xmwe"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "review"
+        ],
+        "updated": "2026-05-10"
+    },
+    "certificados-c1-578-hono-route-base-path-is": {
+        "entities": [
+            "#578"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "incluir"
+        ],
+        "updated": "2026-07-17"
+    },
+    "chat-waha-ai-migrated-to-pocketsoftware-2026-07-30": {
+        "entities": [
+            "aperture-vsr9k",
+            "aperture-c6w9n",
+            "aperture-dk8q3",
+            "pocketsoftware.com.br",
+            "waha.pocketsoftware.com.br"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "dokploy",
+            "infra",
+            "incluir"
+        ],
+        "updated": "2026-07-30"
+    },
+    "cipher-inbound-message-delivery-broken-2026-06-28": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "comms",
+            "hub"
+        ],
+        "updated": "2026-06-28"
+    },
+    "cipher-security-rulings-on-banco-inter-credentials-2026": {
+        "entities": [
+            "INTER_COB_ESCROW_NOTE"
+        ],
+        "project": "eunenem",
+        "standing": true,
+        "standing_text": "Cipher rulings 2026-08-23, formal, binding until re-reviewed; both production-only. (1) COBRANCA credential (INTER_COB_*) must not exist in staging in any form, secret store included. (2) PAYOUT credential (INTER_*, holds pagamento-pix.write) is formally prod-only; reusing it outside prod, even for pre-release validation, needs a fresh explicit security review; convenience is not sufficient. Validate instead: staging E2E against the FAKE provider, then ONE bounded real-Inter smoke in prod on go-live day (scope probe + negative control, one tagged minimal unpaid charge, verify through expiry).",
+        "supersedes": [],
+        "tags": [
+            "security",
+            "credentials",
+            "inter",
+            "eunenem"
+        ],
+        "updated": "2026-08-23"
+    },
+    "cipher-verify-reality": {
+        "entities": [
+            "aperture-pyco",
+            "aperture-w6mx"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "review",
+            "security",
+            "discipline"
+        ],
+        "updated": "2026-05-10"
+    },
+    "cli-bd-update-id-notes-replaces-the-notes": {
+        "entities": [
+            "aperture-t947k"
+        ],
+        "project": "beads-galaxy",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "beads"
+        ],
+        "updated": "2026-07-16"
+    },
+    "close-tag-footgun-bit-me-on-ordb-close-2026-05-22": {
+        "entities": [
+            "aperture-ordb"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "beads",
+            "discipline"
+        ],
+        "updated": "2026-05-22"
+    },
+    "comms-v2-first-boot-test-passed-2026-07": {
+        "entities": [
+            "aperture-syepg",
+            "aperture-1qwty",
+            "~/.aperture/agent-config.json"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "comms",
+            "hub",
+            "testing"
+        ],
+        "updated": "2026-07-19"
+    },
+    "container-createdat-is-not-proof-that-a-deploy": {
+        "entities": [
+            "aperture-4wl1n",
+            "#766",
+            "#765",
+            "/etc/dokploy"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "dokploy",
+            "discipline"
+        ],
+        "updated": "2026-08-12"
+    },
+    "contract-pinning-4-layer-defense": {
+        "entities": [
+            "aperture-b21b",
+            "#381"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "review",
+            "testing",
+            "incluir"
+        ],
+        "updated": "2026-05-24"
+    },
+    "correction-2026-08-23-to-eunenem-pix-rail": {
+        "entities": [
+            "aperture-a4pqt",
+            "#64",
+            "INTER_COB_CLIENT_ID"
+        ],
+        "project": "eunenem",
+        "standing": true,
+        "standing_text": "Correction 2026-08-23 (operator via GLaDOS; live-verified). (1) Never recommend a Stripe support request for pix_payments on eunenem: Stripe PIX was deliberately abandoned after repeated refusals; PIX collection is Banco Inter COBRANCA, Stripe keeps cards only. (2) The prod Inter app already grants cob.write/cob.read/pix.read; a separate cobranca app is justified only by least privilege (it also holds pagamento-pix.write). Get Cipher's call before merging INTER_COB_* into INTER_*; a new app gets cobranca + webhook scopes only. (3) PR #64: Cipher PASSED at 4ef22cd; only Izzy's E2E gate is open.",
+        "supersedes": [
+            "eunenem-pix-rail-disambiguation-prod-stripe-pix-blocked"
+        ],
+        "tags": [
+            "eunenem",
+            "stripe",
+            "inter",
+            "process"
+        ],
+        "updated": "2026-08-23"
+    },
+    "cost-shield-not-rate-shield": {
+        "entities": [
+            "aperture-r70r",
+            "#367"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-05-24"
+    },
+    "credential-cleanup-ordering-peppy-error-2026-08-11": {
+        "entities": [
+            "new.programaincluir.org",
+            "app.programaincluir.org"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "credentials",
+            "security",
+            "playwright",
+            "incluir"
+        ],
+        "updated": "2026-08-11"
+    },
+    "credential-drawer-plaintext-read-ban-2026-08-28": {
+        "entities": [
+            "aperture-12wk",
+            "OPENAI_API_KEY"
+        ],
+        "project": "general",
+        "standing": true,
+        "standing_text": "Cipher interim rule 2026-08-28, BINDING pending operator ack; valid while aperture-12wk (per-consumer keys) is the active fix: migrate per consumer, verify each, revoke shared key LAST. (1) No agent self-service reads of plaintext credential drawers: never pull VALUES via model-visible tools (mempalace_search/get_drawer, cat of a secrets file, any path into model context). (2) Deliver only via a non-model path, secret store to allowlisted destination, fingerprint-only receipt; if none exists the operation WAITS, do not improvise. (3) Helper spec: logical secret name + allowlisted destination/action only; NO arbitrary read/print mode; value never in stdout/stderr/argv/shell history/logs; atomic write, restrictive perms, fail-closed. (4) Never redact ~/.claude transcripts in place; delete /tmp scratch copies only after verified inactivity; report COUNTS AND FINGERPRINTS ONLY, never paths with plaintext. (5) Rotate immediately if: a transcript/support bundle leaves the trusted machine; enters broader-readership backups; permissions drift; any compromise evidence. (6) rm -P on APFS is not shredding: claim 'zero namespace-visible matches after verified inactivity', never 'shredded'.",
+        "supersedes": [],
+        "tags": [
+            "credentials",
+            "security",
+            "process"
+        ],
+        "updated": "2026-08-28"
+    },
+    "credential-hygiene-must-cover-the-whole-task-blast": {
+        "entities": [
+            "DATABASE_URL"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "credentials",
+            "security",
+            "eunenem"
+        ],
+        "updated": "2026-08-24"
+    },
+    "deploy-order-inflight-external-state": {
+        "entities": [
+            "#347",
+            "#343",
+            "#348"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "git",
+            "eunenem"
+        ],
+        "updated": "2026-07-08"
+    },
+    "deploy-time-failure-classes": {
+        "entities": [
+            "aperture-we2f",
+            "aperture-25lw",
+            "aperture-s43y",
+            "aperture-vdzb"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "dokploy",
+            "incluir"
+        ],
+        "updated": "2026-05-24"
+    },
+    "docker-up-n-months-unhealthy-masks-a-dead": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "observability"
+        ],
+        "updated": "2026-08-10"
+    },
+    "dokploy-inflight-build-looks-like-orphaned-deploy": {
+        "entities": [
+            "#848",
+            "/etc/dokploy/compose/"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "dokploy",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-08-28"
+    },
+    "dokploy-p0-crossorg-write-bypass-DEFERRED-2026-08-28": {
+        "entities": [
+            "aperture-b6ofj"
+        ],
+        "project": "incluir",
+        "standing": true,
+        "standing_text": "Dokploy P0 cross-org write bypass on xerox (a valid cross-org token denied read on a compose can still persist a write; tcp/3000 public v4+v6; say 'a valid cross-org token', never 'any token', pending endpoint audit). Containment prepared but DEFERRED by operator 2026-08-28, risk explicitly accepted after full briefing. Do not re-escalate or re-ping; the operator will raise it himself (precedent aperture-b6ofj). When applied: Cipher-passed DOCKER-USER scripts (UFW is not the control; cover IPv6; NO terraform apply; reconcile OCI security list separately, AFTER containment). Cipher's six verifications, evidence per item, never a summary claim: v4+v6 tcp/3000 unreachable from non-GitHub; tailnet admin/API works; 80/443 unchanged; one real webhook deploy; persistence via Docker restart AND host reboot; monitor on re-exposure/CIDR drift. Persistence tests bounce prod: operator-approved window required. Drift monitoring is ALERT ONLY, never auto-applied. Landed write stays (only the auth path was wrong). Durable fix still OPEN: separate webhook ingress from admin API, server-side org authz on every mutation endpoint, two-org regression tests, audit historical writes; token rotation SECONDARY.",
+        "supersedes": [],
+        "tags": [
+            "security",
+            "dokploy",
+            "process"
+        ],
+        "updated": "2026-08-28"
+    },
+    "doorbell-discipline-mesh-pays-out": {
+        "entities": [
+            "#380",
+            "#383",
+            "#381",
+            "#384"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-05-24"
+    },
+    "e2e-spec-formatting-falls-outside-ci-run-biome": {
+        "entities": [
+            "aperture-zn1ud",
+            "#381",
+            "#384"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "e2e",
+            "playwright",
+            "git",
+            "eunenem"
+        ],
+        "updated": "2026-07-10"
+    },
+    "engine-eunenem-repo-origin-staging-is-the-source": {
+        "entities": [
+            "aperture-5b9i8",
+            "aperture-sm7uc"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "eunenem"
+        ],
+        "updated": "2026-06-23"
+    },
+    "engine-migration-prefix-collision-and-branch-time-tip-check": {
+        "entities": [
+            "aperture-3vc12",
+            "#359",
+            "#368"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "deploy",
+            "eunenem"
+        ],
+        "updated": "2026-07-09"
+    },
+    "engine-migration-roundtrip-test-tip-coupling": {
+        "entities": [
+            "aperture-ypmyb",
+            "#285",
+            "#283"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "eunenem"
+        ],
+        "updated": "2026-06-26"
+    },
+    "engine-repo-remote-inversion-mirror-is-canonical": {
+        "entities": [
+            "~/projects/engine"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "eunenem"
+        ],
+        "updated": "2026-07-18"
+    },
+    "eunen-m-2-0-stripe-setup-state-2026": {
+        "entities": [
+            "aperture-cex5l",
+            "aperture-d9492",
+            "aperture-akefl",
+            "eunenem.test.pocketsoftware.com.br",
+            "INTER_EXTRATO_VERIFIED"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "stripe",
+            "credentials",
+            "eunenem"
+        ],
+        "updated": "2026-07-16"
+    },
+    "eunenem-domain-cutover-oauth-checklist": {
+        "entities": [
+            "staging.eunenem.com",
+            "BETTER_AUTH_URL",
+            "EUNENEM_PUBLIC_ORIGIN",
+            "TRUSTED_ORIGINS",
+            "STRIPE_PUBLISHABLE_KEY"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "dokploy",
+            "credentials",
+            "eunenem"
+        ],
+        "updated": "2026-08-26"
+    },
+    "eunenem-engine-repo-is-not-a-pnpm-workspace": {
+        "entities": [],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "eunenem",
+            "testing"
+        ]
+    },
+    "eunenem-engine-worktree-install-recipe-corrected-supersedes": {
+        "entities": [],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [
+            "eunenem-engine-repo-is-not-a-pnpm-workspace"
+        ],
+        "tags": [
+            "eunenem",
+            "git"
+        ]
+    },
+    "eunenem-env-var-reaches-process-env-via-envfile-not-compose-block": {
+        "entities": [
+            "aperture-d7stv",
+            "#27",
+            "LEGACY_USERS_SOURCE",
+            "STRIPE_PUBLISHABLE_KEY"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [
+            "eunenem-server-env-var-read-path-correct-runtime"
+        ],
+        "tags": [
+            "dokploy",
+            "deploy",
+            "eunenem"
+        ],
+        "updated": "2026-07-18"
+    },
+    "eunenem-oauth-login-saga-2026-06-26": {
+        "entities": [
+            "#284",
+            "#287",
+            "#288",
+            "#289",
+            "#291"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "credentials",
+            "deploy",
+            "eunenem"
+        ],
+        "updated": "2026-06-26"
+    },
+    "eunenem-pix-rail-disambiguation-prod-stripe-pix-blocked": {
+        "entities": [
+            "aperture-a4pqt",
+            "aperture-40twz",
+            "cdpj.partners.bancointer.com.br"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "stripe",
+            "inter",
+            "eunenem"
+        ],
+        "updated": "2026-08-23"
+    },
+    "eunenem-secret-mechanism-dokploy-compose-env-not-infisical": {
+        "entities": [
+            "aperture-40twz",
+            "#27",
+            "STRIPE_PUBLISHABLE_KEY"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "dokploy",
+            "credentials",
+            "eunenem"
+        ],
+        "updated": "2026-07-18"
+    },
+    "eunenem-server-env-var-read-path-correct-runtime": {
+        "entities": [
+            "ADMIN_ALLOWED_EMAILS",
+            "TRUSTED_ORIGINS"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "dokploy",
+            "deploy",
+            "eunenem"
+        ],
+        "updated": "2026-06-28"
+    },
+    "eunenem-server-needs-pnpm-dev-not-tsx": {
+        "entities": [],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "eunenem",
+            "testing"
+        ],
+        "updated": "2026-06-01"
+    },
+    "eunenem-staging-prod-dual-homed-2026-07-08": {
+        "entities": [
+            "aperture-118sb",
+            "eunenem.xeroxtoxerox.com",
+            "app.eunenem.com"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "deploy",
+            "eunenem"
+        ],
+        "updated": "2026-07-08"
+    },
+    "eunenem-staging-url-changed-2026-06-24-eunenem": {
+        "entities": [
+            "aperture-re96d",
+            "eunenem.pocketsoftware.com.br",
+            "xeroxtoxerox.com",
+            "app.eunenem.com",
+            "~/projects/eunenem-engine"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [
+            "eunenem-staging-prod-dual-homed-2026-07-08"
+        ],
+        "tags": [
+            "infra",
+            "deploy",
+            "eunenem"
+        ],
+        "updated": "2026-06-24"
+    },
+    "false-blockers-cost-more-than-missing-ones": {
+        "entities": [
+            "aperture-raxji",
+            "s3.programaincluir.org"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "deploy",
+            "discipline",
+            "incluir"
+        ],
+        "updated": "2026-08-13"
+    },
+    "feature-live-doorbell-requires-evidence-not-promise": {
+        "entities": [
+            "#354",
+            "OPENAI_API_KEY"
+        ],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Banked 2026-05-23. Every 'X is ready / feature live / you can test now' message to the operator must attach evidence (verify command + output), never a promise. Verify the full chain for the feature kind: code shipped, env plumbed, env wired, build args (NEXT_PUBLIC_ vars bake at build time; a runtime env-check is not enough), flag flipped, restart, user walk (communicate skill §7.1/§7.2). If you cannot produce the evidence string, do not ring: say 'X almost ready, gate N pending [the missing verify]'.",
+        "supersedes": [],
+        "tags": [
+            "process",
+            "deploy",
+            "discipline"
+        ],
+        "updated": "2026-05-23"
+    },
+    "forro-step-catalog-forr-dance-step-catalog-app": {
+        "entities": [
+            "forro.xeroxtoxerox.com"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "infra"
+        ],
+        "updated": "2026-08-13"
+    },
+    "ghost-text-echoes-the-orchestrator-s-own-messages": {
+        "entities": [
+            "#313"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "comms",
+            "process"
+        ],
+        "updated": "2026-06-28"
+    },
+    "glados-compact-at-60-proactive": {
+        "entities": [],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Operator directive 2026-06-26: compact specialist agents proactively at 60% context, not 65-70%. Any specialist above 60% gets /compact'd unilaterally via tmux (C-u, type /compact, wait for the dropdown, Enter). Exception: never compact an agent with a LIVE subagent (it kills the subagent and its work); wait for the subagent to return, then compact immediately, and compact at 60% BEFORE an agent spawns a high-context subagent. Supersedes the 65% figure in watch-protocol §2 and glados-loop §5.",
+        "supersedes": [],
+        "tags": [
+            "process",
+            "watchdog"
+        ],
+        "updated": "2026-06-26"
+    },
+    "glados-do-dont-ask-when-playbook-banked-2026-06-02": {
+        "entities": [],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Banked 2026-06-02 from operator correction. When a recovery playbook is already banked (e.g. OrbStack hard-kill + relaunch), or an unblock event matches an already-scoped child bead with an assigned owner, just do it: run the recovery / dispatch the owner autonomously. Surface to the operator only if the playbook genuinely does not cover the case or the action is destructive in a way the operator has not pre-approved. Doorbell discipline (watch-protocol §7.1) is not permission-asking. Before every permission-asking surface, scan recent bd memories + skills; if covered, execute and report.",
+        "supersedes": [],
+        "tags": [
+            "process",
+            "discipline",
+            "infra"
+        ],
+        "updated": "2026-06-02"
+    },
+    "glados-loop-idle-not-terminal-2026-07-31": {
+        "entities": [
+            "aperture-jxwbd"
+        ],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Operator escalation 2026-07-31 (aperture-jxwbd). Before ANY idle/clean stop-loop call, apply a mechanical gate, not judgment: (1) bd list --status=in_progress / bd show for every agent in ACTIVE SPECIALISTS; any hit means do not stop; (2) if clear, confirm the last verdict on the thread is not still HOLD/FAIL/blocked; only then idle holds, and when quiet-but-not-terminal loosen the interval instead of killing the loop. Also (watch-protocol S2): a HOLD/FAIL/blocked verdict addressed or CC'd to GLaDOS is an immediate-action trigger; act when read, never wait for the next tick.",
+        "supersedes": [],
+        "tags": [
+            "process",
+            "watchdog",
+            "discipline"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-bot-ro-widened-all-tables-2026-09-06": {
+        "entities": [
+            "aperture-919c3",
+            "HERMES_BOT_RO"
+        ],
+        "project": "incluir",
+        "standing": true,
+        "standing_text": "Operator decision 2026-09-06 (Peppy, aperture-919c3), overriding Cipher's 61-table ruling and superseding the 2026-07-31 role contract: hermes_bot_ro has SELECT on all 70/70 incluir prod base tables, SELECT only, plus ALTER DEFAULT PRIVILEGES FOR ROLE incluir IN SCHEMA public so new migration tables are auto-readable. Bot visibility is controlled by DB grants alone (dynamic has_table_privilege catalog in execute-broad-read.ts); no code allowlist. DSL still allows no raw SQL or aggregates. Note for Cipher: the BetterAuth account table (auth credential hashes) has been readable since July 2026.",
+        "supersedes": [
+            "hermes-broad-read-db-role-contract-2026-07-31"
+        ],
+        "tags": [
+            "hermes",
+            "security",
+            "infra",
+            "incluir"
+        ],
+        "updated": "2026-09-06"
+    },
+    "hermes-broad-read-broker-live-verified-2026-07-31": {
+        "entities": [
+            "aperture-biowu",
+            "#672",
+            "HERMES_BOT_DATABASE_URL",
+            "DATABASE_URL",
+            "HERMES_BOT_ALLOWED_ACTOR_ID"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-broad-read-db-role-contract-2026-07-31": {
+        "entities": [
+            "aperture-biowu",
+            "HERMES_BOT_DATABASE_URL",
+            "HERMES_BOT_ALLOWED_ACTOR_ID",
+            "DATABASE_URL"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "hermes",
+            "security",
+            "credentials"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-developer-role-fix-label-align-2026-07-31": {
+        "entities": [
+            "ALLOWED_ROLES"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-gateway-model-bump-gpt-5.3-chat-latest-2026-07-31": {
+        "entities": [
+            "~/projects/hermes-lane2/docker-compose.yml",
+            "/opt/venv/bin/python3",
+            "GATEWAY_MODEL"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-hmac-pre-mint-deferred-2026-07-30": {
+        "entities": [
+            "#667",
+            "CLIENT_ID"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "hermes",
+            "credentials",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-incluir-broad-read-schema-map-2026-08-01": {
+        "entities": [
+            "BOT_RATE_LIMITED",
+            "BOT_QUERY_FORBIDDEN"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "incluir",
+            "recon"
+        ],
+        "updated": "2026-08-01"
+    },
+    "hermes-lane-1-activation-contract-2026-07-31": {
+        "entities": [
+            "aperture-wisp-qg4wbw",
+            "app.programaincluir.org",
+            "BOT_UNAVAILABLE",
+            "REDIS_URL"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-6a-final-evidence-2026-07": {
+        "entities": [
+            "#668",
+            "~/projects/hermes-lane2",
+            "/tmp/hermes-probes-v5.log"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "testing"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-anomaly1-reconstruct-2026-07-31": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "testing",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-blocker1-peer-guard-done-cipher-B": {
+        "entities": [
+            "BROKER_ALLOWED_PEER",
+            "GATEWAY_ALLOWED_PEER"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "review"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-blockers-6-8-done-2026-07-30": {
+        "entities": [
+            "EAI_AGAIN",
+            "UND_ERR_CONNECT_TIMEOUT",
+            "UND_ERR_HEADERS",
+            "BODY_TIMEOUT"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "review"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-broad-read-consumer-live-2026-07-31": {
+        "entities": [
+            "aperture-b6e9t",
+            "~/projects/hermes-lane2",
+            "INCLUIR_LOOKUP_TOOL",
+            "INCLUIR_QUERY_TOOL",
+            "INCLUIR_QUERY_URL"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-broad-read-name-lookup-fix-2026-08-01": {
+        "entities": [
+            "aperture-csv1x",
+            "INCLUIR_LOOKUP_TOOL",
+            "GATEWAY_MAX_MESSAGE_COUNT"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-08-01"
+    },
+    "hermes-lane-2-bundle-submitted-2026-07-30": {
+        "entities": [
+            "#668",
+            "~/projects/hermes-lane2/CIPHER-REVIEW-BUNDLE.md",
+            "/tmp/hermes-probes-v8.log"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-cipher-golivehold-2026-07-31": {
+        "entities": [
+            "#667",
+            "/tmp/hermes-blocker7-mixedcase.log",
+            "~/projects/hermes-lane2/TRIVY-RISK-ACCEPTANCE.md"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-cipher-verdict-FAIL-HOLD-2026-07-30": {
+        "entities": [
+            "TCP_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "hermes-lane-2-bundle-submitted-2026-07-30"
+        ],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-deploy-todos-resolved-2026-07": {
+        "entities": [
+            "~/projects/hermes-lane2",
+            "ERR_ACCESS_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "infra"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-derivative-image-determination-2026-07": {
+        "entities": [
+            "/opt/data",
+            "/opt/hermes/docker/main-wrapper.sh",
+            "/opt/hermes/.venv/bin/python",
+            "/opt/hermes/bin/hermes"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "infra"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-derivative-proven-non-root-2026": {
+        "entities": [
+            "~/projects/hermes-lane2/hermes-derivative/",
+            "/opt/data",
+            "/opt/hermes/.venv/bin/activate"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "infra"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-distroless-0crit-achieved-2026-07-30": {
+        "entities": [
+            "/opt/venv/bin/python3",
+            "/opt/data",
+            "STATIC_ALL_OK",
+            "HARDENING_ALL_OK"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "infra"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-distroless-rebuild-state-2026-07-30": {
+        "entities": [
+            "aperture-wisp-1bo4js",
+            "aperture-wisp-qmkpho",
+            "~/projects/hermes-lane2/hermes-minimal/",
+            "/opt/data"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "infra"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-final-digest-2026-07-31": {
+        "entities": [
+            "/etc/hermes",
+            "/tmp/hermes-final2-highs.json",
+            "~/projects/hermes-lane2/gateway",
+            "EXPAT_VERSION"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-final-rebuild-2026-07-31": {
+        "entities": [
+            "/etc/hermes/config.yaml",
+            "/opt/data/.hermes",
+            "/etc/hermes",
+            "/opt/venv/bin/python3",
+            "EXPAT_VERSION"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-finalbuild-2026-07-31": {
+        "entities": [
+            "/opt/data"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "testing"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-full-autonomy-reachability-first-2026-07-30": {
+        "entities": [
+            "aperture-wisp-c6c1m5"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "process",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-full-loop-working-2026-07-31": {
+        "entities": [
+            "/opt/data",
+            "/etc/hermes",
+            "/etc/hermes/config.yaml",
+            "HERMES_MANAGED",
+            "HERMES_HOME"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "e2e",
+            "incluir"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-gateway-caps-broad-read-2026-08-01": {
+        "entities": [
+            "aperture-csv1x",
+            "GATEWAY_MAX_MESSAGE_COUNT",
+            "GATEWAY_MAX_BODY_BYTES",
+            "GATEWAY_RPM"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-08-01"
+    },
+    "hermes-lane-2-go-live-work-package-v2": {
+        "entities": [
+            "~/projects/hermes-lane2/hermes-derivative",
+            "TCP_DENIED",
+            "TCP_TUNNEL"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "hermes-lane-2-pre-live-work-package-cipher"
+        ],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-golive-datapath-live-2026-07-31": {
+        "entities": [
+            "aperture-2yzav",
+            "app.programaincluir.org",
+            "SERVICE_AUD",
+            "INGRESS_AUD",
+            "BOT_UNAVAILABLE"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "hermes",
+            "deploy",
+            "credentials"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-isolation-evidence-state-2026-07": {
+        "entities": [
+            "~/projects/hermes-lane2"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "testing"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-next-actions-2026-07-30": {
+        "entities": [
+            "aperture-wisp-1bo4js",
+            "STATIC_ALL_OK",
+            "HARDENING_ALL_OK",
+            "TCP_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "process",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-operator-ship-directive-2026-07-31": {
+        "entities": [
+            "aperture-wisp-wdoem5",
+            "#667",
+            "app.programaincluir.org",
+            "BOT_UNAVAILABLE",
+            "CLIENT_ID"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "process",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-patched-wheel-built-2026-07-31": {
+        "entities": [
+            "aperture-wisp-fv4ekv",
+            "/tmp/wheelhouse",
+            "/tmp/hermes-scan3",
+            "HERMES_CONFIG"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "deploy"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-peer-guard-proven-v7-2026-07-30": {
+        "entities": [
+            "app.programaincluir.org",
+            "~/projects/hermes-lane2/probes",
+            "/tmp/hermes-probes-v7.log",
+            "TCP_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "testing"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-phase2-refreeze-2026-07-31": {
+        "entities": [
+            "#667",
+            "/etc/hermes",
+            "INCLUIR_LOOKUP_URL"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "e2e"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-pre-live-review-bundle-spec": {
+        "entities": [
+            "TCP_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-pre-live-work-package-cipher": {
+        "entities": [
+            "#668",
+            "/opt/hermes/docker/main-wrapper.sh",
+            "~/projects/hermes-lane2",
+            "TCP_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-progress-2026-07-31b": {
+        "entities": [
+            "/tmp/manifest_probe.py",
+            "~/projects/hermes-lane2/probes",
+            "~/projects/hermes-lane2/gateway",
+            "EXPAT_VERSION"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "security"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-punchlist-closed-2026-07-31": {
+        "entities": [
+            "~/projects/hermes-lane2/CIPHER-REVIEW-BUNDLE.md",
+            "/tmp/hbuild.log",
+            "/tmp/hermes-fresh-pipcheck.log"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "hermes-lane-2-cipher-golivehold-2026-07-31"
+        ],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-reachability-verdict-2026-07-30": {
+        "entities": [
+            "/opt/data",
+            "OPENSSL_VERSION"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "recon"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-real-entrypoint-negative-rerun-2026": {
+        "entities": [
+            "/tmp/hermes-probes-real.log",
+            "TCP_DENIED"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "testing"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-review-bundle-addendum-cipher-2026": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-seccomp-done-2026-07-31": {
+        "entities": [
+            "/tmp/docker-compose.yml.bak.20260731-014448"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "infra"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-status-2026-07-31-consolidated": {
+        "entities": [
+            "~/projects/hermes-lane2/CIPHER-REVIEW-BUNDLE.md",
+            "/tmp/hermes-final2-highs.json",
+            "/etc/hermes"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "hermes-lane-2-progress-2026-07-31b",
+            "hermes-lane-2-final-rebuild-2026-07-31"
+        ],
+        "tags": [
+            "hermes",
+            "deploy",
+            "security"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-lane-2-trivy-REALITY-246-high-2026-07-30": {
+        "entities": [
+            "/tmp/hermes-trivy.log",
+            "/tmp/hermes-trivy-clean.out"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "hermes-lane-2-trivy-highs-corrected-2026-07-30"
+        ],
+        "tags": [
+            "hermes",
+            "security",
+            "recon"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-trivy-highs-corrected-2026-07-30": {
+        "entities": [
+            "/tmp/hermes-trivy.log",
+            "~/projects/hermes-lane2/TRIVY-RISK-ACCEPTANCE.md"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "recon"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-vendor-patched-wheel-directive-2026-07-30": {
+        "entities": [
+            "aperture-wisp-fv4ekv",
+            "~/.hermes/config.yaml",
+            "HERMES_CONFIG"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "security",
+            "review"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-lane-2-work-package-v2-precision-pins": {
+        "entities": [
+            "/tmp/hermes-trivy.log"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "hermes-mcp-workspace-google-workspace-starkbank-whatsapp-tra": {
+        "entities": [
+            "/home/ubuntu/projetos-internos/mcp-for-claude",
+            "~/projects/mcp-for-claude",
+            "~/.hermes/config.yaml"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "infra",
+            "deploy"
+        ],
+        "updated": "2026-08-02"
+    },
+    "hermes-operator-override-stop-cipher-gate-2026-07-31": {
+        "entities": [
+            "aperture-jxwbd"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "process",
+            "review"
+        ],
+        "updated": "2026-07-31"
+    },
+    "hermes-slack-tokens-found-scope-gap-2026-07-31": {
+        "entities": [
+            "aperture-2yzav",
+            "SLACK_APP_ID",
+            "SLACK_TEAM_ID",
+            "SLACK_ALLOWED_USERS",
+            "CLIENT_ID"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "hermes",
+            "credentials",
+            "comms"
+        ],
+        "updated": "2026-07-31"
+    },
+    "http-status-is-part-of-the-probe-assert": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "observability",
+            "discipline",
+            "testing"
+        ],
+        "updated": "2026-08-13"
+    },
+    "incluir-prod-backup-built-2026-07-17-aperture": {
+        "entities": [
+            "aperture-vwdqy",
+            "~/incluir-backups/postgres/",
+            "~/incluir-backups/minio/",
+            "/home/ubuntu/incluir-backup-cmd.sh"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "incluir"
+        ],
+        "updated": "2026-07-17"
+    },
+    "incluir-prod-backup-cadence-minio-is-weekly-sundays": {
+        "entities": [
+            "~/incluir-backups/",
+            "~/incluir-watchtower/"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [
+            "incluir-prod-backup-built-2026-07-17-aperture"
+        ],
+        "tags": [
+            "infra",
+            "incluir"
+        ],
+        "updated": "2026-08-14"
+    },
+    "incluir-prod-stack-consolidated-to-single-host-app": {
+        "entities": [
+            "aperture-hsur8",
+            "app.programaincluir.org",
+            "new.programaincluir.org",
+            "CERTIFICADOS_APP_BASE_URL"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "dokploy",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-07-17"
+    },
+    "incluir-public-s3-email-assets-endpoint": {
+        "entities": [
+            "#38",
+            "#604",
+            "s3.programaincluir.org",
+            "programaincluir.org",
+            "minio.programaincluir.org"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "dokploy",
+            "incluir"
+        ],
+        "updated": "2026-07-18"
+    },
+    "infisical-general-project-frequently-used-secrets": {
+        "entities": [
+            "programaincluir.org",
+            "CLIENT_ID",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "WAHA_API_KEY"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "credentials",
+            "infra"
+        ],
+        "updated": "2026-07-18"
+    },
+    "instrument-failure-verify-the-probe-not-just-the-result": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "observability",
+            "discipline",
+            "testing"
+        ],
+        "updated": "2026-08-13"
+    },
+    "inter-cobranca-credential-handoff-spec-the-layer-6a": {
+        "entities": [
+            "aperture-h7sq",
+            "aperture-cz6wg",
+            "VOLUNTEER_CALENDAR_LINK",
+            "INTER_COB_BASE_URL",
+            "INTER_COB_CLIENT_ID"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "inter",
+            "credentials",
+            "eunenem"
+        ],
+        "updated": "2026-08-23"
+    },
+    "inter-cobranca-credential-issued-escrowed-2026-08-23": {
+        "entities": [
+            "INTER_COB_PIX_KEY",
+            "INTER_COB_ESCROW_NOTE"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "inter",
+            "credentials",
+            "eunenem"
+        ],
+        "updated": "2026-08-23"
+    },
+    "inter-eunenem-prod-creds-aperture-40twz-ingested-2026": {
+        "entities": [
+            "aperture-40twz",
+            "#27",
+            "cdpj.partners.bancointer.com.br",
+            "INTER_CONTA_CORRENTE",
+            "INTER_CERT_BASE64"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "inter",
+            "credentials",
+            "deploy"
+        ],
+        "updated": "2026-07-18"
+    },
+    "lazy-migration-trap-deployed-and-migrated-are-separated": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "discipline"
+        ],
+        "updated": "2026-08-13"
+    },
+    "list": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "junk"
+        ]
+    },
+    "macos-bsd-tar-injects-appledouble-sidecar-files-by": {
+        "entities": [
+            "aperture-6lp1n",
+            "COPYFILE_DISABLE"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "incluir"
+        ],
+        "updated": "2026-08-01"
+    },
+    "maintenance-day-2026-07-19-session-anchor-glados": {
+        "entities": [
+            "aperture-iwqol",
+            "BRIDGE_OK"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "beads",
+            "git"
+        ],
+        "updated": "2026-07-19"
+    },
+    "monitoring-gap-self-hosted-github-actions-runner-offline": {
+        "entities": [
+            "aperture-7gi5z"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "observability",
+            "infra",
+            "incluir"
+        ],
+        "updated": "2026-08-13"
+    },
+    "monorepo-incluir-feature-host-routing-banked-2026-06": {
+        "entities": [
+            "financeiro-new.programaincluir.org",
+            "new.programaincluir.org",
+            "programaincluir.org",
+            "CORS_ORIGINS"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-06-25"
+    },
+    "monorepo-incluir-main-autodeploys-on-merge-confirmed-2026-08-02": {
+        "entities": [
+            "#695",
+            "#32",
+            "app.programaincluir.org"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "dokploy",
+            "git",
+            "incluir"
+        ],
+        "updated": "2026-08-02"
+    },
+    "nested-interactive-content-overlay-pattern": {
+        "entities": [
+            "#892"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-09-06"
+    },
+    "never-grep-case-insensitively-for-gstatic-in-a": {
+        "entities": [
+            "aperture-4wl1n",
+            "#766",
+            "/app/apps/frontend/.next"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "recon",
+            "incluir"
+        ],
+        "updated": "2026-08-12"
+    },
+    "never-seed-test-data-against-a-target-value": {
+        "entities": [],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "discipline",
+            "eunenem"
+        ],
+        "updated": "2026-08-24"
+    },
+    "next-js-standalone-on-dokploy-502-from-a": {
+        "entities": [
+            "forro.xeroxtoxerox.com"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "dokploy",
+            "deploy",
+            "infra"
+        ],
+        "updated": "2026-08-25"
+    },
+    "nextjs-public-vars-build-time-not-runtime": {
+        "entities": [
+            "#361",
+            "#362",
+            "NEXT_PUBLIC_VAR",
+            "VAR_NAME"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "dokploy",
+            "discipline"
+        ],
+        "updated": "2026-05-23"
+    },
+    "openai-pricing-verified-2026-08-26-per-1m": {
+        "entities": [
+            "~/.openclaw/openclaw.json",
+            "~/openclaw-config-backup-20260826-000554.json"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "discipline"
+        ],
+        "updated": "2026-08-26"
+    },
+    "openai-shared-key-expo-public-exposure-2026-08-28": {
+        "entities": [
+            "EXPO_PUBLIC_OPENAI_API_KEY"
+        ],
+        "project": "general",
+        "standing": true,
+        "standing_text": "Cipher adjudication 2026-08-28, HIGH/P1; status as of 2026-08-28: awaiting operator, no rotation started (historical decision, not a live probe). Shared prod OpenAI key (serves incluir hono+frontend, Waha, Lucas CROSS, Wanderson FITT, Cadence) is in Cadence .env as EXPO_PUBLIC_OPENAI_API_KEY (client-readable): treat as compromised regardless of build history. Mandatory order: (1) remove direct OpenAI access + the var from Cadence; mobile uses an authenticated server-side proxy with validation, rate/cost caps; (2) get EAS build/update history via operator-authorized NON-MODEL credential handling, retire affected builds; (3) separate keys per server-side consumer, verify each; Cadence never gets a provider key; (4) revoke the shared key LAST. Until revoked keep .env value; Cadence stays STOPPED (no run/build/export/submit/OTA). EXPO_PUBLIC_ trap: rotation needs a REBUILD or OTA push; a runtime env swap does nothing to a built bundle. P0 triggers: unexplained shared-key activity, a public Cadence artifact, or unauthorized use. Key LACKS api.usage.read, so agents can't pull spend; no cost check is not no abuse. ~/.claude transcripts UNTOUCHED pending operator ack; claim 'no namespace-visible copies', never 'shredded'. No Expo tunnel until public vars are PROVEN secret-free.",
+        "supersedes": [],
+        "tags": [
+            "security",
+            "credentials"
+        ],
+        "updated": "2026-08-28"
+    },
+    "openclaw-cutover-from-hermes-2026-08-08": {
+        "entities": [
+            "~/.openclaw/openclaw.json",
+            "~/Library/Logs/openclaw/gateway.log",
+            "~/.hermes",
+            "WAHA_API_KEY"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "infra",
+            "deploy"
+        ],
+        "updated": "2026-08-08"
+    },
+    "openclaw-incluir-mcp-live-2026-09-06": {
+        "entities": [
+            "#672",
+            "app.programaincluir.org",
+            "~/projects/hermes-lane2",
+            "~/projects/mcp-for-claude/src/"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-09-06"
+    },
+    "openclaw-whatsapp-digest-media-v2-2026-09-06": {
+        "entities": [
+            "~/.openclaw/media/whatsapp-digest/",
+            "~/.openclaw/media"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "comms",
+            "deploy"
+        ],
+        "updated": "2026-09-06"
+    },
+    "orbstack-wedge-killall-insufficient-helper-survives": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "e2e"
+        ],
+        "updated": "2026-08-13"
+    },
+    "orchestrator-pane-keystroke-capability-validated-2026-05-23": {
+        "entities": [
+            "aperture-0hv9"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "watchdog"
+        ],
+        "updated": "2026-05-23"
+    },
+    "path-resolver-dev-vs-prod-arithmetic-must-be": {
+        "entities": [
+            "/app/dist/http/server.js",
+            "/app/dist/assets",
+            "/app/assets",
+            "CANDIDATE_ROOTS",
+            "NEXT_PUBLIC"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-07-17"
+    },
+    "pocketsoftware-traefik-global-compression-2026-07-28-apertur": {
+        "entities": [
+            "aperture-re96d",
+            "/etc/dokploy/traefik/dynamic/compress.yml",
+            "/etc/dokploy/traefik/traefik.yml"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "dokploy"
+        ],
+        "updated": "2026-07-28"
+    },
+    "pr-born-conflicting-zero-checks": {
+        "entities": [
+            "#361",
+            "#360"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "review"
+        ],
+        "updated": "2026-07-09"
+    },
+    "pr-follow-up-push-check-state-first": {
+        "entities": [
+            "#881",
+            "#884",
+            "#862"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "discipline"
+        ],
+        "updated": "2026-09-04"
+    },
+    "pr-head-stuck-not-push-failed": {
+        "entities": [
+            "#560",
+            "#561"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "discipline"
+        ],
+        "updated": "2026-07-10"
+    },
+    "pr-head-stuck-stale-merge-loses-commits": {
+        "entities": [
+            "#560",
+            "#561"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [
+            "pr-head-stuck-not-push-failed"
+        ],
+        "tags": [
+            "git",
+            "discipline"
+        ],
+        "updated": "2026-07-10"
+    },
+    "pr-retarget-does-not-trigger-ci-clean-with": {
+        "entities": [
+            "#291",
+            "IN_PROGRESS"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "review"
+        ],
+        "updated": "2026-06-26"
+    },
+    "pre-scoping-grep-removes-already-decided-questions": {
+        "entities": [
+            "aperture-1hcs"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "discipline"
+        ],
+        "updated": "2026-05-24"
+    },
+    "procedural-lesson-banked-2026-05-13-from-aperture": {
+        "entities": [
+            "aperture-lvoo",
+            "#233",
+            "#234"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "process"
+        ],
+        "updated": "2026-05-13"
+    },
+    "process-slip-peppy-2026-08-10": {
+        "entities": [
+            "aperture-wisp-8t0q7y"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "process-slip-peppy-2026-08-10-happened-twice"
+        ],
+        "tags": [
+            "comms",
+            "beads",
+            "process"
+        ],
+        "updated": "2026-08-10"
+    },
+    "process-slip-peppy-2026-08-10-happened-twice": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "comms",
+            "beads",
+            "process"
+        ],
+        "updated": "2026-08-10"
+    },
+    "proxy-no-text-decode": {
+        "entities": [
+            "aperture-r3pj",
+            "aperture-lfgq"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-05-24"
+    },
+    "pt-br-accented-characters-live-in-the-google": {
+        "entities": [
+            "aperture-4wl1n"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "incluir"
+        ],
+        "updated": "2026-08-12"
+    },
+    "qyct9-broad-read-spec-v3-fail-converging-2026": {
+        "entities": [
+            "aperture-qyct9"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "review",
+            "security"
+        ],
+        "updated": "2026-07-30"
+    },
+    "qyct9-parked-2026-07-30-per-operator-budget": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "qyct9-broad-read-spec-v3-fail-converging-2026"
+        ],
+        "tags": [
+            "hermes",
+            "process"
+        ],
+        "updated": "2026-07-30"
+    },
+    "reanimated-4-withspring-underdamp-trap": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing"
+        ],
+        "updated": "2026-06-05"
+    },
+    "reanimated4-state-flip-kills-useeffect-anim": {
+        "entities": [],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing"
+        ],
+        "updated": "2026-06-05"
+    },
+    "retraction-2026-08-23-peppy-banco-inter-oauth": {
+        "entities": [
+            "cdpj.partners.bancointer.com.br"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "inter",
+            "credentials",
+            "discipline",
+            "eunenem"
+        ],
+        "updated": "2026-08-23"
+    },
+    "routing-a-new-caller-through-a-shared-query": {
+        "entities": [
+            "#586"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-07-17"
+    },
+    "rsidz-epic-cascade-discipline-2026-06-01": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "git",
+            "incluir"
+        ],
+        "updated": "2026-06-01"
+    },
+    "rtk-proxy-corrupts-biome-pnpm-output": {
+        "entities": [
+            "~/.claude/RTK.md"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "testing"
+        ],
+        "updated": "2026-07-16"
+    },
+    "sanitizer-redaction-principle-don-t-redact-a-body": {
+        "entities": [
+            "aperture-jp3o",
+            "aperture-xmwe"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "observability"
+        ],
+        "updated": "2026-05-10"
+    },
+    "security-audit-pattern-not-fieldname-and-race-proof": {
+        "entities": [
+            "#891"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-09-06"
+    },
+    "security-review-cross-cut-discipline-precedent-aperture-pdlq": {
+        "entities": [
+            "aperture-pdlq",
+            "aperture-g9p4"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review",
+            "process"
+        ],
+        "updated": "2026-05-20"
+    },
+    "shared-schema-as-form-resolver-codeploy-trap": {
+        "entities": [
+            "#534",
+            "#529"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "deploy",
+            "review",
+            "incluir"
+        ],
+        "updated": "2026-06-25"
+    },
+    "slack-socketmode-dm-message-im-event-subscription-2026-07-31": {
+        "entities": [
+            "/opt/venv/bin/hermes"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "comms"
+        ],
+        "updated": "2026-07-31"
+    },
+    "spec-assertions-about-third-party-api-constraints-are": {
+        "entities": [
+            "#57",
+            "#68"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "inter",
+            "discipline",
+            "eunenem"
+        ],
+        "updated": "2026-08-23"
+    },
+    "sqlite-wal-fake-backup-trap-copying-the-db": {
+        "entities": [
+            "/tmp/snap.db"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "discipline"
+        ],
+        "updated": "2026-08-13"
+    },
+    "squash-merge-breaks-git-ancestry-use-bead-status": {
+        "entities": [
+            "aperture-75oxh"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "beads"
+        ],
+        "updated": "2026-07-10"
+    },
+    "starkbank-guardrails-build-mcp-for-claude-money-movement": {
+        "entities": [
+            "LOCAL_PREPARED",
+            "REQUEST_SUBMITTING",
+            "REQUEST_PENDING_APPROVAL",
+            "REQUEST_CREATE_AMBIGUOUS"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review",
+            "hermes"
+        ],
+        "updated": "2026-08-09"
+    },
+    "static-mirror-image-perf-broken-image-diagnosis-banked": {
+        "entities": [],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "recon",
+            "eunenem"
+        ],
+        "updated": "2026-08-01"
+    },
+    "streaming-relay-gateway-pitfalls-banked-2026-08-01": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "infra"
+        ],
+        "updated": "2026-08-01"
+    },
+    "stripe-pix-on-eunen-m-2-0-sandbox": {
+        "entities": [
+            "aperture-882yu"
+        ],
+        "project": "eunenem",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "stripe",
+            "eunenem"
+        ],
+        "updated": "2026-07-16"
+    },
+    "test-of-the-wrong-reality-principle-a-test": {
+        "entities": [
+            "aperture-xmwe"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "review",
+            "discipline"
+        ],
+        "updated": "2026-05-10"
+    },
+    "tick-output-requires-agent-liveness-deep-peek-not-just-pr-state": {
+        "entities": [],
+        "project": "aperture",
+        "standing": true,
+        "standing_text": "Banked 2026-05-24. A tick output based on PR state + recent merges alone is insufficient and misses stalled agents. Every tick must include: (1) a tail -30 deep-peek on every active agent's pane (not tail -3; thinking indicators scroll out of shallow peeks); (2) detection of typed-but-unsent commands sitting in pane buffers; (3) firing Enter via tmux send-keys for the safe ones (a correct slash command, a message-read cat command). The agent-liveness sweep is part of EVERY tick output, not optional.",
+        "supersedes": [],
+        "tags": [
+            "process",
+            "watchdog"
+        ],
+        "updated": "2026-05-24"
+    },
+    "tool-argument-close-tag-footgun-i-hit-it": {
+        "entities": [
+            "aperture-qbgl"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "beads",
+            "discipline"
+        ],
+        "updated": "2026-05-15"
+    },
+    "trust-but-verify-coordination-claims-not-just-code": {
+        "entities": [
+            "#355",
+            "#370",
+            "#372"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "review",
+            "discipline"
+        ],
+        "updated": "2026-05-24"
+    },
+    "two-sibling-test-walker-drawers-confused-twice-on": {
+        "entities": [
+            "programaincluir.org",
+            "~/.aperture/mempalace",
+            "~/.mempalace/palace"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "secret",
+            "credentials",
+            "playwright",
+            "incluir"
+        ],
+        "updated": "2026-08-11"
+    },
+    "ux-guard-class-axis-corrected-after-vance-pedant": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review"
+        ],
+        "updated": "2026-05-23"
+    },
+    "verification-of-verification-principle-audit-trail-reflects": {
+        "entities": [
+            "aperture-xmwe",
+            "aperture-jp3o"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "review",
+            "discipline"
+        ],
+        "updated": "2026-05-10"
+    },
+    "verify-against-origin-main-not-local": {
+        "entities": [
+            "#345",
+            "/home/reportar"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "git",
+            "discipline",
+            "recon"
+        ],
+        "updated": "2026-05-23"
+    },
+    "verify-against-reality-applied-to-auth-layers-not": {
+        "entities": [
+            "aperture-pdlq",
+            "#309"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "security",
+            "review",
+            "discipline"
+        ],
+        "updated": "2026-05-20"
+    },
+    "verify-against-reality-on-your-own-close-claims": {
+        "entities": [
+            "aperture-kfyb4",
+            "aperture-vw58l",
+            "#554"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "beads",
+            "review",
+            "discipline"
+        ]
+    },
+    "verify-shape-not-just-structure-when-fixing-contracts": {
+        "entities": [
+            "#372",
+            "#376"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "review",
+            "testing",
+            "discipline"
+        ],
+        "updated": "2026-05-24"
+    },
+    "verify-which-host-before-diagnosing": {
+        "entities": [
+            "/Users/franciscomateus/projects/"
+        ],
+        "project": "general",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "discipline",
+            "recon"
+        ],
+        "updated": "2026-08-13"
+    },
+    "verify-with-the-actual-user-shape-not-the-probe-shape-of-convenience": {
+        "entities": [],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "discipline"
+        ],
+        "updated": "2026-05-24"
+    },
+    "visibility-bug-probe-all-viewports": {
+        "entities": [
+            "#276"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "testing",
+            "recon",
+            "incluir"
+        ],
+        "updated": "2026-06-24"
+    },
+    "vkyyi-796-accepted-residual-offline-digest-resolution-untest": {
+        "entities": [
+            "#796"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "infra",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-08-14"
+    },
+    "vkyyi-796-ordering-rule-bead-full-notice-2026": {
+        "entities": [
+            "aperture-vkyyi",
+            "aperture-jxwbd",
+            "#796",
+            "app.programaincluir.org"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "beads",
+            "infra",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-08-13"
+    },
+    "vkyyi-796-state-anchor-2026-08-14-peppy": {
+        "entities": [
+            "aperture-vkyyi",
+            "#796"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "process",
+            "infra",
+            "deploy",
+            "incluir"
+        ],
+        "updated": "2026-08-14"
+    },
+    "waha-alert-chain-hardened-2026-07-18": {
+        "entities": [
+            "~/.waha-last-restart",
+            "/tmp/kuma-venv",
+            "SCAN_QR_CODE",
+            "WAHA_API_KEY",
+            "KUMA_URL"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "observability",
+            "comms"
+        ],
+        "updated": "2026-07-18"
+    },
+    "waha-mcp-all-phases-shipped-2026-08-08": {
+        "entities": [
+            "OPENAI_API_KEY",
+            "WAHA_PRESENCE_AUTO_ONLINE"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [
+            "waha-mcp-phase-a-ack-unread-shipped-2026-08-08"
+        ],
+        "tags": [
+            "comms",
+            "deploy",
+            "hermes"
+        ],
+        "updated": "2026-08-08"
+    },
+    "waha-mcp-phase-a-ack-unread-shipped-2026-08-08": {
+        "entities": [
+            "WAHA_PRESENCE_AUTO_ONLINE"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "comms",
+            "deploy",
+            "hermes"
+        ],
+        "updated": "2026-08-08"
+    },
+    "waha-watchtower-image-update-2026-08-08": {
+        "entities": [
+            "~/pocketsoftware-watchtower/docker-compose.yml",
+            "/app/.sessions",
+            "SCAN_QR_CODE",
+            "WAHA_API_KEY"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "comms"
+        ],
+        "updated": "2026-08-08"
+    },
+    "when-writing-api-contract-specs-if-a-backend": {
+        "entities": [
+            "aperture-psyb",
+            "#215",
+            "#216"
+        ],
+        "project": "incluir",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "review",
+            "discipline",
+            "incluir"
+        ]
+    },
+    "workspace-mcp-mcp-for-claude-on-mac-mini": {
+        "entities": [
+            "~/.openclaw/media/hermes-storage/",
+            "~/.openclaw/media",
+            "~/.openclaw/",
+            "~/.openclaw/openclaw.json"
+        ],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "hermes",
+            "infra",
+            "deploy"
+        ],
+        "updated": "2026-08-09"
+    },
+    "xerox-ssh-hangs-via-the-xerox-alias-tailscale": {
+        "entities": [],
+        "project": "aperture",
+        "standing": false,
+        "supersedes": [],
+        "tags": [
+            "infra",
+            "discipline"
+        ],
+        "updated": "2026-08-14"
+    }
+}

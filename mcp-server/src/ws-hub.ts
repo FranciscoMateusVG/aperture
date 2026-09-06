@@ -11,8 +11,11 @@
  *   - role=subscriber → presence watchers (GLaDOS, launcher UI). Receive
  *                       {type:"presence", agent, event, ts} with event one of
  *                       "join"|"leave"|"busy"|"idle" (busy/idle come from
- *                       Codex bridge turn state; see codex-bridge.ts).
- *   - role=producer   → MCP send-queue drains. Send
+ *                       Codex bridge turn state — see codex-bridge.ts — or
+ *                       from Claude Code hook presence hints, below). A
+ *                       busy/idle that does not change the stored state is
+ *                       NOT re-broadcast; join/leave always are.
+ *   - role=producer   → MCP send-queue drains and hook hint clients. Send
  *                       {type:"notify", to, id, from, preview}; the hub
  *                       forwards {type:"message", id, from, preview} to the
  *                       recipient if connected and always acks
@@ -20,6 +23,18 @@
  *                       "forwarded" (Monitor socket got the push), "codex"
  *                       (injected into the Codex bridge), "offline" (nobody
  *                       to push to — unread replay on reconnect covers it).
+ *                       Or send {type:"presence_hint", event:"busy"|"idle"}
+ *                       (aperture-trgpo; Claude Code UserPromptSubmit /
+ *                       PreToolUse → busy, Stop → idle). The target is ALWAYS
+ *                       the authenticated principal (conn.agent); an `agent`
+ *                       field naming anyone else is rejected. A hint only
+ *                       flips the state of an agent that already has a live
+ *                       Monitor socket — it never creates presence (no ghost
+ *                       agents; only join does) and is ignored for
+ *                       codex-bridged agents (their bridge owns turn state).
+ *                       Acked {type:"ok", hint: event, applied: boolean}
+ *                       where applied=false means no state transition
+ *                       happened (repeat hint, not present, codex-bridged).
  *
  * Delivery semantics: at-least-once, idempotent by message id. A missed push
  * (recipient offline, hub down) is covered by unread replay on reconnect —
@@ -125,16 +140,29 @@ function stateToEvent(state: PresenceState): PresenceEvent {
   return state === "online" ? "join" : state;
 }
 
-function broadcastPresence(agent: string, event: PresenceEvent): void {
+/**
+ * Apply + persist + fan out a presence event. Returns whether the stored
+ * state actually changed.
+ *
+ * join/leave are ALWAYS broadcast and logged (the agent_replaced re-join and
+ * the leave-after-delete are protocol pins the watchdog relies on). busy/idle
+ * are broadcast ONLY on a transition: Claude Code hook hints fire on every
+ * PreToolUse, so a repeated "busy" would otherwise spam every subscriber (and
+ * the log) with frames that carry no information (aperture-trgpo).
+ */
+function broadcastPresence(agent: string, event: PresenceEvent): boolean {
   const ts = new Date().toISOString();
   // Remember current state so a later subscriber hello can be snapshotted,
   // and mirror it to disk for the MCP servers' get_presence.
-  if (applyPresence(agent, event, ts)) persistPresence();
+  const changed = applyPresence(agent, event, ts);
+  if (changed) persistPresence();
+  if (!changed && (event === "busy" || event === "idle")) return false;
   const msg = { type: "presence", agent, event, ts };
   for (const [ws, conn] of conns) {
     if (conn.role === "subscriber") send(ws, msg);
   }
   log("presence", { agent, presence: event });
+  return changed;
 }
 
 /** Read a launcher-provisioned token without following symlinks or accepting
@@ -281,6 +309,44 @@ function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): 
 /** What the hub actually did with a notify — carried on the ok ack. */
 type NotifyOutcome = "forwarded" | "codex" | "offline";
 
+/**
+ * aperture-trgpo: a Claude Code hook (UserPromptSubmit / PreToolUse → busy,
+ * Stop → idle) tells the hub what its agent is doing. Only the codex bridge
+ * had turn-state before this; Claude agents' Monitors emit join/leave only,
+ * so the launcher chip and get_presence showed them as merely "online".
+ *
+ * The target is the authenticated principal — never a field in the frame. A
+ * hint never creates presence: if the agent has no live Monitor socket it is
+ * offline as far as the hub is concerned and the hint is dropped, so a hook
+ * firing during a Monitor reconnect can't leave a ghost "busy" entry behind.
+ */
+function handlePresenceHint(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): void {
+  const agent = conn.agent ?? "unknown";
+  if (typeof msg.agent === "string" && msg.agent !== agent) {
+    log("presence_hint_rejected", { reason: "agent_mismatch", agent });
+    return;
+  }
+  const event = msg.event;
+  if (event !== "busy" && event !== "idle") {
+    log("presence_hint_rejected", { reason: "bad_event", agent, hint: String(event) });
+    return;
+  }
+  if (codexBridges.has(agent)) {
+    // The bridge owns codex turn state; a hint would fight it.
+    log("presence_hint_ignored", { reason: "codex_bridged", agent, hint: event });
+    send(ws, { type: "ok", hint: event, applied: false });
+    return;
+  }
+  if (!agents.has(agent)) {
+    log("presence_hint_ignored", { reason: "not_present", agent, hint: event });
+    send(ws, { type: "ok", hint: event, applied: false });
+    return;
+  }
+  const applied = broadcastPresence(agent, event);
+  log("presence_hint", { agent, hint: event, applied });
+  send(ws, { type: "ok", hint: event, applied });
+}
+
 // aperture-oeb6q: clear the presence snapshot at startup — BEFORE the codex
 // bridges start, so this write is guaranteed to carry zero agents and a stale
 // file left by a crashed hub (dead hub_pid, phantom agents) can't lie past
@@ -360,6 +426,11 @@ wss.on("connection", (ws) => {
 
     if (conn.role === "producer" && msg.type === "notify") {
       handleNotify(ws, conn, msg);
+      return;
+    }
+
+    if (conn.role === "producer" && msg.type === "presence_hint") {
+      handlePresenceHint(ws, conn, msg);
       return;
     }
 

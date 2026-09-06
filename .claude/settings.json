@@ -5,7 +5,12 @@
     },
     "mempalace": {
       "command": "/Users/franciscomateus/.mempalace/venv/bin/python",
-      "args": ["-m", "mempalace.mcp_server", "--palace", "/Users/franciscomateus/.aperture/mempalace"]
+      "args": [
+        "-m",
+        "mempalace.mcp_server",
+        "--palace",
+        "/Users/franciscomateus/.aperture/mempalace"
+      ]
     },
     "playwright-mini": {
       "command": "/Users/franciscomateus/projects/aperture/scripts/playwright-mcp-mini.sh"
@@ -16,7 +21,7 @@
       {
         "hooks": [
           {
-            "command": "bd prime",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh precompact",
             "type": "command"
           }
         ],
@@ -27,11 +32,57 @@
       {
         "hooks": [
           {
-            "command": "bd prime",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh boot",
             "type": "command"
           }
         ],
         "matcher": ""
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/presence-hint.js busy",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/memory-recall.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/presence-hint.js busy",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/presence-hint.js idle",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

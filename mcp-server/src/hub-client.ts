@@ -62,7 +62,7 @@ const BACKOFF_CAP_MS = Number(process.env.APERTURE_HUB_BACKOFF_CAP_MS) || 30_000
 /** ±25% jitter so a fleet of clients doesn't stampede a respawning hub. */
 const BACKOFF_JITTER = 0.25;
 /** No frame (message or ping) for this long → the hub is wedged; reconnect. */
-const STALE_MS = Number(process.env.APERTURE_HUB_STALE_MS) || 90_000;
+const STALE_MS = Number(process.env.APERTURE_HUB_STALE_MS) || 150_000;
 /** Cadence of the HUB_STILL_DISCONNECTED reminder during a long outage. */
 const STILL_DISCONNECTED_EVERY_MS = 5 * 60_000;
 /** Hub close code: a newer connection for this agent name replaced ours. */

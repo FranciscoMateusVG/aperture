@@ -300,3 +300,28 @@ test-rust:
 # skills, byte sizes, and skill x agent assignment. Pass --json for tooling.
 skills-matrix *ARGS:
     @scripts/skills-matrix.sh {{ARGS}}
+
+# ============== Context diet (aperture-trgpo) ==============
+
+# §7 gates: boot/precompact hook bytes, per-agent assembled boot prompt,
+# bank size + sha256 for the non-destruction diff. Pass --json for CI.
+# Exits non-zero on any hard breach (glados boot total, both hook seams).
+context-budget *ARGS:
+    @scripts/context-budget.sh {{ARGS}}
+
+# Render an injection seam by hand: MODE = boot | precompact. Same script the
+# SessionStart/PreCompact hooks and agents.rs::inject_bd_memory run.
+aperture-prime MODE:
+    @scripts/aperture-prime.sh {{MODE}}
+
+# §7 standing-rule retention gate (aperture-trgpo)
+# No skill/prompt may instruct a model-visible credential read (credential-drawer-plaintext-read-ban)
+credential-read-gate:
+    scripts/credential-read-gate.sh
+
+retention-gate:
+    @scripts/retention-gate.sh
+
+# §7 retrieval gate: golden set → recall@5 (aperture-trgpo)
+recall-gate *ARGS:
+    @node scripts/recall-gate.mjs {{ARGS}}

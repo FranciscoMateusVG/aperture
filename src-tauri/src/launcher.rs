@@ -70,6 +70,7 @@ pub fn build_claude_launcher(
         r#"#!/bin/bash
 {path_line}
 export APERTURE_HUB_TOKEN_FILE="${{APERTURE_HUB_TOKEN_DIR:-$HOME/.aperture/run/hub-tokens}}/{name}.token"
+export APERTURE_PROJECT_DIR="{project_dir}"
 cd "{project_dir}"
 PROMPT=$(cat "{prompt_path}")
 exec {claude_bin} --dangerously-skip-permissions --model {model} --system-prompt "$PROMPT" --mcp-config {mcp_config_path} --name {name}{kickoff}
@@ -311,6 +312,7 @@ mod tests {
             r#"#!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export APERTURE_HUB_TOKEN_FILE="${APERTURE_HUB_TOKEN_DIR:-$HOME/.aperture/run/hub-tokens}/atlas.token"
+export APERTURE_PROJECT_DIR="/Users/x/projects/aperture"
 cd "/Users/x/projects/aperture"
 PROMPT=$(cat "/tmp/aperture-prompt-atlas.md")
 exec claude --dangerously-skip-permissions --model opus --system-prompt "$PROMPT" --mcp-config /tmp/aperture-mcp-atlas.json --name atlas 'Session start. Run your boot routine now: start your inbox monitor per your system prompt, then check get_messages and process any unread messages, marking each read after you handle it.'
@@ -336,6 +338,10 @@ exec claude --dangerously-skip-permissions --model opus --system-prompt "$PROMPT
         assert!(s.contains("--mcp-config /tmp/mcp.json"));
         assert!(s.contains("--name borealis"));
         assert!(s.contains(r#"cd "/proj""#));
+        // aperture-3kavd P0: the hooks in .claude/settings.json resolve their scripts through
+        // APERTURE_PROJECT_DIR, so the launch-selected runtime root must be exported to the
+        // session (a worktree-built app must run worktree hooks, never a hard-coded checkout).
+        assert!(s.contains(r#"export APERTURE_PROJECT_DIR="/proj""#));
         assert!(s.contains(r#"PROMPT=$(cat "/tmp/prompt.md")"#));
     }
 
