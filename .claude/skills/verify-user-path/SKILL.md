@@ -66,14 +66,15 @@ For agents without browser access: **dispatch a subagent with `playwright-mini` 
 - Switch to **admin walker** ONLY when the surface returns 403 / redirect to /home / admin-shell-gate observed with staff walker
 - Use BOTH if a single E2E walk crosses admin + non-admin surfaces (e.g. user-as-volunteer creates a thing, admin-as-staff reviews it)
 
-**Fetch via mempalace MCP tool:**
+**Obtaining the credential — NON-MODEL delivery only (standing rule `credential-drawer-plaintext-read-ban`, Cipher 2026-08-28, binding):**
 
-```
-mempalace_get_drawer(drawer_id: "drawer_peppy_secrets_099780bfab08d98a8dcb5a33")  # staff
-mempalace_get_drawer(drawer_id: "drawer_peppy_secrets_38d8c201c77b8c01ef881e71")  # admin
-```
+Do NOT read the drawer with a model-visible tool. No `get_drawer`, no `search`, no `cat` of a secrets file, no path that puts the password into agent context — every such read persists plaintext into a session transcript on disk (13 transcript copies of one shared prod key were found this way, and the count grew while it was being investigated). The drawer ids in the table above are *escrow pointers for the helper*, not something to open.
 
-Each drawer contains: email + password + CPF + BetterAuth `user_id` + `volunteer_id` + permissions list + surfaces this user CAN/CANNOT walk + browser auth pattern + API auth pattern + rotation procedure.
+The only permitted path is the non-model delivery contract: name the **logical secret** (`test-walker` or `test-walker-admin`) and an **approved, allowlisted destination or action** (e.g. write a Playwright `storageState` / `.env` for a walk, mint a session at the exact origin the walk will use), and let the approved helper move the value from the store to that destination. The agent receives **status + fingerprint only** — never the value.
+
+**If the approved helper is not available in your session: STOP and ask Peppy/GLaDOS. Do not improvise a substitute** (no drawer read, no copy-paste, no ad-hoc script that prints the value). A walk that cannot be authenticated without a model-visible read is blocked, not worked around — record it as blocked on the bead.
+
+The drawer still holds, for the helper: email + password + CPF + BetterAuth `user_id` + `volunteer_id` + permissions list + surfaces this user CAN/CANNOT walk + browser auth pattern + API auth pattern + rotation procedure. What the agent may hold in context is only the non-secret half: email, role, `user_id`, `volunteer_id`, permissions, surfaces.
 
 **Why two sibling drawers (not one extended drawer):**
 - Reading "which user has admin?" can't get confused — different drawers, distinct entries
@@ -83,7 +84,7 @@ Each drawer contains: email + password + CPF + BetterAuth `user_id` + `volunteer
 **Why mempalace drawer storage (not inline-in-skill):**
 - Credentials stay out of the aperture repo (no risk of secret-shaped strings tripping GitGuardian or leaking through `git log`)
 - Rotation happens without skill-file edits (Peppy regens; drawer updates; skill pointer stays valid)
-- All agents with `mempalace` access can fetch on-demand
+- Only the approved non-model helper touches the value; agents hold the pointer, never the contents
 
 **Banked precedents:**
 - **aperture-o0kt** (2026-05-25): Peppy created staff walker after the morning prod-walk discipline shipped. DB tagged `volunteers.observation = 'Aperture swarm test-walker user. DO NOT DELETE. See bead aperture-o0kt.'`

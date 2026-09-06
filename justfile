@@ -315,6 +315,10 @@ aperture-prime MODE:
     @scripts/aperture-prime.sh {{MODE}}
 
 # §7 standing-rule retention gate (aperture-trgpo)
+# No skill/prompt may instruct a model-visible credential read (credential-drawer-plaintext-read-ban)
+credential-read-gate:
+    scripts/credential-read-gate.sh
+
 retention-gate:
     @scripts/retention-gate.sh
 
