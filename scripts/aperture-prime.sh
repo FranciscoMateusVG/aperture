@@ -11,6 +11,7 @@
 #               (Codex). Prints `bd prime` with everything from the
 #               `## Persistent Memories` line to EOF stripped, then the memory
 #               index block from `node dist/memory-index.js --mode boot`
+#   preamble | standing N | pointer — Claude hook path, one command per part (≤ 10 KB each)
 #               (standing decisions inlined + one index line per live entry).
 #               Budget: ≤ 40 KiB total.
 #   precompact  PreCompact hook. ONLY the index block (`--mode precompact`),
@@ -43,14 +44,17 @@ PREAMBLE_MAX_BYTES=$((16 * 1024))
 INDEX_MAX_BYTES=$((64 * 1024))
 MEMORY_HEADER_RE='^## Persistent Memories'
 
+STANDING_PART_MAX_BYTES=9500   # Claude shows a hook command's stdout only up to 10,000 chars (aperture-g4hku)
+POINTER_MAX_BYTES=1000
 MODE="${1:-}"
+PART="${2:-1}"
 case "$MODE" in
-    boot|precompact) ;;
+    boot|precompact|preamble|standing|pointer) ;;
     -h|--help)
         sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
         exit 0 ;;
     *)
-        echo "aperture-prime: expected one of boot|precompact, got '${MODE}'" >&2
+        echo "aperture-prime: expected one of boot|precompact|preamble|standing N|pointer, got '${MODE}'" >&2
         exit 2 ;;
 esac
 
@@ -135,6 +139,46 @@ print_index() {
     printf '%s\n' "$out"
 }
 
+# ------------------------------------------------- Claude hook path (≤ 10 KB per command) ---
+
+# Claude Code shows a hook command's stdout to the model only up to 10,000 characters; beyond that the
+# text is persisted to a file and the model sees a ~2 KB preview (measured 2026-09-06, Claude Code
+# 2.1.263; hooks reference). Commands on the same event are capped SEPARATELY. So .claude/settings.json
+# runs one command per part: `preamble`, `standing 1`, `standing 2`, `pointer` — each checked here
+# against STANDING_PART_MAX_BYTES / POINTER_MAX_BYTES, failing VISIBLY (never silently truncated).
+# The index itself is not injected on this path (it was never visible); memory stays reachable via
+# recall/recall_full and the UserPromptSubmit top-3 hook. boot/precompact (Codex prompt.md) unchanged.
+print_standing_part() {
+    local part="$1" out rc
+    if ! command -v node >/dev/null 2>&1; then
+        [ "$part" = 1 ] && echo "[memory index unavailable: node not found — use recall/recall_full]"; return
+    fi
+    if [ ! -f "$INDEX_JS" ]; then
+        [ "$part" = 1 ] && echo "[memory index unavailable: dist not built (just build-mcp) — use recall/recall_full]"; return
+    fi
+    out=$(run_with_timeout "$NODE_TIMEOUT_SECS" node "$INDEX_JS" --mode standing --part "$part" --max-bytes $((STANDING_PART_MAX_BYTES - 500)) 2>/dev/null); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        [ "$part" = 1 ] && echo "[memory index unavailable: memory-index.js --mode standing exited $rc — use recall/recall_full]"; return
+    fi
+    is_blank "$out" && return   # a part beyond the last one is legitimately empty
+    if [ "$(byte_len "$out")" -gt "$STANDING_PART_MAX_BYTES" ]; then
+        echo "[standing part $part unavailable: exceeds ${STANDING_PART_MAX_BYTES} B hook visibility cap — release gate must fail]"
+        return
+    fi
+    printf '%s\n' "$out"
+}
+print_pointer() {
+    local out rc
+    if ! command -v node >/dev/null 2>&1 || [ ! -f "$INDEX_JS" ]; then
+        echo "[memory index unavailable: dist not built (just build-mcp) — use recall/recall_full]"; return
+    fi
+    out=$(run_with_timeout "$NODE_TIMEOUT_SECS" node "$INDEX_JS" --mode pointer 2>/dev/null); rc=$?
+    if [ "$rc" -ne 0 ] || is_blank "$out" || [ "$(byte_len "$out")" -gt "$POINTER_MAX_BYTES" ]; then
+        echo "[memory index unavailable: pointer failed (rc=$rc) — use recall/recall_full]"; return
+    fi
+    printf '%s\n' "$out"
+}
+
 # ------------------------------------------------------------------ main ---
 
 case "$MODE" in
@@ -152,6 +196,20 @@ case "$MODE" in
         ;;
     precompact)
         print_index precompact
+        ;;
+    preamble)
+        if [ -n "${APERTURE_HUB_TOKEN_FILE:-}" ]; then
+            echo "[bd workflow preamble omitted for Aperture agents — the resident beads skill covers bd usage; memory via recall/recall_full]"
+        else
+            print_preamble
+        fi
+        ;;
+    standing)
+        case "$PART" in ''|*[!0-9]*) echo "aperture-prime: standing needs a numeric part, got '$PART'" >&2; exit 2 ;; esac
+        print_standing_part "$PART"
+        ;;
+    pointer)
+        print_pointer
         ;;
 esac
 exit 0

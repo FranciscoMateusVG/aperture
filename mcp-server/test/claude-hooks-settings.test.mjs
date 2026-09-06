@@ -36,19 +36,47 @@ test("tracked settings.json: no hook command carries a build-machine absolute pa
   }
 });
 
-test("rendered commands run from THIS checkout root (a non-master worktree in CI/dev): every hook exits 0; SessionStart injects the index block, not the bank", () => {
+// Claude Code shows the model at most 10,000 chars of a hook command's stdout (measured 2026-09-06 on
+// 2.1.263; hooks reference) — commands on one event are capped SEPARATELY. So visibility, not emission,
+// is the property: every command under the cap, and the standing rules in the UNION (aperture-g4hku).
+const HOOK_VISIBLE_MAX = 9800;
+const byEvent = (ev) => hooks.filter((h) => h.ev === ev);
+
+test("tracked settings.json: SessionStart = preamble + standing 1 + standing 2 + pointer (4 commands); PreCompact = standing 1 + standing 2 + pointer (3)", () => {
+  const ss = byEvent("SessionStart").map((h) => h.command);
+  const pc = byEvent("PreCompact").map((h) => h.command);
+  assert.equal(ss.length, 4, `SessionStart commands:\n${ss.join("\n")}`);
+  assert.equal(pc.length, 3, `PreCompact commands:\n${pc.join("\n")}`);
+  const tail = (c) => c.replace(/^.*aperture-prime\.sh\s+/, "").trim();
+  assert.deepEqual(ss.map(tail), ["preamble", "standing 1", "standing 2", "pointer"]);
+  assert.deepEqual(pc.map(tail), ["standing 1", "standing 2", "pointer"]);
+  for (const c of [...ss, ...pc]) assert.doesNotMatch(c, /aperture-prime\.sh\s+(boot|precompact)\b/, `Codex-only whole-block modes must not be Claude hooks: ${c}`);
+});
+
+test("rendered commands run from THIS checkout root (a non-master worktree in CI/dev): every hook exits 0; each SessionStart/PreCompact command ≤ 9,800 B; the union carries the standing block, never the bank", () => {
   const { env, dir } = baseEnv(); env.APERTURE_PROJECT_DIR = ROOT;
+  const union = { SessionStart: "", PreCompact: "" };
+  const counts = { SessionStart: 0, PreCompact: 0 };
   for (const h of hooks) {
     const r = runHook(h.ev, h.command, env);
     assert.equal(r.status, 0, `${h.ev} ${h.command}\nstderr=${r.stderr}`);
-    if (h.ev === "SessionStart") {
-      assert.match(r.stdout, /memory-index mode=boot|## Memory index/, "SessionStart must inject the memory index block");
+    if (h.ev === "SessionStart" || h.ev === "PreCompact") {
+      const b = Buffer.byteLength(r.stdout, "utf8");
+      assert.ok(b <= HOOK_VISIBLE_MAX, `${h.ev}#${counts[h.ev] + 1} prints ${b} B > ${HOOK_VISIBLE_MAX} — invisible to the model (10 KB hook cap): ${h.command}`);
       assert.doesNotMatch(r.stdout, /## Persistent Memories/, "never the full bank");
-      assert.ok(Buffer.byteLength(r.stdout) < 40 * 1024, `boot block ${Buffer.byteLength(r.stdout)} B exceeds 40 KiB`);
+      assert.doesNotMatch(r.stdout, /standing part \d+ unavailable|STANDING BLOCK OVER BUDGET/, r.stdout.slice(0, 300));
+      union[h.ev] += `${r.stdout}\n`; counts[h.ev] += 1;
     }
-    if (h.ev === "PreCompact") assert.match(r.stdout, /memory-index mode=precompact/);
     if (h.command.includes("memory-recall.js")) assert.match(r.stdout, /^\[memory recall\]|^\[recall unavailable/m);
   }
+  assert.equal(counts.SessionStart, 4); assert.equal(counts.PreCompact, 3);
+  for (const ev of ["SessionStart", "PreCompact"]) {
+    assert.match(union[ev], /^## Standing decisions/m, `${ev} union must carry the standing block`);
+    assert.match(union[ev], /^- \*\*[^*]+\*\*/m, `${ev} union must carry standing entries`);
+    assert.match(union[ev], /memory-index mode=pointer|## Memory index/, `${ev} union must carry the index pointer`);
+    assert.doesNotMatch(union[ev], /## Persistent Memories/, `${ev}: never the full bank`);
+  }
+  assert.match(union.SessionStart, /^\[bd workflow preamble omitted for Aperture agents/m, "agent session: the preamble command prints its one-line notice");
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -59,17 +87,23 @@ test("resolution follows the runtime root: a second root with the same layout wo
   symlinkSync(join(ROOT, "scripts"), join(alt, "scripts")); symlinkSync(join(ROOT, "mcp-server", "dist"), join(alt, "mcp-server", "dist"));
   symlinkSync(join(ROOT, "mcp-server", "node_modules"), join(alt, "mcp-server", "node_modules"));
   symlinkSync(join(ROOT, "docs"), join(alt, "docs")); // sidecar seed lives under <root>/docs
-  const boot = hooks.find((h) => h.ev === "SessionStart");
-  const ok = runHook("SessionStart", boot.command, { ...env, APERTURE_PROJECT_DIR: alt });
-  assert.equal(ok.status, 0, ok.stderr);
-  assert.match(ok.stdout, /memory-index mode=boot|## Memory index/);
+  let altUnion = "";
+  for (const h of byEvent("SessionStart")) {
+    const ok = runHook("SessionStart", h.command, { ...env, APERTURE_PROJECT_DIR: alt });
+    assert.equal(ok.status, 0, ok.stderr);
+    altUnion += ok.stdout;
+  }
+  assert.match(altUnion, /^## Standing decisions/m);
+  assert.match(altUnion, /memory-index mode=pointer|## Memory index/);
   // a root that lacks the files must NOT be papered over by master: the command fails and prints nothing
   const empty = join(dir, "empty-root"); mkdirSync(empty);
-  const bad = runHook("SessionStart", boot.command, { ...env, APERTURE_PROJECT_DIR: empty });
-  assert.notEqual(bad.status, 0, "missing script under the selected root must fail, not fall back");
-  assert.equal(bad.stdout, "");
+  for (const h of byEvent("SessionStart")) {
+    const bad = runHook("SessionStart", h.command, { ...env, APERTURE_PROJECT_DIR: empty });
+    assert.notEqual(bad.status, 0, "missing script under the selected root must fail, not fall back");
+    assert.equal(bad.stdout, "");
+  }
   // CLAUDE_PROJECT_DIR (set by Claude Code itself) is honoured when the launcher var is absent
-  const viaClaude = runHook("SessionStart", boot.command, { ...env, CLAUDE_PROJECT_DIR: ROOT });
+  const viaClaude = runHook("SessionStart", byEvent("SessionStart")[0].command, { ...env, CLAUDE_PROJECT_DIR: ROOT });
   assert.equal(viaClaude.status, 0, viaClaude.stderr);
   // BOTH unset → explicit failure, never a silent fixed checkout (the old master fallback is gone)
   for (const h of hooks) {

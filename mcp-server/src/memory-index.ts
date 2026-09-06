@@ -21,6 +21,9 @@
  *
  * CLI (used by scripts/aperture-prime.sh):
  *   node dist/memory-index.js --mode boot|precompact [--sidecar <path>] [--cache <path>]
+ *   node dist/memory-index.js --mode standing --part N [--max-bytes B]   Claude hook part N (≤ B bytes)
+ *   node dist/memory-index.js --mode standing --parts [--max-bytes B]    number of parts
+ *   node dist/memory-index.js --mode pointer                             ≤ 1 KB index pointer
  *     prints the rendered block to stdout; exit 0 always (fallback text on failure).
  *   node dist/memory-index.js --stats        prints recall_stats JSON.
  */
@@ -674,6 +677,103 @@ export function renderFallback(reason: string, standingCachePath: string = STAND
   return standing ? `${standing}\n\n${oneLine}\n` : `${oneLine}\n`;
 }
 
+// ── Claude hook transport: ≤ 10 KB per hook command (aperture-g4hku) ─────────────────────────
+//
+// Claude Code shows a hook command's stdout to the model only up to 10,000 characters; above that it
+// persists the text to a file and the model sees a ~2 KB preview (measured 2026-09-06 on 2.1.263 with
+// sentinel lines, and stated in the hooks reference). Commands on the same event are capped SEPARATELY
+// and all reach the model. So on the Claude path the standing block is emitted in parts, one hook command
+// per part, and the 25 KB index is replaced by a pointer — it was never visible anyway; memory stays
+// reachable through recall/recall_full and the UserPromptSubmit top-3 hook. The Codex prompt.md path
+// (boot/precompact) is not capped and is unchanged.
+
+export const STANDING_PART_MAX_BYTES = 9000;
+export const POINTER_MAX_BYTES = 1000;
+
+/** One complete `- **key** — text` entry per standing statement (same rendering as renderStandingBlock). */
+function standingEntries(index: MemoryIndex): string[] {
+  return index.standing.map((st) => {
+    const text = (st.text ?? st.body).trim().replace(/\s+/g, " ");
+    const tag = st.reviewed ? "" : " [unreviewed — full memory body; reviewed statement pending]";
+    return `- **${st.key}**${tag} — ${text}`;
+  });
+}
+
+/** Greedy split of complete entries into chunks whose joined bytes stay ≤ maxBytes (an entry larger than
+ *  maxBytes gets its own chunk — never split — and the gate fails on its size). */
+function chunkEntries(entries: string[], maxBytes: number, headerAllowance: number): string[][] {
+  const chunks: string[][] = [];
+  let cur: string[] = [];
+  let curBytes = headerAllowance;
+  for (const e of entries) {
+    const b = Buffer.byteLength(e, "utf8") + 1;
+    if (cur.length && curBytes + b > maxBytes) {
+      chunks.push(cur);
+      cur = [];
+      curBytes = headerAllowance;
+    }
+    cur.push(e);
+    curBytes += b;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+const STANDING_HEADER_ALLOWANCE = 160;
+
+/** All parts of the standing block for the Claude hook path. */
+export function renderStandingParts(index: MemoryIndex, maxBytes: number = STANDING_PART_MAX_BYTES): string[] {
+  const entries = standingEntries(index);
+  const chunks = chunkEntries(entries, maxBytes, STANDING_HEADER_ALLOWANCE);
+  const total = index.standing.length;
+  return chunks.map(
+    (c, i) =>
+      `<!-- memory-standing part ${i + 1}/${chunks.length} built=${index.builtAt} hash=${index.hash.slice(0, 12)} -->\n` +
+      `## Standing decisions (${total} total; part ${i + 1}/${chunks.length})\n${c.join("\n")}\n`,
+  );
+}
+
+/** Part N (1-based) or "" beyond the last part. */
+export function renderStandingPart(index: MemoryIndex, part: number, maxBytes: number = STANDING_PART_MAX_BYTES): string {
+  const parts = renderStandingParts(index, maxBytes);
+  return parts[part - 1] ?? "";
+}
+
+/** ≤ 1 KB pointer that replaces the injected index on the Claude path. */
+export function renderPointer(index: MemoryIndex): string {
+  return (
+    `<!-- memory-index mode=pointer built=${index.builtAt} hash=${index.hash.slice(0, 12)} -->\n` +
+    `## Memory index: ${index.lines.length} live, ${index.supersededCount} superseded hidden, ${index.secretCount} secret excluded — ` +
+    `index not injected (10 KB hook visibility cap); use recall(query) for ranked gists and recall_full(key) for a body; ` +
+    `the UserPromptSubmit hook shows top-3 per prompt.\n`
+  );
+}
+
+/** Fallback for `--mode standing --part N`: chunk the last-good cached standing block the same way; part 1
+ *  also carries the single unavailable line. Never the bank. */
+export function renderStandingFallbackPart(
+  reason: string,
+  part: number,
+  maxBytes: number = STANDING_PART_MAX_BYTES,
+  standingCachePath: string = STANDING_CACHE,
+): string {
+  let cached = "";
+  try {
+    if (existsSync(standingCachePath)) cached = redact(readFileSync(standingCachePath, "utf8")).text;
+  } catch {
+    cached = "";
+  }
+  const entries = cached.split("\n").filter((l) => l.startsWith("- **"));
+  const chunks = entries.length ? chunkEntries(entries, maxBytes, STANDING_HEADER_ALLOWANCE) : [];
+  const oneLine = `[memory index unavailable: ${reason.replace(/\s+/g, " ").trim()} — use recall/recall_full]`;
+  if (part === 1) {
+    const body = chunks[0] ? `## Standing decisions (cached last-good; part 1/${chunks.length})\n${chunks[0].join("\n")}\n\n` : "";
+    return `${body}${oneLine}\n`;
+  }
+  const c = chunks[part - 1];
+  return c ? `## Standing decisions (cached last-good; part ${part}/${chunks.length})\n${c.join("\n")}\n` : "";
+}
+
 // ── retrieval ─────────────────────────────────────────────────────────────
 
 const BM25_K1 = 1.2;
@@ -868,13 +968,18 @@ export function recallStats(index: MemoryIndex, cachePath: string = CACHE_PATH):
 
 // ── CLI ───────────────────────────────────────────────────────────────────
 
-function parseArgs(argv: string[]): { mode: RenderMode | null; stats: boolean; sidecar?: string; cache?: string } {
-  const out: { mode: RenderMode | null; stats: boolean; sidecar?: string; cache?: string } = { mode: null, stats: false };
+type CliMode = RenderMode | "standing" | "pointer";
+function parseArgs(argv: string[]): { mode: CliMode | null; stats: boolean; sidecar?: string; cache?: string; part?: number; parts?: boolean; maxBytes?: number } {
+  const out: { mode: CliMode | null; stats: boolean; sidecar?: string; cache?: string; part?: number; parts?: boolean; maxBytes?: number } = { mode: null, stats: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--stats") out.stats = true;
-    else if (a === "--mode") out.mode = argv[++i] === "precompact" ? "precompact" : "boot";
-    else if (a.startsWith("--mode=")) out.mode = a.slice(7) === "precompact" ? "precompact" : "boot";
+    else if (a === "--mode" || a.startsWith("--mode=")) {
+      const v = a === "--mode" ? argv[++i] : a.slice(7);
+      out.mode = v === "precompact" || v === "standing" || v === "pointer" ? v : "boot";
+    } else if (a === "--part") out.part = Math.max(1, Math.floor(Number(argv[++i]) || 1));
+    else if (a === "--parts") out.parts = true;
+    else if (a === "--max-bytes") out.maxBytes = Math.max(512, Math.floor(Number(argv[++i]) || STANDING_PART_MAX_BYTES));
     else if (a === "--sidecar") out.sidecar = argv[++i];
     else if (a.startsWith("--sidecar=")) out.sidecar = a.slice(10);
     else if (a === "--cache") out.cache = argv[++i];
@@ -895,7 +1000,28 @@ async function main(): Promise<void> {
     }
     return;
   }
-  const mode: RenderMode = args.mode ?? "boot";
+  const mode: CliMode = args.mode ?? "boot";
+  const maxBytes = args.maxBytes ?? STANDING_PART_MAX_BYTES;
+  if (mode === "standing") {
+    try {
+      const index = await buildIndex(opts);
+      if (args.parts) process.stdout.write(`${renderStandingParts(index, maxBytes).length}\n`);
+      else process.stdout.write(renderStandingPart(index, args.part ?? 1, maxBytes));
+    } catch (e) {
+      if (args.parts) process.stdout.write("1\n");
+      else process.stdout.write(renderStandingFallbackPart((e as Error).message, args.part ?? 1, maxBytes, args.cache ? STANDING_CACHE : STANDING_CACHE));
+    }
+    return;
+  }
+  if (mode === "pointer") {
+    try {
+      const index = await buildIndex(opts);
+      process.stdout.write(renderPointer(index));
+    } catch (e) {
+      process.stdout.write(`[memory index unavailable: ${(e as Error).message.replace(/\s+/g, " ").trim()} — use recall/recall_full]\n`);
+    }
+    return;
+  }
   try {
     const index = await buildIndex(opts);
     process.stdout.write(renderIndex(index, mode));

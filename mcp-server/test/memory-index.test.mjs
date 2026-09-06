@@ -565,3 +565,110 @@ test("dist build is present (sanity for the CLI tests)", () => {
   assert.ok(existsSync(DIST));
   execFileSync(process.execPath, ["--check", DIST]);
 });
+
+// ── 12. CLI: Claude hook transport (aperture-g4hku) ───────────────────────────
+// Claude shows the model ≤ 10,000 chars per hook command, so the standing block is served in parts
+// (`--mode standing --part N`) and the index is replaced by a ≤ 1 KB pointer (`--mode pointer`).
+
+/** 6 standing entries of ~250 B each: with --max-bytes 700 (160 B header allowance) that is ≥ 2 parts. */
+function chunkEnv(stubBody = null) {
+  const bank = {}; const meta = {};
+  for (let i = 1; i <= 6; i++) {
+    const key = `chunk-rule-${i}-2026-09-0${i}`;
+    bank[key] = `DECISION-C${i}: chunk rule ${i}. ${"Complete entries only, never split across parts. ".repeat(3)}`.trim();
+    meta[key] = { standing: true, project: "aperture" };
+  }
+  bank["chunk-note-2026-09-07"] = `A note about the ws-hub with ${SECRETS.partial_token.text} inside.`;
+  const body = stubBody ?? `if [ "$1" = "memories" ] && [ "$2" = "--json" ]; then cat <<'EOF'\n${JSON.stringify(bank)}\nEOF\nexit 0; fi\necho "stub: unexpected argv $*" >&2; exit 2`;
+  const c = cliEnv(body);
+  writeFileSync(join(c.dir, "meta.json"), JSON.stringify(meta));
+  return { ...c, keys: Object.keys(meta) };
+}
+const MAXB = 700;
+const cli = (env, args) => spawnSync(process.execPath, [DIST, ...args], { env, encoding: "utf8" });
+const entryLinesOf = (s) => s.split("\n").filter((l) => l.startsWith("- **"));
+
+test("CLI --mode standing --parts / --part N: ≥ 2 parts at a small --max-bytes, every part ≤ max, no entry split, union == full block, part beyond M empty", () => {
+  const { dir, env, keys } = chunkEnv();
+  const full = cli(env, ["--mode", "boot"]);
+  assert.equal(full.status, 0, full.stderr);
+  const expected = entryLinesOf(full.stdout);
+  assert.equal(expected.length, 6);
+
+  const parts = cli(env, ["--mode", "standing", "--parts", "--max-bytes", String(MAXB)]);
+  assert.equal(parts.status, 0, parts.stderr);
+  const M = Number(parts.stdout.trim());
+  assert.ok(Number.isInteger(M) && M >= 2, `--parts must print an integer ≥ 2, got ${JSON.stringify(parts.stdout)}`);
+
+  const seen = [];
+  for (let n = 1; n <= M; n++) {
+    const p = cli(env, ["--mode", "standing", "--part", String(n), "--max-bytes", String(MAXB)]);
+    assert.equal(p.status, 0, p.stderr);
+    const size = Buffer.byteLength(p.stdout, "utf8");
+    assert.ok(size <= MAXB, `part ${n} is ${size} B > ${MAXB}`);
+    const lines = p.stdout.split("\n");
+    assert.match(lines[0], new RegExp(`^<!-- memory-standing part ${n}/${M} built=\\S+ hash=[0-9a-f]{12} -->$`), lines[0]);
+    assert.equal(lines[1], `## Standing decisions (6 total; part ${n}/${M})`);
+    const entries = entryLinesOf(p.stdout);
+    assert.ok(entries.length >= 1, `part ${n} carries at least one entry`);
+    for (const e of entries) assert.ok(expected.includes(e), `part ${n} split or altered an entry: ${e.slice(0, 80)}`);
+    // nothing but header + complete entries
+    assert.equal(lines.slice(2).filter((l) => l !== "").length, entries.length, `part ${n} has non-entry body lines:\n${p.stdout}`);
+    seen.push(...entries);
+    assertNoMarkers(p.stdout, `standing part ${n}`);
+  }
+  assert.deepEqual(seen, expected, "union of parts must equal the full standing block, in order, each entry once");
+  for (const k of keys) assert.equal(seen.filter((l) => l.startsWith(`- **${k}**`)).length, 1, k);
+
+  const beyond = cli(env, ["--mode", "standing", "--part", String(M + 1), "--max-bytes", String(MAXB)]);
+  assert.equal(beyond.status, 0, beyond.stderr);
+  assert.equal(beyond.stdout, "", "a part index beyond M prints nothing");
+
+  // the default cap (no --max-bytes) fits this small bank in a single part
+  const one = cli(env, ["--mode", "standing", "--parts"]);
+  assert.equal(one.stdout.trim(), "1");
+  const single = cli(env, ["--mode", "standing", "--part", "1"]);
+  assert.deepEqual(entryLinesOf(single.stdout), expected);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("CLI --mode standing with a failing bd → part 1 = cached last-good chunk + exactly one unavailable line; never the bank", () => {
+  const { dir, env } = chunkEnv();
+  assert.equal(cli(env, ["--mode", "boot"]).status, 0, "warm the standing cache");
+  assert.ok(existsSync(join(dir, "run", "standing.md")));
+  writeFileSync(join(dir, "bd"), `#!/bin/sh\necho "bd: simulated outage" >&2\nexit 1\n`);
+  rmSync(join(dir, "cache.json"), { force: true });
+
+  const p1 = cli(env, ["--mode", "standing", "--part", "1", "--max-bytes", String(MAXB)]);
+  assert.equal(p1.status, 0, p1.stderr);
+  const unavailable = p1.stdout.split("\n").filter((l) => /^\[memory index unavailable: .*simulated outage.* — use recall\/recall_full\]$/.test(l));
+  assert.equal(unavailable.length, 1, `exactly one unavailable line:\n${p1.stdout}`);
+  assert.match(p1.stdout, /^## Standing decisions \(.*part 1\/\d+\)$/m, "cached chunk header present");
+  const entries = entryLinesOf(p1.stdout);
+  assert.ok(entries.length >= 1, "cached chunk carries entries");
+  assert.ok(entries[0].startsWith("- **chunk-rule-1-2026-09-01**"), entries[0]);
+  assert.ok(Buffer.byteLength(p1.stdout, "utf8") <= MAXB + 200, "fallback part 1 stays near the cap (chunk + one line)");
+  assert.ok(!p1.stdout.includes("chunk-note") && !p1.stdout.includes("ws-hub"), "bank text leaked into fallback");
+  assertNoMarkers(p1.stdout, "standing fallback");
+
+  // cold start: no standing cache at all → part 1 is just the one line, exit 0
+  const cold = chunkEnv(`echo "bd: down" >&2; exit 1`);
+  const c1 = cli(cold.env, ["--mode", "standing", "--part", "1"]);
+  assert.equal(c1.status, 0);
+  assert.equal(c1.stdout.trim().split("\n").length, 1);
+  assert.match(c1.stdout, /^\[memory index unavailable: /);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(cold.dir, { recursive: true, force: true });
+});
+
+test("CLI --mode pointer → ≤ 1,000 B with counts and the recall/recall_full pointer; no index lines, no entries", () => {
+  const { dir, env } = chunkEnv();
+  const r = cli(env, ["--mode", "pointer"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(Buffer.byteLength(r.stdout, "utf8") <= 1000, `pointer is ${Buffer.byteLength(r.stdout, "utf8")} B`);
+  assert.match(r.stdout, /^<!-- memory-index mode=pointer built=\S+ hash=[0-9a-f]{12} -->$/m);
+  assert.match(r.stdout, /^## Memory index: 7 live, 0 superseded hidden, 0 secret excluded — index not injected \(10 KB hook visibility cap\); use recall\(query\) for ranked gists and recall_full\(key\) for a body; the UserPromptSubmit hook shows top-3 per prompt\.$/m, r.stdout);
+  assert.ok(!r.stdout.includes("- **") && !r.stdout.includes("chunk-note"), "no entries, no index lines");
+  assertNoMarkers(r.stdout, "pointer");
+  rmSync(dir, { recursive: true, force: true });
+});
