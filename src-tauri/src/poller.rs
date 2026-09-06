@@ -58,7 +58,10 @@ pub fn run_message_poller(state: Arc<Mutex<AppState>>) {
             if !sender.is_empty() {
                 if let Ok(mut app_state) = state.lock() {
                     if let Some(agent) = app_state.agents.get_mut(&sender) {
-                        agent.attention = true;
+                        // attention_reason = "message" (aperture-ull4y) — unless
+                        // a crash badge is already lit, which a message never
+                        // downgrades (see agents::light_attention).
+                        crate::agents::light_attention(agent, crate::agents::AttentionReason::Message);
                     }
                 }
             }

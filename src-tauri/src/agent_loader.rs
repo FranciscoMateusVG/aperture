@@ -151,6 +151,8 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
                 tmux_window_id: None,
                 status: "stopped".into(),
                 attention: false,
+                attention_reason: None,
+                turn_state: None,
                 current_task_id: None,
                 current_task_title: None,
                 current_task_extra_count: None,

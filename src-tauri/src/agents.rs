@@ -461,6 +461,37 @@ pub fn boot_agent_process(
     boot_result
 }
 
+/// Blocking teardown shared by `stop_agent` and `restart_agent`. Call with NO
+/// AppState lock held (sleeps ~1s). With a window id: interrupt, `/exit`, kill
+/// the window. Always: stop any supervised codex app-server, remove the
+/// kickoff file, and clear the watchdog's in-memory state — see the comments
+/// inline. Does NOT touch AppState; callers write `status`/`tmux_window_id`
+/// themselves under a fresh lock.
+fn teardown_agent(name: &str, window_id: Option<String>) {
+    if let Some(window_id) = window_id {
+        let _ = tmux::tmux_send_keys(window_id.clone(), "C-c".into());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = tmux::tmux_send_keys(window_id.clone(), "/exit".into());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = tmux::tmux_kill_window(window_id);
+    }
+
+    // Comms Layer v2, Phase 2: kill this agent's supervised codex app-server
+    // (no-op for Claude agents, which never register one).
+    codex_appserver::stop_app_server(name);
+
+    // aperture-wul6m: clear watchdog eligibility for a DELIBERATE stop so it is
+    // never fought. Removing the kickoff file drops the agent below the
+    // "expected-present" gate (eligibility = running window + kickoff file);
+    // on_agent_stopped also clears any in-memory presence/attempt state so a
+    // later restart begins from a clean slate.
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let _ = fs::remove_file(format!("{}/.aperture/run/{}.kickoff", home, name));
+        crate::watchdog::on_agent_stopped(name);
+    }
+}
+
 #[tauri::command]
 pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     // Extract needed data and release the lock before the blocking sleep calls
@@ -478,28 +509,7 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
         return Err(format!("Agent '{}' is not running", name));
     }
 
-    if let Some(window_id) = window_id_opt {
-        let _ = tmux::tmux_send_keys(window_id.clone(), "C-c".into());
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = tmux::tmux_send_keys(window_id.clone(), "/exit".into());
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = tmux::tmux_kill_window(window_id);
-    }
-
-    // Comms Layer v2, Phase 2: kill this agent's supervised codex app-server
-    // (no-op for Claude agents, which never register one).
-    codex_appserver::stop_app_server(&name);
-
-    // aperture-wul6m: clear watchdog eligibility for a DELIBERATE stop so it is
-    // never fought. Removing the kickoff file drops the agent below the
-    // "expected-present" gate (eligibility = running window + kickoff file);
-    // on_agent_stopped also clears any in-memory presence/attempt state so a
-    // later restart begins from a clean slate.
-    {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let _ = fs::remove_file(format!("{}/.aperture/run/{}.kickoff", home, name));
-        crate::watchdog::on_agent_stopped(&name);
-    }
+    teardown_agent(&name, window_id_opt);
 
     // Re-acquire to update status
     {
@@ -512,6 +522,99 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
     Ok(())
 }
 
+/// Restart an agent regardless of whether it is currently alive
+/// (aperture-ull4y). The gap this closes: `stop_agent` errors with "not
+/// running" on a crashed/exited agent and `start_agent` errors with "already
+/// running" on a live one, so the launcher had no single action for "bring
+/// this agent back." Liveness is decided by the SAME tmux probe `list_agents`
+/// uses (a real window running claude/codex/node), not the cached `status`,
+/// which can lag a crash by up to one poll cycle.
+///
+/// Running → full stop sequence (C-c, /exit, kill window) then boot.
+/// Not running → skip the tmux teardown WITHOUT erroring, still run the
+/// idempotent cleanup (codex app-server, kickoff file, watchdog state) so a
+/// crash's leftovers can't leak into the fresh boot, then boot.
+///
+/// Lock discipline mirrors `start_agent`: snapshot under the lock, release for
+/// every blocking step (tmux probe, teardown sleeps, boot), re-lock only to
+/// write the outcome.
+#[tauri::command]
+pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
+        let app_state = state.lock().map_err(|e| e.to_string())?;
+        let agent = app_state
+            .agents
+            .get(&name)
+            .ok_or(format!("Agent '{}' not found", name))?
+            .clone();
+        (
+            agent,
+            app_state.tmux_session.clone(),
+            app_state.mcp_server_path.clone(),
+            app_state.mcp_sentry_server_path.clone(),
+            app_state.project_dir.clone(),
+        )
+    }; // ← mutex released here; all I/O below is lock-free
+
+    // Same liveness probe as list_agents. If tmux itself can't be listed,
+    // fall back to the cached status/window id rather than refusing to act.
+    let live_window: Option<String> = match tmux::tmux_list_windows(tmux_session.clone()) {
+        Ok(windows) => find_running_window(&windows, &name).map(|w| w.window_id.clone()),
+        Err(_) => agent.tmux_window_id.clone().filter(|_| agent.status == "running"),
+    };
+
+    if live_window.is_some() {
+        teardown_agent(&name, live_window);
+    } else {
+        eprintln!("[aperture] restart_agent: '{}' is not running — skipping stop, booting fresh", name);
+        teardown_agent(&name, None);
+    }
+
+    // Reflect the stopped state before the (possibly failing) boot so a boot
+    // failure never leaves a phantom "running" with a dead window id.
+    {
+        let mut app_state = state.lock().map_err(|e| e.to_string())?;
+        if let Some(agent_mut) = app_state.agents.get_mut(&name) {
+            agent_mut.tmux_window_id = None;
+            agent_mut.status = "stopped".into();
+        }
+    }
+
+    let window_id = boot_agent_process(
+        &agent,
+        tmux_session,
+        mcp_server_path,
+        mcp_sentry_server_path,
+        project_dir,
+    )?;
+
+    {
+        let mut app_state = state.lock().map_err(|e| e.to_string())?;
+        let agent_mut = app_state
+            .agents
+            .get_mut(&name)
+            .ok_or(format!("Agent '{}' not found", name))?;
+        agent_mut.tmux_window_id = Some(window_id);
+        agent_mut.status = "running".into();
+    }
+
+    Ok(())
+}
+
+/// The one liveness probe: an agent is running iff its tmux session has a
+/// window named after it whose foreground command is claude/codex/node.
+/// Shared by `list_agents` (every 3s poll) and `restart_agent`.
+fn find_running_window<'a>(windows: &'a [tmux::WindowInfo], agent_name: &str) -> Option<&'a tmux::WindowInfo> {
+    windows.iter().find(|window| {
+        window.name == agent_name
+            && (window.command == "claude"
+                || window.command.contains("claude")
+                || window.command == "codex"
+                || window.command.contains("codex")
+                || window.command == "node")
+    })
+}
+
 #[tauri::command]
 pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<AgentDef>, String> {
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
@@ -519,14 +622,7 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
     // Cross-reference with actual tmux windows to detect agents started outside the UI
     if let Ok(windows) = tmux::tmux_list_windows(app_state.tmux_session.clone()) {
         for agent in app_state.agents.values_mut() {
-            let running_window = windows.iter().find(|window| {
-                window.name == agent.name
-                    && (window.command == "claude"
-                        || window.command.contains("claude")
-                        || window.command == "codex"
-                        || window.command.contains("codex")
-                        || window.command == "node")
-            });
+            let running_window = find_running_window(&windows, &agent.name);
 
             if let Some(window) = running_window {
                 agent.status = "running".into();
@@ -583,6 +679,39 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
     Ok(app_state.agents.values().cloned().collect())
 }
 
+/// Why an attention badge is being lit (aperture-ull4y). Serialized onto
+/// `AgentDef.attention_reason` as `"message"` / `"crash"`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AttentionReason {
+    /// The agent rang the operator doorbell (`send_message(to: "operator")`).
+    Message,
+    /// The watchdog latched red after exhausting its re-kick budget.
+    Crash,
+}
+
+impl AttentionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            AttentionReason::Message => "message",
+            AttentionReason::Crash => "crash",
+        }
+    }
+}
+
+/// Light the attention badge with a reason. Precedence rule: `crash` always
+/// wins — a crash latch overwrites a lit `message` badge, but a later message
+/// never downgrades a standing `crash` (the operator must still see that the
+/// agent is dead, and the doorbell text lives in scrollback regardless).
+/// Callers: poller.rs (message), watchdog.rs (crash). `clear_attention` is the
+/// only thing that resets it.
+pub fn light_attention(agent: &mut AgentDef, reason: AttentionReason) {
+    agent.attention = true;
+    let already_crash = agent.attention_reason.as_deref() == Some(AttentionReason::Crash.as_str());
+    if reason == AttentionReason::Crash || !already_crash {
+        agent.attention_reason = Some(reason.as_str().to_string());
+    }
+}
+
 #[tauri::command]
 pub fn clear_attention(
     name: String,
@@ -591,6 +720,7 @@ pub fn clear_attention(
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
     if let Some(agent) = app_state.agents.get_mut(&name) {
         agent.attention = false;
+        agent.attention_reason = None;
     }
     Ok(())
 }
@@ -747,4 +877,85 @@ pub fn inject_bd_memory(mut prompt: String, beads_dir: &str, agent_name: &str) -
         }
     }
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent() -> AgentDef {
+        AgentDef {
+            name: "vance".into(),
+            model: "fable".into(),
+            role: "builder".into(),
+            prompt_file: String::new(),
+            tmux_window_id: None,
+            status: "running".into(),
+            attention: false,
+            attention_reason: None,
+            turn_state: None,
+            current_task_id: None,
+            current_task_title: None,
+            current_task_extra_count: None,
+            dot_state: None,
+            dot_state_since: None,
+            kickoff_fired_at: None,
+        }
+    }
+
+    // ---- aperture-ull4y: attention_reason precedence ----
+
+    #[test]
+    fn attention_reason_message_lights_badge() {
+        let mut a = agent();
+        light_attention(&mut a, AttentionReason::Message);
+        assert!(a.attention);
+        assert_eq!(a.attention_reason.as_deref(), Some("message"));
+    }
+
+    #[test]
+    fn attention_reason_crash_overwrites_message() {
+        let mut a = agent();
+        light_attention(&mut a, AttentionReason::Message);
+        light_attention(&mut a, AttentionReason::Crash);
+        assert!(a.attention);
+        assert_eq!(a.attention_reason.as_deref(), Some("crash"));
+    }
+
+    #[test]
+    fn attention_reason_message_never_downgrades_crash() {
+        let mut a = agent();
+        light_attention(&mut a, AttentionReason::Crash);
+        light_attention(&mut a, AttentionReason::Message);
+        assert!(a.attention);
+        assert_eq!(a.attention_reason.as_deref(), Some("crash"));
+    }
+
+    #[test]
+    fn attention_clear_resets_both_fields() {
+        // Mirrors clear_attention's body (the command itself needs a Tauri
+        // State handle); after a clear, a fresh message lights "message"
+        // again — no stale crash precedence survives the clear.
+        let mut a = agent();
+        light_attention(&mut a, AttentionReason::Crash);
+        a.attention = false;
+        a.attention_reason = None;
+        light_attention(&mut a, AttentionReason::Message);
+        assert_eq!(a.attention_reason.as_deref(), Some("message"));
+    }
+
+    #[test]
+    fn find_running_window_matches_agent_shell_commands_only() {
+        let w = |name: &str, command: &str| tmux::WindowInfo {
+            window_id: format!("@{}", name),
+            name: name.into(),
+            command: command.into(),
+        };
+        let windows = vec![w("vance", "zsh"), w("rex", "codex"), w("izzy", "node"), w("scout", "claude")];
+        assert!(find_running_window(&windows, "vance").is_none(), "a bare shell is a dead agent");
+        assert_eq!(find_running_window(&windows, "rex").unwrap().window_id, "@rex");
+        assert_eq!(find_running_window(&windows, "izzy").unwrap().window_id, "@izzy");
+        assert_eq!(find_running_window(&windows, "scout").unwrap().window_id, "@scout");
+        assert!(find_running_window(&windows, "ghost").is_none());
+    }
 }

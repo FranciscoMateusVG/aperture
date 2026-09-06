@@ -41,20 +41,94 @@ const DOT_TOOLTIPS: Record<DotState, string> = {
   spawned: "Starting — waiting for first turn",
   booting: "Booting — kickoff sent, waiting to connect to the hub",
   online: "Online — connected to the message hub",
-  stuck: "Stuck — kickoff sent {N}s ago, still not connected. Check the tmux pane.",
+  stuck: "Stuck — kickoff sent {N}, still not connected. Check the tmux pane.",
 };
 
+/** Whole seconds elapsed between an ISO timestamp and `now` (ms epoch).
+ *  null when the timestamp is absent or unparseable — callers must NOT
+ *  substitute 0, that is exactly the bogus "~0s" this exists to kill. */
+export function secondsSince(iso: string | null | undefined, now: number): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, Math.round((now - t) / 1000));
+}
+
+/** When the current dot_state began. Prefers dot_state_since (backend-
+ *  stamped with the TRANSITION time since aperture-ull4y); falls back to
+ *  kickoff_fired_at for the pre-watchdog local "booting" read. */
+function stateSince(agent: AgentDef): string | null | undefined {
+  return agent.dot_state_since ?? agent.kickoff_fired_at;
+}
+
 /** {N} is cosmetic display math only (a live-updating "how long has this
- *  been true" counter) — not a deadline decision, so client-side Date.now()
- *  arithmetic is fine here even though the state itself isn't. Prefers
- *  dot_state_since (backend-stamped); falls back to kickoff_fired_at for the
- *  pre-watchdog local "booting" case. */
-export function dotTooltip(state: DotState, agent: AgentDef): string {
+ *  been true" counter) — not a deadline decision, so client-side clock
+ *  arithmetic is fine here even though the state itself isn't. When no
+ *  usable timestamp exists the elapsed clause is dropped entirely rather
+ *  than rendered as "0s ago". `now` is injectable for tests. */
+export function dotTooltip(state: DotState, agent: AgentDef, now: number = Date.now()): string {
   if (state !== "stuck") return DOT_TOOLTIPS[state];
-  const since = agent.dot_state_since ?? agent.kickoff_fired_at;
-  const firedAt = since ? Date.parse(since) : NaN;
-  const seconds = Number.isNaN(firedAt) ? 0 : Math.round((Date.now() - firedAt) / 1000);
-  return DOT_TOOLTIPS.stuck.replace("{N}", String(seconds));
+  const seconds = secondsSince(stateSince(agent), now);
+  return DOT_TOOLTIPS.stuck.replace("{N}", seconds == null ? "earlier" : `${seconds}s ago`);
+}
+
+// ── Turn-state chip (aperture-ull4y) ──
+//
+// One-word label rendered next to the model string. Composes the process
+// status, the presence dot state, and the hub turn_state into a single
+// operator-facing word; the counter in booting/stuck is recomputed on every
+// render off dot_state_since (the list rebuilds on the 3s poll — no
+// per-second timer, on purpose).
+//
+//   not running          → null (no chip; stopped is already the card's look)
+//   online + busy        → "busy"   (pulses — the agent is mid-turn)
+//   online + idle        → "idle"
+//   online + unknown     → "online" (subscriber down / no frame yet)
+//   booting              → "booting {N}s"
+//   stuck                → "stuck {N}s"
+//   spawned              → "spawned"
+
+export type StateChipKind = "busy" | "idle" | "online" | "booting" | "stuck" | "spawned";
+
+export interface StateChip {
+  label: string;
+  kind: StateChipKind;
+  tooltip: string;
+}
+
+const CHIP_TOOLTIPS: Record<StateChipKind, string> = {
+  busy: "Mid-turn — the hub reports this agent is generating",
+  idle: "Between turns — online and waiting for input",
+  online: "Online — connected to the hub, turn state not reported",
+  booting: "Booting — kickoff sent, waiting to connect to the hub",
+  stuck: "Stuck — kickoff sent, still not connected. Check the tmux pane.",
+  spawned: "Spawned — process exists, kickoff not fired yet",
+};
+
+/** Pure: (agent, now-ms) → chip or null. Never throws on a partial AgentDef
+ *  (older backend without turn_state / dot_state_since). */
+export function deriveStateChip(agent: AgentDef, now: number): StateChip | null {
+  if (agent.status !== "running") return null;
+  const dot = deriveDotState(agent);
+  const withCounter = (kind: "booting" | "stuck"): StateChip => {
+    const seconds = secondsSince(stateSince(agent), now);
+    return {
+      kind,
+      label: seconds == null ? kind : `${kind} ${seconds}s`,
+      tooltip: CHIP_TOOLTIPS[kind],
+    };
+  };
+  switch (dot) {
+    case "online": {
+      const kind: StateChipKind =
+        agent.turn_state === "busy" ? "busy" :
+        agent.turn_state === "idle" ? "idle" : "online";
+      return { kind, label: kind, tooltip: CHIP_TOOLTIPS[kind] };
+    }
+    case "booting": return withCounter("booting");
+    case "stuck": return withCounter("stuck");
+    case "spawned": return { kind: "spawned", label: "spawned", tooltip: CHIP_TOOLTIPS.spawned };
+  }
 }
 
 // ── Current-work summary line (aperture-nr65b) ──

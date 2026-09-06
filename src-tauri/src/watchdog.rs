@@ -76,6 +76,25 @@ const RECONNECT_GRACE: Duration = Duration::from_secs(10);
 /// quiet, bounded — never a tight reconnect loop).
 const SUBSCRIBER_RECONNECT_MAX: Duration = Duration::from_secs(30);
 
+/// Hub turn-state (aperture-ull4y): the hub broadcasts `busy` when an agent
+/// starts a turn and `idle` when it finishes. Previously folded into
+/// `Presence.online` and discarded; now carried through to `AgentDef.turn_state`
+/// so the launcher can tell "working" from "waiting" on a green dot.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Turn {
+    Busy,
+    Idle,
+}
+
+impl Turn {
+    fn as_str(self) -> &'static str {
+        match self {
+            Turn::Busy => "busy",
+            Turn::Idle => "idle",
+        }
+    }
+}
+
 /// One agent's hub-presence facts, as learned from the subscriber stream.
 #[derive(Default)]
 struct Presence {
@@ -85,6 +104,10 @@ struct Presence {
     /// When the agent became *continuously* online (reset on any leave). Used
     /// for the ONLINE_DEBOUNCE stability check.
     online_since: Option<SystemTime>,
+    /// Last `busy`/`idle` frame seen since the agent joined. `None` on a fresh
+    /// entry or after `join` alone (no turn frame yet), and cleared on `leave`
+    /// / subscriber disconnect — an absent agent has no trustworthy turn state.
+    turn: Option<Turn>,
 }
 
 /// One agent's re-kick bookkeeping.
@@ -221,6 +244,40 @@ fn compute_dot(kickoff_millis: Option<u64>, presence: Option<&Presence>, at: Sys
         Dot::Stuck
     } else {
         Dot::Booting
+    }
+}
+
+/// When the CURRENT dot state began (aperture-ull4y) — the value behind
+/// `AgentDef.dot_state_since`, which the frontend renders as a live "{N}s ago"
+/// counter. Derived from the two source clocks rather than stamped with the
+/// tick time (the previous bug: every tick re-stamped `now`, so the counter
+/// never left ~0s):
+///
+/// - `online`  → `Presence.online_since` (the join that has held stable).
+/// - `spawned` / `booting` / `stuck` → the kickoff timestamp. `stuck` deliberately
+///   keeps the kickoff clock rather than the deadline crossing: the spec's
+///   tooltip is "kickoff sent {N}s ago, still not connected", so the operator
+///   sees the whole silence, not silence-minus-60s.
+///
+/// Same inputs → same output across ticks, so a steady state yields a steady
+/// `since`; only a real transition (a new kickoff, a fresh join) moves it.
+/// `None` only when the source clock is missing (an online dot always has an
+/// `online_since`; spawned has no kickoff) — the caller falls back to the tick.
+fn dot_since(dot: Dot, kickoff_millis: Option<u64>, presence: Option<&Presence>) -> Option<SystemTime> {
+    match dot {
+        Dot::Online => presence.and_then(|p| p.online_since),
+        Dot::Spawned | Dot::Booting | Dot::Stuck => kickoff_millis.map(millis_to_systemtime),
+    }
+}
+
+/// The hub turn-state to publish for a given dot (aperture-ull4y). Rule:
+/// `turn_state` is `None` whenever the dot is not `online` — an unstable,
+/// booting, or stuck agent has no trustworthy turn state, whatever the last
+/// frame said.
+fn turn_for(dot: Dot, presence: Option<&Presence>) -> Option<Turn> {
+    match dot {
+        Dot::Online => presence.and_then(|p| p.turn),
+        Dot::Spawned | Dot::Booting | Dot::Stuck => None,
     }
 }
 
@@ -480,6 +537,13 @@ fn mark_disconnected(shared: &Arc<Mutex<Shared>>) {
     if let Ok(mut s) = shared.lock() {
         s.subscriber_connected = false;
         s.connected_since = None;
+        // Turn-state is only as fresh as the last frame we received; with the
+        // subscriber down nothing can refresh it, so drop it fleet-wide. The
+        // online flag itself is left for the tick's trustworthiness gate
+        // (and is wiped outright by mark_connected on the next reconnect).
+        for p in s.presence.values_mut() {
+            p.turn = None;
+        }
     }
 }
 
@@ -498,22 +562,37 @@ fn handle_presence_frame(shared: &Arc<Mutex<Shared>>, txt: &str) {
         return;
     };
 
-    // join / busy / idle → positive presence; leave → gone. (busy & idle both
-    // map to online — turn-state is not a separate dot color.)
-    let positive = matches!(event, "join" | "busy" | "idle");
     if let Ok(mut s) = shared.lock() {
-        let p = s.presence.entry(agent.to_string()).or_default();
-        if positive {
-            // Only (re)start the debounce clock on a transition into online —
-            // a steady busy/idle stream must not keep resetting stability.
-            if !p.online {
-                p.online = true;
-                p.online_since = Some(now());
-            }
-        } else {
-            p.online = false;
-            p.online_since = None;
+        apply_presence_event(&mut s.presence, agent, event, now());
+    }
+}
+
+/// Fold one presence event into the map. Pure (clock injected) so the
+/// transitions are unit-testable without a socket.
+///
+/// join / busy / idle → positive presence; leave → gone. busy & idle both map
+/// to online (turn-state is not a separate dot color) but are additionally
+/// remembered as `turn` (aperture-ull4y): `busy` → Busy, `idle` → Idle, `join`
+/// leaves the prior value untouched (None on a fresh entry), `leave` clears it.
+fn apply_presence_event(presence: &mut HashMap<String, Presence>, agent: &str, event: &str, at: SystemTime) {
+    let positive = matches!(event, "join" | "busy" | "idle");
+    let p = presence.entry(agent.to_string()).or_default();
+    if positive {
+        // Only (re)start the debounce clock on a transition into online —
+        // a steady busy/idle stream must not keep resetting stability.
+        if !p.online {
+            p.online = true;
+            p.online_since = Some(at);
         }
+        match event {
+            "busy" => p.turn = Some(Turn::Busy),
+            "idle" => p.turn = Some(Turn::Idle),
+            _ => {} // join: keep whatever we knew
+        }
+    } else {
+        p.online = false;
+        p.online_since = None;
+        p.turn = None;
     }
 }
 
@@ -561,7 +640,7 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
     };
 
     let mut rekicks: Vec<RekickOrder> = Vec::new();
-    let mut dot_writes: Vec<(String, Option<String>, Option<String>, Option<String>)> = Vec::new();
+    let mut dot_writes: Vec<DotWrite> = Vec::new();
 
     {
         let mut s = shared.lock().unwrap();
@@ -597,16 +676,27 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
 
             // Write the dot fields for the frontend poll. Stopped/kickoff-less
             // agents get None (the frontend derives spawned/booting locally).
+            // `since` is derived from the source clocks (dot_since), NOT the
+            // tick time, so it only moves on a real transition; `turn_state`
+            // is None unless the dot is online (turn_for).
             if *running && kickoff_millis.is_some() {
-                let kickoff_iso = kickoff_millis.map(|m| iso8601(millis_to_systemtime(m)));
-                dot_writes.push((
-                    name.clone(),
-                    Some(dot.as_str().to_string()),
-                    Some(iso8601(at)),
-                    kickoff_iso,
-                ));
+                let presence = s.presence.get(name);
+                let since = dot_since(dot, kickoff_millis, presence).unwrap_or(at);
+                dot_writes.push(DotWrite {
+                    name: name.clone(),
+                    dot_state: Some(dot.as_str().to_string()),
+                    dot_state_since: Some(iso8601(since)),
+                    kickoff_fired_at: kickoff_millis.map(|m| iso8601(millis_to_systemtime(m))),
+                    turn_state: turn_for(dot, presence).map(|t| t.as_str().to_string()),
+                });
             } else {
-                dot_writes.push((name.clone(), None, None, None));
+                dot_writes.push(DotWrite {
+                    name: name.clone(),
+                    dot_state: None,
+                    dot_state_since: None,
+                    kickoff_fired_at: None,
+                    turn_state: None,
+                });
             }
 
             // Healthy (stable-online) → reset attempts + clear any latch.
@@ -671,11 +761,12 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
     // Apply dot-field writes to AppState (frontend reads these on its 3s poll).
     if !dot_writes.is_empty() {
         if let Ok(mut a) = app_state.lock() {
-            for (name, dot, since, kickoff_iso) in dot_writes {
-                if let Some(agent) = a.agents.get_mut(&name) {
-                    agent.dot_state = dot;
-                    agent.dot_state_since = since;
-                    agent.kickoff_fired_at = kickoff_iso;
+            for w in dot_writes {
+                if let Some(agent) = a.agents.get_mut(&w.name) {
+                    agent.dot_state = w.dot_state;
+                    agent.dot_state_since = w.dot_state_since;
+                    agent.kickoff_fired_at = w.kickoff_fired_at;
+                    agent.turn_state = w.turn_state;
                 }
             }
         }
@@ -694,6 +785,16 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
             RekickOrder::RingOperator { name } => ring_operator(app_state, &name),
         }
     }
+}
+
+/// One agent's per-tick presence fields, staged under the watchdog lock and
+/// applied to `AgentDef` under the AppState lock (never both at once).
+struct DotWrite {
+    name: String,
+    dot_state: Option<String>,
+    dot_state_since: Option<String>,
+    kickoff_fired_at: Option<String>,
+    turn_state: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -797,7 +898,9 @@ fn ring_operator(app_state: &Arc<Mutex<AppState>>, name: &str) {
     );
     if let Ok(mut a) = app_state.lock() {
         if let Some(agent) = a.agents.get_mut(name) {
-            agent.attention = true;
+            // attention_reason = "crash" (aperture-ull4y); overwrites a lit
+            // "message" badge — see agents::light_attention for the precedence.
+            crate::agents::light_attention(agent, crate::agents::AttentionReason::Crash);
         }
     }
 }
@@ -833,6 +936,7 @@ mod tests {
         let p = Presence {
             online: true,
             online_since: Some(now() - (ONLINE_DEBOUNCE + Duration::from_secs(1))),
+            turn: None,
         };
         assert_eq!(compute_dot(kickoff_ago(90), Some(&p), now()).as_str(), "online");
     }
@@ -844,6 +948,7 @@ mod tests {
         let p = Presence {
             online: true,
             online_since: Some(now()),
+            turn: None,
         };
         assert_eq!(compute_dot(kickoff_ago(5), Some(&p), now()).as_str(), "booting");
     }
@@ -855,6 +960,7 @@ mod tests {
         let p = Presence {
             online: true,
             online_since: Some(now()),
+            turn: None,
         };
         assert_eq!(compute_dot(kickoff_ago(90), Some(&p), now()).as_str(), "stuck");
     }
@@ -864,6 +970,7 @@ mod tests {
         let p = Presence {
             online: false,
             online_since: None,
+            turn: None,
         };
         assert_eq!(compute_dot(kickoff_ago(90), Some(&p), now()).as_str(), "stuck");
     }
@@ -875,5 +982,135 @@ mod tests {
             assert!(j < JITTER_CEILING_SECS);
             assert_eq!(j, agent_jitter_secs(n)); // deterministic
         }
+    }
+
+    // ---- aperture-ull4y: hub turn-state carried through ----
+
+    #[test]
+    fn turn_state_busy_idle_leave_transitions() {
+        let mut m: HashMap<String, Presence> = HashMap::new();
+        let t0 = now();
+        apply_presence_event(&mut m, "vance", "join", t0);
+        assert!(m["vance"].online);
+        assert_eq!(m["vance"].turn, None, "join alone carries no turn frame");
+
+        apply_presence_event(&mut m, "vance", "busy", t0);
+        assert_eq!(m["vance"].turn, Some(Turn::Busy));
+        assert_eq!(m["vance"].online_since, Some(t0), "busy must not reset the debounce clock");
+
+        apply_presence_event(&mut m, "vance", "idle", t0);
+        assert_eq!(m["vance"].turn, Some(Turn::Idle));
+
+        apply_presence_event(&mut m, "vance", "leave", t0);
+        assert!(!m["vance"].online);
+        assert_eq!(m["vance"].turn, None, "leave clears turn");
+        assert_eq!(m["vance"].online_since, None);
+    }
+
+    #[test]
+    fn join_after_busy_keeps_prior_turn() {
+        let mut m: HashMap<String, Presence> = HashMap::new();
+        apply_presence_event(&mut m, "rex", "busy", now());
+        apply_presence_event(&mut m, "rex", "join", now());
+        assert_eq!(m["rex"].turn, Some(Turn::Busy));
+    }
+
+    #[test]
+    fn busy_frame_alone_creates_online_entry_with_turn() {
+        // A busy frame with no prior join (e.g. subscriber reconnected mid-turn)
+        // must both mark online and carry the turn.
+        let mut m: HashMap<String, Presence> = HashMap::new();
+        apply_presence_event(&mut m, "izzy", "busy", now());
+        assert!(m["izzy"].online);
+        assert_eq!(m["izzy"].turn, Some(Turn::Busy));
+    }
+
+    #[test]
+    fn turn_state_is_none_unless_dot_is_online() {
+        // Rule: turn_state must be None whenever dot_state != online, even if
+        // the last frame we saw for the agent was busy/idle.
+        let p = Presence {
+            online: true,
+            online_since: Some(now()),
+            turn: Some(Turn::Busy),
+        };
+        assert_eq!(turn_for(Dot::Booting, Some(&p)), None);
+        assert_eq!(turn_for(Dot::Stuck, Some(&p)), None);
+        assert_eq!(turn_for(Dot::Spawned, Some(&p)), None);
+        assert_eq!(turn_for(Dot::Online, Some(&p)), Some(Turn::Busy));
+        assert_eq!(turn_for(Dot::Online, None), None);
+        assert_eq!(Turn::Busy.as_str(), "busy");
+        assert_eq!(Turn::Idle.as_str(), "idle");
+    }
+
+    // ---- aperture-ull4y: dot_state_since is the state's START, not the tick ----
+
+    #[test]
+    fn since_is_stable_across_ticks_in_same_state() {
+        // Two ticks 5s apart, same state (booting) → identical `since`.
+        let kickoff = kickoff_ago(10);
+        let t1 = now();
+        let t2 = t1 + Duration::from_secs(5);
+        let d1 = compute_dot(kickoff, None, t1);
+        let d2 = compute_dot(kickoff, None, t2);
+        assert_eq!(d1.as_str(), "booting");
+        assert_eq!(d2.as_str(), "booting");
+        let s1 = dot_since(d1, kickoff, None).unwrap();
+        let s2 = dot_since(d2, kickoff, None).unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(s1, millis_to_systemtime(kickoff.unwrap()));
+
+        // Same for a stable-online agent: `since` is online_since both ticks.
+        let joined = t1 - (ONLINE_DEBOUNCE + Duration::from_secs(1));
+        let p = Presence {
+            online: true,
+            online_since: Some(joined),
+            turn: Some(Turn::Idle),
+        };
+        let o1 = compute_dot(kickoff, Some(&p), t1);
+        let o2 = compute_dot(kickoff, Some(&p), t2);
+        assert_eq!(o1.as_str(), "online");
+        assert_eq!(o2.as_str(), "online");
+        assert_eq!(dot_since(o1, kickoff, Some(&p)), Some(joined));
+        assert_eq!(dot_since(o2, kickoff, Some(&p)), Some(joined));
+    }
+
+    #[test]
+    fn since_moves_on_transition_and_stuck_keeps_kickoff_clock() {
+        let kickoff = kickoff_ago(10);
+        let kickoff_at = millis_to_systemtime(kickoff.unwrap());
+        let t1 = now();
+
+        // booting (no presence) → online (stable join): since jumps from the
+        // kickoff clock to the join clock.
+        let booting = compute_dot(kickoff, None, t1);
+        assert_eq!(dot_since(booting, kickoff, None), Some(kickoff_at));
+        let joined = t1 - (ONLINE_DEBOUNCE + Duration::from_secs(1));
+        let p = Presence {
+            online: true,
+            online_since: Some(joined),
+            turn: None,
+        };
+        let online = compute_dot(kickoff, Some(&p), t1);
+        assert_eq!(online.as_str(), "online");
+        let since_online = dot_since(online, kickoff, Some(&p)).unwrap();
+        assert_eq!(since_online, joined);
+        assert_ne!(since_online, kickoff_at);
+
+        // A NEW kickoff (re-kick / respawn) while still not online → since moves
+        // to the new kickoff.
+        let kickoff2 = kickoff_ago(2);
+        let booting2 = compute_dot(kickoff2, None, t1);
+        assert_eq!(booting2.as_str(), "booting");
+        assert_ne!(dot_since(booting2, kickoff2, None), dot_since(booting, kickoff, None));
+
+        // stuck keeps the kickoff clock (tooltip: "kickoff sent {N}s ago").
+        let old = kickoff_ago(90);
+        let stuck = compute_dot(old, None, t1);
+        assert_eq!(stuck.as_str(), "stuck");
+        assert_eq!(dot_since(stuck, old, None), Some(millis_to_systemtime(old.unwrap())));
+
+        // spawned has no source clock → None (caller falls back to the tick).
+        assert_eq!(dot_since(Dot::Spawned, None, None), None);
     }
 }
