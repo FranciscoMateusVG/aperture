@@ -11,6 +11,24 @@ Rules only, one copy each. Step lists, commands and templates → `references/pr
 
 ---
 
+## 0. Binding decisions (resident — governs over any older orchestration skill)
+
+Provenance, superseded text and sources: `DECISIONS.md` in this skill (review-only; NOT injected). The rules themselves live here so they are resident on every path.
+
+- **DECISION-1** — Stuck recovery is classification-driven: a REAL HANG (tool call silent >10 min, no thinking indicator, no error banner, no frozen-counter proof) is surfaced to the operator via doorbell + terminal — never fire keys blind; an API-error silent-drop (banner visible, idle prompt) gets the BEADS dispatch re-sent; and "substantive pane content unchanged across 2 consecutive ticks" is a stall SIGNAL that forces deep-peek + classification, not an auto-interrupt.
+- **DECISION-1b** — The one GLaDOS-fired interrupt: when a thinking indicator's `↑NNNk tokens` / cost / context% are identical across 2+ consecutive ticks while only the timer advances (or an `API Error … Rate limited` banner sits on a locked turn), fire `tmux send-keys -t <agent> C-c`, then re-dispatch via BEADS with a state recap, and verify recovery on the next sweep. Precision guard (GLaDOS 2026-09-06): frozen token/cost counters alone are insufficient while a legitimate long-running tool is executing — check for substantive tool/process/log progress and a deliberate-wait state before classifying a silent drop; never interfere with operator-composed input.
+- **DECISION-2** — `/compact` is a unilateral orchestrator decision fired via `tmux send-keys -t <agent> C-u '/compact' Enter` at **≥ 60% context** for any specialist — no pre-message, no choice, no ack — confirmed as "/compacted <agent> at NN%"; never while that agent has a live subagent (wait, then compact immediately); prefer `/compact` over `/clear`.
+- **DECISION-3** — Bead creation is GLaDOS-only and operator-acknowledged first — no exceptions, including P0s; discovered follow-ups, missing-surface beads and review tasks are batched to the operator for ack, then filed with the project label in the same turn.
+- **DECISION-4** — Reassigning work between specialists requires operator approval; a stuck or throttled specialist gets guidance, an unstall, or a surfaced recommendation — never a quiet move.
+- **DECISION-5** — Pressing Enter on a command the agent itself typed (slash command, inbox-read, agent-typed prompt matching stated intent) is permitted pane housekeeping, not a "blind key"; replace-and-fire (`C-u '/compact' Enter`) when the typed command is wrong; ping the operator first only for destructive-shaped text you don't recognise.
+- **DECISION-6** — Message delivery is Comms v2 (hub push + replay on reconnect); the `cat '/tmp/aperture-msg-…'` examples and "the poller delivers it again" wording in the originals are legacy mechanism, and the rules are read generically ("inbox-read command", "resend via `send_message`").
+- **DECISION-7** — Sweep order is `get_presence` → pane (`tail -30`) → bead state → PR state: presence answers online/busy/idle/offline cheaply; the pane remains ground truth for stuck-vs-working-vs-waiting.
+- **DECISION-8** — Timing floors: in_progress with no thinking indicator > 30 min → deep-peek then ping with context; post-`/clear` empty prompt > 15 min, or a dispatched bead unclaimed > 15 min → cold-start re-dispatch / ping.
+- **DECISION-9** — Deep-peek floor is `tail -30`; use `-40`+ (`-S -40 \| tail -40`) when in doubt.
+- **DECISION-10** — "Idle/clean" is never a self-certifying stop condition: before any stop-loop decision run the mechanical gate — (1) `bd list --status=in_progress` for every named agent, any hit = do not stop; (2) last inter-specialist review verdict must read PASS/resolved, not HOLD/FAIL/blocked; (3) prefer loosening to killing when quiet-but-not-terminal.
+- **DECISION-11** — Specialists do not self-authorise scope (new investigation tracks, tooling/harnesses, "while I'm at it" hardening, non-trivial `bd ready` self-claims) — they ask GLaDOS first; GLaDOS authorises directly only what is genuinely small and brings anything non-trivial to the operator BEFORE authorising; identical gate for Codex/GPT-backed specialists.
+- **DECISION-12** — Loop cadence and agent count are sized to the serial-engineer anchor (< 2 h: 1 agent, no standing loop; ~half day: 2–3 agents, loop only if unattended at ≥ 20–30 min; multi-day parallel: full fan-out, 10 min only while the operator actively waits) and re-sized at every scope pivot.
+
 ## 1. Loop contract
 
 **Tick = orchestrator wakeup, NOT a status poll.** The cron makes you wake at the right cadence; your job on waking is intervention, not enumeration. Role on every tick: *a proactive, cunning strategist of operations and deployments — you seize the responsibility.* A queue that isn't moving is a problem to SOLVE, not a state to REPORT. (Precedent: precedents.md → watch-protocol §0)

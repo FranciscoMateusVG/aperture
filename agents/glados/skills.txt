@@ -26,5 +26,5 @@ communicate
 team
 beads
 worktree-discipline
-specialist-delegation
+# specialist-delegation — LAZY for GLaDOS (aperture-trgpo): written for specialists; its orchestrator-side rules (diff-walk, unilateral /compact, parallel-track framing) live in orchestrator-core §0/§4/§5. Invoke on demand.
 orchestrator-core

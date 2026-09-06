@@ -313,3 +313,11 @@ context-budget *ARGS:
 # SessionStart/PreCompact hooks and agents.rs::inject_bd_memory run.
 aperture-prime MODE:
     @scripts/aperture-prime.sh {{MODE}}
+
+# §7 standing-rule retention gate (aperture-trgpo)
+retention-gate:
+    @scripts/retention-gate.sh
+
+# §7 retrieval gate: golden set → recall@5 (aperture-trgpo)
+recall-gate *ARGS:
+    @node scripts/recall-gate.mjs {{ARGS}}
