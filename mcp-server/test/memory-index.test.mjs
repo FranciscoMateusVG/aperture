@@ -26,10 +26,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadSecretsFixture } from "./fixtures/load-secrets.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = resolve(HERE, "..", "dist", "memory-index.js");
-const FIXTURES = JSON.parse(readFileSync(join(HERE, "fixtures", "memory-secrets.json"), "utf8"));
+const FIXTURES = loadSecretsFixture(join(HERE, "fixtures", "memory-secrets.json"));
 const SECRETS = FIXTURES.secrets;
 const MARKERS = [...Object.values(SECRETS).map((s) => s.marker), FIXTURES.tagged_marker];
 
