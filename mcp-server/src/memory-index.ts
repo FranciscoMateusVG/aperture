@@ -30,7 +30,8 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
 import { runBd } from "./beads.js";
 
 // ── paths / knobs ─────────────────────────────────────────────────────────
@@ -903,7 +904,7 @@ async function main(): Promise<void> {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && pathToFileURL(realpathSync(fileURLToPath(import.meta.url))).href === pathToFileURL(realpathSync(process.argv[1])).href) {
   main()
     .catch((e) => process.stdout.write(renderFallback(String((e as Error)?.message ?? e))))
     .finally(() => process.exit(0));

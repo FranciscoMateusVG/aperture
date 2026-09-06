@@ -21,7 +21,7 @@
       {
         "hooks": [
           {
-            "command": "/Users/franciscomateus/projects/aperture/scripts/aperture-prime.sh precompact",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh precompact",
             "type": "command"
           }
         ],
@@ -32,7 +32,7 @@
       {
         "hooks": [
           {
-            "command": "/Users/franciscomateus/projects/aperture/scripts/aperture-prime.sh boot",
+            "command": "\"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/scripts/aperture-prime.sh boot",
             "type": "command"
           }
         ],
@@ -45,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/presence-hint.js busy",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/presence-hint.js busy",
             "timeout": 5
           }
         ]
@@ -55,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/memory-recall.js",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/memory-recall.js",
             "timeout": 5
           }
         ]
@@ -67,7 +67,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/presence-hint.js busy",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/presence-hint.js busy",
             "timeout": 5
           }
         ]
@@ -79,7 +79,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/presence-hint.js idle",
+            "command": "node \"${APERTURE_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:?aperture hooks: no runtime root (APERTURE_PROJECT_DIR/CLAUDE_PROJECT_DIR unset)}}\"/mcp-server/dist/presence-hint.js idle",
             "timeout": 5
           }
         ]
