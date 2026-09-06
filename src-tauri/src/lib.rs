@@ -202,6 +202,8 @@ pub fn run() {
             // Launcher essentials — start/stop/list agents and configure model.
             agents::start_agent,
             agents::stop_agent,
+            // Stop-if-alive then boot; works on crashed agents too (aperture-ull4y).
+            agents::restart_agent,
             agents::list_agents,
             agents::update_agent_model,
             agents::clear_attention,
