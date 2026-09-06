@@ -293,3 +293,10 @@ test-hub:
 # L1: Rust unit tests (launcher/config generation)
 test-rust:
     cd src-tauri && cargo test
+
+# ============== Skills matrix ==============
+
+# Report what each agent carries at boot: resident (force-injected) vs lazy
+# skills, byte sizes, and skill x agent assignment. Pass --json for tooling.
+skills-matrix *ARGS:
+    @scripts/skills-matrix.sh {{ARGS}}
