@@ -93,6 +93,10 @@ async function spawnHub({ bdFail = false } = {}) {
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-replay-agents-"));
   const dataDir = mkdtempSync(join(tmpdir(), "hub-replay-bdstub-"));
   const tokenDir = mkdtempSync(join(tmpdir(), "hub-replay-tokens-"));
+  // aperture-oeb6q: the hub now writes presence.json under APERTURE_RUN_DIR on
+  // boot and on every presence change — isolate it so a test hub never
+  // clobbers the developer's real ~/.aperture/run/presence.json.
+  const runDir = mkdtempSync(join(tmpdir(), "hub-replay-run-"));
   for (const [principal, token] of Object.entries(TOKENS)) {
     writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
   }
@@ -102,6 +106,7 @@ async function spawnHub({ bdFail = false } = {}) {
     APERTURE_WS_PORT: String(port),
     APERTURE_AGENTS_DIR: emptyAgentsDir,
     APERTURE_HUB_TOKEN_DIR: tokenDir,
+    APERTURE_RUN_DIR: runDir,
     BD_STUB_DIR: dataDir,
     PATH: `${stubBinDir}:${process.env.PATH ?? ""}`,
     BD_PATH: stubBdPath,
@@ -177,6 +182,7 @@ async function spawnHub({ bdFail = false } = {}) {
     rmSync(emptyAgentsDir, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
     rmSync(tokenDir, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);

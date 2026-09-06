@@ -15,16 +15,25 @@
  *   - role=producer   → MCP send-queue drains. Send
  *                       {type:"notify", to, id, from, preview}; the hub
  *                       forwards {type:"message", id, from, preview} to the
- *                       recipient if connected and always acks {type:"ok", id}.
+ *                       recipient if connected and always acks
+ *                       {type:"ok", id, outcome} with outcome one of
+ *                       "forwarded" (Monitor socket got the push), "codex"
+ *                       (injected into the Codex bridge), "offline" (nobody
+ *                       to push to — unread replay on reconnect covers it).
  *
  * Delivery semantics: at-least-once, idempotent by message id. A missed push
  * (recipient offline, hub down) is covered by unread replay on reconnect —
  * BEADS remains the store of record; this is transport only.
  *
+ * Presence is also mirrored to ~/.aperture/run/presence.json on every change
+ * (see presence-snapshot.ts) so MCP servers can answer "who is online" without
+ * a hub round-trip. Cleared to zero agents at startup.
+ *
  * Env:
  *   APERTURE_WS_PORT        — listen port (default 4517, loopback only)
  *   APERTURE_HUB_SKIP_REPLAY=1 — skip the bd unread-replay on agent connect
  *                                (testing hook; smoke tests have no BEADS)
+ *   APERTURE_RUN_DIR        — where presence.json lands (default ~/.aperture/run)
  */
 import { WebSocketServer, WebSocket } from "ws";
 import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
@@ -33,6 +42,7 @@ import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { getUnreadMessages } from "./beads.js";
 import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
+import { writePresenceSnapshot, PRESENCE_FILE, type PresenceEntry, type PresenceState } from "./presence-snapshot.js";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.APERTURE_WS_PORT ?? 4517);
@@ -61,10 +71,16 @@ const agents = new Map<string, WebSocket>();
  * bridges re-join, but if the watchdog reconnects a beat later it misses those
  * joins — and since a codex bridge lives inside the hub, respawning the pane
  * never re-emits its join, so the watchdog false-re-kicked idle codex agents
- * forever. We now snapshot this map to every subscriber on hello. "leave"
- * deletes; every other event sets.
+ * forever. We now snapshot this map to every subscriber on hello.
+ *
+ * aperture-oeb6q: the map now holds {state, since} (the presence-snapshot
+ * contract) instead of the raw last event, and is mirrored to presence.json
+ * after every mutation. Rules: "join" → "online" only if the agent is NOT
+ * already present (a re-join, e.g. agent_replaced, keeps state + since);
+ * "busy"/"idle" → that state; "leave" → delete. `since` moves ONLY on a state
+ * transition — a repeated "busy" frame must not bump it.
  */
-const presenceState = new Map<string, PresenceEvent>();
+const presenceState = new Map<string, PresenceEntry>();
 
 /** Structured single-line JSON logging to stderr. */
 function log(event: string, fields: Record<string, unknown> = {}): void {
@@ -79,11 +95,42 @@ function send(ws: WebSocket, obj: unknown): void {
   }
 }
 
+/** Apply a presence event to the state map. Returns true if anything changed. */
+function applyPresence(agent: string, event: PresenceEvent, ts: string): boolean {
+  if (event === "leave") return presenceState.delete(agent);
+  const current = presenceState.get(agent);
+  if (event === "join") {
+    if (current) return false; // already present: keep state + since
+    presenceState.set(agent, { state: "online", since: ts });
+    return true;
+  }
+  const next: PresenceState = event; // "busy" | "idle"
+  if (current && current.state === next) return false; // repeated frame: since untouched
+  presenceState.set(agent, { state: next, since: ts });
+  return true;
+}
+
+/** Mirror the state map to presence.json (atomic; best-effort, logged on failure). */
+function persistPresence(): void {
+  const agents: Record<string, PresenceEntry> = {};
+  for (const [name, entry] of presenceState) agents[name] = { ...entry };
+  const ok = writePresenceSnapshot({ hub_pid: process.pid, updated_at: new Date().toISOString(), agents });
+  if (!ok) log("presence_snapshot_write_failed", { file: PRESENCE_FILE });
+}
+
+/** Subscriber wire format is the EVENT name, not the stored state — the Rust
+ *  watchdog consumes {type:"presence", agent, event, ts} and must not notice
+ *  the storage change. "online" maps back to "join". */
+function stateToEvent(state: PresenceState): PresenceEvent {
+  return state === "online" ? "join" : state;
+}
+
 function broadcastPresence(agent: string, event: PresenceEvent): void {
-  // Remember current state so a later subscriber hello can be snapshotted.
-  if (event === "leave") presenceState.delete(agent);
-  else presenceState.set(agent, event);
-  const msg = { type: "presence", agent, event, ts: new Date().toISOString() };
+  const ts = new Date().toISOString();
+  // Remember current state so a later subscriber hello can be snapshotted,
+  // and mirror it to disk for the MCP servers' get_presence.
+  if (applyPresence(agent, event, ts)) persistPresence();
+  const msg = { type: "presence", agent, event, ts };
   for (const [ws, conn] of conns) {
     if (conn.role === "subscriber") send(ws, msg);
   }
@@ -179,8 +226,8 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): b
     // aperture-3x136: hand the newcomer the current presence of everyone so it
     // isn't blind to agents that joined before it (re)connected — the fix for
     // the watchdog false-re-kick loop on hub restart.
-    for (const [name, event] of presenceState) {
-      send(ws, { type: "presence", agent: name, event, ts: new Date().toISOString() });
+    for (const [name, entry] of presenceState) {
+      send(ws, { type: "presence", agent: name, event: stateToEvent(entry.state), ts: new Date().toISOString() });
     }
   }
 
@@ -210,21 +257,35 @@ function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): 
   }
   const preview = typeof msg.preview === "string" ? msg.preview : "";
   const target = agents.get(to);
+  let outcome: NotifyOutcome;
   if (codexBridges.has(to)) {
     // Codex agent: no Monitor socket — deliver by injecting a turn into its
     // app-server thread. The bridge fetches the full body from BEADS itself.
     codexBridges.deliver(to);
+    outcome = "codex";
     log("notify_codex", { to, id, from });
   } else if (target) {
     send(target, { type: "message", id, from, preview });
+    outcome = "forwarded";
     log("notify_forwarded", { to, id, from });
   } else {
     // Recipient offline: no-op — unread replay on reconnect covers it.
+    outcome = "offline";
     log("notify_offline", { to, id, from });
   }
-  // Always ack so the producer's await resolves.
-  send(ws, { type: "ok", id });
+  // Always ack so the producer's await resolves — and say what actually
+  // happened, so the producer's log line is honest (aperture-oeb6q).
+  send(ws, { type: "ok", id, outcome });
 }
+
+/** What the hub actually did with a notify — carried on the ok ack. */
+type NotifyOutcome = "forwarded" | "codex" | "offline";
+
+// aperture-oeb6q: clear the presence snapshot at startup — BEFORE the codex
+// bridges start, so this write is guaranteed to carry zero agents and a stale
+// file left by a crashed hub (dead hub_pid, phantom agents) can't lie past
+// this boot. Every later join/busy/idle/leave rewrites the file.
+persistPresence();
 
 // Phase 2: Codex bridge clients — one WS-over-unix-socket JSON-RPC client per
 // discovered Codex agent (manifest model "codex/…"). A connected+bound bridge

@@ -7,7 +7,14 @@ import { readFileSync } from "node:fs";
  * Called from the send-queue drain path AFTER a message has successfully
  * landed in BEADS. The hub forwards a {type:"message"} event to the recipient
  * if their Monitor socket is connected; if the hub is down or the recipient
- * offline, this is a silent no-op — the hub's unread replay covers it.
+ * offline, this is a no-op — the hub's unread replay covers it.
+ *
+ * Resolves with what actually happened (aperture-oeb6q — honest acks):
+ *   "forwarded" — hub pushed to the recipient's Monitor socket
+ *   "codex"     — hub injected a turn into the recipient's Codex bridge
+ *   "offline"   — hub acked but nobody was there to push to (replay covers it)
+ *   "unacked"   — no ack at all: hub down/unreachable, credential missing,
+ *                 or timed out (replay covers it too)
  *
  * MUST NEVER throw or hang: resolves within HUB_NOTIFY_TIMEOUT_MS regardless
  * of outcome. send_message durability lives entirely in the BEADS queue.
@@ -25,15 +32,20 @@ export interface HubNotification {
   preview: string;
 }
 
+/** Hub-reported outcomes (on the ok ack) plus the local "no ack" case. */
+export type HubNotifyOutcome = "forwarded" | "codex" | "offline" | "unacked";
+
+const ACKED_OUTCOMES: ReadonlySet<string> = new Set(["forwarded", "codex", "offline"]);
+
 export function notifyHub(
   note: HubNotification,
   log: (msg: string) => void = (m) => console.error(m),
-): Promise<void> {
+): Promise<HubNotifyOutcome> {
   return new Promise((resolve) => {
     let settled = false;
     let ws: WebSocket | null = null;
 
-    const finish = (reason?: string) => {
+    const finish = (outcome: HubNotifyOutcome, reason?: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -43,7 +55,7 @@ export function notifyHub(
       } catch {
         // already closed/terminated
       }
-      resolve();
+      resolve(outcome);
     };
 
     const timer = setTimeout(() => {
@@ -52,14 +64,14 @@ export function notifyHub(
       } catch {
         // ignore
       }
-      finish("timed out awaiting hub ack");
+      finish("unacked", "timed out awaiting hub ack");
     }, HUB_NOTIFY_TIMEOUT_MS);
     timer.unref?.();
 
     try {
       ws = new WebSocket(`ws://127.0.0.1:${HUB_PORT}`);
     } catch (e: unknown) {
-      finish(`hub connect failed: ${e instanceof Error ? e.message : String(e)}`);
+      finish("unacked", `hub connect failed: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
 
@@ -68,7 +80,7 @@ export function notifyHub(
       try {
         token = readFileSync(TOKEN_FILE, "utf8");
       } catch {
-        finish("hub credential unavailable");
+        finish("unacked", "hub credential unavailable");
         return;
       }
       ws!.send(JSON.stringify({ type: "hello", role: "producer", agent: AGENT_NAME, token }));
@@ -78,18 +90,25 @@ export function notifyHub(
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        if (msg?.type === "ok") finish();
+        if (msg?.type === "ok") {
+          // A pre-oeb6q hub acks without `outcome`. It DID ack, so "unacked"
+          // would be wrong; read it conservatively as "offline" (replay covers).
+          const outcome = ACKED_OUTCOMES.has(msg.outcome) ? (msg.outcome as HubNotifyOutcome) : "offline";
+          finish(outcome);
+        }
       } catch {
         // ignore non-JSON frames; timeout is the backstop
       }
     });
 
     ws.on("error", (err) => {
-      finish(`hub unavailable: ${err.message}`);
+      finish("unacked", `hub unavailable: ${err.message}`);
     });
 
     ws.on("close", () => {
-      finish();
+      // Closed before an ok arrived (hub rejected the hello, or shut down
+      // mid-flight): no ack.
+      finish("unacked", "hub closed before ack");
     });
   });
 }

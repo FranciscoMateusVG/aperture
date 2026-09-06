@@ -48,8 +48,22 @@ export interface QueuedMessage {
   attempts: number;
 }
 
-/** Flushes one message to the backend. Resolves on success, rejects on failure. */
-export type FlushFn = (msg: QueuedMessage) => Promise<void>;
+/**
+ * Optional delivery report a flush may return on success (aperture-oeb6q):
+ * the BEADS id the message landed as, and what the hub said it did with the
+ * push. Purely informational — the queue logs it and moves on. An "offline"
+ * or "unacked" outcome is still a SUCCESS for the queue: the BEADS row exists
+ * and unread replay on reconnect covers delivery. Only a rejected flush
+ * (createMessage failed) retries.
+ */
+export interface FlushReport {
+  id: string;
+  outcome: "forwarded" | "codex" | "offline" | "unacked";
+}
+
+/** Flushes one message to the backend. Resolves on success (optionally with a
+ *  FlushReport), rejects on failure. */
+export type FlushFn = (msg: QueuedMessage) => Promise<void | FlushReport>;
 
 export interface MessageQueueOptions {
   /** Absolute path to the durability file (JSONL, one QueuedMessage per line). */
@@ -142,8 +156,9 @@ export class MessageQueue {
     try {
       while (this.queue.length > 0) {
         const head = this.queue[0]!;
+        let report: void | FlushReport;
         try {
-          await this.flush(head);
+          report = await this.flush(head);
         } catch (e: unknown) {
           // Flush failed — backend likely unreachable. Keep the head (FIFO),
           // back off, and retry later. NEVER drop, NEVER fall back to a local
@@ -166,10 +181,24 @@ export class MessageQueue {
         this.queue.shift();
         this.consecutiveFailures = 0;
         this.persistAll();
+        if (report) this.logDelivery(head, report);
       }
     } finally {
       this.draining = false;
     }
+  }
+
+  /** One honest stderr line per delivered message: where the push actually went. */
+  private logDelivery(msg: QueuedMessage, report: FlushReport): void {
+    const note =
+      report.outcome === "forwarded"
+        ? "pushed to Monitor socket"
+        : report.outcome === "codex"
+          ? "injected into codex bridge"
+          : report.outcome === "offline"
+            ? "replay on reconnect"
+            : "no hub ack; replay on reconnect";
+    this.log(`[send-queue] delivered id=${report.id || "?"} to=${msg.to} outcome=${report.outcome} (${note})`);
   }
 
   private scheduleRetry(): void {
