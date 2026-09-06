@@ -1,5 +1,5 @@
 ---
-name: aperture-codex-comms
+name: codex-comms
 description: Communication protocol for Codex agents in Aperture (comms v2). Codex agents now call aperture-bus MCP tools directly (send_message, get_messages, mark_as_read, BEADS task tools) and receive inbound messages as injected turns via the app-server bridge. Use this skill if your model starts with codex/.
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: verify-user-path
-description: Manual user-path verification before sign-off — NON-NEGOTIABLE for Sterling, Izzy, and any agent gating a feature's promotion to "done" or "ready for operator". Open the production URL in a browser, walk the user path, use the actual feature, verify the network response and the DB/audit/log trail — CI green is necessary but NOT sufficient. Triggers on any sign-off claim, "Gate 7" review, "approved" comment, "ready for review" status, close-on-PR-open for user-facing features.
+description: Manual user-path verification before sign-off — NON-NEGOTIABLE for Izzy and any agent gating a feature's promotion to "done" or "ready for operator". Open the production URL in a browser, walk the user path, use the actual feature, verify the network response and the DB/audit/log trail — CI green is necessary but NOT sufficient. Triggers on any sign-off claim, "Gate 7" review, "approved" comment, "ready for review" status, close-on-PR-open for user-facing features.
 ---
 
 # Verify User Path — Manual Walk Before Sign-Off
@@ -9,7 +9,7 @@ You are about to sign off a feature. Or you are about to declare a PR ready for 
 
 If the answer is "no, but CI passed" or "no, but my Playwright E2E went green" or "no, but the code review looked clean" — your sign-off is **incomplete**. CI catches some bugs. Code review catches others. Playwright catches yet others. **None of them catch the bug class where the user clicks Submit and gets a 404 because the frontend code calls a URL that doesn't exist on the backend.**
 
-This skill is non-negotiable for **Sterling** (cross-discipline final sign-off), **Izzy** (E2E + functional QA), and **Peppy** (post-deploy verify). It is also recommended for **Vance** + **Rex** + **Cipher** + **Atlas** at PR-open time for any user-facing change.
+This skill is non-negotiable for **Izzy** (E2E + functional QA + final QA-gate sign-off) and **Peppy** (post-deploy verify). It is also recommended for **Vance** + **Rex** + **Cipher** at PR-open time for any user-facing change.
 
 ---
 
@@ -126,11 +126,11 @@ If any of Layers A-D fails: **the feature is NOT done.** Re-open the bead. File 
 
 ---
 
-## 3. Sterling-Specific Discipline
+## 3. QA-Gate Sign-off Discipline (Izzy)
 
-You are the final sign-off. The operator should never have to find a prod-broken state that you missed.
+You are the QA gate (Izzy) — the final sign-off. The operator should never have to find a prod-broken state that you missed.
 
-**On EVERY Sterling sign-off bead (St1 / 6aqw / o7y0 / rark / nwqq / 1gcw etc.):**
+**On EVERY QA-gate (Izzy) sign-off bead (historically St1 / 6aqw / o7y0 / rark / nwqq / 1gcw etc.):**
 
 1. **List every user-facing surface the feature touches.** Public page? Authenticated dashboard? Mobile viewport? Admin panel? Email-triggered link? Each is a separate walk.
 2. **Walk each surface** per Layers A-D above. Document the walk on the bead notes — URLs, screenshots, response codes, DB-row IDs, audit-event timestamps.
@@ -199,6 +199,6 @@ If you skip this section, your sign-off is INCOMPLETE and the bead acceptance cr
 
 Going forward, for every feature touching a user-facing surface:
 
-**No close-on-PR-open invariant fires without a documented manual user-walk in the bead notes. No Sterling sign-off without documented Layer A-D verification per surface. No Izzy close without the E2E green AND a real-browser walk against a production-equivalent build.**
+**No close-on-PR-open invariant fires without a documented manual user-walk in the bead notes. No QA sign-off without documented Layer A-D verification per surface. No Izzy close without the E2E green AND a real-browser walk against a production-equivalent build.**
 
 This is the discipline. It is not optional. The operator should never find a prod-break that one of us could have caught in a 5-minute walk.

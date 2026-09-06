@@ -42,7 +42,7 @@ Apply this before you fire the merge, not after the page 404s and someone files 
 
 Rex shipped backend PR #233; Vance shipped frontend PR #234 that consumed Rex's new route. Both PRs opened with `--auto-merge`. The frontend's CI finished first (faster check set). PR #234 merged before #233. Admin user-info forms **temporarily 404'd** until #233's CI finished and the deploy rolled. Wheatley banked the lesson in `aperture-lvoo` as the original observation.
 
-### Provenance 2 — `aperture-ftuy` (Vance, today / 2026-05-21)
+### Provenance 2 — `aperture-ftuy` (Vance, 2026-05-21)
 
 Rex shipped backend PR #323 with a new `gestao`-gated `/by-semester/:id` endpoint. Vance shipped frontend PR #324 that swapped the page over to consume the new route. PR #324 was merged via `gh pr merge --auto --squash` while PR #323 was still **OPEN** with drift + vitest QUEUED and Cipher reviewing.
 

@@ -134,4 +134,4 @@ When Turbopack (or any Next.js bundler-side rule) bites you in a way that took >
 4. **Where this shows up** — the pattern of code organization that triggers it
 5. **Source** — agent name, PR + commit SHA, file(s) touched
 
-Then open a PR on the aperture repo with the edit. Ping Atlas if you'd like a second pair of eyes on the framing.
+Then open a PR on the aperture repo with the edit. Ping GLaDOS to bank it as a skill precedent.

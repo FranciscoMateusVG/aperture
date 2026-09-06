@@ -1,5 +1,5 @@
 ---
-name: aperture-deploy-workflow
+name: deploy-workflow
 description: End-to-end app deployment workflow for Aperture. Use when creating new apps, deploying to Dokploy, scaffolding projects, or handing off between builder and deployer. Triggers on deployment tasks, app creation, Dokploy operations, and deploy handoffs.
 ---
 

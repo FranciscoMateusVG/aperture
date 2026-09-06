@@ -9,7 +9,7 @@ A discipline for PR authors: **if the diff changes a production-runtime contract
 
 The shape this protects against: the PR's primary work is disclosed and well-reviewed; a *secondary* runtime change rides along in the same diff, not mentioned in the body, ships unreviewed for the property that matters most. The PR appears to be about X; it's actually about X *and* Y, where Y is the part with the blast radius.
 
-This skill sits in the same family as `aperture:verify-against-reality` (in `specialist-delegation §6`) — Cipher's principle of checking code against external state. Verify-against-reality is the code-vs-prod check at the END of implementation. This skill is the **diff-vs-PR-body check at the END of authoring** — the same discipline applied to the human-readable artifact reviewers depend on.
+This skill sits in the same family as `aperture:specialist-delegation §6` (trust-but-verify) — Cipher's principle of checking code against external state. Verify-against-reality is the code-vs-prod check at the END of implementation. This skill is the **diff-vs-PR-body check at the END of authoring** — the same discipline applied to the human-readable artifact reviewers depend on.
 
 ---
 

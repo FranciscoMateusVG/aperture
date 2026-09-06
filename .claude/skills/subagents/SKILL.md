@@ -1,5 +1,5 @@
 ---
-name: aperture-subagents
+name: subagents
 description: Subagent delegation patterns for Aperture. Use when GLaDOS (or any agent) needs to delegate scoped, parallelisable work using the Agent tool — research sweeps, scoped implementations, multi-file audits, or anything that fits the fire-and-return pattern. Triggers on parallel work, multiple independent tasks, scoped delegation, the Agent tool, and "spawn a worker" intentions.
 ---
 
@@ -19,7 +19,7 @@ You have three delegation surfaces. Pick the right one:
 |---------|---------|-----|
 | **Yourself** | Small edits, single-file work, anything < 5 minutes, anything needing your conversation context | Just do it |
 | **Agent tool (subagents)** | Scoped, parallelisable, fire-and-return work — research, audits, implementations that can be specified up front | `Agent(subagent_type, prompt)` — multiple in one message for parallelism |
-| **Specialist agents** (Wheatley, Peppy, Izzy, Vance, Rex, Scout, Cipher, Sage, Atlas, Sterling) | Lane-specific work that benefits from persistent memory, expertise, and visibility in the launcher | BEADS task with assignee |
+| **Specialist agents** (Wheatley, Peppy, Izzy, Vance, Rex, Scout, Cipher) | Lane-specific work that benefits from persistent memory, expertise, and visibility in the launcher | BEADS task with assignee |
 
 **Default rule:** if the task is parallelisable and self-contained, reach for the Agent tool. If it sits squarely in a specialist's lane, route via BEADS to that specialist. Only do it yourself if it's trivially small or requires your context.
 
@@ -69,7 +69,7 @@ A good subagent prompt has:
 
 ✅ Good prompt:
 ```
-I need to add OAuth2 to the Hono backend at apps/api/. Current auth is BetterAuth with email/password.
+I need to add OAuth2 to the Hono backend at apps/hono-app/. Current auth is BetterAuth with email/password.
 I want to add Google OAuth as a second provider, alongside the existing flow.
 
 Already ruled out: Auth0 (too expensive), Supabase (don't want to migrate the user store).
@@ -138,22 +138,22 @@ Single message with three Agent calls:
 Agent({
   description: "Find all auth-related routes",
   subagent_type: "Explore",
-  prompt: "Find every Hono route in apps/api/src/ that requires authentication.
+  prompt: "Find every Hono route in apps/hono-app/src/ that requires authentication.
            Return: list of method+path, the auth middleware used, and the file:line.
-           Focus only on apps/api/. Under 300 words."
+           Focus only on apps/hono-app/. Under 300 words."
 })
 
 Agent({
   description: "Audit current rate limiting",
   subagent_type: "Explore",
-  prompt: "Locate the rate-limiting implementation in apps/api/. Return: where it's
+  prompt: "Locate the rate-limiting implementation in apps/hono-app/. Return: where it's
            configured, what tiers exist, and which routes opt in/out. Under 250 words."
 })
 
 Agent({
   description: "Map session storage",
   subagent_type: "general-purpose",
-  prompt: "How is the session token stored on the frontend? Check apps/web/ for
+  prompt: "How is the session token stored on the frontend? Check apps/frontend/ for
            cookie or localStorage usage. Return: storage mechanism, expiry, refresh
            behaviour. Under 300 words."
 })

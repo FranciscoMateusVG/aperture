@@ -1,6 +1,6 @@
 ---
 name: scope-from-artifact
-description: Scoping discipline — when a feature has an operator source-of-truth artifact (spreadsheet, mockup, written spec, screenshot), scope from THAT, not from the existing schema or code. Use any time you are scoping new work where an operator-facing artifact and an existing implementation/schema both exist. Triggers on: scoping briefs, spec authoring, epic decomposition, Wheatley dispatches, "we already have a table for this" reasoning, "let's reuse the existing model" reasoning.
+description: Scoping discipline — when a feature has an operator source-of-truth artifact (spreadsheet, mockup, written spec, screenshot), scope from THAT, not from the existing schema or code. Use any time you are scoping new work where an operator-facing artifact and an existing implementation/schema both exist. Triggers on — scoping briefs, spec authoring, epic decomposition, Wheatley dispatches, "we already have a table for this" reasoning, "let's reuse the existing model" reasoning.
 ---
 
 # Scope From the Artifact, Not the Schema

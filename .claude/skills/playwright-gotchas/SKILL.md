@@ -267,4 +267,4 @@ When Playwright bites you in a way that took >10 minutes to figure out and would
 4. **Where this shows up** — the pattern of UI/test scenarios that trigger it
 5. **Source** — agent name, PR / bead ID, file, and which test earned the lesson
 
-Then open a PR on the aperture repo with the edit. Ping Atlas if you'd like a second pair of eyes on the framing.
+Then open a PR on the aperture repo with the edit. Ping GLaDOS to bank it as a skill precedent.
