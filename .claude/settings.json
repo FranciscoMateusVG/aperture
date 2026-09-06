@@ -5,7 +5,12 @@
     },
     "mempalace": {
       "command": "/Users/franciscomateus/.mempalace/venv/bin/python",
-      "args": ["-m", "mempalace.mcp_server", "--palace", "/Users/franciscomateus/.aperture/mempalace"]
+      "args": [
+        "-m",
+        "mempalace.mcp_server",
+        "--palace",
+        "/Users/franciscomateus/.aperture/mempalace"
+      ]
     },
     "playwright-mini": {
       "command": "/Users/franciscomateus/projects/aperture/scripts/playwright-mcp-mini.sh"
@@ -32,6 +37,42 @@
           }
         ],
         "matcher": ""
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/presence-hint.js busy",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/presence-hint.js busy",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/franciscomateus/projects/aperture/mcp-server/dist/presence-hint.js idle",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }
