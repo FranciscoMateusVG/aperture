@@ -64,11 +64,15 @@ function envMs(name: string, fallback: number): number {
  *
  * This is intentionally static. It is control-plane text, not a BEADS
  * message, so it must never interpolate agent, user, or message content.
- * Keep byte-identical with KICKOFF_TEXT in src-tauri/src/agents.rs;
- * aperture-syepg is the source-of-truth task for this copy.
+ * Provider-aware since aperture-1socy: this text is ONLY ever injected into
+ * Codex sessions, whose inbox is delivered by this bridge. It must not tell the
+ * agent to start the Claude inbox monitor / hub-client or to look for a hub
+ * token (a fresh Codex Rex spent ~75 s doing exactly that). The Claude kickoff
+ * (KICKOFF_TEXT in src-tauri/src/launcher.rs) keeps the monitor step.
+ * Regression: mcp-server/test/codex-startup-instructions.test.mjs.
  */
 export const CODEX_KICKOFF_TEXT =
-  "Session start. Run your boot routine now: start your inbox monitor per your system prompt, then check get_messages and process any unread messages, marking each read after you handle it.";
+  "Session start. Your inbox is delivered by the Aperture bridge as injected turns: do not start a monitor process or hub-client and do not look for a hub token. Check get_messages now, process any unread messages, and mark each read after you handle it. Then await scoped dispatch.";
 
 export type PresenceEvent = "join" | "leave" | "busy" | "idle";
 
