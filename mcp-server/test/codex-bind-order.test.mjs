@@ -48,6 +48,11 @@ writeFileSync(BD_STUB, `#!/bin/sh\ncat "$FAKE_BD_UNREAD_FILE"\n`, { mode: 0o755 
 process.env.APERTURE_RUN_DIR = TMP; // thread-ready files land here
 process.env.BD_PATH = BD_STUB; // beads.ts shells this instead of real bd
 process.env.FAKE_BD_UNREAD_FILE = UNREAD_FILE;
+// aperture-oeb6q pins: shrink the bridge's wall-clock cadences so socket-death
+// reconnect and the single inject re-pump happen in ~100ms instead of 10s/5s.
+process.env.APERTURE_CODEX_RECONNECT_MS = "100";
+process.env.APERTURE_CODEX_INJECT_RETRY_MS = "100";
+const INJECT_RETRY_MS = 100;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const { CodexBridgeClient, CODEX_KICKOFF_TEXT } = await import(
@@ -76,6 +81,12 @@ async function waitFor(cond, what, timeoutMs = 5000, stepMs = 20) {
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Simulate app-server death mid-turn: kill every client connection but keep
+ *  listening, so the bridge's reconnect finds the same server (same threads). */
+function dropClients(server) {
+  for (const ws of server.sockets) ws.terminate();
 }
 
 function makeHooks() {
@@ -310,6 +321,88 @@ test("turn-state serialization: message during an active turn → turn/steer, no
   assert.equal(inj2.length, 1);
   assert.equal(inj2[0].method, "turn/start", "idle again → turn/start");
   assert.equal(server.turnCallsContaining("m-e1").length, 1, "m-e1 still deduped");
+});
+
+test("aperture-oeb6q A — socket death after inject: delivered-set cleared on close, same unread id re-injected after reconnect + rebind", async (t) => {
+  const { server, bridge, logs } = await scenario(t, { threads: [{ id: "t-r" }] });
+
+  bridge.start();
+  await waitFor(() => bridge.isBound, "bridge bound");
+
+  setUnread([msgRow("m-r1", "glados", "cbx-r", "message riding a turn that dies")]);
+  bridge.deliver();
+  await waitFor(() => server.turnCallsContaining("m-r1").length === 1, "m-r1 injected once");
+
+  // The app-server dies mid-turn (user abort / crash / hub-side drop). BEADS
+  // still reports m-r1 unread — the agent never acked it. Pre-fix, `delivered`
+  // survived onClose and the rebind replay filtered m-r1 out forever.
+  dropClients(server);
+  await waitFor(() => !bridge.isBound, "bridge observed the close");
+  assert.ok(logs.some((l) => l.event === "codex_disconnected"), "codex_disconnected logged");
+
+  await waitFor(() => bridge.isBound, "bridge reconnected + rebound", 5000);
+  await waitFor(() => server.turnCallsContaining("m-r1").length === 2, "m-r1 re-injected after rebind");
+  await delay(300); // grace: an over-eager fix would triple-inject within the same chain
+
+  const inj = server.turnCallsContaining("m-r1");
+  assert.equal(inj.length, 2, "exactly two injections: one per app-server connection");
+  const resumes = server.callsOf("thread/resume");
+  assert.equal(resumes.length, 2, "rebind resumed the surviving thread again");
+  assert.ok(
+    server.calls.indexOf(inj[1]) > server.calls.indexOf(resumes[1]),
+    "re-injection lands after the second thread/resume",
+  );
+  assert.equal(inj[1].method, "turn/start", "fresh connection resets turn-state → turn/start");
+  assert.equal(
+    logs.filter((l) => l.event === "codex_inject_retry").length,
+    0,
+    "socket-loss rejection is handled by the rebind replay, not the inject re-pump",
+  );
+});
+
+test("aperture-oeb6q B — inject error: one re-pump with flipped turn-state after INJECT_RETRY_MS; second failure → codex_inject_retry_exhausted, no third attempt", async (t) => {
+  const { server, bridge, logs } = await scenario(t, {
+    threads: [{ id: "t-x" }],
+    failures: { "turn/start": 1, "turn/steer": 1 },
+  });
+
+  bridge.start();
+  await waitFor(() => bridge.isBound, "bridge bound");
+
+  setUnread([msgRow("m-x1", "glados", "cbx-x", "message hitting a stale turn-state")]);
+  bridge.deliver();
+  await waitFor(
+    () => logs.some((l) => l.event === "codex_inject_error" && l.method === "turn/start"),
+    "first inject (turn/start) errored",
+  );
+  assert.equal(bridge.isTurnActive, true, "turn/start refused → bridge now assumes the thread is busy");
+
+  await waitFor(
+    () => server.turnCallsContaining("m-x1").length === 2,
+    "single re-pump attempted",
+    INJECT_RETRY_MS * 5,
+  );
+  const inj = server.turnCallsContaining("m-x1");
+  assert.equal(inj[0].method, "turn/start", "first attempt assumed idle");
+  assert.equal(inj[1].method, "turn/steer", "retry uses the other method (flipped turn-state)");
+  assert.ok(
+    inj[1].ts - inj[0].ts >= INJECT_RETRY_MS * 0.8,
+    `retry waited ~INJECT_RETRY_MS (got ${inj[1].ts - inj[0].ts}ms)`,
+  );
+  assert.equal(logs.filter((l) => l.event === "codex_inject_retry").length, 1, "codex_inject_retry logged once");
+
+  // The retry is scripted to fail too → exhausted, and NO automatic third try.
+  await waitFor(() => logs.some((l) => l.event === "codex_inject_retry_exhausted"), "exhausted logged");
+  const exhausted = logs.find((l) => l.event === "codex_inject_retry_exhausted");
+  assert.deepEqual(exhausted.ids, ["m-x1"], "exhausted log names the ids");
+  assert.equal(exhausted.method, "turn/steer");
+  await delay(INJECT_RETRY_MS * 5);
+  assert.equal(server.turnCallsContaining("m-x1").length, 2, "no third attempt within 5× the interval");
+  assert.equal(logs.filter((l) => l.event === "codex_inject_retry").length, 1, "no second re-pump armed");
+
+  // Ids were released both times: the NEXT hub notify is the next chance.
+  bridge.deliver();
+  await waitFor(() => server.turnCallsContaining("m-x1").length === 3, "next notify re-injects");
 });
 
 test.after(() => {

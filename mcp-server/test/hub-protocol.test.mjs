@@ -5,14 +5,20 @@
 //
 //   1. hello-then-join        — subscriber sees presence join; agent hello gets NO ack
 //   2. bad-first-frame        — garbage or non-hello first frame → close 4001
-//   3. producer-notify-online — notify forwarded exactly once + {type:"ok"} ack
-//   4. producer-notify-offline— offline recipient still acked, notify_offline logged
+//   3. producer-notify-online — notify forwarded exactly once + {type:"ok", outcome:"forwarded"} ack
+//   4. producer-notify-offline— offline recipient acked {outcome:"offline"}, notify_offline logged
 //   5. agent_replaced (old alive) — old socket closed 4000, two joins / zero leaves,
 //                                   delivery reaches the NEW socket only
 //   6. agent_replaced (old dead first) — abrupt TCP death then fast re-hello:
 //                                        new socket mapped, no dup delivery, no crash
 //   7. post-hello garbage ignored — connection stays open, later delivery still works
 //   8. shutdown               — SIGTERM → clean exit 0
+//   9. presence snapshot (aperture-oeb6q) — ~/.aperture/run/presence.json (APERTURE_RUN_DIR):
+//        a. startup clears a stale file; join → "online"; re-join (agent_replaced)
+//           keeps state+since; leave → agent removed; late subscriber still gets
+//           the {type:"presence", agent, event:"join", ts} snapshot frame
+//        b. codex bridge turn state → "busy"/"idle", `since` moves only on a
+//           transition; app-server socket loss → leave; ack outcome "codex"
 //
 // Run: node --test test/hub-protocol.test.mjs   (from mcp-server/, after pnpm build)
 // Or:  pnpm test:hub
@@ -29,11 +35,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { FakeAppServer } from "./fixtures/fake-appserver.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const hubPath = resolve(here, "..", "dist", "ws-hub.js");
@@ -56,19 +63,33 @@ const TOKENS = {
 /**
  * Spawn a fresh hub on a random high port.
  *   - APERTURE_HUB_SKIP_REPLAY=1 : no bd/BEADS in the loop
- *   - APERTURE_AGENTS_DIR=<empty tmp dir> : no Codex bridges discovered, so
- *     notify routing always takes the Monitor-socket path (isolation from the
- *     developer's real ~/.claude/aperture tree)
- * Returns { port, proc, stderrEvents, waitForEvent, stop }.
+ *   - APERTURE_AGENTS_DIR=<tmp dir> : empty by default, so no Codex bridges are
+ *     discovered and notify routing always takes the Monitor-socket path
+ *     (isolation from the developer's real ~/.claude/aperture tree). Pass
+ *     `codexAgent` to seed ONE codex manifest so the hub starts a bridge for it
+ *     (its app-server socket is expected at <runDir>/<codexAgent>.sock).
+ *   - APERTURE_RUN_DIR=<tmp dir> : presence.json + codex sockets land here, never
+ *     in the developer's real ~/.aperture/run. Pass `staleSnapshot` to pre-seed
+ *     presence.json before the hub boots (startup-clear pin).
+ * Returns { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, stop }.
  * stderrEvents is the live array of parsed JSON log lines from hub stderr.
  */
-async function spawnHub() {
+async function spawnHub({ codexAgent = null, staleSnapshot = null } = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-test-agents-"));
   const tokenDir = mkdtempSync(join(tmpdir(), "hub-test-tokens-"));
+  // Short prefix: the codex app-server unix socket lives here and sun_path is
+  // ~104 bytes on macOS.
+  const runDir = mkdtempSync(join(tmpdir(), "hr-"));
+  const presenceFile = join(runDir, "presence.json");
   for (const [principal, token] of Object.entries(TOKENS)) {
     writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
   }
+  if (codexAgent) {
+    mkdirSync(join(emptyAgentsDir, codexAgent));
+    writeFileSync(join(emptyAgentsDir, codexAgent, "manifest.json"), JSON.stringify({ model: "codex/gpt-5-codex" }));
+  }
+  if (staleSnapshot) writeFileSync(presenceFile, JSON.stringify(staleSnapshot));
   const proc = spawn(process.execPath, [hubPath], {
     env: {
       ...process.env,
@@ -76,9 +97,21 @@ async function spawnHub() {
       APERTURE_HUB_SKIP_REPLAY: "1",
       APERTURE_AGENTS_DIR: emptyAgentsDir,
       APERTURE_HUB_TOKEN_DIR: tokenDir,
+      APERTURE_RUN_DIR: runDir,
+      // Never let the developer's real ~/.aperture/agent-config.json model
+      // overrides leak into discovery.
+      APERTURE_AGENT_CONFIG_PATH: join(runDir, "no-such-agent-config.json"),
+      // Codex bridge reconnect cadence (default 10s) — fast so a bridge whose
+      // socket appears/disappears during a test is observed promptly.
+      APERTURE_CODEX_RECONNECT_MS: "200",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+
+  /** Parse presence.json as the hub last wrote it. */
+  function readPresence() {
+    return JSON.parse(readFileSync(presenceFile, "utf8"));
+  }
 
   const stderrEvents = [];
   const waiters = []; // { pred, resolve }
@@ -128,10 +161,11 @@ async function spawnHub() {
     proc.kill("SIGKILL");
     rmSync(emptyAgentsDir, { recursive: true, force: true });
     rmSync(tokenDir, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
-  return { port, proc, stderrEvents, waitForEvent, stop };
+  return { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, stop };
 }
 
 function connect(port) {
@@ -340,7 +374,7 @@ test("authenticated producer cannot spoof notify.from", async () => {
 
 // ── c. producer notify → online agent ───────────────────────────────────────
 
-test("producer notify to online agent: exactly-once delivery + ok ack", async () => {
+test("producer notify to online agent: exactly-once delivery + ok ack with outcome:'forwarded'", async () => {
   const hub = await spawnHub();
   try {
     const agent = await connect(hub.port);
@@ -359,7 +393,13 @@ test("producer notify to online agent: exactly-once delivery + ok ack", async ()
     producer.send(
       JSON.stringify({ type: "notify", to: "izzy-test", id: "msg-1", from: "glados", preview: "ping" }),
     );
-    await okPromise;
+    const ack = await okPromise;
+    // aperture-oeb6q: the ack says what the hub actually did.
+    assert.deepEqual(
+      ack,
+      { type: "ok", id: "msg-1", outcome: "forwarded" },
+      "ack is exactly {type:'ok', id, outcome:'forwarded'} when the Monitor socket is connected",
+    );
     const delivered = await deliveryPromise;
     assert.deepEqual(
       delivered,
@@ -384,7 +424,7 @@ test("producer notify to online agent: exactly-once delivery + ok ack", async ()
 
 // ── d. producer notify → offline agent ──────────────────────────────────────
 
-test("producer notify to offline agent: still acked ok, notify_offline logged, no crash", async () => {
+test("producer notify to offline agent: acked ok with outcome:'offline', notify_offline logged, no crash", async () => {
   const hub = await spawnHub();
   try {
     const producer = await connect(hub.port);
@@ -394,7 +434,13 @@ test("producer notify to offline agent: still acked ok, notify_offline logged, n
     producer.send(
       JSON.stringify({ type: "notify", to: "nobody-home", id: "msg-2", from: "glados", preview: "x" }),
     );
-    await okPromise;
+    const ack = await okPromise;
+    // aperture-oeb6q: an honest ack — nobody was pushed to; replay covers it.
+    assert.deepEqual(
+      ack,
+      { type: "ok", id: "msg-2", outcome: "offline" },
+      "ack is exactly {type:'ok', id, outcome:'offline'} when no socket is connected for the recipient",
+    );
     await hub.waitForEvent(
       (e) => e.event === "notify_offline" && e.to === "nobody-home" && e.id === "msg-2",
       "notify_offline log",
@@ -405,7 +451,7 @@ test("producer notify to offline agent: still acked ok, notify_offline logged, n
     producer.send(
       JSON.stringify({ type: "notify", to: "nobody-home", id: "msg-3", from: "glados", preview: "y" }),
     );
-    await okAgain;
+    assert.equal((await okAgain).outcome, "offline", "second ack also reports offline");
     assert.equal(hub.proc.exitCode, null, "hub process still alive");
     closeAll(producer);
   } finally {
@@ -611,5 +657,164 @@ test("SIGTERM: hub logs shutdown and exits 0", async () => {
     closeAll(agent);
   } finally {
     hub.stop(); // no-op if already exited; cleans the tmp agents dir
+  }
+});
+
+// ── i. presence snapshot file (aperture-oeb6q) ──────────────────────────────
+
+/** Poll until fn() is truthy (for count-based conditions past first occurrence). */
+async function until(fn, what, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fn()) return;
+    await sleep(20);
+  }
+  throw new Error(`timed out waiting until: ${what}`);
+}
+
+test("presence snapshot (agent socket): startup clears stale file; join → online; re-join keeps since; leave removes; late subscriber still gets event:'join'", async () => {
+  // A crashed hub left this behind: dead pid, phantom busy agent.
+  const stale = {
+    hub_pid: 999999,
+    updated_at: "2000-01-01T00:00:00.000Z",
+    agents: { ghost: { state: "busy", since: "2000-01-01T00:00:00.000Z" } },
+  };
+  const hub = await spawnHub({ staleSnapshot: stale });
+  try {
+    // Startup write: the file is rewritten with THIS hub's pid and zero agents
+    // before the hub even listens.
+    const boot = hub.readPresence();
+    assert.equal(boot.hub_pid, hub.proc.pid, "startup snapshot carries the live hub pid");
+    assert.deepEqual(boot.agents, {}, "startup snapshot has zero agents (stale ghost cleared)");
+    assert.ok(boot.updated_at > stale.updated_at, "updated_at is fresh");
+
+    // join → "online"
+    const sockA = await connect(hub.port);
+    await authenticate(hub, sockA, "agent", "dup-test");
+    await hub.waitForEvent(
+      (e) => e.event === "presence" && e.agent === "dup-test" && e.presence === "join",
+      "presence join log",
+    );
+    const afterJoin = hub.readPresence();
+    assert.deepEqual(Object.keys(afterJoin.agents), ["dup-test"], "only the joined agent is present");
+    assert.equal(afterJoin.agents["dup-test"].state, "online", "join → state 'online'");
+    const since = afterJoin.agents["dup-test"].since;
+    assert.ok(!Number.isNaN(Date.parse(since)), "since is an ISO timestamp");
+    assert.ok(afterJoin.updated_at >= boot.updated_at, "updated_at moves forward on join");
+
+    // Byte-compat pin: a subscriber that connects AFTER the join still gets the
+    // legacy snapshot frame — the stored "online" state maps back to event "join".
+    const subscriber = await connect(hub.port);
+    const snapFrame = waitFor(subscriber, (m) => m.type === "presence" && m.agent === "dup-test", "snapshot frame");
+    await authenticate(hub, subscriber, "subscriber");
+    const snap = await snapFrame;
+    assert.deepEqual(Object.keys(snap).sort(), ["agent", "event", "ts", "type"], "snapshot frame has exactly {type, agent, event, ts}");
+    assert.equal(snap.event, "join", "stored 'online' is presented to subscribers as event 'join'");
+    assert.equal(typeof snap.ts, "string");
+
+    // Re-join (agent_replaced) is NOT a transition: state and since are kept.
+    await sleep(20); // make a since bump observable at ms resolution
+    const sockB = await connect(hub.port);
+    const aClosed = waitForClose(sockA, "old socket close");
+    await authenticate(hub, sockB, "agent", "dup-test");
+    await aClosed;
+    await until(
+      () => hub.stderrEvents.filter((e) => e.event === "presence" && e.agent === "dup-test" && e.presence === "join").length >= 2,
+      "second join logged",
+    );
+    const afterRejoin = hub.readPresence();
+    assert.equal(afterRejoin.agents["dup-test"].state, "online", "re-join keeps state");
+    assert.equal(afterRejoin.agents["dup-test"].since, since, "re-join keeps since (not a transition)");
+
+    // leave → agent removed from the file.
+    sockB.close();
+    await hub.waitForEvent(
+      (e) => e.event === "presence" && e.agent === "dup-test" && e.presence === "leave",
+      "presence leave log",
+    );
+    const afterLeave = hub.readPresence();
+    assert.deepEqual(afterLeave.agents, {}, "leave deletes the agent from the snapshot");
+    assert.equal(afterLeave.hub_pid, hub.proc.pid, "hub_pid stable across writes");
+    assert.ok(afterLeave.updated_at >= afterJoin.updated_at, "updated_at moves forward on leave");
+    closeAll(subscriber);
+  } finally {
+    hub.stop();
+  }
+});
+
+test("presence snapshot (codex bridge): busy/idle set state, since moves only on transition; socket loss → leave; notify ack outcome:'codex'", async () => {
+  const hub = await spawnHub({ codexAgent: "cbx" });
+  // The bridge starts before the fake app-server exists (codex_offline), then
+  // reconnects within APERTURE_CODEX_RECONNECT_MS once the socket appears.
+  const server = new FakeAppServer(join(hub.runDir, "cbx.sock"), { threads: [{ id: "t-1" }] });
+  let serverClosed = false;
+  const closeServer = async () => {
+    if (serverClosed) return;
+    serverClosed = true;
+    await server.close();
+  };
+  try {
+    await server.start();
+    await hub.waitForEvent((e) => e.event === "codex_bound" && e.agent === "cbx", "codex_bound", 5000);
+    await hub.waitForEvent(
+      (e) => e.event === "presence" && e.agent === "cbx" && e.presence === "join",
+      "codex join log",
+    );
+    const online = hub.readPresence().agents.cbx;
+    assert.equal(online.state, "online", "bridge bind → 'online'");
+
+    // online → busy: a transition, since moves.
+    await sleep(20);
+    server.notify("turn/started", { threadId: "t-1" });
+    await hub.waitForEvent((e) => e.event === "presence" && e.agent === "cbx" && e.presence === "busy", "busy log");
+    const busy = hub.readPresence().agents.cbx;
+    assert.equal(busy.state, "busy", "turn/started → 'busy'");
+    assert.ok(busy.since > online.since, "online→busy transition moved since");
+
+    // Late subscriber sees the stored "busy" state as event "busy" (legacy frame).
+    const subscriber = await connect(hub.port);
+    const snapFrame = waitFor(subscriber, (m) => m.type === "presence" && m.agent === "cbx", "snapshot frame");
+    await authenticate(hub, subscriber, "subscriber");
+    const snap = await snapFrame;
+    assert.deepEqual(Object.keys(snap).sort(), ["agent", "event", "ts", "type"]);
+    assert.equal(snap.event, "busy", "stored 'busy' is presented to subscribers as event 'busy'");
+
+    // Repeated busy signals are NOT a transition: the file must be untouched.
+    // (The bridge itself dedups turnActive, so these never reach the hub — the
+    // pin still holds either way: nothing about cbx changes.)
+    await sleep(20);
+    server.notify("turn/started", { threadId: "t-1" });
+    server.notify("thread/status/changed", { threadId: "t-1", status: "active" });
+    await sleep(150);
+    assert.deepEqual(hub.readPresence().agents.cbx, busy, "repeated busy leaves state + since untouched");
+
+    // Producer notify to a codex agent → ack outcome "codex".
+    const producer = await connect(hub.port);
+    await authenticate(hub, producer, "producer");
+    const okPromise = waitFor(producer, (m) => m.type === "ok" && m.id === "msg-cbx", "ok ack");
+    producer.send(JSON.stringify({ type: "notify", to: "cbx", id: "msg-cbx", from: "glados", preview: "hi" }));
+    assert.deepEqual(await okPromise, { type: "ok", id: "msg-cbx", outcome: "codex" }, "codex recipient → outcome 'codex'");
+    await hub.waitForEvent((e) => e.event === "notify_codex" && e.id === "msg-cbx", "notify_codex log");
+
+    // busy → idle: a transition, since moves.
+    await sleep(20);
+    server.notify("turn/completed", { threadId: "t-1" });
+    await hub.waitForEvent((e) => e.event === "presence" && e.agent === "cbx" && e.presence === "idle", "idle log");
+    const idle = hub.readPresence().agents.cbx;
+    assert.equal(idle.state, "idle", "turn/completed → 'idle'");
+    assert.ok(idle.since > busy.since, "busy→idle transition moved since");
+
+    // App-server socket loss → bridge leave → agent removed from the file.
+    await closeServer();
+    await hub.waitForEvent(
+      (e) => e.event === "presence" && e.agent === "cbx" && e.presence === "leave",
+      "codex leave log",
+      5000,
+    );
+    assert.deepEqual(hub.readPresence().agents, {}, "leave deletes the codex agent from the snapshot");
+    closeAll(subscriber, producer);
+  } finally {
+    await closeServer();
+    hub.stop();
   }
 });

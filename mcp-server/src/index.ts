@@ -7,6 +7,7 @@ import { MailboxStore } from "./store.js";
 import { MessageQueue } from "./message-queue.js";
 import { formatUpdateAck, formatCloseAck, createTask, updateTask, closeTask, queryTasks, storeArtifact, searchTasks, createMessage, getUnreadMessages, markMessageRead, extractTaskId } from "./beads.js";
 import { notifyHub } from "./hub-notify.js";
+import { presenceReport, describePresence, type PresenceReport } from "./presence-snapshot.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
 if (!AGENT_NAME) {
@@ -25,20 +26,24 @@ store.ensureMailbox(AGENT_NAME);
 // send_message enqueues + returns instantly; this background worker flushes to
 // BEADS (createMessage), retrying on failure and replaying persisted messages
 // on restart. Only send_message is queued (it is read-after-write-safe — the
-// recipient reads via the 5s poller); all task writes stay synchronous.
+// recipient receives it via hub push / unread replay); all task writes stay
+// synchronous.
 const sendQueue = new MessageQueue({
   queueFilePath: resolve(homedir(), ".aperture", "send-queue", `${AGENT_NAME}.jsonl`),
   flush: async (m) => {
     // createMessage throws on bd failure → the queue keeps the message and
     // retries. It NEVER falls back to a divergent local store (split-brain).
     const result = await createMessage(m.from, m.to, m.content);
-    // Comms-layer v2 (Phase 1): best-effort push to the WS hub so a connected
-    // recipient gets the message immediately instead of waiting for the
-    // poller. notifyHub never throws and resolves within 1500ms; hub-down or
-    // recipient-offline is silent (log only) — unread replay covers it.
+    // Comms-layer v2: best-effort push to the WS hub so a connected recipient
+    // gets the message immediately. notifyHub never throws and resolves within
+    // 1500ms with the hub's delivery outcome (forwarded / codex / offline /
+    // unacked). Returning it lets the queue log the truth (aperture-oeb6q);
+    // an offline/unacked outcome is NOT a failure — the BEADS row exists and
+    // the hub's unread replay on reconnect covers it.
     const id = extractTaskId(result) ?? "";
     const preview = m.content.slice(0, 60).replace(/\n/g, " ");
-    await notifyHub({ to: m.to, id, from: m.from, preview });
+    const outcome = await notifyHub({ to: m.to, id, from: m.from, preview });
+    return { id, outcome };
   },
 });
 sendQueue.start();
@@ -48,7 +53,12 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-const PERMANENT_RECIPIENTS = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "sage", "atlas", "sterling", "operator"];
+const PERMANENT_RECIPIENTS = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "operator"];
+
+// Decommissioned 2026-07-19. Kept only so a message addressed to one of them
+// gets a routing hint instead of a bare "unknown recipient".
+const RETIRED_RECIPIENTS = ["sage", "atlas", "sterling"];
+const RETIRED_HINT = "sage/atlas/sterling were retired 2026-07-19 — route SEO/content to vance, docs to the implementing agent, QA sign-off to izzy.";
 
 function isValidRecipient(name: string): boolean {
   return PERMANENT_RECIPIENTS.includes(name);
@@ -58,16 +68,17 @@ function isValidRecipient(name: string): boolean {
 
 server.tool(
   "send_message",
-  "Send a message to another agent or the human operator. Valid recipients: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, sage, atlas, sterling, operator. Use 'operator' to reach the human (lights up an attention badge — does not deliver text to a UI).",
-  { to: z.string().describe("Recipient: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, sage, atlas, sterling, or operator"), message: z.string().describe("Message content. NOTE: avoid literal XML/HTML close-tag patterns like `</message>`, `</reason>` inside the body — they can be misread as parameter terminators by the tool-argument wire format. Use `&lt;/...&gt;` or paraphrase.") },
+  "Send a message to another agent or the human operator. Valid recipients: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, operator. Use 'operator' to reach the human (lights up an attention badge — does not deliver text to a UI). Agent-to-agent messages are persisted to BEADS and pushed over the hub; the reply tells you the recipient's current presence (online/busy/idle/offline/unknown) so you know whether to expect a prompt response.",
+  { to: z.string().describe("Recipient: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, or operator"), message: z.string().describe("Message content. NOTE: avoid literal XML/HTML close-tag patterns like `</message>`, `</reason>` inside the body — they can be misread as parameter terminators by the tool-argument wire format. Use `&lt;/...&gt;` or paraphrase.") },
   async ({ to, message }) => {
     const target = to.toLowerCase().trim();
 
     if (!isValidRecipient(target)) {
+      const hint = RETIRED_RECIPIENTS.includes(target) ? `\n${RETIRED_HINT}` : "";
       return {
         content: [{
           type: "text",
-          text: `ERROR: Unknown recipient "${to}". Valid recipients are: ${PERMANENT_RECIPIENTS.join(", ")}. Use "operator" to message the human.`,
+          text: `ERROR: Unknown recipient "${to}". Valid recipients are: ${PERMANENT_RECIPIENTS.join(", ")}. Use "operator" to message the human.${hint}`,
         }],
         isError: true,
       };
@@ -97,21 +108,31 @@ server.tool(
     // All agent-to-agent messages go through BEADS, via the durable
     // fire-and-forget queue (aperture-ktwoy). Enqueue + return INSTANTLY; the
     // background worker flushes to BEADS (createMessage) with retry + restart
-    // replay. This is read-after-write-safe: the sender never re-reads a sent
-    // message and the recipient receives it via the 5s poller, so the small
-    // async flush delay is invisible. No file-fallback here — the queue's
-    // retry handles backend hiccups; falling back to a divergent store would
-    // be split-brain (Cipher/Peppy guardrail).
+    // replay, then pushes over the hub. This is read-after-write-safe: the
+    // sender never re-reads a sent message and the recipient receives it via
+    // hub push (or unread replay on reconnect), so the small async flush delay
+    // is invisible. No file-fallback here — the queue's retry handles backend
+    // hiccups; falling back to a divergent store would be split-brain
+    // (Cipher/Peppy guardrail).
     sendQueue.enqueue(AGENT_NAME, target, message);
+    // Recipient presence rides on the ack (aperture-oeb6q) so the sender knows
+    // whether to expect a prompt reply. Best-effort: a presence read failure
+    // must never turn a successfully queued send into an error.
+    let ack = `Queued for ${target}.`;
+    try {
+      ack = formatSendAck(target, presenceReport());
+    } catch {
+      // presence unavailable — the bare ack above stands
+    }
     return {
-      content: [{ type: "text", text: `Message queued for ${target}. The poller will deliver it.` }],
+      content: [{ type: "text", text: ack }],
     };
   }
 );
 
 server.tool(
   "mark_as_read",
-  "Mark a BEADS message as read. Use this after receiving a message delivered by the poller.",
+  "Mark a BEADS message as read. Call it once per message after you have read it via get_messages (or a hub push event), otherwise it is replayed to you on every reconnect.",
   { message_id: z.string().describe("The BEADS message ID to mark as read (e.g. aperture-abc)") },
   async ({ message_id }) => {
     try {
@@ -165,11 +186,68 @@ server.tool(
   }
 );
 
+// ── Presence (aperture-oeb6q) ──
+
+/** Local-time hh:mm:ss for an ISO timestamp, or null if unparseable. Mirrors
+ *  describePresence's formatting so the table and the send ack agree. */
+function hhmmss(iso: string | null): string | null {
+  if (!iso) return null;
+  const t = new Date(iso);
+  return Number.isNaN(t.getTime()) ? null : t.toTimeString().slice(0, 8);
+}
+
+export const HUB_DOWN_TEXT =
+  "Hub: down — presence unknown for all agents. The launcher may be closed or the hub restarting; retry in a few seconds.";
+
+/** One compact text block: a header line plus one padded row per roster
+ *  agent (already name-sorted by presenceReport). Exported so it can be unit
+ *  tested without booting the MCP server. */
+export function formatPresenceTable(report: PresenceReport): string {
+  if (report.hub === "down") return HUB_DOWN_TEXT;
+  const snap = hhmmss(report.updated_at);
+  const nameW = Math.max(...report.agents.map((a) => a.name.length), 4) + 2;
+  const stateW = "offline".length + 2;
+  const rows = report.agents.map((a) => {
+    const since = hhmmss(a.since);
+    const line = a.name.padEnd(nameW) + a.state.padEnd(stateW) + (since ? `since ${since}` : "");
+    return line.trimEnd();
+  });
+  return [`Hub: up${snap ? ` (snapshot ${snap})` : ""}`, ...rows].join("\n");
+}
+
+/** send_message ack: queued + recipient presence + what that means for
+ *  delivery. One line. Exported for the same reason as formatPresenceTable. */
+export function formatSendAck(target: string, report: PresenceReport): string {
+  const desc = describePresence(report, target);
+  const entry = report.agents.find((a) => a.name === target);
+  const state = report.hub === "down" ? "unknown" : (entry?.state ?? "offline");
+  let ack = `Queued for ${target}. ${desc}.`;
+  if (state === "offline" || state === "unknown") {
+    ack += " It will be pushed when they reconnect (unread replay); nothing is lost.";
+  } else if (state === "busy") {
+    ack += " It will interrupt their current turn as a Monitor event.";
+  }
+  return ack;
+}
+
+server.tool(
+  "get_presence",
+  "Who is online right now. Reads the hub's presence snapshot (no round-trip, no side effects) — cheap, call it freely, especially before dispatching work to another agent or when a reply is overdue. States: online = socket connected, no turn frame yet; busy = mid-turn (a message will interrupt them as a Monitor event); idle = between turns (a message is picked up promptly); offline = no socket (a message waits in BEADS and is replayed when they reconnect); unknown = the hub itself is down, so nobody's state can be read. Each row shows when the current state began.",
+  {},
+  async () => {
+    try {
+      return { content: [{ type: "text", text: formatPresenceTable(presenceReport()) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  }
+);
+
 // ── Identity ──
 
 server.tool(
   "get_identity",
-  "Get your identity and role within the Aperture orchestration system.",
+  "Get your identity and role within the Aperture orchestration system, plus how inbound messages reach you.",
   {},
   async () => {
     return {
@@ -180,7 +258,7 @@ server.tool(
           role: agentRole,
           model: agentModel,
           system: "Aperture AI Orchestration Platform",
-          description: "You are an AI agent inside the Aperture orchestration system. Messages from other agents are delivered directly into your conversation as file contents.",
+          description: "You are an AI agent inside the Aperture orchestration system. Messages from other agents are persisted to BEADS and delivered by the hub: Claude agents receive hub push events on their inbox Monitor; Codex agents receive them as injected turns. On a push (or whenever you suspect unread mail), call get_messages, then mark_as_read for each message you have handled.",
         }, null, 2),
       }],
     };
@@ -198,7 +276,7 @@ server.tool(
     description: z.string().optional().describe("Task description. NOTE: avoid literal XML/HTML close-tag patterns like `</reason>`, `</notes>`, `</description>` inside the text — the tool-argument wire format can misinterpret them as parameter terminators, causing argument truncation. If you must reference such tags, use `&lt;/reason&gt;` or paraphrase (e.g. \"the reason field\")."),
     type: z.enum(["task", "bug", "feature", "chore", "epic"]).optional().describe("Task type. Defaults to 'task'."),
     labels: z.array(z.string()).optional().describe("Labels to apply at creation. If provided, MUST contain exactly one `project:<name>` label (canonical: project:aperture, project:incluir, project:beads-galaxy, project:mempalace). If omitted, no labels are set — add the project label separately via update_task add_labels."),
-    assignee: z.string().optional().describe("Assignee (agent name: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, sage, atlas, sterling — or any string). Set without a separate update call."),
+    assignee: z.string().optional().describe("Assignee (agent name: glados, wheatley, peppy, izzy, vance, rex, scout, cipher — or any string). Set without a separate update call."),
     acceptance: z.string().optional().describe("Testable acceptance criteria. NOTE: avoid literal XML/HTML close-tag patterns like `</acceptance>` inside the text; they can be misread as parameter terminators. Use `&lt;/...&gt;` or paraphrase."),
     blocked_by: z.array(z.string()).optional().describe("Task IDs that block this one. Each is wired up via `bd dep add <new> <blocker>` after creation."),
   },
