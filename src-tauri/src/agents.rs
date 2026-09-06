@@ -302,7 +302,7 @@ pub fn boot_agent_process(
         // SessionStart hook runs (scripts/aperture-prime.sh boot: workflow
         // preamble + memory INDEX, never the full bank) is mirrored into the
         // static prompt manually here.
-        let prompt_content = inject_bd_memory(prompt_content, &project_dir, &beads_dir, &name);
+        let prompt_content = inject_bd_memory(prompt_content, &project_dir, &beads_dir, &name, Some(&hub_token_path));
         // Comms Layer v2 (docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md):
         // unread messages are replayed by the aperture-bus codex-bridge over
         // the app-server socket; nothing is prepended to the prompt here.
@@ -865,13 +865,34 @@ pub const BD_MEMORY_INDEX_HEADER: &str =
 /// failure appends a visible `[memory index unavailable: <reason>]` line
 /// under the header instead of nothing, so a Codex agent can tell "no index"
 /// from "no memories" and fall back to `recall` explicitly.
-pub fn inject_bd_memory(mut prompt: String, project_dir: &str, beads_dir: &str, agent_name: &str) -> String {
+///
+/// `hub_token_path` is the already-provisioned per-agent hub token FILE PATH
+/// (never its contents). The boot seam keys "agent session vs operator
+/// session" on `APERTURE_HUB_TOKEN_FILE` — the launcher exports it for
+/// Claude agents (launcher.rs) and this is the Codex-side equivalent. Without
+/// it the seam treats the assembly as an operator session and prepends the
+/// bd workflow preamble, which is what pushed the Codex boot prompt over the
+/// 40 KiB hook budget (aperture-3kavd HOLD #3). `None` = explicit operator /
+/// no-token path; the env var is then left unset, never set to "".
+pub fn inject_bd_memory(
+    mut prompt: String,
+    project_dir: &str,
+    beads_dir: &str,
+    agent_name: &str,
+    hub_token_path: Option<&str>,
+) -> String {
     let script = format!("{}/scripts/aperture-prime.sh", project_dir);
-    let output = std::process::Command::new(&script)
-        .arg("boot")
-        .env("BEADS_DIR", beads_dir)
-        .env("BD_ACTOR", agent_name)
-        .output();
+    let mut cmd = std::process::Command::new(&script);
+    cmd.arg("boot").env("BEADS_DIR", beads_dir).env("BD_ACTOR", agent_name);
+    match hub_token_path {
+        Some(p) if !p.is_empty() => {
+            cmd.env("APERTURE_HUB_TOKEN_FILE", p);
+        }
+        _ => {
+            cmd.env_remove("APERTURE_HUB_TOKEN_FILE");
+        }
+    }
+    let output = cmd.output();
     let body = match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1093,7 +1114,7 @@ mod tests {
             "ok",
             "echo \"MARKER mode=$1 actor=$BD_ACTOR beads=$BEADS_DIR\"",
         );
-        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", None);
         assert!(out.starts_with("PROMPT\n\n---\n"), "prompt body must be preserved: {out}");
         assert!(out.contains(BD_MEMORY_INDEX_HEADER), "new header missing: {out}");
         assert!(
@@ -1102,6 +1123,40 @@ mod tests {
         );
         assert!(!out.contains("Beads Memory Bank (bd prime"), "old bd-prime header must be gone");
         assert!(!out.contains("[memory index unavailable"), "success path must not print the fallback");
+    }
+
+    #[test]
+    fn inject_bd_memory_passes_provisioned_hub_token_path_never_contents() {
+        // aperture-3kavd HOLD #3: the seam decides agent-vs-operator on this
+        // env var. The launched-agent assembly must carry the provisioned
+        // token FILE PATH (the stub prints the var, proving the path — not a
+        // token value — crossed the boundary).
+        let p = FakeProject::with_script("tokenpath", "echo \"TOKENFILE=${APERTURE_HUB_TOKEN_FILE:-UNSET}\"");
+        let out = inject_bd_memory(
+            "PROMPT".into(),
+            p.path(),
+            "/tmp/fake-beads",
+            "rex",
+            Some("/Users/x/.aperture/run/hub-tokens/rex.token"),
+        );
+        assert!(
+            out.contains("TOKENFILE=/Users/x/.aperture/run/hub-tokens/rex.token"),
+            "provisioned token path must reach the boot seam: {out}"
+        );
+    }
+
+    #[test]
+    fn inject_bd_memory_operator_path_leaves_hub_token_env_unset() {
+        // Explicit no-token path: the var must be ABSENT (not empty), so the
+        // seam takes the operator branch deliberately, and an inherited value
+        // from the launcher's own environment can never leak into a `None` call.
+        let p = FakeProject::with_script("operatorpath", "echo \"TOKENFILE=${APERTURE_HUB_TOKEN_FILE-ABSENT}\"");
+        std::env::set_var("APERTURE_HUB_TOKEN_FILE", "/should/not/leak.token");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", None);
+        std::env::remove_var("APERTURE_HUB_TOKEN_FILE");
+        assert!(out.contains("TOKENFILE=ABSENT"), "operator path must not set the var: {out}");
+        let out2 = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", Some(""));
+        assert!(out2.contains("TOKENFILE=ABSENT"), "empty path must behave as None: {out2}");
     }
 
     #[test]
@@ -1115,7 +1170,7 @@ mod tests {
     #[test]
     fn inject_bd_memory_missing_script_appends_visible_fallback() {
         let p = FakeProject::empty("missing");
-        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", None);
         assert!(out.starts_with("PROMPT"));
         assert!(out.contains(BD_MEMORY_INDEX_HEADER));
         assert!(
@@ -1128,7 +1183,7 @@ mod tests {
     #[test]
     fn inject_bd_memory_nonzero_exit_appends_fallback_with_stderr_reason() {
         let p = FakeProject::with_script("fail", "echo 'boom' >&2; exit 3");
-        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", None);
         assert!(out.contains(BD_MEMORY_INDEX_HEADER));
         assert!(out.contains("[memory index unavailable: aperture-prime.sh boot exited"), "{out}");
         assert!(out.contains("boom"), "stderr reason must be surfaced: {out}");
@@ -1137,7 +1192,7 @@ mod tests {
     #[test]
     fn inject_bd_memory_empty_output_appends_fallback() {
         let p = FakeProject::with_script("empty", "exit 0");
-        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex");
+        let out = inject_bd_memory("PROMPT".into(), p.path(), "/tmp/fake-beads", "rex", None);
         assert!(out.contains(BD_MEMORY_INDEX_HEADER));
         assert!(out.contains("[memory index unavailable: aperture-prime.sh boot returned empty output]"), "{out}");
     }

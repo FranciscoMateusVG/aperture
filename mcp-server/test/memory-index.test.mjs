@@ -40,7 +40,7 @@ process.env.APERTURE_MEMORY_META = join(TMP, "no-such-sidecar.json");
 process.env.APERTURE_MEMORY_CACHE = join(TMP, "default-cache.json");
 delete process.env.APERTURE_STANDING_CACHE;
 const mi = await import(DIST);
-const { redact, buildIndex, renderIndex, renderFallback, recall, recallFull, recallStats, STANDING_CACHE, RECALL_FULL_MAX_BYTES } = mi;
+const { BEAD_ID_RE, redact, buildIndex, renderIndex, renderFallback, recall, recallFull, recallStats, STANDING_CACHE, RECALL_FULL_MAX_BYTES } = mi;
 
 process.on("exit", () => rmSync(TMP, { recursive: true, force: true }));
 
@@ -355,6 +355,35 @@ test("recall ranks an exact key match first", async () => {
   assert.equal(r.index_built_at, idx.builtAt);
   const r2 = recall(idx, { query: "aperture-3x136 hub" });
   assert.equal(r2.items[0].key, "hub-self-heal-pr-46", "bead-id identifier match ranks first");
+});
+
+test("bead ids: 4/5/6-char suffixes all earn exact rank; a longer hyphenated id never partial-matches (aperture-3kavd HOLD #2)", async () => {
+  // Isolated bank so fixture totals elsewhere stay untouched. Distractors share MORE terms than the id docs,
+  // so only the exact-id rank can put the id doc first.
+  const bank = {
+    "pane-keystroke-2026-05-23": "Orchestrator pane keystroke capability validated via tmux send-keys (bead aperture-0hv9).",
+    "hub-launch-path-2026-07-19": "GUI launch-path PATH starvation, fixed in PR #46 (bead aperture-3x136).",
+    "codex-bind-order-2026-09-05": "Codex bind order: hello before bind, retry once (bead aperture-oeb6q).",
+    "wisp-thread-2026-09-06": "Message thread aperture-wisp-174klx discussed pane keystroke capability and orchestrator liveness.",
+    "distractor-a-2026-09-01": "Orchestrator pane keystroke capability liveness notes about tmux panes and orchestrator capability.",
+    "distractor-b-2026-09-02": "More orchestrator pane keystroke capability liveness notes, tmux panes, orchestrator, capability, keystroke.",
+  };
+  const idx = await buildIndex({ bank, sidecar: {}, firstSeen, now: NOW, cachePath: freshCache() });
+  const first = (q) => recall(idx, { query: q, k: 5 }).items[0]?.key;
+  assert.equal(first("orchestrator pane keystroke capability aperture-0hv9"), "pane-keystroke-2026-05-23", "4-char id must rank first");
+  assert.equal(first("orchestrator pane keystroke capability aperture-3x136"), "hub-launch-path-2026-07-19", "5-char id must rank first");
+  assert.equal(first("orchestrator pane keystroke capability aperture-oeb6q"), "codex-bind-order-2026-09-05", "6-char id must rank first");
+  // Partial-longer-id rejection: the wisp doc's aperture-wisp-174klx must not register as bead id aperture-wisp,
+  // so a query for "aperture-wisp" gets no exact hit at all (and a 4-char query never matches the wisp doc by id).
+  assert.deepEqual("aperture-wisp-174klx".match(BEAD_ID_RE), null, "longer hyphenated id yields no bead-id match");
+  // "aperture-wisp" still matches the wisp doc LEXICALLY (token `wisp`) — that is fine. What must not happen is an
+  // EXACT hit: with both ids in the query, the 4-char exact doc must beat the wisp doc; if the prefix counted as an
+  // exact bead id, both would be exact and BM25 tie-break (rare `wisp` term) would put the wisp doc first.
+  assert.equal(first("aperture-wisp aperture-0hv9"), "pane-keystroke-2026-05-23", "prefix of a longer id must not be an exact hit");
+  assert.deepEqual("see aperture-abcdefg now".match(BEAD_ID_RE), null, "7-char suffix is not a bead id");
+  assert.deepEqual("xaperture-0hv9".match(BEAD_ID_RE), null, "left boundary");
+  assert.deepEqual("(aperture-0hv9), aperture-3x136. aperture-oeb6q!".match(BEAD_ID_RE), ["aperture-0hv9", "aperture-3x136", "aperture-oeb6q"]);
+  assert.equal(recall(idx, { query: "PR #46" }).items[0].key, "hub-launch-path-2026-07-19", "#NNN exact rank still works");
 });
 
 test("recall ranks a #NNN identifier match first even when other docs share more terms", async () => {

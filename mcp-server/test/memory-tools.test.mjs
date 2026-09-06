@@ -60,6 +60,8 @@ const FAKE_BANK = {
   [SECRET_KEY]: "Root password for the mac mini is hunter2-mini-2026. Do not share.",
   "playwright-tobevisible-overflow-clip":
     "Playwright toBeVisible passes on an element clipped by overflow:hidden — assert boundingBox intersects the viewport instead. Banked 2026-09-05 (aperture-acr3t).",
+  "orchestrator-pane-keystroke-2026-05-23":
+    "Orchestrator pane-keystroke capability validated: tmux send-keys can fire slash commands in an idle agent pane. Banked 2026-05-23 (aperture-0hv9).",
   "incluir-runner-mac-mini":
     "monorepo-incluir CI runs on the Mac Mini self-hosted runner; auto-merge is enabled for trusted actors only. Banked 2026-08-20.",
 };
@@ -68,6 +70,7 @@ const SIDECAR_META = {
   [PARTIAL_SECRET_KEY]: { project: "aperture", tags: ["infra"], updated: "2026-08-01" },
   [SECRET_KEY]: { project: "aperture", tags: ["secret", "infra"], updated: "2026-08-01" },
   "playwright-tobevisible-overflow-clip": { project: "aperture", tags: ["testing"], updated: "2026-09-05" },
+  "orchestrator-pane-keystroke-2026-05-23": { project: "aperture", tags: ["liveness"], updated: "2026-05-23" },
   "incluir-runner-mac-mini": { project: "incluir", tags: ["ci"], updated: "2026-08-20" },
 };
 writeFileSync(SIDECAR, JSON.stringify(SIDECAR_META, null, 2));
@@ -302,6 +305,15 @@ test("hook: bead id in the prompt / APERTURE_ACTIVE_BEAD join the query terms", 
   const viaEnv = await runHook({ payload: hookPayload("keep going with the active bead"), env: { ...HOOK_ENV, APERTURE_ACTIVE_BEAD: "aperture-acr3t" } });
   assert.equal(viaEnv.code, 0, viaEnv.stderr);
   assert.match(viaEnv.stdout, /^- playwright-tobevisible-overflow-clip · /m);
+});
+
+test("hook: a real 4-char APERTURE_ACTIVE_BEAD surfaces its bead-scoped memory first (aperture-3kavd HOLD #2)", async () => {
+  const viaEnv = await runHook({ payload: hookPayload("keep going with the active bead"), env: { ...HOOK_ENV, APERTURE_ACTIVE_BEAD: "aperture-0hv9" } });
+  assert.equal(viaEnv.code, 0, viaEnv.stderr);
+  const items = viaEnv.stdout.trimEnd().split("\n").slice(1);
+  assert.match(items[0] ?? "", /^- orchestrator-pane-keystroke-2026-05-23 · /, `expected the 4-char bead's memory first:\n${viaEnv.stdout}`);
+  const inPrompt = await runHook({ payload: hookPayload("continue the pane keystroke work on aperture-0hv9 please"), env: HOOK_ENV });
+  assert.match(inPrompt.stdout, /^- orchestrator-pane-keystroke-2026-05-23 · /m);
 });
 
 test("hook: slash command prompt (/compact) → empty stdout, exit 0", async () => {

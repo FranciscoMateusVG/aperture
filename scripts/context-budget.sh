@@ -74,18 +74,28 @@ sha256_of_stdin() {
 
 # ------------------------------------------------------------- hook seams ---
 
-boot_hook_bytes=$("$PRIME" boot 2>/dev/null | wc -c | tr -d ' ')
-precompact_bytes=$("$PRIME" precompact 2>/dev/null | wc -c | tr -d ' ')
-boot_hook_ok=1; [ "$boot_hook_bytes" -le "$BOOT_HOOK_MAX" ] || boot_hook_ok=0
+# The boot seam keys "agent session" vs "operator session" on APERTURE_HUB_TOKEN_FILE (agents get the
+# provisioned token FILE PATH from the launcher / inject_bd_memory; an operator shell has none and gets
+# the bd workflow preamble). Measure BOTH paths EXPLICITLY and never inherit the calling shell's value —
+# inheriting is how one reviewer's shell read PASS and another's FAIL on the same tree (aperture-3kavd
+# HOLD #3). The agent path uses the exact path form launcher.rs exports; only the path, never contents.
+TOKEN_DIR="${APERTURE_HUB_TOKEN_DIR:-$HOME/.aperture/run/hub-tokens}"
+agent_boot_bytes() { env APERTURE_HUB_TOKEN_FILE="$TOKEN_DIR/$1.token" "$PRIME" boot 2>/dev/null | wc -c | tr -d ' '; }
+operator_boot_bytes=$(env -u APERTURE_HUB_TOKEN_FILE "$PRIME" boot 2>/dev/null | wc -c | tr -d ' ')
+precompact_bytes=$(env -u APERTURE_HUB_TOKEN_FILE "$PRIME" precompact 2>/dev/null | wc -c | tr -d ' ')
+boot_hook_bytes=0   # hard gate = the LARGEST launched-agent boot hook (filled in the per-agent loop)
 precompact_ok=1; [ "$precompact_bytes" -le "$PRECOMPACT_MAX" ] || precompact_ok=0
 
 # ------------------------------------------------------------- per agent ---
 
 # skills-matrix --json → "name<TAB>backend<TAB>prompt_bytes<TAB>resident_bytes<TAB>always_injected_bytes"
-A_NAME=(); A_BACKEND=(); A_PROMPT=(); A_RES=(); A_TOTAL=(); A_OK=(); A_HARD=()
+A_NAME=(); A_BACKEND=(); A_PROMPT=(); A_RES=(); A_HOOK=(); A_TOTAL=(); A_OK=(); A_HARD=()
 while IFS=$'\t' read -r name backend prompt_bytes resident_bytes always; do
     [ -n "$name" ] || continue
-    total=$((always + boot_hook_bytes))
+    hook=$(agent_boot_bytes "$name")
+    [ "$hook" -gt "$boot_hook_bytes" ] && boot_hook_bytes=$hook
+    A_HOOK+=("$hook")
+    total=$((always + hook))
     ok=1; [ "$total" -le "$AGENT_BOOT_MAX" ] || ok=0
     hard=0; in_list "$name" "$HARD_AGENTS" && hard=1
     A_NAME+=("$name"); A_BACKEND+=("$backend"); A_PROMPT+=("$prompt_bytes")
@@ -101,6 +111,7 @@ if [ "${#A_NAME[@]}" -eq 0 ]; then
     echo "context-budget: skills-matrix --json returned no agents" >&2
     exit 2
 fi
+boot_hook_ok=1; [ "$boot_hook_bytes" -le "$BOOT_HOOK_MAX" ] || boot_hook_ok=0
 
 # ------------------------------------------------------------------ bank ---
 
@@ -147,15 +158,17 @@ if [ "$JSON" = 1 ]; then
     printf '  "hooks": {\n'
     printf '    "boot_hook_bytes": {"bytes": %s, "tokens": %s, "max_bytes": %s, "pass": %s, "hard": true},\n' \
         "$boot_hook_bytes" "$(tokens "$boot_hook_bytes")" "$BOOT_HOOK_MAX" "$([ "$boot_hook_ok" = 1 ] && echo true || echo false)"
-    printf '    "precompact_bytes": {"bytes": %s, "tokens": %s, "max_bytes": %s, "pass": %s, "hard": true}\n' \
+    printf '    "precompact_bytes": {"bytes": %s, "tokens": %s, "max_bytes": %s, "pass": %s, "hard": true},\n' \
         "$precompact_bytes" "$(tokens "$precompact_bytes")" "$PRECOMPACT_MAX" "$([ "$precompact_ok" = 1 ] && echo true || echo false)"
+    printf '    "operator_boot_bytes": {"bytes": %s, "tokens": %s, "path": "no APERTURE_HUB_TOKEN_FILE (operator shell, includes bd workflow preamble)", "hard": false}\n' \
+        "$operator_boot_bytes" "$(tokens "$operator_boot_bytes")"
     printf '  },\n'
     printf '  "agents": {'
     sep=""
     for i in "${!A_NAME[@]}"; do
         printf '%s\n    %s: {"backend": %s, "prompt_bytes": %s, "resident_bytes": %s, "boot_hook_bytes": %s, "boot_total_bytes": %s, "tokens": %s, "max_bytes": %s, "pass": %s, "hard": %s}' \
             "$sep" "$(jstr "${A_NAME[$i]}")" "$(jstr "${A_BACKEND[$i]}")" "${A_PROMPT[$i]}" "${A_RES[$i]}" \
-            "$boot_hook_bytes" "${A_TOTAL[$i]}" "$(tokens "${A_TOTAL[$i]}")" "$AGENT_BOOT_MAX" \
+            "${A_HOOK[$i]}" "${A_TOTAL[$i]}" "$(tokens "${A_TOTAL[$i]}")" "$AGENT_BOOT_MAX" \
             "$([ "${A_OK[$i]}" = 1 ] && echo true || echo false)" "$([ "${A_HARD[$i]}" = 1 ] && echo true || echo false)"
         sep=","
     done
@@ -180,13 +193,15 @@ echo "INJECTION SEAMS (scripts/aperture-prime.sh)"
 printf '%-18s %9s %9s %9s %8s   %s\n' gate bytes KiB '≈tokens' 'max KiB' verdict
 printf '%-18s %9s %9s %9s %8s   %s\n' boot_hook_bytes "$boot_hook_bytes" "$(kib "$boot_hook_bytes")" "$(tokens "$boot_hook_bytes")" "$((BOOT_HOOK_MAX / 1024))" "$(verdict "$boot_hook_ok" 1)"
 printf '%-18s %9s %9s %9s %8s   %s\n' precompact_bytes "$precompact_bytes" "$(kib "$precompact_bytes")" "$(tokens "$precompact_bytes")" "$((PRECOMPACT_MAX / 1024))" "$(verdict "$precompact_ok" 1)"
+printf '%-18s %9s %9s %9s %8s   %s\n' operator_boot "$operator_boot_bytes" "$(kib "$operator_boot_bytes")" "$(tokens "$operator_boot_bytes")" "-" "info (no token file: operator shell, bd preamble included; not gated)"
+printf '%-18s %s\n' '' "boot_hook_bytes = largest launched-agent boot hook, measured with APERTURE_HUB_TOKEN_FILE=$TOKEN_DIR/<agent>.token (launcher.rs form); never inherited from this shell"
 echo
 
 echo "ASSEMBLED BOOT PROMPT per agent (prompt + resident skills + boot hook)  max $((AGENT_BOOT_MAX / 1024)) KiB"
 printf '%-9s %-7s %8s %9s %9s %10s %9s %9s   %s\n' agent path prompt resident boot_hook total 'KiB' '≈tokens' verdict
 for i in "${!A_NAME[@]}"; do
     printf '%-9s %-7s %8s %9s %9s %10s %9s %9s   %s\n' \
-        "${A_NAME[$i]}" "${A_BACKEND[$i]}" "${A_PROMPT[$i]}" "${A_RES[$i]}" "$boot_hook_bytes" \
+        "${A_NAME[$i]}" "${A_BACKEND[$i]}" "${A_PROMPT[$i]}" "${A_RES[$i]}" "${A_HOOK[$i]}" \
         "${A_TOTAL[$i]}" "$(kib "${A_TOTAL[$i]}")" "$(tokens "${A_TOTAL[$i]}")" "$(verdict "${A_OK[$i]}" "${A_HARD[$i]}")"
 done
 echo "(hard gate: $HARD_AGENTS — the constitutional core lands with this gate; the rest are soft until their"
