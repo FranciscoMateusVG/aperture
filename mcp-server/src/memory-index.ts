@@ -44,9 +44,9 @@ export const CACHE_PATH = process.env.APERTURE_MEMORY_CACHE ?? join(RUN_DIR, "me
 export const STANDING_CACHE = process.env.APERTURE_STANDING_CACHE ?? join(RUN_DIR, "standing.md");
 
 export const GIST_MAX_WORDS = 10;
-export const STANDING_BLOCK_MAX_BYTES = 10 * 1024;
+export const STANDING_BLOCK_MAX_BYTES = 16 * 1024;
 /** Hard limit for a reviewed standing statement; validated in loadSidecar, never truncated. */
-export const STANDING_TEXT_MAX_BYTES = 600;
+export const STANDING_TEXT_MAX_BYTES = 1200;
 export const RECALL_FULL_MAX_BYTES = 8 * 1024;
 export const RECALL_K_MAX = 10;
 export const STALE_AFTER_DAYS = 90;
@@ -599,20 +599,19 @@ const LEGEND = "Use recall(query) for ranked gists and recall_full(key) for a bo
  *  the full body. No per-entry truncation ever (GLaDOS hold #4); the whole block is capped at
  *  STANDING_BLOCK_MAX_BYTES by dropping WHOLE trailing entries with a notice naming them. */
 function renderStandingBlock(index: MemoryIndex): string {
+  // GLaDOS hold #4b: NEVER silently drop a standing entry. Every designated statement is rendered
+  // in full; if the block exceeds STANDING_BLOCK_MAX_BYTES the release gates (context-budget /
+  // retention-gate) FAIL visibly on size — omission is not an option.
   const total = index.standing.length;
   let out = `## Standing decisions (${total})\n`;
-  let shown = 0;
   for (const s of index.standing) {
     const text = (s.text ?? s.body).trim().replace(/\s+/g, " ");
     const tag = s.reviewed ? "" : " [unreviewed — full memory body; reviewed statement pending]";
-    const chunk = `- **${s.key}**${tag} — ${text}\n`;
-    if (Buffer.byteLength(out + chunk, "utf8") > STANDING_BLOCK_MAX_BYTES) {
-      const rest = index.standing.slice(shown).map((r) => r.key).join(", ");
-      out += `[standing block cap ${STANDING_BLOCK_MAX_BYTES} bytes reached: ${shown} of ${total} shown in full; NOT shown (read with recall_full before acting): ${rest}]\n`;
-      return out;
-    }
-    out += chunk;
-    shown++;
+    out += `- **${s.key}**${tag} — ${text}\n`;
+  }
+  const bytes = Buffer.byteLength(out, "utf8");
+  if (bytes > STANDING_BLOCK_MAX_BYTES) {
+    out += `[STANDING BLOCK OVER BUDGET: ${bytes} > ${STANDING_BLOCK_MAX_BYTES} bytes — all ${total} entries are still rendered above; the release gate must fail]\n`;
   }
   return out;
 }

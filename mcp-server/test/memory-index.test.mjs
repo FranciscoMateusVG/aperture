@@ -246,7 +246,7 @@ test("standing entries appear in full in renderIndex (both modes) and in STANDIN
   assert.equal(statSync(STANDING_CACHE).mode & 0o777, 0o600);
 });
 
-test("standing entries are COMPLETE (reviewed standing_text verbatim, else full body marked unreviewed); >600 B standing_text is rejected; block cap drops whole entries and names them", async () => {
+test("standing entries are COMPLETE (reviewed standing_text verbatim, else full body marked unreviewed); >1200 B standing_text is rejected; over-budget block renders everything and flags itself", async () => {
   const big = "x".repeat(6000);
   const reviewed = "RULE: never inject the bank at boot. Exception: operator-run plain sessions get the bd preamble only. Pending: Cipher regex review.";
   const idx = await build({
@@ -261,16 +261,17 @@ test("standing entries are COMPLETE (reviewed standing_text verbatim, else full 
   assert.ok(!block.includes("…"), "no excerpt ellipsis anywhere in the standing block");
   // >600 B standing_text → sidecar REJECTED (never truncated)
   await assert.rejects(
-    build({ bank: BANK, sidecar: { ...SIDECAR, "standing-compact-at-60-2026-07-19": { standing: true, standing_text: "y".repeat(601) } } }),
-    /standing_text is 601 bytes > 600 — shorten by review, never truncate/,
+    build({ bank: BANK, sidecar: { ...SIDECAR, "standing-compact-at-60-2026-07-19": { standing: true, standing_text: "y".repeat(1201) } } }),
+    /standing_text is 1201 bytes > 1200 — shorten by review, never truncate/,
   );
-  // cap: many standing entries → whole trailing entries dropped and NAMED, shown ones intact
+  // over-budget: NOTHING is dropped — every entry still rendered, plus a visible over-budget marker
   const many = {}; const manyMeta = {};
-  for (let i = 0; i < 40; i++) { const k = `standing-rule-${String(i).padStart(2, "0")}-2026-09-01`; many[k] = `Rule ${i}: ${"y".repeat(400)}`; manyMeta[k] = { standing: true }; }
+  for (let i = 0; i < 40; i++) { const k = `standing-rule-${String(i).padStart(2, "0")}-2026-09-01`; many[k] = `Rule ${i}: ${"y".repeat(500)}`; manyMeta[k] = { standing: true }; }
   const idx2 = await build({ bank: { ...BANK, ...many }, sidecar: { ...SIDECAR, ...manyMeta } });
   const out2 = renderIndex(idx2, "precompact");
-  assert.match(out2, /\[standing block cap 10240 bytes reached: \d+ of 42 shown in full; NOT shown \(read with recall_full before acting\): standing-rule-/);
-  assert.ok(!/Rule \d+: y+\.\.\.|…/.test(out2), "no partial rule text");
+  for (let i = 0; i < 40; i++) assert.ok(out2.includes(`- **standing-rule-${String(i).padStart(2, "0")}-2026-09-01**`), `entry ${i} must still be rendered`);
+  assert.match(out2, /\[STANDING BLOCK OVER BUDGET: \d+ > 16384 bytes — all 42 entries are still rendered above; the release gate must fail\]/);
+  assert.ok(!/…/.test(out2), "no partial rule text");
 });
 
 test("renderFallback emits the cached standing block + exactly one unavailable line, never bank text", async () => {
