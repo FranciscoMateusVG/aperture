@@ -58,17 +58,25 @@ esac
 
 # run_with_timeout SECS cmd...  — uses coreutils timeout/gtimeout when present
 # (macOS ships neither by default); otherwise runs the command plain.
+# Portable real deadline (GLaDOS hold #1): macOS ships neither `timeout` nor `gtimeout`, and an
+# unbounded `bd prime` would make boot unbounded. Run the command in the background, arm a
+# watchdog subshell that SIGTERMs then SIGKILLs it at the deadline, and reap. The watchdog's
+# stdio is detached so a $(…) capture around this function returns as soon as the child dies.
+# Exit 124 on deadline, else the child's own status. Verified by test/aperture-prime.test.mjs:
+# the hung child is gone (kill -0 fails), not merely the wrapper returned.
 run_with_timeout() {
     local secs="$1"; shift
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$secs" "$@"
-    elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$secs" "$@"
-    else
-        "$@"
-    fi
+    local pid wd rc
+    "$@" &
+    pid=$!
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
+    wd=$!
+    wait "$pid" 2>/dev/null; rc=$?
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; fi
+    if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then return 124; fi
+    return "$rc"
 }
-
 is_blank() { [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]; }
 byte_len() { printf '%s' "$1" | wc -c | tr -d ' '; }
 
@@ -76,36 +84,31 @@ byte_len() { printf '%s' "$1" | wc -c | tr -d ' '; }
 
 # `bd prime` minus its memory section. The section starts at the line
 # `## Persistent Memories (N)` and runs to EOF; awk stops printing there.
+# GLaDOS holds #2/#3: never advise re-running `bd prime` (that re-injects the whole, possibly
+# secret-bearing bank), and never trust a regex + size cap alone — emit the preamble ONLY when
+# the stripped text has the recognised structure: first line `# Beads Workflow Context`, the
+# `## Persistent Memories` header was actually found (so stripping happened), a workflow
+# section is present, and no memory-entry heading (`### <key>`) survives. Anything else is
+# suppressed with a one-line notice. Memory always goes through recall/recall_full.
+PREAMBLE_UNAVAILABLE="[bd workflow preamble unavailable — bd usage is in the beads skill; memory via recall/recall_full]"
 print_preamble() {
-    local raw rc stripped
-    if ! command -v bd >/dev/null 2>&1; then
-        echo "[bd prime unavailable — run bd prime manually]"
-        return
-    fi
+    local raw rc stripped found first
+    if ! command -v bd >/dev/null 2>&1; then echo "$PREAMBLE_UNAVAILABLE"; return; fi
     raw=$(run_with_timeout "$BD_TIMEOUT_SECS" bd prime 2>/dev/null); rc=$?
-    if [ "$rc" -ne 0 ] || is_blank "$raw"; then
-        echo "[bd prime unavailable — run bd prime manually]"
-        return
-    fi
+    if [ "$rc" -ne 0 ] || is_blank "$raw"; then echo "$PREAMBLE_UNAVAILABLE"; return; fi
+    found=$(printf '%s\n' "$raw" | grep -c "$MEMORY_HEADER_RE")
     stripped=$(printf '%s\n' "$raw" | awk -v re="$MEMORY_HEADER_RE" '$0 ~ re { exit } { print }')
-    if is_blank "$stripped"; then
-        echo "[bd prime unavailable — run bd prime manually]"
-        return
-    fi
-    if [ "$(byte_len "$stripped")" -gt "$PREAMBLE_MAX_BYTES" ]; then
-        # The preamble is ~5 KiB; anything this big means the memory header
-        # moved and the bank slipped through. Never print it.
-        echo "[bd prime preamble exceeded $((PREAMBLE_MAX_BYTES / 1024)) KiB after stripping — suppressed; run bd prime manually]"
+    first=$(printf '%s\n' "$stripped" | head -n 1)
+    if [ "$found" -lt 1 ] \
+       || [ "$first" != "# Beads Workflow Context" ] \
+       || ! printf '%s\n' "$stripped" | grep -qE '^## (Core Rules|Essential Commands)' \
+       || printf '%s\n' "$stripped" | grep -qE '^### [A-Za-z0-9][A-Za-z0-9._-]{5,}$' \
+       || [ "$(byte_len "$stripped")" -gt "$PREAMBLE_MAX_BYTES" ]; then
+        echo "[bd workflow preamble suppressed — unrecognised bd prime structure; bd usage is in the beads skill; memory via recall/recall_full]"
         return
     fi
     printf '%s\n' "$stripped"
 }
-
-# --------------------------------------------------------- memory index ---
-
-# The index CLI contract (mcp-server/src/memory-index.ts): prints the
-# rendered block, exit 0 always, fallback text on failure. Until it lands,
-# dist/memory-index.js is absent or a stub — both are treated as "unavailable".
 print_index() {
     local mode="$1" out rc
     if ! command -v node >/dev/null 2>&1; then
@@ -113,7 +116,7 @@ print_index() {
         return
     fi
     if [ ! -f "$INDEX_JS" ]; then
-        echo "[memory index unavailable: dist not built — run just build-mcp]"
+        echo "[memory index unavailable: dist not built (just build-mcp) — use recall/recall_full]"
         return
     fi
     out=$(run_with_timeout "$NODE_TIMEOUT_SECS" node "$INDEX_JS" --mode "$mode" 2>/dev/null); rc=$?
@@ -140,7 +143,7 @@ case "$MODE" in
         # `beads` skill, which documents every bd command the preamble repeats — skip it for
         # them (≈4.7 KiB of boot budget). The operator's own plain sessions in this repo keep it.
         if [ -n "${APERTURE_HUB_TOKEN_FILE:-}" ]; then
-            echo "[bd workflow preamble omitted for Aperture agents — the resident beads skill covers bd usage; run bd prime manually if needed]"
+            echo "[bd workflow preamble omitted for Aperture agents — the resident beads skill covers bd usage; memory via recall/recall_full]"
         else
             print_preamble
         fi

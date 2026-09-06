@@ -26,6 +26,7 @@
         "entities": [],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Operator-directed 2026-05-23. As orchestrator: (1) proactively deep-peek (tail -40, not -3) any agent on a claimed task that has not moved per tick visibility; (2) classify stuck vs working vs deliberately-waiting from scrollback, thinking indicator, context-bar motion and last self-message; (3) on API-error symptoms re-send the BEADS message (Anthropic drops silently); (4) on real hangs ask the operator for Ctrl+C; (5) NEVER re-ping an agent deliberately paused awaiting operator-only action. Never treat 'no motion' as 'fine'.",
         "supersedes": [],
         "tags": [
             "process",
@@ -125,6 +126,7 @@
         ],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Operator standing decision 2026-07-19: aperture-b6ofj (incluir prod BETTER_AUTH_SECRET is the framework default placeholder; session tokens forgeable; account takeover confirmed by Cipher) is CLOSED as risk-accepted by operator order. Do not re-file, re-surface, or escalate it; the operator has explicitly deferred rotation. Cipher's evidence is banked in the bead history. Reopen only if the operator directly asks.",
         "supersedes": [],
         "tags": [
             "security",
@@ -273,6 +275,7 @@
         ],
         "project": "eunenem",
         "standing": true,
+        "standing_text": "Cipher rulings 2026-08-23, formal, binding until re-reviewed; both production-only. (1) COBRANCA credential (INTER_COB_*) must not exist in staging in any form, secret store included. (2) PAYOUT credential (INTER_*, holds pagamento-pix.write) is formally prod-only; reusing it outside prod, even for pre-release validation, needs a fresh explicit security review; convenience is not sufficient. Validate instead: staging E2E against the FAKE provider, then ONE bounded real-Inter smoke in prod on go-live day (scope probe + negative control, one tagged minimal unpaid charge, verify through expiry).",
         "supersedes": [],
         "tags": [
             "security",
@@ -379,6 +382,7 @@
         ],
         "project": "eunenem",
         "standing": true,
+        "standing_text": "Correction 2026-08-23 (operator via GLaDOS; live-verified). (1) Never recommend a Stripe support request for pix_payments on eunenem: Stripe PIX was deliberately abandoned after repeated refusals; PIX collection is Banco Inter COBRANCA, Stripe keeps cards only. (2) The prod Inter app already grants cob.write/cob.read/pix.read; a separate cobranca app is justified only by least privilege (it also holds pagamento-pix.write). Get Cipher's call before merging INTER_COB_* into INTER_*; a new app gets cobranca + webhook scopes only. (3) PR #64: Cipher PASSED at 4ef22cd; only Izzy's E2E gate is open.",
         "supersedes": [
             "eunenem-pix-rail-disambiguation-prod-stripe-pix-blocked"
         ],
@@ -428,6 +432,7 @@
         ],
         "project": "general",
         "standing": true,
+        "standing_text": "Interim rule, Cipher 2026-08-28, BINDING pending operator ack. (1) No agent self-service reads of plaintext credential drawers: never pull credential values via model-visible tools (mempalace_search/get_drawer, cat of a secrets file, any path into model context). (2) Deliver credentials only via a non-model path from secret store to an allowlisted destination, fingerprint-only receipt; if none exists, the operation WAITS; do not improvise. (3) Never redact ~/.claude transcripts in place; report counts and fingerprints only. (4) Valid while aperture-12wk (per-consumer keys) is active.",
         "supersedes": [],
         "tags": [
             "credentials",
@@ -515,6 +520,7 @@
         ],
         "project": "incluir",
         "standing": true,
+        "standing_text": "Dokploy P0 cross-org write bypass on xerox (token denied read on a compose can still persist a write; tcp/3000 public v4+v6): containment prepared but DEFERRED by operator 2026-08-28, risk explicitly accepted after full briefing. Do not re-escalate or re-ping; the operator will raise it himself (precedent aperture-b6ofj). When applied: use the Cipher-passed DOCKER-USER scripts (UFW is not the control; cover IPv6; NO terraform apply); run Cipher's six verifications with evidence; persistence tests need an operator-approved window; drift monitoring alerts only. Landed write stays.",
         "supersedes": [],
         "tags": [
             "security",
@@ -829,6 +835,7 @@
         ],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Banked 2026-05-23. Every 'X is ready / feature live / you can test now' message to the operator must attach evidence (verify command + output), never a promise. Verify the full chain for the feature kind: code shipped, env plumbed, env wired, build args (NEXT_PUBLIC_ vars bake at build time; a runtime env-check is not enough), flag flipped, restart, user walk (communicate skill §7.1/§7.2). If you cannot produce the evidence string, do not ring: say 'X almost ready, gate N pending [the missing verify]'.",
         "supersedes": [],
         "tags": [
             "process",
@@ -867,6 +874,7 @@
         "entities": [],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Operator directive 2026-06-26: compact specialist agents proactively at 60% context, not 65-70%. Any specialist above 60% gets /compact'd unilaterally via tmux (C-u, type /compact, wait for the dropdown, Enter). Exception: never compact an agent with a LIVE subagent (it kills the subagent and its work); wait for the subagent to return, then compact immediately, and compact at 60% BEFORE an agent spawns a high-context subagent. Supersedes the 65% figure in watch-protocol §2 and glados-loop §5.",
         "supersedes": [],
         "tags": [
             "process",
@@ -878,6 +886,7 @@
         "entities": [],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Banked 2026-06-02 from operator correction. When a recovery playbook is already banked (e.g. OrbStack hard-kill + relaunch), or an unblock event matches an already-scoped child bead with an assigned owner, just do it: run the recovery / dispatch the owner autonomously. Surface to the operator only if the playbook genuinely does not cover the case or the action is destructive in a way the operator has not pre-approved. Doorbell discipline (watch-protocol §7.1) is not permission-asking. Before every permission-asking surface, scan recent bd memories + skills; if covered, execute and report.",
         "supersedes": [],
         "tags": [
             "process",
@@ -892,6 +901,7 @@
         ],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Operator escalation 2026-07-31 (aperture-jxwbd). Before ANY idle/clean stop-loop call, apply a mechanical gate, not judgment: (1) bd list --status=in_progress / bd show for every agent in ACTIVE SPECIALISTS; any hit means do not stop; (2) if clear, confirm the last verdict on the thread is not still HOLD/FAIL/blocked; only then idle holds, and when quiet-but-not-terminal loosen the interval instead of killing the loop. Also (watch-protocol S2): a HOLD/FAIL/blocked verdict addressed or CC'd to GLaDOS is an immediate-action trigger; act when read, never wait for the next tick.",
         "supersedes": [],
         "tags": [
             "process",
@@ -907,6 +917,7 @@
         ],
         "project": "incluir",
         "standing": true,
+        "standing_text": "Operator decision 2026-09-06 (Peppy, aperture-919c3), overriding Cipher's 61-table ruling and superseding the 2026-07-31 role contract: hermes_bot_ro has SELECT on all 70/70 incluir prod base tables, SELECT only, plus ALTER DEFAULT PRIVILEGES FOR ROLE incluir IN SCHEMA public so new migration tables are auto-readable. Bot visibility is controlled by DB grants alone (dynamic has_table_privilege catalog in execute-broad-read.ts); no code allowlist. DSL still allows no raw SQL or aggregates. Note for Cipher: the BetterAuth account table (auth credential hashes) has been readable since July 2026.",
         "supersedes": [
             "hermes-broad-read-db-role-contract-2026-07-31"
         ],
@@ -2093,6 +2104,7 @@
         ],
         "project": "general",
         "standing": true,
+        "standing_text": "Cipher adjudication 2026-08-28, HIGH/P1; no rotation started, awaiting operator. Shared prod OpenAI key sits in Cadence as EXPO_PUBLIC_OPENAI_API_KEY (client-readable): treat as compromised. Order is mandatory: (1) remove direct OpenAI access from Cadence, use an authenticated server-side proxy; (2) find EAS build history via non-model handling, retire affected builds; (3) separate keys per server-side consumer, verify each; Cadence never gets a provider key; (4) revoke shared key LAST. Until then keep the .env value; Cadence stays stopped. No Expo tunnel until public vars proven secret-free.",
         "supersedes": [],
         "tags": [
             "security",
@@ -2646,6 +2658,7 @@
         "entities": [],
         "project": "aperture",
         "standing": true,
+        "standing_text": "Banked 2026-05-24. A tick output based on PR state + recent merges alone is insufficient and misses stalled agents. Every tick must include: (1) a tail -30 deep-peek on every active agent's pane (not tail -3; thinking indicators scroll out of shallow peeks); (2) detection of typed-but-unsent commands sitting in pane buffers; (3) firing Enter via tmux send-keys for the safe ones (a correct slash command, a message-read cat command). The agent-liveness sweep is part of EVERY tick output, not optional.",
         "supersedes": [],
         "tags": [
             "process",

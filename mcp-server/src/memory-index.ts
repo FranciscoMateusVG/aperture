@@ -44,10 +44,9 @@ export const CACHE_PATH = process.env.APERTURE_MEMORY_CACHE ?? join(RUN_DIR, "me
 export const STANDING_CACHE = process.env.APERTURE_STANDING_CACHE ?? join(RUN_DIR, "standing.md");
 
 export const GIST_MAX_WORDS = 10;
-export const STANDING_BLOCK_MAX_BYTES = 8 * 1024;
-/** Per-standing-entry excerpt in the resident block. The full body is one recall_full(key) away and the
- *  constitutional rules themselves are resident verbatim in orchestrator-core/DECISIONS.md (bd-independent). */
-export const STANDING_EXCERPT_BYTES = 300;
+export const STANDING_BLOCK_MAX_BYTES = 10 * 1024;
+/** Hard limit for a reviewed standing statement; validated in loadSidecar, never truncated. */
+export const STANDING_TEXT_MAX_BYTES = 600;
 export const RECALL_FULL_MAX_BYTES = 8 * 1024;
 export const RECALL_K_MAX = 10;
 export const STALE_AFTER_DAYS = 90;
@@ -64,6 +63,11 @@ export interface MemoryMeta {
   supersedes?: string[];
   /** ISO date (YYYY-MM-DD). Age source #1; else a date in the key; else Dolt first-seen. */
   updated?: string;
+  /** Reviewed, COMPLETE statement of a standing rule (every clause, exception and condition),
+   *  ≤ STANDING_TEXT_MAX_BYTES UTF-8. Rendered verbatim in the resident standing block. Longer
+   *  → loadSidecar REJECTS the sidecar (never truncates). Absent → the full memory body is
+   *  rendered instead (marked unreviewed) so a missing statement never drops a restriction. */
+  standing_text?: string;
 }
 export type Sidecar = Record<string, MemoryMeta>;
 
@@ -98,8 +102,9 @@ export interface MemoryIndex {
   hash: string;
   entries: MemoryEntry[];
   lines: IndexLine[];
-  /** Standing entries in full (redacted), in stable key order. */
-  standing: Array<{ key: string; body: string }>;
+  /** Standing entries, stable key order. `text` = reviewed standing_text (reviewed:true) or the full
+   *  redacted body (reviewed:false). Always complete — never an excerpt. */
+  standing: Array<{ key: string; body: string; text?: string; reviewed?: boolean }>;
   /** Keys excluded as secret (count only is ever exposed). */
   secretCount: number;
   supersededCount: number;
@@ -296,6 +301,16 @@ function validateMeta(key: string, raw: unknown): MemoryMeta {
     }
     meta.updated = r.updated;
   }
+  if (r.standing_text !== undefined) {
+    if (typeof r.standing_text !== "string" || r.standing_text.trim().length === 0) {
+      throw new Error(`sidecar: "${key}".standing_text must be a non-empty string`);
+    }
+    const n = Buffer.byteLength(r.standing_text, "utf8");
+    if (n > STANDING_TEXT_MAX_BYTES) {
+      throw new Error(`sidecar: "${key}".standing_text is ${n} bytes > ${STANDING_TEXT_MAX_BYTES} — shorten by review, never truncate`);
+    }
+    meta.standing_text = r.standing_text;
+  }
   return meta;
 }
 
@@ -485,7 +500,11 @@ function makeGist(body: string): string {
 export async function buildIndex(opts: BuildOptions = {}): Promise<MemoryIndex> {
   const now = opts.now ?? new Date();
   const cachePath = opts.cachePath ?? CACHE_PATH;
-  const sidecar = opts.sidecar ?? loadSidecar(opts.sidecarPath ?? SIDECAR_PATH);
+  // Injected sidecars (tests, programmatic callers) get the SAME validation as the file path —
+  // standing_text length/shape rejection must not be bypassable.
+  const sidecar: Sidecar = opts.sidecar
+    ? Object.fromEntries(Object.entries(opts.sidecar).map(([k, v]) => [k, validateMeta(k, v)]))
+    : loadSidecar(opts.sidecarPath ?? SIDECAR_PATH);
   const bank = opts.bank ?? (await loadBank());
 
   const bankJson = JSON.stringify(bank);
@@ -524,7 +543,7 @@ export async function buildIndex(opts: BuildOptions = {}): Promise<MemoryIndex> 
 
   const entries: MemoryEntry[] = [];
   const lines: IndexLine[] = [];
-  const standing: Array<{ key: string; body: string }> = [];
+  const standing: MemoryIndex["standing"] = [];
   let secretCount = 0;
   let supersededCount = 0;
 
@@ -550,7 +569,12 @@ export async function buildIndex(opts: BuildOptions = {}): Promise<MemoryIndex> 
       ageDays,
       standing: meta.standing === true,
     });
-    if (meta.standing === true) standing.push({ key: k, body: rb.body });
+    if (meta.standing === true) {
+      // Reviewed statement (redacted like everything else) or the full body — never an excerpt.
+      const reviewed = typeof meta.standing_text === "string";
+      const text = reviewed ? redact(meta.standing_text as string).text : rb.body;
+      standing.push({ key: k, body: rb.body, text, reviewed });
+    }
   }
 
   const index: MemoryIndex = { builtAt: now.toISOString(), hash, entries, lines, standing, secretCount, supersededCount };
@@ -571,23 +595,20 @@ export function computeHash(bankJson: string, sidecarJson: string): string {
 const LEGEND = "Use recall(query) for ranked gists and recall_full(key) for a body; the full bank is never injected.";
 
 /** "## Standing decisions (N)" + full redacted bodies, capped at STANDING_BLOCK_MAX_BYTES with a notice. */
-function standingExcerpt(body: string): string {
-  const b = body.trim().replace(/\s+/g, " ");
-  if (Buffer.byteLength(b, "utf8") <= STANDING_EXCERPT_BYTES) return b;
-  const buf = Buffer.from(b, "utf8").subarray(0, STANDING_EXCERPT_BYTES);
-  return `${buf.toString("utf8").replace(/\uFFFD+$/, "").trimEnd()}… [full text: recall_full(key)]`;
-}
-
-/** "## Standing decisions (N)" — one excerpt per standing entry (≤ STANDING_EXCERPT_BYTES each, so 20 rules
- *  fit in ~6 KiB and are never truncated mid-rule), whole block capped at STANDING_BLOCK_MAX_BYTES with a notice. */
+/** "## Standing decisions (N)" — each entry COMPLETE: the reviewed standing_text verbatim, or (unreviewed)
+ *  the full body. No per-entry truncation ever (GLaDOS hold #4); the whole block is capped at
+ *  STANDING_BLOCK_MAX_BYTES by dropping WHOLE trailing entries with a notice naming them. */
 function renderStandingBlock(index: MemoryIndex): string {
   const total = index.standing.length;
   let out = `## Standing decisions (${total})\n`;
   let shown = 0;
   for (const s of index.standing) {
-    const chunk = `- **${s.key}** — ${standingExcerpt(s.body)}\n`;
+    const text = (s.text ?? s.body).trim().replace(/\s+/g, " ");
+    const tag = s.reviewed ? "" : " [unreviewed — full memory body; reviewed statement pending]";
+    const chunk = `- **${s.key}**${tag} — ${text}\n`;
     if (Buffer.byteLength(out + chunk, "utf8") > STANDING_BLOCK_MAX_BYTES) {
-      out += `[standing block truncated: ${shown} of ${total} entries shown; cap ${STANDING_BLOCK_MAX_BYTES} bytes — use recall_full(key) for the rest]\n`;
+      const rest = index.standing.slice(shown).map((r) => r.key).join(", ");
+      out += `[standing block cap ${STANDING_BLOCK_MAX_BYTES} bytes reached: ${shown} of ${total} shown in full; NOT shown (read with recall_full before acting): ${rest}]\n`;
       return out;
     }
     out += chunk;

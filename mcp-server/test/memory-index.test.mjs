@@ -246,24 +246,31 @@ test("standing entries appear in full in renderIndex (both modes) and in STANDIN
   assert.equal(statSync(STANDING_CACHE).mode & 0o777, 0o600);
 });
 
-test("standing entries are excerpted (≤ STANDING_EXCERPT_BYTES) and the block is capped with a notice", async () => {
+test("standing entries are COMPLETE (reviewed standing_text verbatim, else full body marked unreviewed); >600 B standing_text is rejected; block cap drops whole entries and names them", async () => {
   const big = "x".repeat(6000);
+  const reviewed = "RULE: never inject the bank at boot. Exception: operator-run plain sessions get the bd preamble only. Pending: Cipher regex review.";
   const idx = await build({
-    bank: { ...BANK, "standing-big-a-2026-09-01": `A ${big}`, "standing-big-b-2026-09-02": `B ${big}` },
-    sidecar: { ...SIDECAR, "standing-big-a-2026-09-01": { standing: true }, "standing-big-b-2026-09-02": { standing: true } },
+    bank: { ...BANK, "standing-big-a-2026-09-01": `A ${big}`, "standing-reviewed-2026-09-02": `long narrative ${big}` },
+    sidecar: { ...SIDECAR, "standing-big-a-2026-09-01": { standing: true }, "standing-reviewed-2026-09-02": { standing: true, standing_text: reviewed } },
   });
   const out = renderIndex(idx, "boot");
   const block = out.slice(out.indexOf("## Standing decisions"), out.indexOf("## Memory index"));
-  assert.ok(block.includes("## Standing decisions (4)"));
-  assert.ok(!block.includes(big), "a 6000-char body is never inlined whole");
-  assert.ok(block.includes("… [full text: recall_full(key)]"), "long standing entries carry the excerpt notice");
-  assert.ok(Buffer.byteLength(block, "utf8") <= 8 * 1024 + 256);
-  // cap: 40 standing entries of ~300 B each exceed 8 KiB → truncation notice
+  assert.ok(block.includes(`- **standing-reviewed-2026-09-02** — ${reviewed}`), "reviewed statement rendered verbatim, complete");
+  assert.ok(!block.includes("standing-reviewed-2026-09-02** [unreviewed"), "reviewed entry not marked unreviewed");
+  assert.ok(block.includes("standing-big-a-2026-09-01** [unreviewed — full memory body; reviewed statement pending] — A " + big), "unreviewed entry carries its FULL body, never an excerpt");
+  assert.ok(!block.includes("…"), "no excerpt ellipsis anywhere in the standing block");
+  // >600 B standing_text → sidecar REJECTED (never truncated)
+  await assert.rejects(
+    build({ bank: BANK, sidecar: { ...SIDECAR, "standing-compact-at-60-2026-07-19": { standing: true, standing_text: "y".repeat(601) } } }),
+    /standing_text is 601 bytes > 600 — shorten by review, never truncate/,
+  );
+  // cap: many standing entries → whole trailing entries dropped and NAMED, shown ones intact
   const many = {}; const manyMeta = {};
-  for (let i = 0; i < 40; i++) { many[`standing-rule-${String(i).padStart(2, "0")}-2026-09-01`] = `Rule ${i}: ${"y".repeat(280)}`; manyMeta[`standing-rule-${String(i).padStart(2, "0")}-2026-09-01`] = { standing: true }; }
+  for (let i = 0; i < 40; i++) { const k = `standing-rule-${String(i).padStart(2, "0")}-2026-09-01`; many[k] = `Rule ${i}: ${"y".repeat(400)}`; manyMeta[k] = { standing: true }; }
   const idx2 = await build({ bank: { ...BANK, ...many }, sidecar: { ...SIDECAR, ...manyMeta } });
   const out2 = renderIndex(idx2, "precompact");
-  assert.match(out2, /\[standing block truncated: \d+ of 42 entries shown; cap 8192 bytes/);
+  assert.match(out2, /\[standing block cap 10240 bytes reached: \d+ of 42 shown in full; NOT shown \(read with recall_full before acting\): standing-rule-/);
+  assert.ok(!/Rule \d+: y+\.\.\.|…/.test(out2), "no partial rule text");
 });
 
 test("renderFallback emits the cached standing block + exactly one unavailable line, never bank text", async () => {
