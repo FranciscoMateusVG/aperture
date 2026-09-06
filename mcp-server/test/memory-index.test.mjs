@@ -261,8 +261,8 @@ test("standing entries are COMPLETE (reviewed standing_text verbatim, else full 
   assert.ok(!block.includes("…"), "no excerpt ellipsis anywhere in the standing block");
   // >600 B standing_text → sidecar REJECTED (never truncated)
   await assert.rejects(
-    build({ bank: BANK, sidecar: { ...SIDECAR, "standing-compact-at-60-2026-07-19": { standing: true, standing_text: "y".repeat(1201) } } }),
-    /standing_text is 1201 bytes > 1200 — shorten by review, never truncate/,
+    build({ bank: BANK, sidecar: { ...SIDECAR, "standing-compact-at-60-2026-07-19": { standing: true, standing_text: "y".repeat(1301) } } }),
+    /standing_text is 1301 bytes > 1300 — shorten by review, never truncate/,
   );
   // over-budget: NOTHING is dropped — every entry still rendered, plus a visible over-budget marker
   const many = {}; const manyMeta = {};

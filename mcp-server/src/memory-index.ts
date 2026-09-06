@@ -46,7 +46,7 @@ export const STANDING_CACHE = process.env.APERTURE_STANDING_CACHE ?? join(RUN_DI
 export const GIST_MAX_WORDS = 10;
 export const STANDING_BLOCK_MAX_BYTES = 16 * 1024;
 /** Hard limit for a reviewed standing statement; validated in loadSidecar, never truncated. */
-export const STANDING_TEXT_MAX_BYTES = 1200;
+export const STANDING_TEXT_MAX_BYTES = 1300;
 export const RECALL_FULL_MAX_BYTES = 8 * 1024;
 export const RECALL_K_MAX = 10;
 export const STALE_AFTER_DAYS = 90;
