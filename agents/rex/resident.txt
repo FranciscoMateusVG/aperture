@@ -1,9 +1,10 @@
-# RESIDENT SET (aperture-i7bg0) — full bodies force-injected into prompt.md.
-# Everything else in skills.txt stays available lazily via Codex's native
-# $CODEX_HOME/skills catalog (name+description at boot, body read on demand).
-# Residency = always-active behavioral norms; reference/gotcha skills stay lazy.
-communicate
-team
-beads
-worktree-discipline
-specialist-delegation
+# RESIDENT SET — Constitution rollout (aperture-1socy, after the Peppy pilot
+# aperture-g4hku). Full bodies force-injected into prompt.md. Everything else in
+# skills.txt stays lazily available via Codex's native $CODEX_HOME/skills catalog
+# (name+description at boot, body read on demand). The `constitution` skill
+# carries the shared binding rules (creation gate, BEADS-only comms, await-scoped
+# dispatch, worktrees, closure, delegation, verification) with an index to the
+# detailed modules; walk-the-route stays resident as Rex's daily backend
+# discipline (read the actual handler bodies, not the spec of them).
+constitution
+walk-the-route
