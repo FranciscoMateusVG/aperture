@@ -18,5 +18,13 @@ done < <(find .claude/skills -name SKILL.md; ls prompts/*.md 2>/dev/null)
 S=.claude/skills/verify-user-path/SKILL.md
 grep -q 'NON-MODEL delivery only' "$S" || { echo "$S: non-model delivery contract paragraph missing"; fail=1; }
 grep -q 'STOP and ask' "$S" || { echo "$S: stop-and-ask clause missing"; fail=1; }
-[ $fail -eq 0 ] && echo "credential-read-gate: PASS (no model-visible credential read instructions in skills/prompts)"
+# Synthetic-secret fixtures must never carry a contiguous detector-shaped literal at rest (GitGuardian
+# 37036434/37036433, aperture-3kavd): they are stored as fragments and re-joined at test time.
+FIXTURE_PAT='BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|sk_(live|test)_|sk-[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{10,}|xox[bap]-[0-9]{6,}|AKIA[0-9A-Z]{8,}|password=|BEADS_DOLT_PASSWORD='
+for f in mcp-server/test/fixtures/*.json; do
+  if hits=$(grep -nE "$FIXTURE_PAT" "$f"); then
+    echo "CONTIGUOUS DETECTOR-SHAPED LITERAL AT REST in $f (store as text_parts/marker_parts):"; echo "$hits" | cut -c1-40 | sed 's/^/  /'; fail=1
+  fi
+done
+[ $fail -eq 0 ] && echo "credential-read-gate: PASS (no model-visible credential read instructions in skills/prompts; fixtures fragmented at rest)"
 exit $fail
