@@ -680,8 +680,17 @@ const BM25_B = 0.75;
 const STANDING_BOOST = 1.5;
 const STALE_DEMOTION = 0.7;
 
+/**
+ * Bead ids: `aperture-` + 4–6 lowercase alphanumerics, bounded so a longer hyphenated id never yields a
+ * partial match (`aperture-wisp-174klx` is not `aperture-wisp`; `aperture-abcdefg` matches nothing).
+ * Real ids in the bank are 4 and 5 chars. Single source of truth — the memory-recall hook imports it, so
+ * the extractor and the exact-rank matcher cannot drift (aperture-3kavd HOLD #2: hook extracted 4–6,
+ * ranker accepted exactly 5, so a 4-char active bead never earned exact priority).
+ */
+export const BEAD_ID_RE = /(?<![a-z0-9-])aperture-[a-z0-9]{4,6}(?![a-z0-9-])/g;
+
 /** Ids that earn an exact-match rank: bead ids and `#NNN` PR/issue numbers. */
-const IDENT_RE = /aperture-[a-z0-9]{5}\b|#\d+\b/g;
+const IDENT_RE = new RegExp(`${BEAD_ID_RE.source}|(?<![a-z0-9#])#\\d+(?![a-z0-9])`, "g");
 
 /** Lowercase; alphanumeric parts ≥ 2 chars; hyphen/underscore-joined identifiers kept whole as well. */
 function tokenize(text: string): string[] {

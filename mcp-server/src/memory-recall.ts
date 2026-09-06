@@ -40,7 +40,7 @@
  * secret-tagged memories never reach this script.
  */
 
-import { buildIndex, recall } from "./memory-index.js";
+import { BEAD_ID_RE, buildIndex, recall } from "./memory-index.js";
 
 const DEFAULT_TIMEOUT_MS = 1500;
 const STDIN_GRACE_MS = 300;
@@ -49,7 +49,6 @@ const TOP_K = 3;
 const OUTPUT_MAX_BYTES = 600;
 const QUERY_MAX_CHARS = 2000;
 const HEADER = "[memory recall] top matches for this prompt — use recall_full(key) for detail:";
-const BEAD_ID = /\baperture-[a-z0-9]{4,6}\b/g;
 
 let settled = false;
 
@@ -138,7 +137,7 @@ async function main(): Promise<void> {
   const terms = [prompt.slice(0, QUERY_MAX_CHARS)];
   const activeBead = process.env.APERTURE_ACTIVE_BEAD?.trim();
   if (activeBead) terms.push(activeBead);
-  for (const id of new Set(prompt.match(BEAD_ID) ?? [])) terms.push(id);
+  for (const id of new Set(prompt.toLowerCase().match(BEAD_ID_RE) ?? [])) terms.push(id);
 
   const idx = await buildIndex();
   const r = recall(idx, { query: terms.join(" "), k: TOP_K });
