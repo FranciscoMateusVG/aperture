@@ -315,7 +315,12 @@ function parseSidecar(json: string, origin: string): Sidecar {
 }
 
 /** Read + validate the sidecar. Missing file → {}. Malformed → throws (fail closed at build). */
+/** Repo-tracked seed used when the per-machine sidecar has not been installed yet. Resolved
+ *  relative to this module (dist/ → ../../docs), so it works from the worktree and the main checkout. */
+export const SIDECAR_SEED_PATH = resolve(dirname(new URL(import.meta.url).pathname), "..", "..", "docs", "memory-meta.seed.json");
+
 export function loadSidecar(path: string = SIDECAR_PATH): Sidecar {
+  if (path === SIDECAR_PATH && !existsSync(path) && existsSync(SIDECAR_SEED_PATH)) path = SIDECAR_SEED_PATH;
   if (!existsSync(path)) return {};
   return parseSidecar(readFileSync(path, "utf8"), path);
 }
