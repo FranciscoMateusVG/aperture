@@ -56,10 +56,33 @@ A **separate** hook script `dist/memory-recall.js` on `UserPromptSubmit` prints 
 | recall@3 (hook truth) and recall@5 (tool truth) on gated golden kinds / conflict subset at both k | ≥ 0.90 and ≥ 0.90 / 100% (measured: 0.967 / 1.000 / 100%) |
 | hook truth — real `dist/memory-recall.js` top-3 on identifier / conflict subsets | ≥ 0.90 / 100% (measured 10/10, 9/9) |
 | zero-overlap queries (semantic) | **unsupported in v1** — reported by the gate, never gated (measured 0/4) |
-| standing-rule retention | 25 named DECISION rules present verbatim in resident output (grep test) |
+| standing-rule retention — named obligation coverage (see §7a) | (a) all **13 enumerated DECISION rows** (DECISION-1, DECISION-1b, DECISION-2, DECISION-3, DECISION-4, DECISION-5, DECISION-6, DECISION-7, DECISION-8, DECISION-9, DECISION-10, DECISION-11, DECISION-12) present verbatim in resident `orchestrator-core/SKILL.md §0`, checked by id; (b) all **13 designated standing memory statements** (sidecar `standing:true`, listed by key in the gate output) present in both `boot` and `precompact` renders. Two disjoint sets; the gate prints every id/key it verified, never a bare count. Measured: 13/13 and 13/13 boot + 13/13 precompact |
 | secret exclusion | seeded fixtures absent from all 5 surfaces + cache |
 | latency | cold < 1.5 s, warm recall < 50 ms |
 | non-destruction | `bd memories --json` hash unchanged by any tooling step |
+
+### 7a. Retention obligations — reconciliation of "25" (aperture-3kavd catch, 2026-09-06)
+
+**What the 25 was.** v1 of this spec (`feaf0c2`) wrote "25 named constitutional rules" in §7 *before* `DECISIONS.md` existed, while the same v1 §1 already sized the reconciled rule set at **13 overlap clusters**. No commit in the branch history enumerates more than 13 decisions (there is no `DECISION-13` or higher anywhere). The 25 was an **unenumerated draft estimate** carried into v1.1, not a list anything was measured against — so nothing that was ever enumerated has been dropped. This section replaces the estimate with the enumerated set.
+
+**The enumerated set = the 13 DECISION rows** (`DECISION-1, 1b, 2 … 12` in `orchestrator-core/DECISIONS.md`), GLaDOS-reviewed before merge per §1. Coverage of the source skills whose rules were reconciled (derived from each row's *Supersedes* / *Source* columns):
+
+| source skill / prompt | reconciled by |
+|---|---|
+| `cost-proportional-orchestration` | DECISION-1, DECISION-11, DECISION-12 |
+| `agent-liveness` | DECISION-1, DECISION-1b, DECISION-2, DECISION-4, DECISION-5, DECISION-6, DECISION-8, DECISION-9 |
+| `watch-protocol` | DECISION-1, DECISION-1b, DECISION-2, DECISION-3, DECISION-4, DECISION-5, DECISION-6, DECISION-7, DECISION-8, DECISION-9, DECISION-10 |
+| `glados-loop` | DECISION-2, DECISION-8, DECISION-10, DECISION-12 |
+| `specialist-delegation` | DECISION-2 |
+| `prompts/glados.md` | DECISION-3, DECISION-4, DECISION-6, DECISION-7, DECISION-11 |
+| `beads` | DECISION-3, DECISION-12 |
+| `communicate` | DECISION-6 |
+
+Rows whose *Supersedes* column says "None"/"Nothing superseded" (DECISION-5, DECISION-9) are harmonisations that pin an agreed reading; they are obligations too and are gated identically. The other resident core clauses (procedures in `references/procedures.md`, precedents in `references/precedents.md`) are **not** binding decisions and are not gated.
+
+**Separate set: the 13 standing memory statements** (sidecar `standing:true`, with reviewed `standing_text`). These are bank memories rendered resident by `aperture-prime.sh` in both modes; they are enumerated by key in the gate output and are unrelated to the DECISION rows (no overlap in either direction).
+
+**Gate.** `just retention-gate` prints each DECISION id it verified and each standing key it found in both renders, and additionally asserts that the DECISION ids in `DECISIONS.md` equal the ids named in this spec (so spec and code cannot drift silently again). Substantive acceptance was not lowered: the obligations that exist are all still required verbatim; the only change is that the requirement now names them.
 
 ## Files
 `mcp-server/src/{memory-index,memory-recall}.ts` (+tests), `index.ts` (3 tools), `scripts/aperture-prime.sh`, `scripts/context-budget.sh` + `justfile`, `.claude/settings.json`, `src-tauri/src/agents.rs::inject_bd_memory`, `.claude/skills/orchestrator-core/{SKILL.md,DECISIONS.md,references/}`, `agents/glados/{skills,resident}.txt`, `prompts/glados.md`, `docs/memory-meta.seed.json`, `test/fixtures/memory-golden.json`.
