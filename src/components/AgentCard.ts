@@ -1,6 +1,6 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
-import { deriveDotState, dotTooltip, deriveWorkSummary } from "../services/hub-presence";
+import { deriveDotState, dotTooltip, deriveWorkSummary, deriveStateChip } from "../services/hub-presence";
 import type { AgentConfigModal } from "./AgentConfigModal";
 
 const AGENT_THEME: Record<string, { icon: string; color: string }> = {
@@ -34,7 +34,34 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpdate: () => void): HTMLElement {
+/** Lifecycle ops are owned by AgentList (aperture-ull4y): it holds the
+ *  per-agent in-flight lock, merges it into `op_pending`, routes failures
+ *  into the error strip, and re-renders. The card only asks. */
+export interface CardLifecycle {
+  start: (name: string) => void;
+  stop: (name: string) => void;
+  restart: (name: string) => void;
+}
+
+const BADGE: Record<"message" | "crash", { glyph: string; mod: string; title: string }> = {
+  message: {
+    glyph: "📨",
+    mod: "agent-mini__badge--message",
+    title: "Agent rang the operator doorbell — read its tmux scrollback",
+  },
+  crash: {
+    glyph: "⚠",
+    mod: "agent-mini__badge--crash",
+    title: "Watchdog gave up after 3 re-kicks — agent needs a manual restart",
+  },
+};
+
+export function createAgentCard(
+  agent: AgentDef,
+  modal: AgentConfigModal,
+  onUpdate: () => void,
+  lifecycle: CardLifecycle,
+): HTMLElement {
   const card = document.createElement("div");
   const theme = AGENT_THEME[agent.name] ?? DEFAULT_THEME;
   render();
@@ -42,10 +69,13 @@ export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpda
   function render() {
     const isRunning = agent.status === "running";
     const wantsAttention = agent.attention === true;
+    const pending = agent.op_pending ?? null;
     card.className = [
       "agent-mini",
       isRunning ? "agent-mini--running" : "",
       wantsAttention ? "agent-mini--attention" : "",
+      wantsAttention && agent.attention_reason === "crash" ? "agent-mini--crash" : "",
+      pending ? "agent-mini--pending" : "",
     ].filter(Boolean).join(" ");
     card.dataset.agentName = agent.name;
     card.style.setProperty("--agent-color", theme.color);
@@ -70,14 +100,41 @@ export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpda
       }
     }
 
+    // Attention badge, split by reason (aperture-ull4y). No reason = older
+    // backend → the original generic dot.
+    let badge = "";
+    if (wantsAttention) {
+      const b = agent.attention_reason ? BADGE[agent.attention_reason] : null;
+      badge = b
+        ? `<span class="agent-mini__badge ${b.mod}" title="${b.title}">${b.glyph}</span>`
+        : `<span class="agent-mini__badge" title="Agent has a message — open their tmux window to read it">●</span>`;
+    }
+
+    // State chip (aperture-ull4y), or — while a lifecycle op is in flight —
+    // a spinner + verb in the same slot. The chip's counter is recomputed
+    // per render; AgentList folds the label into its rebuild hash so the
+    // 3s poll keeps it ticking.
+    let stateSlot = "";
+    if (pending) {
+      stateSlot = `<span class="agent-mini__pending"><span class="agent-list__spinner"></span>${pending}…</span>`;
+    } else {
+      const chip = deriveStateChip(agent, Date.now());
+      if (chip) {
+        stateSlot = `<span class="agent-mini__state agent-mini__state--${chip.kind}" title="${chip.tooltip}">${chip.label}</span>`;
+      }
+    }
+
+    const disabled = pending ? " disabled" : "";
     card.innerHTML = `
       <div class="agent-mini__row">
         <span class="agent-mini__icon">${theme.icon}${presenceDot}</span>
         <span class="agent-mini__name">${agent.name}</span>
-        ${wantsAttention ? `<span class="agent-mini__badge" title="Agent has a message — open their tmux window to read it">●</span>` : ""}
+        ${badge}
+        ${stateSlot}
         <span class="agent-mini__model">${agent.model}</span>
         <button class="agent-mini__config" title="Configure">⚙</button>
-        <button class="agent-mini__toggle" title="${isRunning ? "Stop" : "Start"}">
+        <button class="agent-mini__restart" title="Restart (stop if running, then boot)"${disabled}>↻</button>
+        <button class="agent-mini__toggle" title="${isRunning ? "Stop" : "Start"}"${disabled}>
           ${isRunning ? "■" : "▶"}
         </button>
       </div>
@@ -103,20 +160,17 @@ export function createAgentCard(agent: AgentDef, modal: AgentConfigModal, onUpda
       modal.open(agent);
     });
 
-    card.querySelector(".agent-mini__toggle")!.addEventListener("click", async (e) => {
+    card.querySelector(".agent-mini__restart")!.addEventListener("click", (e) => {
       e.stopPropagation();
-      try {
-        if (isRunning) {
-          await commands.stopAgent(agent.name);
-        } else {
-          await commands.startAgent(agent.name);
-        }
-        onUpdate();
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`Failed to toggle agent ${agent.name}:`, err);
-        alert(`Failed to ${isRunning ? "stop" : "start"} ${agent.name}:\n${msg}`);
-      }
+      if (pending) return;
+      lifecycle.restart(agent.name);
+    });
+
+    card.querySelector(".agent-mini__toggle")!.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (pending) return;
+      if (isRunning) lifecycle.stop(agent.name);
+      else lifecycle.start(agent.name);
     });
   }
 
