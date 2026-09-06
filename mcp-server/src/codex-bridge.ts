@@ -13,9 +13,15 @@
  * Delivery: full message bodies are fetched from BEADS (same unread query the
  * hub replay uses) and injected via `turn/start` when the thread is idle,
  * `turn/steer` when a turn is active. An in-memory delivered-set per agent
- * (keyed by message id) prevents double-injection within one hub lifetime;
- * BEADS unread state remains the durable truth — the agent acks with
- * mark_as_read via its aperture-bus MCP tools.
+ * (keyed by message id) prevents double-injection within one app-server
+ * connection — it is cleared on socket loss so a rebind re-injects whatever
+ * BEADS still reports unread. BEADS unread state remains the durable truth —
+ * the agent acks with mark_as_read via its aperture-bus MCP tools.
+ *
+ * Inject failure (aperture-oeb6q): a rejected inject RPC releases its ids,
+ * flips the turn-state assumption (the usual cause is a stale one) and
+ * re-pumps exactly once after INJECT_RETRY_MS. A second failure logs
+ * codex_inject_retry_exhausted and waits for the next notify or rebind.
  *
  * Presence: connected+bound = present (join/leave), turn activity = busy/idle,
  * broadcast through the same hub presence channel as Claude Monitor sockets.
@@ -38,13 +44,20 @@ const RUN_DIR = process.env.APERTURE_RUN_DIR ?? resolve(homedir(), ".aperture", 
 const AGENT_CONFIG_PATH =
   process.env.APERTURE_AGENT_CONFIG_PATH ?? resolve(homedir(), ".aperture", "agent-config.json");
 
-const RECONNECT_MS = 10_000; // socket missing/dropped → retry cadence
+const RECONNECT_MS = envMs("APERTURE_CODEX_RECONNECT_MS", 10_000); // socket missing/dropped → retry cadence
 const THREAD_POLL_MS = 10_000; // no thread yet (TUI not started) → re-list cadence
 const KICKOFF_RETRY_INITIAL_MS = 500;
 const KICKOFF_RETRY_MAX_MS = 10_000;
 const RPC_TIMEOUT_MS = 10_000; // control-plane calls (initialize, thread/*)
 const TURN_RPC_TIMEOUT_MS = 600_000; // turn/start may not respond until the turn ends
 const DISCOVERY_MS = 60_000; // manifest re-scan cadence
+const INJECT_RETRY_MS = envMs("APERTURE_CODEX_INJECT_RETRY_MS", 5_000); // failed inject RPC → single re-pump delay
+
+/** Positive-integer millisecond override from env (test knob); fallback otherwise. */
+function envMs(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
 
 /**
  * First turn for a freshly launched Codex app-server.
@@ -174,8 +187,11 @@ export class CodexBridgeClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private readyWaiters: Array<(v: void) => void> = [];
 
-  /** Message ids injected during this hub lifetime (double-injection guard). */
+  /** Message ids injected over the current app-server connection
+   *  (double-injection guard; cleared in onClose — see there). */
   private readonly delivered = new Set<string>();
+  /** Armed single re-pump after a failed inject RPC (aperture-oeb6q); null when none. */
+  private injectRetryTimer: NodeJS.Timeout | null = null;
   /** Serializes deliverUnread runs so a notify during replay can't double-inject. */
   private deliverChain: Promise<void> = Promise.resolve();
 
@@ -209,6 +225,7 @@ export class CodexBridgeClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.clearInjectRetry();
     this.clearThreadReady();
     const ws = this.ws;
     this.ws = null;
@@ -504,6 +521,15 @@ export class CodexBridgeClient {
     this.initialized = false;
     this.threadId = null;
     this.clearThreadReady();
+    this.clearInjectRetry();
+    // aperture-oeb6q: forget what was injected over the dead socket. BEADS is
+    // the delivery truth — an id still unread after the rebind MUST be
+    // re-injected: the turn it rode on died with the socket (user abort,
+    // app-server crash, hub-side drop) and no later notify will re-push it,
+    // so leaving it in `delivered` hid the message for the rest of the hub's
+    // lifetime. Re-injecting an already-acked message is impossible because
+    // getUnreadMessages no longer returns it.
+    this.delivered.clear();
     // A replacement app-server is a fresh session.  If it has no existing
     // thread after initialize, bindThread will create exactly one kickoff.
     this.kickoffInjected = false;
@@ -642,7 +668,7 @@ export class CodexBridgeClient {
 
   // ── delivery ──
 
-  private async deliverUnread(): Promise<void> {
+  private async deliverUnread(retry = false): Promise<void> {
     if (!this.threadId || this.hooks.skipReplay) return;
     let rows: Record<string, unknown>[];
     try {
@@ -668,14 +694,49 @@ export class CodexBridgeClient {
     const params = { threadId: this.threadId, input: [{ type: "text", text }] };
     if (method === "turn/start") this.setTurnActive(true); // optimistic; notifications correct it
 
-    this.hooks.log("codex_inject", { agent: this.agent, method, ids });
+    this.hooks.log("codex_inject", { agent: this.agent, method, ids, retry });
     // Fire-and-forget: turn/start's RPC response may not arrive until the turn
     // ends. Delivery truth stays in BEADS (unread until the agent acks).
     this.request(method, params).catch((e: Error) => {
       // Allow a later pump to retry these ids — the injection never went in.
       for (const id of ids) this.delivered.delete(id);
-      this.hooks.log("codex_inject_error", { agent: this.agent, method, ids, error: e.message });
+      this.hooks.log("codex_inject_error", { agent: this.agent, method, ids, retry, error: e.message });
+      this.onInjectFailure(method, ids, retry);
     });
+  }
+
+  /**
+   * aperture-oeb6q: a rejected inject RPC used to leave its released ids
+   * waiting for the NEXT hub notify — possibly hours away. The likeliest cause
+   * is a stale turn-state (turn/start into a busy thread, turn/steer into an
+   * idle one), so flip the assumption and re-pump once after INJECT_RETRY_MS.
+   * Exactly one retry per failure: if that also fails, the next notify or
+   * rebind is the next chance — never a tight loop against the app-server.
+   */
+  private onInjectFailure(method: string, ids: string[], retry: boolean): void {
+    if (retry) {
+      this.hooks.log("codex_inject_retry_exhausted", { agent: this.agent, method, ids });
+      return;
+    }
+    // Socket-loss rejections arrive via failAllPending: onClose has already
+    // reset turn-state and cleared `delivered`, and the rebind replay IS the
+    // retry. Flipping turn-state here would poison the fresh connection.
+    const ws = this.ws;
+    if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
+    this.setTurnActive(method === "turn/start");
+    if (this.injectRetryTimer) return; // one armed re-pump covers every failure in flight
+    this.injectRetryTimer = setTimeout(() => {
+      this.injectRetryTimer = null;
+      this.hooks.log("codex_inject_retry", { agent: this.agent, ids, retryMs: INJECT_RETRY_MS });
+      this.deliverChain = this.deliverChain.then(() => this.deliverUnread(true));
+    }, INJECT_RETRY_MS);
+    this.injectRetryTimer.unref?.();
+  }
+
+  private clearInjectRetry(): void {
+    if (!this.injectRetryTimer) return;
+    clearTimeout(this.injectRetryTimer);
+    this.injectRetryTimer = null;
   }
 }
 
