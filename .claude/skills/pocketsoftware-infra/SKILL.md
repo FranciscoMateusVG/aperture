@@ -183,12 +183,14 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ---
 
-### Agent access to Infisical — READ THIS FIRST (status: NOT end-to-end operational)
+### Agent access to Infisical — READ THIS FIRST (status: HOLD, NOT operational)
 
-> **Current status, stated plainly so nobody rediscovers this the hard way: an agent CANNOT
-> read Infisical metadata end-to-end today.** The helper exists and is reviewable; the
-> credential bootstrap that would feed it does NOT. Do not plan work that assumes agent
-> Infisical access until the bootstrap below is resolved. Bead: `aperture-a4ph5`.
+> **STATUS: HOLD — not approved for live use, not operational.** Security review
+> (Cipher, `aperture-5nxd8`) has NOT passed the helper for live credential use, and NO
+> live authentication has ever been performed against this instance by this tool. The
+> helper exists and is reviewable; the credential bootstrap that would feed it does NOT
+> exist. Do not run it against real credentials, and do not plan work that assumes agent
+> Infisical access. Bead: `aperture-a4ph5`.
 
 **What exists.** `scripts/infisical-metadata.mjs` in the aperture repo — a fixed-purpose,
 single-action helper that authenticates with the EXISTING `peppy-admin` Universal Auth
