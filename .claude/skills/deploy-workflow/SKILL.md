@@ -237,3 +237,49 @@ If `/healthz` does NOT do a DB ping in your app, file a follow-up task to make i
 | Container name conflict | Missing hash suffix | Rename service with `<name>-<6hex>` pattern |
 | Domain not resolving | DNS not propagated | Check `dig <domain>`, wait for propagation |
 | Dokploy serviceName mismatch | Service key ≠ domain config | serviceName must match exact key in docker-compose.yml |
+
+---
+
+## 13. Routine merge → Dokploy deploys vs exceptional manual operations
+
+**The default is that merging deploys.** Dokploy watches a compose's configured branch and redeploys on push when `autoDeploy` is true. That is the normal path and it needs no agent, no dispatch and no bespoke script. Reserve manual, reviewed operations for the exceptions listed below.
+
+### Which path applies
+
+| Change | Path |
+|---|---|
+| Application code merged into the compose's tracked branch | ROUTINE — merge, Dokploy builds and deploys |
+| Env var add/change, secret rotation | EXCEPTIONAL — reviewed operation |
+| Schema/migration work with rollback implications | EXCEPTIONAL |
+| Domain retarget, service rename, network changes | EXCEPTIONAL — see the cutover ordering below |
+| First-time provisioning of a service/environment | EXCEPTIONAL |
+
+A per-merge pinned-SHA approval cycle for ordinary code changes is a symptom that `autoDeploy` is off or the compose tracks the wrong branch — fix the configuration rather than institutionalising the ceremony.
+
+### Verified Quiz configuration (2026-09-07)
+
+| | Production | Staging |
+|---|---|---|
+| composeId | `eAVrq4KRr2EUx0f7sYAgH` | `YxWNm8CuV70dXA1kt8KM7` |
+| appName | `quiz-incluir-e17b8a-w3hpak` | `quiz-incluir-staging-4400a18b9519d0bb-v2vvhj` |
+| tracked branch | `aperture-ztid5-prod-auth-cutover` | `aperture-ztid5-staging` |
+| composePath | `./docker-compose.prod.yml` | `./docker-compose.staging.yml` |
+| autoDeploy | **false** (enablement pending, see below) | **true** |
+| webhook token present | yes | yes |
+| public host → service:port | `quiz.programaincluir.org` → `quiz-incluir-backend-e17b8a:8000` | `staging-quiz.programaincluir.org` → `quiz-incluir-backend-staging:8000` |
+
+Production tracks a release branch, not `main`. Merging to `main` deploys nothing.
+
+### Production autoDeploy: enablement BLOCKED, not complete
+
+Operator has requested it. It is **not enabled**. Status is *blocked on access*, not *done*:
+
+- The field exists and is settable in principle — `autoDeploy` is a boolean in Dokploy's compose schema, so `compose.update` accepts it.
+- No authorized native client is available to set it: there is **no `dokploy` CLI on the host**, the justfile recipes authenticate to a different org and cannot see this project, and the reviewed production action is fixed-phase (`prepare`/`publish`/`reconcile-trust`/`restore-metadata`) with no autoDeploy phase.
+- Writing a wrapper to flip one boolean is explicitly out of scope.
+
+**Actionable native step:** in the Dokploy dashboard, open the Quiz Incluir project → the production compose (`quiz-incluir-e17b8a-w3hpak`) → enable **Auto Deploy**. Change nothing else; the tracked branch, composePath, env, domain and data must stay as they are.
+
+### Configuration verified ≠ webhook witnessed
+
+Ticking the box is *configuration verified*. Do not claim routine merges deploy until an ordinary merge into the tracked branch has been observed moving `composeStatus` to `running` then `done`, with the container restarting and **no** agent invoking a phase. Until that is seen, the accurate wording is "autoDeploy enabled, webhook not yet witnessed". Do not manufacture a synthetic commit to prove it — wait for a legitimate change.
