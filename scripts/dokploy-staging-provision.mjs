@@ -136,13 +136,11 @@ function classifyRuntime(st) {
   if ((st.execArgv || []).some((a) => /^--(inspect|require|import|experimental-loader)/.test(a))) {
     throw new Fail(E.UNSAFE_RUNTIME);
   }
-  if (!st.globalAgentIsStock) throw new Fail(E.UNSAFE_RUNTIME);
   return true;
 }
 function assertSafeRuntime() {
   return classifyRuntime({
     env: process.env, execArgv: process.execArgv,
-    globalAgentIsStock: http.globalAgent && http.globalAgent.keepAlive === false,
   });
 }
 

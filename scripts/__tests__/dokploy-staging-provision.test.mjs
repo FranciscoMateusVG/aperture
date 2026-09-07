@@ -12,6 +12,7 @@
 import { test } from 'node:test';
 import * as MOD from '../dokploy-staging-provision.mjs';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 
 import {
   orchestrate, projectStagingBinding, selectTarget, projectComposeState,
@@ -21,7 +22,8 @@ import {
   extractComposeId, generateStagingEnv, envToBlock, parseEscrowBlock, ESCROW_KEYS,
   escrowDecision, assertAdoptable, isUntouchedStub, assertId, assertInfraRevision,
   intendedAppName, appNameCarriesNonce,
-  assertNoProdIds, E, Fail, OK_RECEIPT, QUIZ_PROJECT_ID, QUIZ_ORG_ID,
+  assertNoProdIds, classifyRuntime, assertSafeRuntime, E, Fail, OK_RECEIPT,
+  QUIZ_PROJECT_ID, QUIZ_ORG_ID,
   PROD_DENYLIST, COMPOSE_APPNAME, DOMAIN_HOST, DOMAIN_PORT, DOMAIN_SERVICE,
   INFRA_BRANCH, PINNED_HONO_IMAGE_ID, P_PROJECT_ONE, P_COMPOSE_ONE,
   P_COMPOSE_CREATE, P_COMPOSE_UPDATE, P_DOMAIN_BY_COMPOSE, P_DOMAIN_CREATE,
@@ -103,6 +105,23 @@ function harness({ prior = null, intent = { nonce: NONCE }, existingRows = [], d
            posts: () => calls.filter((c) => c.startsWith('POST')) };
 }
 const EXISTING = [{ composeId: COMPOSE_ID, appName: APPNAME_SUFFIXED }];
+
+test('runtime guard accepts clean current Node and rejects explicit instrumentation', () => {
+  assert.equal(classifyRuntime({ env: {}, execArgv: [] }), true);
+  // Exercise the real assertSafeRuntime path in a clean process. node:test
+  // itself carries inspector-related default argv on this host, so calling it
+  // in-process would test the harness rather than the operational invocation.
+  const moduleUrl = new URL('../dokploy-staging-provision.mjs', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import(${JSON.stringify(moduleUrl)}).then((m) => { m.assertSafeRuntime(); process.stdout.write('CLEAN_RUNTIME_OK'); })`],
+  { env: { PATH: process.env.PATH }, encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout, 'CLEAN_RUNTIME_OK');
+  assert.throws(() => classifyRuntime({ env: { NODE_OPTIONS: '--inspect' }, execArgv: [] }),
+    (e) => e.code === E.UNSAFE_RUNTIME);
+  assert.throws(() => classifyRuntime({ env: {}, execArgv: ['--import=instrument.mjs'] }),
+    (e) => e.code === E.UNSAFE_RUNTIME);
+});
 
 // ══ Sequence: every read precedes the mutations ═════════════════════════
 test('fresh provision: create, rebind, read domain, THEN mutate', async () => {
