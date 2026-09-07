@@ -24,9 +24,14 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { Readable } from 'node:stream';
 import {
   parseCredentials, safeStr, isForbiddenCp, classifyStatus, parseBounded,
-  requireArray, projectSecretNames, projectWorkspaceMeta, E, Fail, ONLY_ACTION,
+  requireArray, projectSecretNames, projectWorkspaceMeta,
+  consumeBoundedStream, validateAction, serializeReceipt,
+  makeBudget, chargeRequest, remainingMs, orchestrateMetadata,
+  MAX_RECEIPT_BYTES, MAX_REQUESTS, MAX_NAMES_TOTAL, ACTION_DEADLINE_MS,
+  E, Fail, ONLY_ACTION,
 } from '../infisical-metadata.mjs';
 
 const run = promisify(execFile);
@@ -70,21 +75,20 @@ test('parseCredentials takes TEXT so it cannot read a file even by accident', ()
   assert.deepEqual(c, { clientId: 'a', clientSecret: 'b' });
 });
 
-// ── CLI: only rejected actions (they return before file/network access) ────
-test('unknown, case-mutated, extra and empty actions are all rejected', async () => {
-  const cases = [['list-secrets'], ['List-Metadata'], ['LIST-METADATA'], [ONLY_ACTION, '--x'], []];
-  for (const args of cases) {
-    const r = await run(process.execPath, [SCRIPT, ...args]).catch((e) => e);
-    const out = JSON.parse(String(r.stdout).trim());
-    assert.equal(out.ok, false);
-    assert.equal(out.error, E.BAD_ACTION, `args ${JSON.stringify(args)}`);
-  }
+// ── Action validation: PURE, no subprocess (Cipher r2-4). A subprocess test
+// cannot prove ordering survives a later regression, and once a credential file
+// exists a subprocess of the real action would authenticate live.
+test('validateAction accepts only the exact single action', () => {
+  assert.equal(validateAction([ONLY_ACTION]), ONLY_ACTION);
 });
 
-test('no inject-like action exists, not even a stub', async () => {
-  for (const a of ['inject', 'write', 'set', 'get', 'read', 'export']) {
-    const r = await run(process.execPath, [SCRIPT, a]).catch((e) => e);
-    assert.equal(JSON.parse(String(r.stdout).trim()).error, E.BAD_ACTION, `action ${a}`);
+test('validateAction rejects unknown, case-mutated, extra, empty and non-array', () => {
+  const bad = [['list-secrets'], ['List-Metadata'], ['LIST-METADATA'], [ONLY_ACTION, '--x'],
+    [], [ONLY_ACTION + ' '], ['inject'], ['write'], ['set'], ['get'], ['read'], ['export'],
+    null, undefined, 'list-metadata'];
+  for (const args of bad) {
+    assert.throws(() => validateAction(args), (e) => e.code === E.BAD_ACTION,
+      'args ' + JSON.stringify(args));
   }
 });
 
@@ -299,3 +303,168 @@ test('source never references secretValue in executable code', async () => {
   assert.ok(!code.includes('secretValue'), 'secretValue must not appear in code');
   assert.ok(/\.secretKey\b/.test(code), 'only the key name is projected');
 });
+
+// ══ Cipher r2-4: the load-bearing composition, through narrow seams ══════
+// None of these can reach a host: the transport is injected and the streams are
+// synthetic. No credential reader, URL or live transport is exported.
+
+const FAKE_CREDS = { clientId: 'fake-id', clientSecret: 'fake-secret' };
+
+function fakeTransport(handlers) {
+  return async ({ path }) => {
+    for (const [prefix, fn] of handlers) {
+      if (path.startsWith(prefix)) return fn();
+    }
+    throw new Fail(E.BAD_SHAPE);
+  };
+}
+
+// ── Bounded streaming: abort DURING the stream, before full allocation ────
+test('consumeBoundedStream aborts above the cap mid-stream, not after buffering', async () => {
+  let pushed = 0;
+  const stream = new Readable({
+    read() { pushed += 1; this.push(Buffer.alloc(1024, 0x61)); },
+  });
+  await assert.rejects(() => consumeBoundedStream(stream, 4096), (e) => e.code === E.BODY_TOO_LARGE);
+  assert.ok(pushed < 50, 'must abort early, not consume an unbounded stream');
+  assert.ok(stream.destroyed, 'stream must be destroyed on abort');
+});
+
+test('consumeBoundedStream accepts a body at the cap and decodes UTF-8', async () => {
+  const text = await consumeBoundedStream(Readable.from([Buffer.from('{"a":1}', 'utf8')]), 4096);
+  assert.equal(text, '{"a":1}');
+});
+
+test('consumeBoundedStream rejects invalid UTF-8 rather than substituting U+FFFD', async () => {
+  const bad = Readable.from([Buffer.from([0xff, 0xfe, 0xfd])]);
+  await assert.rejects(() => consumeBoundedStream(bad, 4096), (e) => e.code === E.BAD_ENCODING);
+});
+
+test('a DRIP stream terminates via the cap rather than running forever', async () => {
+  // Continual bytes defeat a socket-inactivity timeout; the byte cap is what
+  // actually bounds it. Cipher's drip scenario.
+  const stream = new Readable({ read() { this.push(Buffer.alloc(64, 0x62)); } });
+  await assert.rejects(() => consumeBoundedStream(stream, 2048), (e) => e.code === E.BODY_TOO_LARGE);
+  assert.ok(stream.destroyed);
+});
+
+// ── Budget: absolute deadline and global caps ────────────────────────────
+test('chargeRequest returns min(per-request cap, remaining action time)', () => {
+  const b = makeBudget();
+  const t = chargeRequest(b);
+  assert.ok(t > 0 && t <= 10000, 'per-request cap applies while plenty of time remains');
+  const nearEnd = makeBudget();
+  nearEnd.startedAt = Date.now() - (ACTION_DEADLINE_MS - 250);
+  const t2 = chargeRequest(nearEnd);
+  assert.ok(t2 <= 250, 'must clamp to the remaining action time, got ' + t2);
+});
+
+test('chargeRequest rejects AT or AFTER the action deadline', () => {
+  const b = makeBudget();
+  b.startedAt = Date.now() - ACTION_DEADLINE_MS;
+  assert.throws(() => chargeRequest(b), (e) => e.code === E.DEADLINE);
+  const past = makeBudget();
+  past.startedAt = Date.now() - (ACTION_DEADLINE_MS + 5000);
+  assert.throws(() => chargeRequest(past), (e) => e.code === E.DEADLINE);
+});
+
+test('the global request cap is enforced', () => {
+  const b = makeBudget();
+  for (let i = 0; i < MAX_REQUESTS; i += 1) chargeRequest(b);
+  assert.throws(() => chargeRequest(b), (e) => e.code === E.LIMIT_EXCEEDED);
+});
+
+test('remainingMs shrinks as the action proceeds', () => {
+  const b = makeBudget();
+  b.startedAt = Date.now() - 1000;
+  assert.ok(remainingMs(b) <= ACTION_DEADLINE_MS - 900);
+});
+
+// ── Receipt ceiling measured in BYTES, not UTF-16 code units ─────────────
+test('serializeReceipt returns a single line for a small receipt', () => {
+  const line = serializeReceipt({ ok: true, projects: [] });
+  assert.equal(line.split(LF).length, 1);
+  assert.deepEqual(JSON.parse(line), { ok: true, projects: [] });
+});
+
+test('serializeReceipt measures UTF-8 BYTES so multibyte names cannot slip past', () => {
+  // Each char is 3 UTF-8 bytes but ONE UTF-16 code unit, so a code-unit check
+  // would wrongly pass this.
+  const wide = '中'.repeat(1);
+  const many = Array.from({ length: Math.ceil(MAX_RECEIPT_BYTES / 3) + 100 }, () => 'A' + wide);
+  assert.throws(() => serializeReceipt({ ok: true, names: many }),
+    (e) => e.code === E.RECEIPT_TOO_LARGE);
+});
+
+// ── Injected-transport orchestration: the REAL operational path ──────────
+test('orchestration succeeds end to end and emits names only', async () => {
+  const transport = fakeTransport([
+    ['/api/v1/auth/universal-auth/login', () => ({ accessToken: TOKEN_CANARY })],
+    ['/api/v1/workspace', () => ({ workspaces: [
+      { id: 'w1', name: 'Quiz', slug: 'quiz', environments: [{ slug: 'prod' }] },
+    ] })],
+    ['/api/v3/secrets/raw', () => ({ secrets: [
+      { secretKey: 'OPENAI_API_KEY', secretValue: SECRET_CANARY },
+    ] })],
+  ]);
+  const receipt = await orchestrateMetadata({ transport, credentials: FAKE_CREDS });
+  assert.equal(receipt.ok, true);
+  assert.equal(receipt.projectCount, 1);
+  assert.equal(receipt.secretNameCount, 1);
+  assert.deepEqual(receipt.projects[0].environments[0].secretNames, ['OPENAI_API_KEY']);
+  // The bearer token was returned BY the fake auth and must not appear anywhere.
+  assertNoCanary(serializeReceipt(receipt), 'successful orchestration receipt');
+});
+
+test('orchestration rejects a malformed auth envelope', async () => {
+  for (const authBody of [{}, { accessToken: '' }, { accessToken: 42 }, null, 'nope']) {
+    const transport = fakeTransport([['/api/v1/auth', () => authBody]]);
+    await assert.rejects(() => orchestrateMetadata({ transport, credentials: FAKE_CREDS }),
+      (e) => e.code === E.BAD_SHAPE, 'auth body ' + JSON.stringify(authBody));
+  }
+});
+
+test('orchestration rejects a malformed workspace envelope', async () => {
+  for (const wsBody of [{}, { workspaces: null }, { workspaces: 'x' }, { workspaces: [null] }]) {
+    const transport = fakeTransport([
+      ['/api/v1/auth/universal-auth/login', () => ({ accessToken: 'tok' })],
+      ['/api/v1/workspace', () => wsBody],
+    ]);
+    await assert.rejects(() => orchestrateMetadata({ transport, credentials: FAKE_CREDS }),
+      (e) => e.code === E.BAD_SHAPE, 'ws body ' + JSON.stringify(wsBody));
+  }
+});
+
+test('orchestration enforces the cumulative name cap across environments', async () => {
+  const envs = Array.from({ length: 15 }, (_, i) => ({ slug: 'env' + i }));
+  const bulk = { secrets: Array.from({ length: 400 }, (_, i) => ({ secretKey: 'K' + i })) };
+  const transport = fakeTransport([
+    ['/api/v1/auth/universal-auth/login', () => ({ accessToken: 'tok' })],
+    ['/api/v1/workspace', () => ({ workspaces: [
+      { id: 'w1', name: 'W', slug: 'w', environments: envs },
+    ] })],
+    ['/api/v3/secrets/raw', () => bulk],
+  ]);
+  await assert.rejects(() => orchestrateMetadata({ transport, credentials: FAKE_CREDS }),
+    (e) => e.code === E.LIMIT_EXCEEDED);
+});
+
+test('a failing orchestration never leaks the injected token or value', async () => {
+  const transport = fakeTransport([
+    ['/api/v1/auth/universal-auth/login', () => ({ accessToken: TOKEN_CANARY })],
+    ['/api/v1/workspace', () => ({ workspaces: [
+      { id: 'w1', name: 'W', slug: 'w', environments: [{ slug: 'p' }] },
+    ] })],
+    // secretKey wrong type while the entry still carries a value -> throws
+    ['/api/v3/secrets/raw', () => ({ secrets: [{ secretKey: 1, secretValue: SECRET_CANARY }] })],
+  ]);
+  let surface = '';
+  try { await orchestrateMetadata({ transport, credentials: FAKE_CREDS }); }
+  catch (e) {
+    let j = ''; try { j = JSON.stringify(e); } catch { j = ''; }
+    surface = [e && e.code, e && e.message, e && e.stack, j].join('|');
+  }
+  assert.ok(surface.includes(E.BAD_SHAPE));
+  assertNoCanary(surface, 'failing orchestration error surface');
+});
+

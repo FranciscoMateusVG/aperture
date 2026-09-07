@@ -52,6 +52,10 @@ const P_SECRETS = '/api/v3/secrets/raw';
 
 const ONLY_ACTION = 'list-metadata';
 
+// Cipher addendum: an explicitly PRIVATE agent, never http.globalAgent, so
+// ambient mutation of the global agent cannot redirect or observe this traffic.
+const AGENT = new http.Agent({ keepAlive: false, maxSockets: 2 });
+
 // Cipher MEDIUM-6: global ceilings, not per-collection caps that multiply out.
 const MAX_CRED_BYTES = 4096;
 const MAX_CRED_VALUE_LEN = 512;
@@ -94,10 +98,19 @@ const E = {
   RECEIPT_TOO_LARGE: 'E_RECEIPT_TOO_LARGE',
 };
 
-// ─── Cipher HIGH-2: reject proxy-enabling runtime state before any secret read.
+// ─── Reject an INSTRUMENTED runtime before any secret is read.
+// Cipher r2-HIGH-1: rejecting only proxy state is not enough. NODE_DEBUG=http
+// makes Node emit HTTP internals, and NODE_OPTIONS / execArgv preload, import
+// and inspect flags can monkeypatch or attach a debugger to node:http BEFORE
+// this guard ever runs — after which the credential and bearer token live in an
+// instrumented process. For a fixed-purpose CLI there is no legitimate reason
+// for ANY of these to be set, so the guard is a flat refusal rather than a
+// blocklist of individual flags (a blocklist is exactly what gets bypassed).
 function assertSafeRuntime() {
-  const opts = String(process.env.NODE_OPTIONS ?? '');
-  if (/--use-env-proxy\b/.test(opts)) throw new Fail(E.UNSAFE_RUNTIME);
+  if (String(process.env.NODE_OPTIONS ?? '') !== '') throw new Fail(E.UNSAFE_RUNTIME);
+  if (Array.isArray(process.execArgv) && process.execArgv.length > 0) throw new Fail(E.UNSAFE_RUNTIME);
+  if (process.env.NODE_DEBUG) throw new Fail(E.UNSAFE_RUNTIME);
+  if (process.env.NODE_DEBUG_NATIVE) throw new Fail(E.UNSAFE_RUNTIME);
   if (process.env.NODE_USE_ENV_PROXY) throw new Fail(E.UNSAFE_RUNTIME);
   if (http.globalAgent && http.globalAgent.constructor !== http.Agent) {
     throw new Fail(E.UNSAFE_RUNTIME);
@@ -236,18 +249,85 @@ function projectWorkspaceMeta(ws) {
   };
 }
 
+// ─── Testable seams. None takes a URL, a credential, or a live transport, so
+// exporting them cannot yield a credential reader or a live caller.
+
+// Cipher MEDIUM-5 / r2-MEDIUM-4: stream and abort ABOVE the cap mid-flight,
+// before allocation completes — not after buffering the whole body.
+function consumeBoundedStream(readable, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const fail = (f) => {
+      if (settled) return;
+      settled = true;
+      try { readable.destroy(); } catch { /* best effort */ }
+      reject(f);
+    };
+    readable.on('data', (c) => {
+      if (settled) return;
+      total += c.length;
+      if (total > maxBytes) { fail(new Fail(E.BODY_TOO_LARGE)); return; }
+      chunks.push(c);
+    });
+    readable.on('error', () => fail(new Fail(E.NETWORK)));
+    readable.on('end', () => {
+      if (settled) return;
+      settled = true;
+      try {
+        // Fatal decode: reject invalid UTF-8 rather than substituting U+FFFD.
+        resolve(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+      } catch { reject(new Fail(E.BAD_ENCODING)); }
+    });
+  });
+}
+
+// Pure action validator. Cipher r2-MEDIUM-4: preferred over CLI subprocess
+// tests, which cannot prove ordering survives a later regression.
+function validateAction(args) {
+  if (!Array.isArray(args) || args.length !== 1 || args[0] !== ONLY_ACTION) {
+    throw new Fail(E.BAD_ACTION);
+  }
+  return ONLY_ACTION;
+}
+
 // ─── Budget: one action deadline plus global request/name ceilings. ─────────
 function makeBudget() { return { requests: 0, names: 0, startedAt: Date.now() }; }
 
+function remainingMs(budget) {
+  return ACTION_DEADLINE_MS - (Date.now() - budget.startedAt);
+}
+
+// Cipher r2-MEDIUM-2: the deadline must be ABSOLUTE. Checking only before a
+// request let a call started at 59s run a fresh 10s timeout and finish past 69s.
+// chargeRequest now returns the socket timeout to use: min(per-request, remaining).
 function chargeRequest(budget) {
-  if (Date.now() - budget.startedAt > ACTION_DEADLINE_MS) throw new Fail(E.DEADLINE);
+  const left = remainingMs(budget);
+  if (left <= 0) throw new Fail(E.DEADLINE);
   budget.requests += 1;
   if (budget.requests > MAX_REQUESTS) throw new Fail(E.LIMIT_EXCEEDED);
+  return Math.min(REQUEST_TIMEOUT_MS, left);
 }
 
 // ─── Transport: node:http, literal host/port/path, streamed with a byte cap. ─
-function request({ method, path, token, body }) {
+function request({ method, path, token, body, timeoutMs }) {
   return new Promise((resolve, reject) => {
+    // Cipher addendum: node:http's `timeout` fires on socket INACTIVITY, so a
+    // response dripping a byte at a time never trips it. This wall-clock timer
+    // is the absolute bound, it covers body streaming as well as headers, and
+    // it is cleared on every settle path.
+    let settled = false;
+    let timer = null;
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      fn(arg);
+    };
+    const ok = (v) => settle(resolve, v);
+    const bad = (e) => settle(reject, e);
+
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : null;
     const headers = { accept: 'application/json' };
     if (token) headers.authorization = 'Bearer ' + token;
@@ -257,33 +337,25 @@ function request({ method, path, token, body }) {
     }
 
     const req = http.request(
-      { host: HOST, port: PORT, method, path, headers, timeout: REQUEST_TIMEOUT_MS },
+      { host: HOST, port: PORT, method, path, headers, timeout: timeoutMs, agent: AGENT },
       (res) => {
         try { classifyStatus(res.statusCode); }
-        catch (e) { res.destroy(); reject(e); return; }
+        catch (e) { res.destroy(); bad(e); return; }
 
-        // Cipher MEDIUM-5: stream and abort above the cap; never buffer first.
-        const chunks = [];
-        let total = 0;
-        res.on('data', (c) => {
-          total += c.length;
-          if (total > MAX_BODY_BYTES) { res.destroy(); reject(new Fail(E.BODY_TOO_LARGE)); return; }
-          chunks.push(c);
-        });
-        res.on('error', () => reject(new Fail(E.NETWORK)));
-        res.on('end', () => {
-          let text;
-          try {
-            // Fatal decode: reject invalid UTF-8 rather than substituting U+FFFD.
-            text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
-          } catch { reject(new Fail(E.BAD_ENCODING)); return; }
-          try { resolve(parseBounded(text)); } catch (e) { reject(e); }
-        });
+        consumeBoundedStream(res, MAX_BODY_BYTES).then(
+          (text) => { try { ok(parseBounded(text)); } catch (e) { bad(e); } },
+          bad,
+        );
       },
     );
 
-    req.on('timeout', () => { req.destroy(); reject(new Fail(E.NETWORK)); });
-    req.on('error', () => reject(new Fail(E.NETWORK)));   // never surface the cause
+    timer = setTimeout(() => {
+      try { req.destroy(); } catch { /* best effort */ }
+      settle(reject, new Fail(E.DEADLINE));
+    }, timeoutMs);
+
+    req.on('timeout', () => { req.destroy(); bad(new Fail(E.NETWORK)); });
+    req.on('error', () => bad(new Fail(E.NETWORK)));   // never surface the cause
     if (payload) req.write(payload);
     req.end();
   });
@@ -293,19 +365,31 @@ function request({ method, path, token, body }) {
 // trigger a credential read or a live call.
 async function listMetadata() {
   assertSafeRuntime();
-  const budget = makeBudget();
-  const { clientId, clientSecret } = readCredentials();
+  const credentials = readCredentials();
+  return orchestrateMetadata({ transport: request, credentials });
+}
 
-  chargeRequest(budget);
-  const auth = await request({ method: 'POST', path: P_LOGIN, body: { clientId, clientSecret } });
+// The real orchestration, with the transport and credentials INJECTED. Tests
+// drive this with a fake transport that cannot address any host; the live path
+// passes the private request(). Neither a URL nor a credential reader is
+// exposed by exporting it.
+async function orchestrateMetadata({ transport, credentials }) {
+  const budget = makeBudget();
+  const { clientId, clientSecret } = credentials;
+
+  const auth = await transport({
+    method: 'POST', path: P_LOGIN, body: { clientId, clientSecret },
+    timeoutMs: chargeRequest(budget),
+  });
   if (!auth || typeof auth !== 'object' || typeof auth.accessToken !== 'string'
       || auth.accessToken.length === 0) {
     throw new Fail(E.BAD_SHAPE);
   }
   const token = auth.accessToken;   // secret: memory only, never emitted
 
-  chargeRequest(budget);
-  const wsBody = await request({ method: 'GET', path: P_WORKSPACES, token });
+  const wsBody = await transport({
+    method: 'GET', path: P_WORKSPACES, token, timeoutMs: chargeRequest(budget),
+  });
   const workspaces = requireArray(wsBody, 'workspaces', MAX_PROJECTS);
 
   const projects = [];
@@ -313,11 +397,13 @@ async function listMetadata() {
     const meta = projectWorkspaceMeta(ws);
     const envs = [];
     for (const slug of meta.environmentSlugs) {
-      chargeRequest(budget);
+      const timeoutMs = chargeRequest(budget);
       const q = new URLSearchParams({
         workspaceId: meta.id, environment: slug, secretPath: '/',
       }).toString();
-      const sBody = await request({ method: 'GET', path: P_SECRETS + '?' + q, token });
+      const sBody = await transport({
+        method: 'GET', path: P_SECRETS + '?' + q, token, timeoutMs,
+      });
       const names = projectSecretNames(sBody);
       budget.names += names.length;
       if (budget.names > MAX_NAMES_TOTAL) throw new Fail(E.LIMIT_EXCEEDED);
@@ -343,18 +429,25 @@ async function listMetadata() {
   };
 }
 
+// Cipher r2-MEDIUM-3: the ceiling is a BYTE ceiling, so measure UTF-8 bytes.
+// JS string .length counts UTF-16 code units, so multibyte names could exceed
+// the stated byte cap while appearing to pass.
+function serializeReceipt(receipt) {
+  const line = JSON.stringify(receipt);
+  if (Buffer.byteLength(line, 'utf8') > MAX_RECEIPT_BYTES) throw new Fail(E.RECEIPT_TOO_LARGE);
+  return line;
+}
+
 // ─── Entry point. Action validated BEFORE any runtime, file or network access.
 async function main() {
-  const args = process.argv.slice(2);
-  if (args.length !== 1 || args[0] !== ONLY_ACTION) {
+  try { validateAction(process.argv.slice(2)); }
+  catch { 
     process.stdout.write(JSON.stringify({ ok: false, error: E.BAD_ACTION }) + '\n');
     process.exitCode = 2;
     return;
   }
   try {
-    const receipt = await listMetadata();
-    const line = JSON.stringify(receipt);
-    if (line.length > MAX_RECEIPT_BYTES) throw new Fail(E.RECEIPT_TOO_LARGE);
+    const line = serializeReceipt(await listMetadata());
     process.stdout.write(line + '\n');
   } catch (err) {
     const code = err instanceof Fail ? err.code : 'E_INTERNAL';
@@ -372,5 +465,8 @@ if (isDirectRun) main();
 export {
   parseCredentials, safeStr, isForbiddenCp, classifyStatus, parseBounded,
   requireArray, projectSecretNames, projectWorkspaceMeta,
+  consumeBoundedStream, validateAction, serializeReceipt,
+  makeBudget, chargeRequest, remainingMs, orchestrateMetadata,
+  MAX_RECEIPT_BYTES, MAX_REQUESTS, MAX_NAMES_TOTAL, ACTION_DEADLINE_MS,
   E, Fail, ONLY_ACTION,
 };

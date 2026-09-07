@@ -213,6 +213,15 @@ passthrough, and no generic read mode — by design, per Cipher's ruling.
 | Credential source | A `0600` file at `~/.config/aperture/infisical-peppy-admin.env` containing exactly `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`, inside an owned `0700` parent. The path is HARDCODED; there is no override. |
 | Identity | Logical reference only: the `peppy-admin` machine identity registered in the `peppy/secrets` drawer "PocketSoftware Infisical". **Never open that drawer through a model-visible tool.** |
 
+**Runtime guard — what it does and does NOT do.** The helper refuses to run when
+`NODE_OPTIONS` or `process.execArgv` is non-empty, or `NODE_DEBUG` / `NODE_DEBUG_NATIVE`
+is set, and it uses a private `http.Agent` rather than the ambient global agent. Be clear
+about the limit: this **detects unsafe invocation**, it is **not protection against
+malicious code that is already preloaded**. Anything that has already patched the runtime
+before this process starts has defeated it. It is a guard against accidental instrumented
+runs — `NODE_DEBUG=http` printing HTTP internals, a stray `--inspect`, an inherited
+`NODE_OPTIONS` — not a sandbox.
+
 **⛔ THE MISSING PIECE — credential bootstrap is UNRESOLVED.** Nothing currently populates
 that `0600` file, and no approved non-model handoff has been identified to do so. The
 credential registry is reachable in principle but reading it is NOT authorized, and
