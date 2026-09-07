@@ -28,8 +28,8 @@
  * evidence the staging binding. Never a secret, hash, length, header, env
  * value or raw response body.
  */
-import { openSync, fstatSync, lstatSync, readSync, closeSync, mkdirSync, mkdtempSync,
-         rmSync, writeFileSync, linkSync } from 'node:fs';
+import { openSync, fstatSync, lstatSync, readSync, writeSync, closeSync, fsyncSync,
+         mkdirSync, mkdtempSync, rmSync, linkSync } from 'node:fs';
 import { constants as FS } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -116,6 +116,7 @@ const E = Object.freeze({
   PROD_ID_REFUSED: 'E_PROD_ID_REFUSED', IMAGE_NOT_PINNED: 'E_IMAGE_NOT_PINNED',
   COMPOSE_CONFLICT: 'E_COMPOSE_CONFLICT', DOMAIN_CONFLICT: 'E_DOMAIN_CONFLICT',
   ESCROW_CORRUPT: 'E_ESCROW_CORRUPT', ESCROW_WRITE: 'E_ESCROW_WRITE',
+  ESCROW_MISSING: 'E_ESCROW_MISSING', ADOPT_AMBIGUOUS: 'E_ADOPT_AMBIGUOUS',
   IDENTITY_UNPROVEN: 'E_IDENTITY_UNPROVEN',
   INTERNAL: 'E_INTERNAL',
 });
@@ -403,12 +404,26 @@ function selectTarget(binding, priorBinding) {
   if (priorBinding) {
     const hits = binding.composes.filter((c) => c.composeId === priorBinding.composeId);
     if (hits.length !== 1) throw new Fail(E.COMPOSE_CONFLICT);
-    return { composeId: hits[0].composeId, create: false };
+    return { composeId: hits[0].composeId, create: false, adopt: false };
   }
   const collide = binding.composes.filter((c) => c.appName === COMPOSE_APPNAME
     || c.appName.startsWith(COMPOSE_APPNAME + '-'));
-  if (collide.length !== 0) throw new Fail(E.COMPOSE_CONFLICT);
-  return { composeId: null, create: true };
+  if (collide.length === 0) return { composeId: null, create: true, adopt: false };
+  // RECOVERY, narrowly scoped: compose.create is a remote side effect that
+  // precedes saveBinding, so a crash in that window leaves a suffixed orphan
+  // and no local binding. Exactly one candidate may be ADOPTED, and only after
+  // compose.one proves it sits in the selected staging environment and still
+  // has an allowed shape. More than one candidate is unresolvable.
+  if (collide.length !== 1) throw new Fail(E.ADOPT_AMBIGUOUS);
+  return { composeId: collide[0].composeId, create: false, adopt: true };
+}
+
+// An adoptable row is either an untouched create stub (source fields still
+// unset) or already exactly our target. Anything else is someone else's object.
+function assertAdoptable(st) {
+  const stub = !st.repository && !st.owner && !st.branch;
+  if (stub || composeMatchesTarget(st)) return true;
+  throw new Fail(E.COMPOSE_CONFLICT);
 }
 
 // The compose and environment rows both carry an `env` column holding secret
@@ -520,22 +535,39 @@ function generateStagingEnv() {
 function envToBlock(env) {
   return ESCROW_KEYS.map((k) => `${k}=${env[k]}`).join('\n');
 }
+const MAX_ESCROW_VALUE = 512;
+const MAX_ESCROW_BYTES = 8192;
+
+// Strict exactly-once grammar. Duplicate keys are a HARD ERROR: a second
+// SECRET_KEY line previously overwrote the first, so an appended line could
+// silently substitute a secret.
 function parseEscrowBlock(text) {
-  const out = {};
-  for (const line of text.split('\n')) {
-    if (line === '') continue;
+  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_ESCROW_BYTES) {
+    throw new Fail(E.ESCROW_CORRUPT);
+  }
+  const lines = text.split('\n');
+  if (lines[lines.length - 1] !== '') throw new Fail(E.ESCROW_CORRUPT); // exactly one trailing LF
+  lines.pop();
+  if (lines.length !== ESCROW_KEYS.length) throw new Fail(E.ESCROW_CORRUPT);
+  const out = Object.create(null);
+  for (const line of lines) {
     const eq = line.indexOf('=');
     if (eq <= 0) throw new Fail(E.ESCROW_CORRUPT);
-    out[line.slice(0, eq)] = line.slice(eq + 1);
+    const k = line.slice(0, eq);
+    const v = line.slice(eq + 1);
+    if (!ESCROW_KEYS.includes(k)) throw new Fail(E.ESCROW_CORRUPT);
+    if (Object.prototype.hasOwnProperty.call(out, k)) throw new Fail(E.ESCROW_CORRUPT); // duplicate
+    if (v.length === 0 || v.length > MAX_ESCROW_VALUE) throw new Fail(E.ESCROW_CORRUPT);
+    if (!/^[\x20-\x7e]+$/.test(v)) throw new Fail(E.ESCROW_CORRUPT);  // no control bytes
+    out[k] = v;
   }
   for (const k of ESCROW_KEYS) {
-    if (typeof out[k] !== 'string' || out[k].length === 0) throw new Fail(E.ESCROW_CORRUPT);
+    if (!Object.prototype.hasOwnProperty.call(out, k)) throw new Fail(E.ESCROW_CORRUPT);
   }
-  if (Object.keys(out).length !== ESCROW_KEYS.length) throw new Fail(E.ESCROW_CORRUPT);
-  if ('TRUSTED_PROXY_CIDRS' in out) throw new Fail(E.ESCROW_CORRUPT);
   if (out.STAGING_HONO_IMAGE !== PINNED_HONO_IMAGE_ID) throw new Fail(E.IMAGE_NOT_PINNED);
   return out;
 }
+
 function readOwnedFile(path, code) {
   let fd;
   try { fd = openSync(path, FS.O_RDONLY | FS.O_NOFOLLOW); }
@@ -552,44 +584,70 @@ function readOwnedFile(path, code) {
     catch { throw new Fail(code); }
   } finally { try { closeSync(fd); } catch { /* cleanup only */ } }
 }
-// Atomic no-overwrite publication: write a private temp, then hard-link it
-// into place. link() fails if the destination exists, so a concurrent run can
-// never clobber an escrow that is already authoritative.
+// Durable atomic no-overwrite publication. The escrow is the state that
+// recovery depends on, so it is fully written, fsynced, hard-linked into place
+// (link fails if the destination exists, so a concurrent run cannot clobber an
+// authoritative escrow), the DIRECTORY is fsynced so the link itself survives a
+// crash, and the result is reopened and compared before it is trusted.
 function publishFile(path, contents, code) {
+  const buf = Buffer.from(contents, 'utf8');
+  if (buf.length === 0 || buf.length > MAX_ESCROW_BYTES) throw new Fail(code);
   const tmp = `${path}.tmp-${randomBytes(8).toString('hex')}`;
+  let fd;
   try {
-    writeFileSync(tmp, contents, { mode: 0o600, flag: 'wx' });
-    linkSync(tmp, path);
-  } catch { throw new Fail(code); }
+    fd = openSync(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL | FS.O_NOFOLLOW, 0o600);
+    let off = 0;
+    while (off < buf.length) off += writeSync(fd, buf, off, buf.length - off);
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.uid !== ACCOUNT.uid || (st.mode & 0o077) !== 0
+        || st.size !== buf.length) {
+      throw new Fail(code);
+    }
+    fsyncSync(fd);                       // contents durable before it is named
+  } catch { try { if (fd !== undefined) closeSync(fd); } catch { /* cleanup */ }
+           try { rmSync(tmp, { force: true }); } catch { /* cleanup */ }
+           throw new Fail(code); }
+  try { closeSync(fd); } catch { /* cleanup only */ }
+  try {
+    linkSync(tmp, path);                 // fails if it already exists
+    let dfd;
+    try { dfd = openSync(TEMP_PARENT, FS.O_RDONLY); fsyncSync(dfd); }  // link durable
+    finally { try { if (dfd !== undefined) closeSync(dfd); } catch { /* cleanup */ } }
+  } catch { try { rmSync(tmp, { force: true }); } catch { /* cleanup */ }
+           throw new Fail(code); }
   finally { try { rmSync(tmp, { force: true }); } catch { /* cleanup only */ } }
-  return path;
+  // Reopen and verify what actually landed; never trust the write path alone.
+  const back = readOwnedFile(path, code);
+  if (back !== contents) throw new Fail(code);
+  return back;
 }
-// Returns the SAME secret set on every invocation once created. The read and
-// publish primitives are seams so the REUSE decision itself is testable without
-// touching the real escrow file; the defaults are the hardcoded paths and are
-// the only thing the live action ever uses.
-function defaultEscrowRead() {
-  assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
-  return readOwnedFile(ESCROW_PATH, E.ESCROW_CORRUPT);
-}
-function defaultEscrowPublish(text) {
-  assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
-  return publishFile(ESCROW_PATH, text, E.ESCROW_WRITE);
-}
-function loadOrCreateEscrow({ readFn = defaultEscrowRead,
-                              publishFn = defaultEscrowPublish } = {}) {
-  const existing = readFn();
-  // An escrow that already exists is AUTHORITATIVE. Regenerating here would
-  // rotate auth material and strand the Postgres volumes of a live stack.
-  if (existing !== null && existing !== undefined) {
-    return { env: parseEscrowBlock(existing), reused: true };
+
+// The escrow DECISION is exported as a pure composition seam with NO defaults:
+// every input must be injected, so an importer can exercise the logic but can
+// never reach the real file. The live reader/publisher below stay private and
+// are referenced only by main(), so no exported call can discover or return
+// the real secret set.
+function escrowDecision({ existingText, generateFn, publishFn }) {
+  if (typeof generateFn !== 'function' || typeof publishFn !== 'function') {
+    throw new Fail(E.BAD_SHAPE);
   }
-  const env = generateStagingEnv();
-  publishFn(envToBlock(env) + '\n');
-  // Re-read what actually landed, so a partial write can never be used.
-  const back = readFn();
+  if (existingText !== null && existingText !== undefined) {
+    return { env: parseEscrowBlock(existingText), reused: true };
+  }
+  const env = generateFn();
+  const back = publishFn(envToBlock(env) + '\n');
   if (back === null || back === undefined) throw new Fail(E.ESCROW_WRITE);
-  return { env: parseEscrowBlock(back), reused: false };
+  return { env: parseEscrowBlock(back), reused: false };   // trust only what landed
+}
+
+// PRIVATE. Never exported, never a default parameter of an exported function.
+function loadOrCreateEscrow() {
+  assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
+  return escrowDecision({
+    existingText: readOwnedFile(ESCROW_PATH, E.ESCROW_CORRUPT),
+    generateFn: generateStagingEnv,
+    publishFn: (text) => publishFile(ESCROW_PATH, text, E.ESCROW_WRITE),
+  });
 }
 
 // Durable record of the remote object this run bound to, so a retry rebinds
@@ -599,17 +657,26 @@ function loadBinding() {
   if (t === null) return null;
   let v;
   try { v = JSON.parse(t); } catch { throw new Fail(E.ESCROW_CORRUPT); }
-  if (!v || typeof v.composeId !== 'string' || v.composeId.length === 0) {
+  if (!v || typeof v !== 'object' || Object.keys(v).length !== 1
+      || typeof v.composeId !== 'string' || v.composeId.length === 0
+      || v.composeId.length > 200 || !/^[\x21-\x7e]+$/.test(v.composeId)) {
     throw new Fail(E.ESCROW_CORRUPT);
   }
   assertNoProdIds([v.composeId]);
   return v;
 }
 function saveBinding(composeId) {
-  return publishFile(BINDING_PATH, JSON.stringify({ composeId }) + '\n', E.ESCROW_WRITE);
+  if (typeof composeId !== 'string' || composeId.length === 0 || composeId.length > 200
+      || !/^[\x21-\x7e]+$/.test(composeId)) {
+    throw new Fail(E.ESCROW_WRITE);
+  }
+  assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
+  publishFile(BINDING_PATH, JSON.stringify({ composeId }) + '\n', E.ESCROW_WRITE);
+  return BINDING_PATH;
 }
 
-export { projectComposeState, composeMatchesTarget, assertComposeIdentity, selectTarget, projectDomainRows,
+export { projectComposeState, composeMatchesTarget, assertComposeIdentity, selectTarget,
+         assertAdoptable, escrowDecision, projectDomainRows,
          domainMatchesTarget, classifyDomainState, COMPOSE_FIELDS, DOMAIN_FIELDS,
          P_COMPOSE_ONE, P_DOMAIN_BY_COMPOSE,
          assertSshContext, SSH_ARGS, buildRequestOptions, projectStagingBinding,
@@ -661,9 +728,16 @@ function extractComposeId(body) {
 // No mutation may precede the identity and staging-environment binding.
 async function orchestrate({
   assertContextFn, readTokenFn, openForwardFn, requestFn,
-  escrowFn = loadOrCreateEscrow, loadBindingFn = loadBinding, saveBindingFn = saveBinding,
+  escrowFn, loadBindingFn, saveBindingFn,
   deadlineMs = ACTION_DEADLINE_MS,
 }) {
+  // No live defaults: every secret-capable seam must be supplied by the caller,
+  // and only main() supplies the private live ones. An importer therefore
+  // cannot reach the real escrow through this function.
+  for (const fn of [assertContextFn, readTokenFn, openForwardFn, requestFn,
+                    escrowFn, loadBindingFn, saveBindingFn]) {
+    if (typeof fn !== 'function') throw new Fail(E.BAD_SHAPE);
+  }
   assertContextFn();
   const token = readTokenFn();
 
@@ -674,6 +748,11 @@ async function orchestrate({
   if (env.STAGING_HONO_IMAGE !== PINNED_HONO_IMAGE_ID) throw new Fail(E.IMAGE_NOT_PINNED);
   if ('TRUSTED_PROXY_CIDRS' in env) throw new Fail(E.BAD_SHAPE);
   const priorBinding = loadBindingFn();
+  // Coupling: a pre-existing remote object may only be touched with the SAME
+  // escrow that created it. Binding present with a freshly generated escrow
+  // means the escrow was lost, and proceeding would rotate the live stack's
+  // DB and auth secrets.
+  if (priorBinding && !escrow.reused) throw new Fail(E.ESCROW_MISSING);
 
   const fwd = openForwardFn();
   let timer = null;
@@ -695,6 +774,9 @@ async function orchestrate({
 
       let composeId = target.composeId;
       const created = target.create;
+      // Same coupling rule for an adopted orphan: it was created by a previous
+      // run, so its secrets must be the escrowed ones, not a fresh set.
+      if (!created && !escrow.reused) throw new Fail(E.ESCROW_MISSING);
 
       // Creating the stub is the only mutation allowed before the remaining
       // reads, and it is unavoidable: the object must exist to be read.
@@ -710,9 +792,15 @@ async function orchestrate({
       const st = projectComposeState(
         await call(`${P_COMPOSE_ONE}?composeId=${composeId}`, 'GET', undefined));
       assertComposeIdentity(st, composeId, binding.environmentId);
-      // A freshly created stub is not yet configured, so only an existing
-      // service is held to the exact-configuration test.
-      if (!created && !composeMatchesTarget(st)) throw new Fail(E.COMPOSE_CONFLICT);
+      if (target.adopt) {
+        // Adopting a crash orphan: allowed shapes only, then persist the
+        // binding BEFORE any mutation so the window cannot reopen.
+        assertAdoptable(st);
+        saveBindingFn(composeId);
+      } else if (!created && !composeMatchesTarget(st)) {
+        // A previously bound service must still be exactly our target.
+        throw new Fail(E.COMPOSE_CONFLICT);
+      }
 
       // Domain state is read BEFORE the update mutations, so a conflict on an
       // existing service is discovered with ZERO POSTs issued.
@@ -753,6 +841,10 @@ async function main() {
       readTokenFn: readToken,
       openForwardFn: openForward,
       requestFn: requestOnce,
+      // The private live seams are supplied HERE and nowhere else.
+      escrowFn: loadOrCreateEscrow,
+      loadBindingFn: loadBinding,
+      saveBindingFn: saveBinding,
     });
     // Fixed receipt plus the minimum non-secret IDs evidencing the binding.
     process.stdout.write(`${OK_RECEIPT}\n`);
@@ -769,6 +861,6 @@ async function main() {
 
 export { orchestrate, bodyComposeCreate, bodyComposeSource, bodyComposeEnv,
          bodyDomainCreate, bodyComposeDeploy, extractComposeId,
-         parseEscrowBlock, ESCROW_KEYS, loadOrCreateEscrow };
+         parseEscrowBlock, ESCROW_KEYS };
 
 if (import.meta.url === `file://${process.argv[1]}`) { await main(); }

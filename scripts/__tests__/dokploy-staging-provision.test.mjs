@@ -10,6 +10,7 @@
  * Run: node --test --test-timeout=8000 scripts/__tests__/dokploy-staging-provision.test.mjs
  */
 import { test } from 'node:test';
+import * as MOD from '../dokploy-staging-provision.mjs';
 import assert from 'node:assert/strict';
 
 import {
@@ -18,7 +19,7 @@ import {
   domainMatchesTarget, classifyDomainState, buildRequestOptions,
   bodyComposeCreate, bodyComposeSource, bodyDomainCreate, bodyComposeDeploy,
   extractComposeId, generateStagingEnv, envToBlock, parseEscrowBlock, ESCROW_KEYS,
-  loadOrCreateEscrow,
+  escrowDecision, assertAdoptable,
   assertNoProdIds, E, Fail, OK_RECEIPT, QUIZ_PROJECT_ID, QUIZ_ORG_ID,
   PROD_DENYLIST, COMPOSE_APPNAME, DOMAIN_HOST, DOMAIN_PORT, DOMAIN_SERVICE,
   INFRA_BRANCH, PINNED_HONO_IMAGE_ID, P_PROJECT_ONE, P_COMPOSE_ONE,
@@ -181,33 +182,139 @@ test('REGRESSION: every partial-failure resume reuses the SAME escrowed secrets'
 test('REUSE: an existing escrow is authoritative — nothing is regenerated', () => {
   const stored = envToBlock(ESCROW_ENV) + '\n';
   let published = 0;
-  const r = loadOrCreateEscrow({ readFn: () => stored, publishFn: () => { published += 1; } });
+  const r = escrowDecision({ existingText: stored, generateFn: generateStagingEnv,
+                             publishFn: () => { published += 1; return stored; } });
   assert.equal(r.reused, true);
   assert.equal(published, 0, 'an existing escrow must never be rewritten');
   for (const k of ESCROW_KEYS) assert.equal(r.env[k], ESCROW_ENV[k], k);
 });
 
-test('CREATE: with no escrow, one publish happens and the re-read value is used', () => {
+test('CREATE: with no escrow, one publish happens and only what LANDED is used', () => {
   let stored = null;
   const published = [];
-  const r = loadOrCreateEscrow({
-    readFn: () => stored,
-    publishFn: (t) => { published.push(t); stored = t; },
+  const r = escrowDecision({
+    existingText: null, generateFn: generateStagingEnv,
+    publishFn: (t) => { published.push(t); stored = t; return t; },
   });
   assert.equal(r.reused, false);
-  assert.equal(published.length, 1, 'exactly one publish');
+  assert.equal(published.length, 1);
   assert.equal(r.env.STAGING_HONO_IMAGE, PINNED_HONO_IMAGE_ID);
-  // Second invocation must now REUSE, not regenerate.
-  const again = loadOrCreateEscrow({ readFn: () => stored, publishFn: () => {
+  const again = escrowDecision({ existingText: stored, generateFn: () => {
     throw new Error('regenerated after the escrow existed');
-  } });
+  }, publishFn: () => { throw new Error('republished'); } });
   assert.equal(again.reused, true);
-  assert.equal(again.env.SECRET_KEY, r.env.SECRET_KEY, 'same secret across invocations');
+  assert.equal(again.env.SECRET_KEY, r.env.SECRET_KEY);
 });
 
-test('a publish that does not land fails closed rather than proceeding', () => {
-  assert.throws(() => loadOrCreateEscrow({ readFn: () => null, publishFn: () => {} }),
-    (e) => e.code === E.ESCROW_WRITE);
+test('a publish that does not land fails closed', () => {
+  assert.throws(() => escrowDecision({ existingText: null, generateFn: generateStagingEnv,
+    publishFn: () => null }), (e) => e.code === E.ESCROW_WRITE);
+  assert.throws(() => escrowDecision({ existingText: null }), (e) => e.code === E.BAD_SHAPE);
+});
+
+// ── Cipher F1: no live secret reader may escape the module ──────────────
+test('MODULE SURFACE: no export can discover or return the live escrow', () => {
+  const banned = ['loadOrCreateEscrow', 'readToken', 'openForward', 'requestOnce', 'main',
+                  'TOKEN_PATH', 'TOKEN_PARENT', 'ESCROW_PATH', 'BINDING_PATH',
+                  'readOwnedFile', 'publishFile', 'loadBinding', 'saveBinding',
+                  'defaultEscrowRead', 'defaultEscrowPublish'];
+  for (const b of banned) assert.ok(!(b in MOD), 'must not export ' + b);
+  // The exported decision seam has NO defaults: with nothing injected it cannot
+  // fall back to a live reader, it refuses.
+  assert.throws(() => escrowDecision({}), (e) => e.code === E.BAD_SHAPE);
+  assert.throws(() => escrowDecision({ existingText: null, generateFn: generateStagingEnv }),
+    (e) => e.code === E.BAD_SHAPE);
+});
+
+test('MODULE SURFACE: orchestrate refuses to run without injected seams', async () => {
+  await assert.rejects(() => orchestrate({}), (e) => e.code === E.BAD_SHAPE);
+  const h = harness();
+  for (const missing of ['escrowFn', 'loadBindingFn', 'saveBindingFn', 'requestFn']) {
+    const args = { ...h.args };
+    delete args[missing];
+    await assert.rejects(() => orchestrate(args), (e) => e.code === E.BAD_SHAPE, missing);
+  }
+});
+
+// ── Cipher F2: escrow and binding must be coupled ───────────────────────
+test('binding present + escrow missing STOPS before the forward and any POST', async () => {
+  const h = harness({ prior: { composeId: COMPOSE_ID }, existingRows: EXISTING });
+  let forwards = 0;
+  h.args.escrowFn = () => ({ env: { ...ESCROW_ENV }, reused: false });  // freshly generated
+  h.args.openForwardFn = () => { forwards += 1; return { ready: Promise.resolve('/s'), cleanup: () => {} }; };
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.ESCROW_MISSING);
+  assert.equal(forwards, 0, 'must stop before the forward opens');
+  assert.deepEqual(h.posts(), []);
+});
+
+test('adopting an orphan with a fresh escrow also STOPS', async () => {
+  const h = harness({ existingRows: EXISTING });
+  h.args.escrowFn = () => ({ env: { ...ESCROW_ENV }, reused: false });
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.ESCROW_MISSING);
+  assert.deepEqual(h.posts(), [], 'no mutation on a lost-escrow adoption');
+});
+
+// ── Cipher F3: the create-crash window is recoverable ───────────────────
+test('RECOVERY: create succeeds, binding write fails, second run adopts it', async () => {
+  // Run 1: compose.create lands remotely, then saveBinding throws.
+  const h1 = harness();
+  h1.args.saveBindingFn = () => { throw new Fail(E.ESCROW_WRITE); };
+  await assert.rejects(() => orchestrate(h1.args), (e) => e.code === E.ESCROW_WRITE);
+  assert.equal(h1.calls.filter((c) => c === `POST ${P_COMPOSE_CREATE}`).length, 1);
+
+  // Run 2: no local binding, one suffixed orphan present, escrow REUSED.
+  const h2 = harness({ existingRows: EXISTING, prior: null,
+                       composeRow: { ...COMPOSE_ROW, repository: null, owner: null, branch: null } });
+  h2.args.escrowFn = () => ({ env: { ...ESCROW_ENV }, reused: true });
+  const sent = [];
+  const inner = h2.args.requestFn;
+  h2.args.requestFn = (o) => { if (o.body?.env) sent.push(o.body.env); return inner(o); };
+  const r = await orchestrate(h2.args);
+  assert.equal(r.composeId, COMPOSE_ID, 'adopts the orphan');
+  assert.ok(!h2.calls.includes(`POST ${P_COMPOSE_CREATE}`), 'NO duplicate create');
+  assert.deepEqual(h2.savedBindings, [COMPOSE_ID], 'binding persisted on adoption');
+  assert.equal(sent[0], envToBlock(ESCROW_ENV), 'identical escrow reused');
+  assert.ok(h2.calls.indexOf('saveBinding') < h2.calls.findIndex(
+    (c) => c === `POST ${P_COMPOSE_UPDATE}`), 'binding persisted before mutating');
+});
+
+test('adoption is refused when the candidate is someone else shape, or ambiguous', () => {
+  assert.equal(assertAdoptable({ repository: null, owner: null, branch: null }), true);
+  assert.equal(assertAdoptable(projectComposeState(COMPOSE_ROW)), true);
+  assert.throws(() => assertAdoptable({ repository: 'other', owner: 'x', branch: 'main',
+    sourceType: 'github', composePath: './x.yml' }), (e) => e.code === E.COMPOSE_CONFLICT);
+  const two = [{ composeId: 'a', appName: COMPOSE_APPNAME + '-1' },
+               { composeId: 'b', appName: COMPOSE_APPNAME + '-2' }];
+  const b = projectStagingBinding(projectBody({ composes: two }));
+  assert.throws(() => selectTarget(b, null), (e) => e.code === E.ADOPT_AMBIGUOUS);
+});
+
+// ── Cipher F4: strict escrow grammar ────────────────────────────────────
+test('duplicate keys are REJECTED, not silently overwritten', () => {
+  const good = envToBlock(ESCROW_ENV) + '\n';
+  assert.equal(parseEscrowBlock(good).SECRET_KEY, SECRET_CANARY);
+  // The exact probe Cipher ran: a second SECRET_KEY previously replaced the first.
+  // NOTE: an APPENDED line also trips the line-count check, so it would pass for
+  // the wrong reason and could not detect a missing duplicate guard. This block
+  // has the CORRECT line count and substitutes a duplicate for another key, so
+  // only the duplicate check can reject it.
+  const dup = ESCROW_KEYS.map((k) => (k === 'ADMIN_USERNAME'
+    ? 'SECRET_KEY=ATTACKER_VALUE' : `${k}=${ESCROW_ENV[k]}`)).join('\n') + '\n';
+  assert.equal(dup.split('\n').length - 1, ESCROW_KEYS.length, 'line count is correct');
+  assert.throws(() => parseEscrowBlock(dup), (e) => e.code === E.ESCROW_CORRUPT);
+  // And the appended form must still be rejected.
+  assert.throws(() => parseEscrowBlock(good.trimEnd() + '\nSECRET_KEY=X\n'),
+    (e) => e.code === E.ESCROW_CORRUPT);
+});
+
+test('values are bounded and control-free; the block is exactly the fixed keys', () => {
+  const mk = (over) => envToBlock({ ...ESCROW_ENV, ...over }) + '\n';
+  assert.throws(() => parseEscrowBlock(mk({ SECRET_KEY: 'x'.repeat(600) })), (e) => e.code === E.ESCROW_CORRUPT);
+  assert.throws(() => parseEscrowBlock(mk({ SECRET_KEY: 'a\u0000b' })), (e) => e.code === E.ESCROW_CORRUPT);
+  assert.throws(() => parseEscrowBlock(mk({ SECRET_KEY: '' })), (e) => e.code === E.ESCROW_CORRUPT);
+  assert.throws(() => parseEscrowBlock(envToBlock(ESCROW_ENV)), (e) => e.code === E.ESCROW_CORRUPT); // no trailing LF
+  assert.throws(() => parseEscrowBlock(good_extra()), (e) => e.code === E.ESCROW_CORRUPT);
+  function good_extra() { return envToBlock(ESCROW_ENV) + '\nEXTRA=1\n'; }
 });
 
 test('secrets are escrowed BEFORE the forward opens, never after a side effect', async () => {
@@ -253,9 +360,15 @@ test('binding never projects environment env values', () => {
 });
 
 // ══ Target selection: no prefix acceptance, no first-of-many ════════════
-test('a prefix appName collision STOPS rather than creating a duplicate', () => {
+test('a single prefix collision is ADOPTED, never duplicated; two are ambiguous', () => {
+  // One candidate is the crash-orphan case: adopt it rather than create a
+  // second service, but only after compose.one proves its shape (asserted in
+  // the recovery test). More than one is unresolvable.
   const b = projectStagingBinding(projectBody({ composes: EXISTING }));
-  assert.throws(() => selectTarget(b, null), (e) => e.code === E.COMPOSE_CONFLICT);
+  assert.deepEqual(selectTarget(b, null), { composeId: COMPOSE_ID, create: false, adopt: true });
+  const two = projectStagingBinding(projectBody({ composes: [
+    { composeId: 'a', appName: COMPOSE_APPNAME }, { composeId: 'b', appName: COMPOSE_APPNAME + '-2' }] }));
+  assert.throws(() => selectTarget(two, null), (e) => e.code === E.ADOPT_AMBIGUOUS);
 });
 
 test('two rows matching a prior binding stop; exactly one is required', () => {
@@ -268,7 +381,7 @@ test('two rows matching a prior binding stop; exactly one is required', () => {
 test('a prior binding that no longer exists stops, never silently recreates', () => {
   const b = projectStagingBinding(projectBody({ composes: [] }));
   assert.throws(() => selectTarget(b, { composeId: 'gone' }), (e) => e.code === E.COMPOSE_CONFLICT);
-  assert.deepEqual(selectTarget(b, null), { composeId: null, create: true });
+  assert.deepEqual(selectTarget(b, null), { composeId: null, create: true, adopt: false });
 });
 
 // ══ Ownership binding ═══════════════════════════════════════════════════
