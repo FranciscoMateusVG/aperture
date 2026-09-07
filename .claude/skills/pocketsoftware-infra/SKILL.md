@@ -183,6 +183,119 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ---
 
+### Agent access to Infisical — READ THIS FIRST (status: WORKING for metadata, 2026-09-07)
+
+> **STATUS: WORKING for METADATA — verified live 2026-09-07.** An agent CAN authenticate to
+> Infisical **using the credentials in the protected file** and enumerate project /
+> environment / secret **NAMES**. Proven by a real run, not by inspection: 5 projects, 116
+> secret names, 16 requests, exit 0, zero values emitted.
+>
+> **The receipt does NOT confirm WHICH identity the server authenticated.** It reports an
+> `identityLocator` explicitly marked *not verified from a server field* — that string is a
+> label we supply, not something the API attested. Authentication succeeding proves the
+> credentials were accepted; it does NOT prove they belong to `peppy-admin`. Do not write
+> "authenticated as peppy-admin" anywhere on this evidence.
+>
+> **This is METADATA access, NOT provider readiness.** You can see that a secret named
+> `OPENAI_API_KEY` exists in a given project/environment. You CANNOT tell from this whether
+> two same-named secrets in different projects hold the same value, whether any given key is
+> suitable for a new consumer, or whether it is compromised. Those questions require
+> separate authorization and a different mechanism. Do not let "I can list the names" become
+> "the key is ready".
+>
+> **Injection is still NOT implemented.** This reads metadata. It cannot deliver a secret to
+> any runtime. Bead: `aperture-a4ph5`.
+
+**What exists.** `scripts/infisical-metadata.mjs` in the aperture repo — a fixed-purpose,
+single-action helper that authenticates with the Universal Auth credentials held in the
+protected file and emits ONLY project / environment / secret-KEY-NAME metadata as one
+bounded JSON receipt. (The credentials are *labelled* `peppy-admin`; the server does not
+attest that, so do not describe a run as "authenticated as peppy-admin".) Invocation is exactly:
+
+```bash
+node scripts/infisical-metadata.mjs list-metadata
+```
+
+No other action exists. There is no `inject`, no path/URL/query argument, no shell
+passthrough, and no generic read mode — by design, per Cipher's ruling.
+
+**Prerequisites, all of which must hold or the helper fails closed.**
+
+| Requirement | Detail |
+|---|---|
+| Tailnet | Must be connected. Infisical is tailnet-only at `http://100.102.73.112:3005` (pocketsoftware). Publicly closed — that is correct posture, not a fault. |
+| Server compatibility | Infisical **v0.146** (`infisical/infisical:v0.146.0-postgres`). The CLI, if ever used, is pinned `@infisical/cli@0.42.6` — v4/latest mismatches this server. |
+| Credential source | A `0600` file at `~/.config/aperture/infisical-peppy-admin.env` containing exactly `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`, inside an owned `0700` parent. The path is HARDCODED; there is no override. |
+| Identity | Logical reference only: the `peppy-admin` machine identity registered in the `peppy/secrets` drawer "PocketSoftware Infisical". **Never open that drawer through a model-visible tool.** |
+
+**Runtime guard — what it does and does NOT do.** The helper refuses to run when
+`NODE_OPTIONS` or `process.execArgv` is non-empty, or `NODE_DEBUG` / `NODE_DEBUG_NATIVE`
+is set, and it uses a private `http.Agent` rather than the ambient global agent. Be clear
+about the limit: this **detects unsafe invocation**, it is **not protection against
+malicious code that is already preloaded**. Anything that has already patched the runtime
+before this process starts has defeated it. It is a guard against accidental instrumented
+runs — `NODE_DEBUG=http` printing HTTP internals, a stray `--inspect`, an inherited
+`NODE_OPTIONS` — not a sandbox.
+
+**Credential bootstrap — SOLVED 2026-09-07, and how.** The `0600` file is populated by a
+one-shot non-model transfer from an operator-supplied file, never by a model-visible read.
+The operator places `client_id=` and `new_secret=` in a private file; a reviewed Python
+action opens it read-only under a verified directory descriptor, maps the two fields to
+`INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET`, and publishes via `O_EXCL` temp plus
+hard-link (never a rename-over), emitting only the constant receipt `TRANSFER_OK`. If the
+file is absent the helper still returns `E_CRED_MISSING` **before any network call** — the
+intended fail-closed behavior.
+
+> **TWO TRAPS THAT COST THREE ATTEMPTS. Read these before repeating the bootstrap.**
+> 1. **Check the actual filename and mode before blaming the tooling.** OBSERVED in this
+>    incident (2026-09-07), not a general rule: the operator's file was named `secret.txt`
+>    rather than `secret`, and it carried group/other permission bits. The transfer refuses
+>    on `st_mode & 0o077` — correctly — and fails before reading a byte. I do NOT know what
+>    produced either condition and am not claiming editors universally append `.txt` or use
+>    a particular umask. Verify the real name and mode; fix the MODE (`chmod 600`), never
+>    weaken the check.
+> 2. **A constant-receipt design cannot be debugged by retrying it.** `TRANSFER_FAILED`
+>    yields exactly one bit, which is right for a live credential and useless for
+>    diagnosis. Pair it with a bounded **metadata-only** `lstat` probe (exists / regular /
+>    symlink / owner / no-group-other-bits / link-count) and the failing prerequisite falls
+>    out immediately. Two blind retries bought two bits; one probe bought the answer.
+
+**That pre-authorisation is CONSUMED.** Cipher's binding one-shot — exactly ONE
+`list-metadata` invocation, no retries, constant receipt — was SPENT on the verified run of
+2026-09-07 and Cipher issued a security PASS for that single action. It does **not** carry
+forward. **Any future live call needs its own fresh dispatch with an explicitly stated
+scope**; do not treat the existence of a working helper, or this runbook, as standing
+permission to invoke it. The standing prohibitions are unchanged regardless of scope: no
+model-visible drawer call, no registry adapter, no mutation, no injection, no key creation,
+no rotation.
+
+**⛔ INJECTION IS NOT IMPLEMENTED.** This helper only READS metadata. It cannot deliver a
+secret to any runtime. Anything that needs a secret injected into an app — Quiz included —
+is NOT served by this and requires separate design and review.
+
+**Success evidence looks like** a single JSON line with `ok: true`, project/environment
+names and secret KEY names, and the value-boundary statement: *"Infisical returned
+value-bearing responses; zero values were emitted, logged, persisted, fingerprinted, or
+placed in model-visible output."* Note the honesty of that wording — v0.146 list-secrets
+responses DO contain `secretValue`, so the claim is about emission, never about retrieval.
+
+**Failure and recovery.** All failures are stable codes; upstream status, bodies and headers
+are never reflected. `E_CRED_MISSING` / `E_CRED_PERMS` / `E_CRED_OWNER` / `E_CRED_SYMLINK` /
+`E_CRED_LINKS` / `E_CRED_RACE` — fix the file or its parent, never work around the guard.
+`E_AUTH_REJECTED` — the identity is invalid, expired, or lost its grant: **STOP and report.
+Do not retry, do not re-provision, do not create a new identity or key.** `E_NETWORK` —
+check the tailnet first. `E_REDIRECT_REFUSED` / `E_UPSTREAM_STATUS` / `E_BAD_SHAPE` /
+`E_BODY_TOO_LARGE` — treat as a server or compatibility change and re-verify against this
+section before touching the helper.
+
+**Source of truth vs documentation.** Live metadata access was VERIFIED on 2026-09-07 by a
+real `list-metadata` run under explicit dispatch (5 projects, 116 names, exit 0), and Cipher
+issued a security PASS for that single action. Two limits survive that verification and must
+not be quietly dropped: the run proves METADATA access only — not provider-key suitability,
+uniqueness, compromise status, or Quiz readiness — and it does NOT establish the identity
+from a server field. If this section is ever re-verified, record the date and what the run
+actually proved, not what it made you feel confident about.
+
 ## 10. Databases (platform-postgres)
 
 Central shared Postgres 17 for all pocketsoftware apps. Live since 2026-07-14 (BEADS `aperture-sazvl`).
