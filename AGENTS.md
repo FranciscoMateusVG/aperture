@@ -1,188 +1,32 @@
-# Agent Instructions
+# Aperture agent instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
+Canonical shared rules: `.claude/skills/constitution/SKILL.md`. Detailed procedures live in `beads`, `communicate`, `worktree-discipline`, `specialist-delegation`, and `orchestrator-core`. Do not infer permission from historical examples.
 
-## Quick Reference
+## Task ownership and delivery
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --status in_progress  # Claim work
-bd close <id>         # Complete work
-bd sync               # Sync with git
-```
+- GLaDOS discovers/assigns work. Specialists fetch only their assigned bead and await scoped dispatch; no ready/list/search sweeps or self-claims of unassigned work.
+- Only GLaDOS files beads, only after explicit operator acknowledgment. Every bead has exactly one approved project label. Findings within current scope belong in its concise notes; other work is proposed, not automatically filed.
+- Claim the existing bead before work. Edit in a per-task worktree from the actual canonical remote branch; never use the shared main checkout as an editing surface.
+- A bounded repair discovered during assigned work may be fixed by its finder after the current owner explicitly agrees to the file handoff. Follow `communicate` §10: one pen per file set, own worktree, focused regression, independent diff review. This is not permission to reassign the whole task or expand into architecture/security/infra work.
+- Store deliverables as artifacts and open a PR; ordinary task closure is PR-open, unless acceptance explicitly requires a later QA verdict. Do not claim unfinished operations complete.
+- Use `bd update <id> --append-notes` for short progress notes. Put long reports in artifacts, not growing notes blobs. No blanket issue filing, stash clearing, branch deletion, force push, or endless failed-push retries at session end.
 
-<!-- BEGIN BEADS INTEGRATION -->
-## Issue Tracking with bd (beads)
+## Evidence and review
 
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
+Use the smallest sufficient test layer. Ordinary UI/input logic uses unit/component tests; E2E is reserved for agreed primary user journeys and consequential reproduced failures that lower tests cannot faithfully cover. Follow `verify-user-path` for a scoped browser check, not an every-control campaign. One reviewer checks the exact diff; no self-approval after a finder repair. Required release sign-off remains explicit; operator risk acceptance is recorded as such, never rewritten as a passing test.
 
-### Why bd?
+## Coordination and deployment
 
-- Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Auto-syncs to JSONL for version control
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
+One execution owner per bounded change. Message only a next actor, decision owner, or materially affected colleague; no routine all-agent FYIs or acknowledgments of acknowledgments. All such messages use BEADS.
 
-### Quick Start
+Before implementation, summarize the actual stack, rendering/runtime constraints, deployment branch and existing tooling. Routine approved code delivery uses the configured merge-to-Dokploy path; initial provisioning, environment/schema changes and exceptional cutovers are separate. Do not commission a custom broker, per-service script or replacement deployment framework when supported native tools/configuration can do the job. If access is missing, name the missing native setup rather than inventing a transport.
 
-**Check for ready work:**
+## Lanes
 
-```bash
-bd ready --json
-```
+GLaDOS: orchestration and shared instructions. Wheatley: planning/research. Peppy: infrastructure/deployment. Izzy: scoped QA and bounded owner-consented repairs. Vance: frontend/design/performance. Rex: backend/APIs. Scout: mobile. Cipher: security. Implementers write their docs; `.claude/skills/team` is the complete roster.
 
-**Create new issues:**
+## How instructions load
 
-```bash
-bd create "Issue title" --description="Detailed context" -t bug|feature|task -p 0-4 --label project:<name> --json
-bd create "Issue title" --description="What this issue is about" -p 1 --label project:aperture --deps discovered-from:bd-123 --json
-```
+Canonical sources are `prompts/<agent>.md`, `.claude/skills/<skill>/SKILL.md`, and `agents/<agent>/{skills.txt,resident.txt}`. `just setup` links them into `~/.claude/aperture/<agent>/`; `src-tauri/src/agents.rs` assembles resident skill bodies on both harness paths, while non-resident skills remain discoverable. Without resident.txt, all assigned skills are injected. See `scripts/skills-matrix.sh` for the current mapping.
 
-**Project label is REQUIRED.** Every task carries exactly one `project:<name>` label. Canonical taxonomy: `project:aperture`, `project:incluir`, `project:beads-galaxy`, `project:mempalace`, `project:frame`. See the `aperture:beads` skill for the full convention. Tasks without a project label become invisible to project-scoped queries.
-
-**A task is closed when the PR is opened, NOT when it's merged.** PR-open = work shipped from the agent's side. Reviewer feedback creates a follow-up task. See `aperture:beads` section 3.
-
-**Claim and update:**
-
-```bash
-bd update bd-42 --status in_progress --json
-bd update bd-42 --priority 1 --json
-```
-
-**Complete work:**
-
-```bash
-bd close bd-42 --reason "Completed" --json
-```
-
-### Issue Types
-
-- `bug` - Something broken
-- `feature` - New functionality
-- `task` - Work item (tests, docs, refactoring)
-- `epic` - Large feature with subtasks
-- `chore` - Maintenance (dependencies, tooling)
-
-### Priorities
-
-- `0` - Critical (security, data loss, broken builds)
-- `1` - High (major features, important bugs)
-- `2` - Medium (default, nice-to-have)
-- `3` - Low (polish, optimization)
-- `4` - Backlog (future ideas)
-
-### Workflow for AI Agents
-
-1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task**: `bd update <id> --status in_progress`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-   - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
-
-### Auto-Sync
-
-bd automatically syncs with git:
-
-- Exports to `.beads/issues.jsonl` after changes (5s debounce)
-- Imports from JSONL when newer (e.g., after `git pull`)
-- No manual export/import needed!
-
-### Important Rules
-
-- ✅ Use bd for ALL task tracking
-- ✅ Always use `--json` flag for programmatic use
-- ✅ Link discovered work with `discovered-from` dependencies
-- ✅ Check `bd ready` before asking "what should I work on?"
-- ❌ Do NOT create markdown TODO lists
-- ❌ Do NOT use external issue trackers
-- ❌ Do NOT duplicate tracking systems
-
-For more details, see README.md and docs/QUICKSTART.md.
-
-<!-- END BEADS INTEGRATION -->
-
-## Agent Lanes
-
-Each agent has a distinct specialization. Stay in your lane; cross-agent delegation flows through GLaDOS.
-
-| Agent | Lane | Responsibilities |
-|-------|------|-----------------|
-| **GLaDOS** | Orchestration | Task delegation (specialists or subagents), cross-agent consistency, architectural decisions |
-| **Wheatley** | Implementation | Code writing, file editing, bug fixing, feature implementation |
-| **Peppy** | Infrastructure | Docker, deployments, services, environment management, CI/CD, health monitoring |
-| **Izzy** | Testing & QA | Writing tests, running test suites, code review, regression catching, quality gates |
-
-**Task creation rules:**
-- Any agent can create BEADS tasks for work they discover mid-flight (self-assigned)
-- Only GLaDOS assigns tasks to other agents and dispatches subagents via the Agent tool
-- Cross-agent delegation always flows through GLaDOS
-
-## Pre-loaded Skills
-
-Skill loading is **folder-driven** as of v1.0. Each agent's skills live at
-`~/.claude/aperture/<agent>/skills/` — symlinks built by `just setup` from the
-canonical sources at `agents/<agent>/skills.txt` + `.claude/skills/<skill>/`.
-
-To see what an agent loads: `ls ~/.claude/aperture/<agent>/skills/`. To add or
-remove a skill, edit `agents/<agent>/skills.txt` and re-run `just setup` — no
-recompile needed.
-
-Common skills carried by all agents: `communicate`, `team`, `beads`.
-
-Domain-specific additions:
-- **GLaDOS:** `subagents` (Agent-tool delegation), `deploy-workflow`
-- **Wheatley:** `deploy-workflow`
-- **Peppy:** `deploy-workflow`, `dokploy-api`
-- **Rex / Izzy / Cipher / Vance:** `worktree-discipline` (senior monorepo-incluir agents)
-
-## Proactivity Rules
-
-Agents should act without waiting for explicit instructions, within these bounds:
-
-### On Session Startup
-1. Check `query_tasks(mode: "ready")` for unclaimed tasks in your domain
-2. If a task matches your lane, claim it and begin work immediately
-3. If no tasks are available, report readiness to GLaDOS
-
-### Bounded Autonomy
-- **DO:** Self-start on existing BEADS tasks in your domain
-- **DO:** Create tasks for work you discover mid-flight (self-assigned)
-- **DO NOT:** Create new initiatives without a trigger from the operator or GLaDOS
-- **DO NOT:** Contact the operator without a trigger (blocked task, critical issue, or completion report)
-
-### Wheatley → Izzy Handoff Protocol
-When Wheatley closes an implementation task:
-1. Wheatley sends Izzy a message: what changed, which files, what to test
-2. Izzy creates a test/review task, claims it, and validates the work
-3. Work is not considered "done" until Izzy signs off
-
-### Quality Gate
-No code ships without Izzy reviewing it. If an implementation task is closed without a corresponding test/review task, that is a process failure. GLaDOS enforces this at the task chain level.
-
-## Landing the Plane (Session Completion)
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+Changing a PR does not update running sessions. Report source/merge/setup/session adoption separately. Do not relaunch the fleet or run setup solely to claim new rules are active.

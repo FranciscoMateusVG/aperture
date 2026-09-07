@@ -2,54 +2,12 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+## Shared operating rules
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+Read `AGENTS.md` and `.claude/skills/constitution/SKILL.md` for current task, QA, communication and worktree rules. GLaDOS alone discovers/files tasks after operator acknowledgment; specialists fetch assigned beads only. PR-open closure is subject to the bead's explicit acceptance. No blanket follow-up filing, stash clearing, branch deletion or forced push at session end.
 
-### Quick Reference
+Use BEADS for tracking and persistent knowledge, not a parallel markdown TODO or MEMORY.md bank. Existing skill details remain invocable; do not treat older generated boilerplate as permission to create tasks, expand tests or bypass review.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
-- **Every `bd create` MUST include a `--label project:<name>` flag.** Canonical taxonomy: `project:aperture`, `project:incluir`, `project:beads-galaxy`, `project:mempalace`, `project:frame`. See the `aperture:beads` skill for the full discipline.
-- **A task is closed when its PR is OPENED, not when merged.** Reviewer feedback creates a follow-up task. Don't hold tasks open through merge.
-
-## Session Completion
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
 
 
 ## Build & Test
