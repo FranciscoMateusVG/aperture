@@ -496,6 +496,41 @@ test('production identifiers are refused structurally', () => {
     (e) => e.code === E.PROD_ID_REFUSED);
 });
 
+test('mixed project permits read-only production siblings and selects safe staging', () => {
+  const production = {
+    environmentId: 'env_prod_1', name: 'production',
+    compose: [{ composeId: 'cmp_prod_1', appName: 'quiz-incluir-e17b8a-w3hpak' }],
+  };
+  const selected = projectStagingBinding(projectBody({ extraEnvs: [production] }));
+  assert.equal(selected.environmentId, ENV_ID);
+  assert.deepEqual(selected.composes, []);
+});
+
+test('zero staging reports E_NO_STAGING_ENV even when production siblings are present', () => {
+  const onlyProduction = {
+    projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID,
+    environments: [{ environmentId: 'env_prod_1', name: 'production',
+      compose: [{ composeId: 'cmp_prod_1', appName: 'quiz-incluir-e17b8a-w3hpak' }] }],
+  };
+  assert.throws(() => projectStagingBinding(onlyProduction),
+    (e) => e.code === E.NO_STAGING_ENV);
+});
+
+test('a production identifier in selected staging stops before every POST', async () => {
+  const h = harness();
+  const inner = h.args.requestFn;
+  h.args.requestFn = (o) => {
+    if (o.path.startsWith(P_PROJECT_ONE)) {
+      h.calls.push(`GET ${P_PROJECT_ONE}`);
+      return Promise.resolve(projectBody({ composes: [{ composeId: 'cmp_prod_1',
+        appName: 'quiz-incluir-e17b8a-w3hpak' }] }));
+    }
+    return inner(o);
+  };
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.PROD_ID_REFUSED);
+  assert.deepEqual(h.posts(), []);
+});
+
 test('the sequence stops at the first non-success; later calls never happen', async () => {
   for (const [failPath, later] of [
     [P_COMPOSE_CREATE, [P_COMPOSE_UPDATE, P_DOMAIN_CREATE, P_COMPOSE_DEPLOY]],

@@ -385,15 +385,19 @@ function projectStagingBinding(body) {
     return { environmentId: id, name, composes };
   });
 
-  assertNoProdIds(projected.flatMap((e) =>
-    [e.environmentId, ...e.composes.flatMap((c) => [c.composeId, c.appName])]));
-
   const matches = projected.filter((e) => e.name.toLowerCase() === STAGING_ENV_NAME);
   if (matches.length === 0) throw new Fail(E.NO_STAGING_ENV);
   if (matches.length > 1) throw new Fail(E.MULTI_STAGING_ENV);
-  return { environmentId: matches[0].environmentId,
+  const selected = matches[0];
+  // A project.one response legitimately contains read-only production siblings.
+  // Refuse production identifiers only at the selected staging mutation
+  // boundary; applying the denylist to every sibling made this action
+  // impossible to run against the real mixed-environment Quiz project.
+  assertNoProdIds([selected.environmentId,
+    ...selected.composes.flatMap((c) => [c.composeId, c.appName])]);
+  return { environmentId: selected.environmentId,
            environmentCount: projected.length,
-           composes: matches[0].composes };
+           composes: selected.composes };
 }
 
 // Selects the remote object to act on, WITHOUT guessing.
