@@ -185,10 +185,16 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ### Agent access to Infisical — READ THIS FIRST (status: WORKING for metadata, 2026-09-07)
 
-> **STATUS: WORKING for METADATA — verified live 2026-09-07.** An agent CAN authenticate
-> to Infisical with the existing `peppy-admin` machine identity and enumerate project /
+> **STATUS: WORKING for METADATA — verified live 2026-09-07.** An agent CAN authenticate to
+> Infisical **using the credentials in the protected file** and enumerate project /
 > environment / secret **NAMES**. Proven by a real run, not by inspection: 5 projects, 116
-> secret names, exit 0, zero values emitted.
+> secret names, 16 requests, exit 0, zero values emitted.
+>
+> **The receipt does NOT confirm WHICH identity the server authenticated.** It reports an
+> `identityLocator` explicitly marked *not verified from a server field* — that string is a
+> label we supply, not something the API attested. Authentication succeeding proves the
+> credentials were accepted; it does NOT prove they belong to `peppy-admin`. Do not write
+> "authenticated as peppy-admin" anywhere on this evidence.
 >
 > **This is METADATA access, NOT provider readiness.** You can see that a secret named
 > `OPENAI_API_KEY` exists in a given project/environment. You CANNOT tell from this whether
@@ -276,11 +282,13 @@ check the tailnet first. `E_REDIRECT_REFUSED` / `E_UPSTREAM_STATUS` / `E_BAD_SHA
 `E_BODY_TOO_LARGE` — treat as a server or compatibility change and re-verify against this
 section before touching the helper.
 
-**Source of truth vs documentation.** This section documents the INTENDED access path. It is
-not evidence that the path currently works: the `peppy-admin` identity is a DOCUMENTED
-REFERENCE that authenticated on 2026-08-23 but has NOT been re-verified live since. Treat a
-successful `list-metadata` run as the only proof, and update this section with the verified
-command and date when one lands.
+**Source of truth vs documentation.** Live metadata access was VERIFIED on 2026-09-07 by a
+real `list-metadata` run under explicit dispatch (5 projects, 116 names, exit 0), and Cipher
+issued a security PASS for that single action. Two limits survive that verification and must
+not be quietly dropped: the run proves METADATA access only — not provider-key suitability,
+uniqueness, compromise status, or Quiz readiness — and it does NOT establish the identity
+from a server field. If this section is ever re-verified, record the date and what the run
+actually proved, not what it made you feel confident about.
 
 ## 10. Databases (platform-postgres)
 
