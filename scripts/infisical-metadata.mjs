@@ -86,6 +86,7 @@ const E = {
   CRED_SIZE: 'E_CRED_SIZE',
   CRED_RACE: 'E_CRED_RACE',
   CRED_PARSE: 'E_CRED_PARSE',
+  CRED_ENCODING: 'E_CRED_ENCODING',
   NETWORK: 'E_NETWORK',
   AUTH_REJECTED: 'E_AUTH_REJECTED',
   REDIRECT_REFUSED: 'E_REDIRECT_REFUSED',
@@ -106,15 +107,25 @@ const E = {
 // instrumented process. For a fixed-purpose CLI there is no legitimate reason
 // for ANY of these to be set, so the guard is a flat refusal rather than a
 // blocklist of individual flags (a blocklist is exactly what gets bypassed).
+// Pure classifier so every rejection case is testable without mutating this
+// process's real environment. Takes state, returns true, or throws.
+function classifyRuntime({ env, execArgv, globalAgentIsStock }) {
+  const e = env ?? {};
+  if (String(e.NODE_OPTIONS ?? '') !== '') throw new Fail(E.UNSAFE_RUNTIME);
+  if (Array.isArray(execArgv) && execArgv.length > 0) throw new Fail(E.UNSAFE_RUNTIME);
+  if (e.NODE_DEBUG) throw new Fail(E.UNSAFE_RUNTIME);
+  if (e.NODE_DEBUG_NATIVE) throw new Fail(E.UNSAFE_RUNTIME);
+  if (e.NODE_USE_ENV_PROXY) throw new Fail(E.UNSAFE_RUNTIME);
+  if (globalAgentIsStock === false) throw new Fail(E.UNSAFE_RUNTIME);
+  return true;
+}
+
 function assertSafeRuntime() {
-  if (String(process.env.NODE_OPTIONS ?? '') !== '') throw new Fail(E.UNSAFE_RUNTIME);
-  if (Array.isArray(process.execArgv) && process.execArgv.length > 0) throw new Fail(E.UNSAFE_RUNTIME);
-  if (process.env.NODE_DEBUG) throw new Fail(E.UNSAFE_RUNTIME);
-  if (process.env.NODE_DEBUG_NATIVE) throw new Fail(E.UNSAFE_RUNTIME);
-  if (process.env.NODE_USE_ENV_PROXY) throw new Fail(E.UNSAFE_RUNTIME);
-  if (http.globalAgent && http.globalAgent.constructor !== http.Agent) {
-    throw new Fail(E.UNSAFE_RUNTIME);
-  }
+  return classifyRuntime({
+    env: process.env,
+    execArgv: process.execArgv,
+    globalAgentIsStock: !http.globalAgent || http.globalAgent.constructor === http.Agent,
+  });
 }
 
 // ─── Credential file: open once, validate the SAME descriptor. PRIVATE. ─────
@@ -149,9 +160,20 @@ function readCredentials() {
     const buf = Buffer.allocUnsafe(st.size);
     const n = readSync(fd, buf, 0, st.size, 0);
     if (n !== st.size) throw new Fail(E.CRED_SIZE);
-    return parseCredentials(buf.toString('utf8'));
+    return parseCredentials(decodeCredentialBytes(buf));
   } finally {
     try { closeSync(fd); } catch { /* fd cleanup only */ }
+  }
+}
+
+// Cipher r3-3: Buffer.toString('utf8') SUBSTITUTES U+FFFD for invalid bytes,
+// which would silently mutate a credential and send the mutation upstream.
+// Decode fatally and fail closed instead.
+function decodeCredentialBytes(buf) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    throw new Fail(E.CRED_ENCODING);
   }
 }
 
@@ -249,8 +271,10 @@ function projectWorkspaceMeta(ws) {
   };
 }
 
-// ─── Testable seams. None takes a URL, a credential, or a live transport, so
-// exporting them cannot yield a credential reader or a live caller.
+// ─── Testable seams. None exposes the credential SOURCE, the credential PATH,
+// or the live transport. orchestrateMetadata and composeAction intentionally
+// ACCEPT caller-supplied transports and readers — that is the injection point
+// tests use — but neither can discover the real ones.
 
 // Cipher MEDIUM-5 / r2-MEDIUM-4: stream and abort ABOVE the cap mid-flight,
 // before allocation completes — not after buffering the whole body.
@@ -283,6 +307,32 @@ function consumeBoundedStream(readable, maxBytes) {
   });
 }
 
+// Cipher r3-2: the wall-clock deadline extracted as a narrow, testable
+// wrapper. `start` receives ok/bad callbacks; `abort` tears down the in-flight
+// work. Settles exactly once and always clears the timer. Takes no URL and no
+// transport, so exporting it grants no network authority.
+function withAbsoluteDeadline({ start, abort, ms }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      fn(arg);
+    };
+    timer = setTimeout(() => {
+      try { if (abort) abort(); } catch { /* best effort */ }
+      settle(reject, new Fail(E.DEADLINE));
+    }, ms);
+    try {
+      start((v) => settle(resolve, v), (e) => settle(reject, e));
+    } catch (e) {
+      settle(reject, e);
+    }
+  });
+}
+
 // Pure action validator. Cipher r2-MEDIUM-4: preferred over CLI subprocess
 // tests, which cannot prove ordering survives a later regression.
 function validateAction(args) {
@@ -312,22 +362,11 @@ function chargeRequest(budget) {
 
 // ─── Transport: node:http, literal host/port/path, streamed with a byte cap. ─
 function request({ method, path, token, body, timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    // Cipher addendum: node:http's `timeout` fires on socket INACTIVITY, so a
-    // response dripping a byte at a time never trips it. This wall-clock timer
-    // is the absolute bound, it covers body streaming as well as headers, and
-    // it is cleared on every settle path.
-    let settled = false;
-    let timer = null;
-    const settle = (fn, arg) => {
-      if (settled) return;
-      settled = true;
-      if (timer) { clearTimeout(timer); timer = null; }
-      fn(arg);
-    };
-    const ok = (v) => settle(resolve, v);
-    const bad = (e) => settle(reject, e);
-
+  let activeReq = null;
+  return withAbsoluteDeadline({
+    ms: timeoutMs,
+    abort: () => { try { if (activeReq) activeReq.destroy(); } catch { /* best effort */ } },
+    start: (ok, bad) => {
     const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : null;
     const headers = { accept: 'application/json' };
     if (token) headers.authorization = 'Bearer ' + token;
@@ -349,24 +388,33 @@ function request({ method, path, token, body, timeoutMs }) {
       },
     );
 
-    timer = setTimeout(() => {
-      try { req.destroy(); } catch { /* best effort */ }
-      settle(reject, new Fail(E.DEADLINE));
-    }, timeoutMs);
+    activeReq = req;
 
     req.on('timeout', () => { req.destroy(); bad(new Fail(E.NETWORK)); });
     req.on('error', () => bad(new Fail(E.NETWORK)));   // never surface the cause
     if (payload) req.write(payload);
     req.end();
+    },
   });
 }
 
 // ─── The one action. PRIVATE — not exported, so importing this module cannot
 // trigger a credential read or a live call.
+// Cipher r3-1: composition extracted so ordering is provable — the guard runs
+// BEFORE the credential reader, and a failing guard must mean the reader is
+// never invoked at all.
+async function composeAction({ guard, readCreds, orchestrate }) {
+  guard();
+  const credentials = readCreds();
+  return orchestrate(credentials);
+}
+
 async function listMetadata() {
-  assertSafeRuntime();
-  const credentials = readCredentials();
-  return orchestrateMetadata({ transport: request, credentials });
+  return composeAction({
+    guard: assertSafeRuntime,
+    readCreds: readCredentials,
+    orchestrate: (credentials) => orchestrateMetadata({ transport: request, credentials }),
+  });
 }
 
 // The real orchestration, with the transport and credentials INJECTED. Tests
@@ -466,6 +514,7 @@ export {
   parseCredentials, safeStr, isForbiddenCp, classifyStatus, parseBounded,
   requireArray, projectSecretNames, projectWorkspaceMeta,
   consumeBoundedStream, validateAction, serializeReceipt,
+  classifyRuntime, decodeCredentialBytes, withAbsoluteDeadline, composeAction,
   makeBudget, chargeRequest, remainingMs, orchestrateMetadata,
   MAX_RECEIPT_BYTES, MAX_REQUESTS, MAX_NAMES_TOTAL, ACTION_DEADLINE_MS,
   E, Fail, ONLY_ACTION,

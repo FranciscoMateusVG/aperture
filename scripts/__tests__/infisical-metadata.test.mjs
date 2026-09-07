@@ -29,6 +29,7 @@ import {
   parseCredentials, safeStr, isForbiddenCp, classifyStatus, parseBounded,
   requireArray, projectSecretNames, projectWorkspaceMeta,
   consumeBoundedStream, validateAction, serializeReceipt,
+  classifyRuntime, decodeCredentialBytes, withAbsoluteDeadline, composeAction,
   makeBudget, chargeRequest, remainingMs, orchestrateMetadata,
   MAX_RECEIPT_BYTES, MAX_REQUESTS, MAX_NAMES_TOTAL, ACTION_DEADLINE_MS,
   E, Fail, ONLY_ACTION,
@@ -466,5 +467,111 @@ test('a failing orchestration never leaks the injected token or value', async ()
   }
   assert.ok(surface.includes(E.BAD_SHAPE));
   assertNoCanary(surface, 'failing orchestration error surface');
+});
+
+// ══ Cipher r3-1: runtime guard classifier ═══════════════════════════════
+const CLEAN_RUNTIME = { env: {}, execArgv: [], globalAgentIsStock: true };
+
+test('classifyRuntime accepts a clean runtime', () => {
+  assert.equal(classifyRuntime(CLEAN_RUNTIME), true);
+  assert.equal(classifyRuntime({ ...CLEAN_RUNTIME, env: { PATH: '/usr/bin', HOME: '/x' } }), true);
+});
+
+test('classifyRuntime rejects every instrumented state', () => {
+  const rejected = [
+    { ...CLEAN_RUNTIME, env: { NODE_OPTIONS: '--require ./evil.js' } },
+    { ...CLEAN_RUNTIME, env: { NODE_OPTIONS: '--use-env-proxy' } },
+    { ...CLEAN_RUNTIME, env: { NODE_OPTIONS: ' ' } },
+    { ...CLEAN_RUNTIME, execArgv: ['--inspect'] },
+    { ...CLEAN_RUNTIME, execArgv: ['--use-env-proxy'] },
+    { ...CLEAN_RUNTIME, execArgv: ['--import', './evil.mjs'] },
+    { ...CLEAN_RUNTIME, env: { NODE_DEBUG: 'http' } },
+    { ...CLEAN_RUNTIME, env: { NODE_DEBUG_NATIVE: 'http' } },
+    { ...CLEAN_RUNTIME, env: { NODE_USE_ENV_PROXY: '1' } },
+    { ...CLEAN_RUNTIME, globalAgentIsStock: false },
+  ];
+  for (const state of rejected) {
+    assert.throws(() => classifyRuntime(state), (e) => e.code === E.UNSAFE_RUNTIME,
+      'must reject ' + JSON.stringify({ env: state.env, execArgv: state.execArgv, g: state.globalAgentIsStock }));
+  }
+});
+
+test('the guard runs BEFORE the credential reader, and a failing guard means it is never called', async () => {
+  const order = [];
+  const readCreds = () => { order.push('read'); return { clientId: 'a', clientSecret: 'b' }; };
+  const orchestrate = () => { order.push('orchestrate'); return { ok: true }; };
+
+  await composeAction({ guard: () => { order.push('guard'); }, readCreds, orchestrate });
+  assert.deepEqual(order, ['guard', 'read', 'orchestrate'], 'guard must be first');
+
+  order.length = 0;
+  await assert.rejects(
+    () => composeAction({ guard: () => { order.push('guard'); throw new Fail(E.UNSAFE_RUNTIME); }, readCreds, orchestrate }),
+    (e) => e.code === E.UNSAFE_RUNTIME);
+  assert.deepEqual(order, ['guard'], 'credential reader must NOT run when the guard fails');
+});
+
+// ══ Cipher r3-2: the wall-clock deadline wrapper ════════════════════════
+test('withAbsoluteDeadline rejects E_DEADLINE, aborts once, and settles once', async () => {
+  let aborts = 0;
+  let settles = 0;
+  const p = withAbsoluteDeadline({
+    ms: 30,
+    abort: () => { aborts += 1; },
+    // never calls back — the deadline is the only way out
+    start: (ok, bad) => { setTimeout(() => { settles += 1; ok('late'); }, 300); },
+  });
+  await assert.rejects(() => p, (e) => e.code === E.DEADLINE);
+  assert.equal(aborts, 1, 'abort called exactly once');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(settles, 1, 'the late callback fired but must not re-settle the promise');
+});
+
+test('withAbsoluteDeadline clears its timer on a normal settle', async () => {
+  const before = process.getActiveResourcesInfo ? process.getActiveResourcesInfo().filter((x) => x === 'Timeout').length : 0;
+  const v = await withAbsoluteDeadline({ ms: 5000, abort: () => {}, start: (ok) => ok('done') });
+  assert.equal(v, 'done');
+  const after = process.getActiveResourcesInfo ? process.getActiveResourcesInfo().filter((x) => x === 'Timeout').length : 0;
+  assert.ok(after <= before, 'the 5s timer must be cleared, not left pending');
+});
+
+test('a NEVER-ENDING LOW-VOLUME stream is stopped by the deadline, not the byte cap', async () => {
+  // Trickles a few bytes on an interval: too slow to hit the byte cap, and a
+  // socket-inactivity timeout would never fire. Only the wall clock stops it.
+  let ticks = 0;
+  let destroyed = false;
+  const stream = new Readable({ read() {} });
+  const iv = setInterval(() => { ticks += 1; stream.push(Buffer.alloc(4, 0x63)); }, 10);
+  stream.on('close', () => { destroyed = true; });
+
+  await assert.rejects(
+    () => withAbsoluteDeadline({
+      ms: 60,
+      abort: () => { clearInterval(iv); stream.destroy(); },
+      start: (ok, bad) => { consumeBoundedStream(stream, 10 * 1024 * 1024).then(ok, bad); },
+    }),
+    (e) => e.code === E.DEADLINE);
+  clearInterval(iv);
+  assert.ok(ticks > 0, 'the stream was genuinely producing bytes');
+  assert.ok(destroyed || stream.destroyed, 'the stream must be destroyed on deadline');
+});
+
+// ══ Cipher r3-3: fatal credential decoding ══════════════════════════════
+test('decodeCredentialBytes decodes valid UTF-8', () => {
+  const buf = Buffer.from('INFISICAL_CLIENT_ID=a', 'utf8');
+  assert.equal(decodeCredentialBytes(buf), 'INFISICAL_CLIENT_ID=a');
+});
+
+test('invalid credential bytes fail closed instead of becoming U+FFFD', () => {
+  // Buffer.toString('utf8') would SUBSTITUTE here and silently mutate the
+  // credential, then send the mutation upstream.
+  const invalid = Buffer.from([0x49, 0x44, 0x3d, 0xff, 0xfe, 0xfd]);
+  assert.notEqual(invalid.toString('utf8').indexOf('\ufffd'), -1,
+    'baseline: the replacement path really does substitute');
+  assert.throws(() => decodeCredentialBytes(invalid), (e) => e.code === E.CRED_ENCODING);
+});
+
+test('a lone surrogate / truncated multibyte sequence is rejected', () => {
+  assert.throws(() => decodeCredentialBytes(Buffer.from([0xe4, 0xb8])), (e) => e.code === E.CRED_ENCODING);
 });
 
