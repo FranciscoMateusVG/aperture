@@ -207,9 +207,10 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 > any runtime. Bead: `aperture-a4ph5`.
 
 **What exists.** `scripts/infisical-metadata.mjs` in the aperture repo — a fixed-purpose,
-single-action helper that authenticates with the EXISTING `peppy-admin` Universal Auth
-machine identity and emits ONLY project / environment / secret-KEY-NAME metadata as one
-bounded JSON receipt. Invocation is exactly:
+single-action helper that authenticates with the Universal Auth credentials held in the
+protected file and emits ONLY project / environment / secret-KEY-NAME metadata as one
+bounded JSON receipt. (The credentials are *labelled* `peppy-admin`; the server does not
+attest that, so do not describe a run as "authenticated as peppy-admin".) Invocation is exactly:
 
 ```bash
 node scripts/infisical-metadata.mjs list-metadata
@@ -246,22 +247,27 @@ file is absent the helper still returns `E_CRED_MISSING` **before any network ca
 intended fail-closed behavior.
 
 > **TWO TRAPS THAT COST THREE ATTEMPTS. Read these before repeating the bootstrap.**
-> 1. **A GUI editor saves `secret.txt`, not `secret`,** and it saves with a default umask
->    that leaves the file **group/other-readable**. The transfer refuses on
->    `st_mode & 0o077` — correctly — so it fails before reading a byte. Fix the MODE
->    (`chmod 600`), do not weaken the check.
+> 1. **Check the actual filename and mode before blaming the tooling.** OBSERVED in this
+>    incident (2026-09-07), not a general rule: the operator's file was named `secret.txt`
+>    rather than `secret`, and it carried group/other permission bits. The transfer refuses
+>    on `st_mode & 0o077` — correctly — and fails before reading a byte. I do NOT know what
+>    produced either condition and am not claiming editors universally append `.txt` or use
+>    a particular umask. Verify the real name and mode; fix the MODE (`chmod 600`), never
+>    weaken the check.
 > 2. **A constant-receipt design cannot be debugged by retrying it.** `TRANSFER_FAILED`
 >    yields exactly one bit, which is right for a live credential and useless for
 >    diagnosis. Pair it with a bounded **metadata-only** `lstat` probe (exists / regular /
 >    symlink / owner / no-group-other-bits / link-count) and the failing prerequisite falls
 >    out immediately. Two blind retries bought two bits; one probe bought the answer.
 
-**Pre-authorised scope for the eventual first live run** (Cipher, binding): exactly **ONE**
-`list-metadata` invocation, and only after GLaDOS/the operator has selected and completed an
-approved non-model bootstrap into the reviewed fixed file. **No retries** after an auth,
-schema, or network failure — a failure code STOPS the run and is reported as-is. No
+**That pre-authorisation is CONSUMED.** Cipher's binding one-shot — exactly ONE
+`list-metadata` invocation, no retries, constant receipt — was SPENT on the verified run of
+2026-09-07 and Cipher issued a security PASS for that single action. It does **not** carry
+forward. **Any future live call needs its own fresh dispatch with an explicitly stated
+scope**; do not treat the existence of a working helper, or this runbook, as standing
+permission to invoke it. The standing prohibitions are unchanged regardless of scope: no
 model-visible drawer call, no registry adapter, no mutation, no injection, no key creation,
-no rotation. Return only the single bounded JSON receipt for Cipher's final review.
+no rotation.
 
 **⛔ INJECTION IS NOT IMPLEMENTED.** This helper only READS metadata. It cannot deliver a
 secret to any runtime. Anything that needs a secret injected into an app — Quiz included —
