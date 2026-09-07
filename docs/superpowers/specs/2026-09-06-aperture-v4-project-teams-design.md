@@ -1,6 +1,6 @@
 # Aperture V4 — Project Teams: seats, incarnations, presets, safe replacement
 
-**Bead:** aperture-nap3u. **Author:** Wheatley. **Status:** v2 — revised once against GLaDOS's architecture batch and Izzy's testability HOLD (12 findings); the resolution table is §11. **Implementation:** not before the operator resumes Thursday (token reset); nothing in this document authorizes code, installs or a demo before then.
+**Bead:** aperture-nap3u. **Author:** Wheatley. **Status:** v2.1 — revised once against GLaDOS's architecture batch and Izzy's testability HOLD (12 findings), plus GLaDOS's precision corrections; the resolution table is §11. Gates in §8 are **recommended defaults pending final spec approval** — the operator has not yet chosen them. **Implementation:** not before the operator resumes Thursday (token reset); nothing in this document authorizes code, installs or a demo before then.
 
 Baseline: master `4fb8cad` (v3.2.0 released and canonical 2026-09-06). **verified** = read in that tree by a read-only recon pass; **hypothesis** = not exercised end-to-end; **GATE** = an unresolved product choice that changes tests and must be decided (with the recommendation given) before the phase that depends on it starts.
 
@@ -95,8 +95,8 @@ Checklist gate (§4.7). Archive is a single state transition with an explicit ro
 
 ## 4. Architecture
 
-### 4.1 Names (resolves GATE #7 with a recommendation)
-Canonical seat-name rule, one literal regex used by hub, Rust, presence-hint and the UI: **`^[a-z0-9][a-z0-9_-]{0,30}$` — total length 1–31 characters.** Rationale: 31 stays under the tightest existing gate (presence-hint's 32), under the ≈62-char `sun_path` ceiling with room for `~/.aperture/run/` + `.sock`, and leaves headroom for generated suffixes. Team name ≤ 16, role ≤ 10, optional `-<n>` (n ≤ 99) → `16 + 1 + 10 + 3 = 30 ≤ 31`; the wizard enforces the per-part limits so the composed name can never exceed 31. **Collision handling:** the composed name must not equal (a) an existing registry folder (active or archived team), (b) a coordination-trio name, (c) reserved principals (`operator`, `watchdog`, `shared`), (d) any `_`-prefixed name; duplicates within a team append `-2`, `-3` only when the operator adds two seats of the same role. Boundary fixtures: length 1, 31 (pass), 32 (fail), leading `-`/`_`/digit-then-upper, `.`/`:`/space/`<` (fail), `t1-backend`, `team-fullstack-lead` (pass). **Defense-in-depth seam for the `<` fixture:** the loader (`agent_loader.rs`) applies the same regex and rejects the folder with a warning; the UI additionally escapes `agent.name` before `innerHTML`; the visual fixture injects an invalid name **below the loader** through the `list_agents` test double so the escaping path is exercised even though a real folder can never carry it.
+### 4.1 Names (GATE #7 — proposed design choice, recommended default)
+Proposed canonical seat-name rule (a technical bound, offered as the recommended default), one literal regex used by hub, Rust, presence-hint and the UI: **`^[a-z0-9][a-z0-9_-]{0,30}$` — total length 1–31 characters.** Rationale: 31 stays under the tightest existing gate (presence-hint's 32), under the ≈62-char `sun_path` ceiling with room for `~/.aperture/run/` + `.sock`, and leaves headroom for generated suffixes. Team name ≤ 16, role ≤ 10, optional `-<n>` (n ≤ 99) → `16 + 1 + 10 + 3 = 30 ≤ 31`; the wizard enforces the per-part limits so the composed name can never exceed 31. **Collision handling:** the composed name must not equal (a) an existing registry folder (active or archived team), (b) a coordination-trio name, (c) reserved principals (`operator`, `watchdog`, `shared`), (d) any `_`-prefixed name; duplicates within a team append `-2`, `-3` only when the operator adds two seats of the same role. Boundary fixtures: length 1, 31 (pass), 32 (fail), leading `-`/`_`/digit-then-upper, `.`/`:`/space/`<` (fail), `t1-backend`, `team-fullstack-lead` (pass). **Defense-in-depth seam for the `<` fixture:** the loader (`agent_loader.rs`) applies the same regex and rejects the folder with a warning; the UI additionally escapes `agent.name` before `innerHTML`; the visual fixture injects an invalid name **below the loader** through the `list_agents` test double so the escaping path is exercised even though a real folder can never carry it.
 
 ### 4.2 Where things live
 | Thing | Location | Notes |
@@ -137,14 +137,14 @@ Blocked swap **invariants** (tested): no new owner record, no new token, no new 
 ### 4.6 Permissions, recipients, messaging semantics
 - **Recipient validation** (P0): `send_message.to` is valid iff the name is in the **enabled seat registry** (the same folders `agent_loader` loads, `enabled:true`, plus `operator`) — existence in the registry, **not** a live token, defines a recipient. Messages to an **enabled, never-booted** or **stopped-between-incarnations** seat are stored in BEADS and replayed on that seat's next hello (existing replay path); messages to an **archived/disabled/unknown** seat fail closed with `E_UNKNOWN_RECIPIENT`. A seat can only send as its own authenticated identity (hello token ↔ `AGENT_NAME` must match; mismatch closes with 4002).
 - **BEADS**: a new seat must round-trip `update_task(claim)` and `assignee` through the real `bd` binary (P0 test) — the hub round-trip alone does not prove it.
-- **Authority** (GATE #4, recommendation): swaps whose target model is on the team's **operator-approved fallback list** are authorized by the lead or GLaDOS; any other model, harness change, or budget change needs operator acknowledgement (the dialog waits). Create team: operator via UI, epic filed by GLaDOS after ack. Archive: GLaDOS after the checklist. Delete: nobody.
+- **Authority** (GATE #4 — recommended default, not yet operator-decided): swaps whose target model is on the team's **operator-approved fallback list** are authorized by the lead or GLaDOS; any other model, harness change, or budget change needs operator acknowledgement (the dialog waits). Create team: operator via UI, epic filed by GLaDOS after ack. Archive: GLaDOS after the checklist. Delete: nobody.
 - **Lead as contact:** GLaDOS dispatches to the lead; seats keep the Constitution (no sweeps, await scoped dispatch, process-then-ack).
 
 ### 4.7 Archive — one canonical state
 Archived seats: manifest `enabled:false` **and** the seat folder moved to `~/.claude/aperture/_archived/<team>/<seat>/` (the `_` prefix is already skipped by the loader, `agent_loader.rs:93`) **and** `team.json` moved to `~/.aperture/teams/archive/<team>/`. `just setup` never touches `_`-prefixed dirs, so nothing is resurrected. Preconditions: epic success-metric evidence recorded as `{metric, observed_at, evidence_ref}`; all seat beads closed; review recorded `{reviewer, verdict, at}`; zero live processes for every seat (owner records all `stale` or absent); worktrees clean **or** carrying a `.aperture-protected` marker file. Archive is performed as staging → atomic renames → `state.json = archived`; rollback = the inverse renames (script provided). Same-name reuse is refused while an archived team of that name exists (rename the archive first).
 
 ### 4.8 Constitution and context budget — measured, not promised
-Per-seat structure: `resident.txt` = `constitution` + one role core; everything else lazy; no `/context` inside measured windows. Budgets are **acceptance thresholds on measured tokens**, set from a baseline captured on the first fresh seat of each harness during P1 (fields: first request `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, deduplicated by message id; pinned model; fresh thread proven by id): **target ≤ 1.10 × the Peppy pilot's fresh first request on Claude (60,260 → ≤ 66.3k)** and **≤ 1.10 × the Rex rollout's fresh first request on Codex (34,338 → ≤ 37.8k)**; **first-task growth** (after one scoped task, before any `/context`) ≤ 1.5 × the first request. Byte caps on prompt/resident remain gates, not the acceptance.
+Per-seat structure: `resident.txt` = `constitution` + one role core; everything else lazy; no `/context` inside measured windows. Budgets are **acceptance thresholds on measured tokens**. Definition: first API request `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, deduplicated by message id, fresh thread proven by id, and **the same role, model and reasoning effort as the baseline it is compared with** — a threshold never compares across roles or models. Baselines and thresholds: Claude — the Peppy pilot's fresh first request 60,260 (Opus, 2f847855) → seat target **≤ 1.10 × = 66.3k**; Codex — the Rex figure 34,338 is **provisional** (measured at d671835, before the kickoff fix; superseded by the 5266ad0 fresh result once Izzy records it) → target ≤ 1.10 × the recorded 5266ad0 baseline. **First-task growth ≤ 1.5 × the first request is a proposed budget, not an empirical finding**; it is measured on a fixed fixture task (defined in P1: one scoped backend task with exactly one lazy skill load, no `/context`) so successive runs are comparable. Byte caps on prompt/resident remain gates, not the acceptance.
 
 ---
 
@@ -205,12 +205,12 @@ Sizing (honest): P0 ½ day; P1 1½–2 days (lock/staging semantics are the bulk
 | 1 | Operator-edited presets location | `~/.aperture/teams/presets/`; shipped defaults in repo | P1 |
 | 2 | Personas per role | keep (already preferred) | P1 templates |
 | 3 | Ownership storage | §4.3 lock + generation record; validate on APFS in P1 before relying on it | P1/P3 |
-| 4 | Swap authority | **operator-approved fallback list per team, enforced by lead/GLaDOS; anything else waits for operator ack** | P3 |
+| 4 | Swap authority | recommended default (not yet operator-decided): **operator-approved fallback list per team, enforced by lead/GLaDOS; anything else waits for operator ack** | P3 |
 | 5 | Specialists' future | standing seats stay **temporarily**; retire/re-home in M3 at the operator's timing | M3 |
 | 6 | Foundation demo before UI | only if the operator wants it Thursday | scheduling |
-| 7 | Name ceiling | **`^[a-z0-9][a-z0-9_-]{0,30}$`, 31 chars total, per-part limits 16/10/3** | P0 |
+| 7 | Name ceiling | proposed technical bound (recommended default): **`^[a-z0-9][a-z0-9_-]{0,30}$`, 31 chars total, per-part limits 16/10/3** | P0 |
 
-Gates 4 and 7 must be decided before P0/P3 start; the others may be accepted as recommended or left non-gating.
+Gates 4 and 7 must be decided at final spec approval, before P0/P3 start — until then they are recommended defaults, not decisions; the others may be accepted as recommended or left non-gating.
 
 ## 9. Out of scope (V4.0)
 Multi-machine ownership; tool-level write fencing or credential revocation; embeddings/transcript memory; agent-initiated team creation; cross-team memory policy; automatic destructive cleanup; renaming the coordination trio.
@@ -232,7 +232,8 @@ Multi-machine ownership; tool-level write fencing or credential revocation; embe
 | GLaDOS | "reuse unchanged" overstated | §2 retitled "verified naming compatibility vs required changes" |
 | GLaDOS | budgets need measured totals | §4.8 thresholds from measured baselines (60,260 / 34,338) + first-task growth |
 | GLaDOS | specialists retention is temporary | §1, §5 M1/M3 |
-| GLaDOS | gates with recommendations; name 31; swap policy | §8 (7 gates), §4.1, §4.6 |
+| GLaDOS | gates with recommendations; name 31; swap policy | §8 (7 gates), §4.1, §4.6 — gates 4/7 labelled recommended defaults pending approval |
+| GLaDOS (v2.1) | thresholds need same role/model/effort + input+cache definition; 34,338 provisional; 1.5× is a proposal | §4.8 rewritten accordingly |
 | Izzy 1 | ambiguous regex; `<` fixture unreachable | §4.1 literal regex, boundary fixtures, below-loader injection seam |
 | Izzy 2 | recipients vs per-boot tokens; BEADS round-trip | §4.6 registry-existence semantics with stored/replayed messages; P0 real `bd` test |
 | Izzy 3 | P1 failure semantics | §4.2 staging protocol, `E_*` codes, pending state, rollback residue |
@@ -244,4 +245,4 @@ Multi-machine ownership; tool-level write fencing or credential revocation; embe
 | Izzy 9 | archive contradiction | §4.7 one canonical state (`enabled:false` + `_archived/` move + `archive/`), rollback, evidence schema, marker, same-name |
 | Izzy 10 | no total-token ceiling | §4.8 |
 | Izzy 11 | negative FS/security fixtures | §7 security acceptance (paths, symlinks, modes, partial staging, forged hello, sentinels, source oracle) |
-| Izzy 12 | decisions #4/#7 | §8 gates 4 and 7 with concrete recommendations |
+| Izzy 12 | decisions #4/#7 | §8 gates 4 and 7 with concrete recommended defaults (pending final approval) |
