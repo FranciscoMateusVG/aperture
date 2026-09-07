@@ -699,7 +699,10 @@ async function orchestrate({ phase, readTokenFn, assertContextFn, openForwardFn,
                     readStateFn, publishStateFn, revisionFn]) {
     if (typeof fn !== 'function') throw new Fail(E.BAD_SHAPE);
   }
-  assertReleaseRevision(revisionFn());
+  // Rollback availability must not depend on the candidate branch continuing
+  // to exist. The pin gates forward movement only; restore uses the captured
+  // original metadata and the separately prepared exact-image host artifact.
+  if (phase !== 'restore-metadata') assertReleaseRevision(revisionFn());
   assertContextFn();
   const token = readTokenFn();
   const fwd = openForwardFn();

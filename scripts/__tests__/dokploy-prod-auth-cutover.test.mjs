@@ -238,6 +238,7 @@ test('publish refuses before POST when private deployment state is not exact', a
 test('restore-metadata writes captured env/source/domain only and never deploys', async () => {
   const seen = []; const state = serializeState(compose(), domain());
   const receipt = await orchestrate({ phase: 'restore-metadata', ...deps({
+    revisionFn() { throw new Error('release branch unavailable during rollback'); },
     requestFn: makeRequest({
       composeBody: compose({ branch: RELEASE_BRANCH, autoDeploy: false, env: reconcilePrepareEnv(oldEnv).env }),
       domainBody: domain({ serviceName: 'quiz-incluir-backend-e17b8a', port: 8000, enabled: true }), seen,
