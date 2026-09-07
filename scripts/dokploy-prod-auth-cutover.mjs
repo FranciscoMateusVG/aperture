@@ -732,8 +732,27 @@ async function orchestrate({ phase, readTokenFn, assertContextFn, openForwardFn,
           state = parseState(storedText);
         }
         const expected = reconcilePrepareEnv(state.compose.env).env;
-        if (domain.enabled === true) assertOldPublishedDomain(domain);
-        else assertPreparedDomain(domain);
+        const originalSource = current.branch === state.compose.branch
+          && composeBody.autoDeploy === state.compose.autoDeploy;
+        const releaseSource = current.branch === RELEASE_BRANCH
+          && composeBody.autoDeploy === false;
+        const originalEnv = current.env === state.compose.env;
+        const preparedEnv = current.env === expected;
+        if (domain.enabled === true) {
+          assertOldPublishedDomain(domain);
+          // Before the first mutation, the supported API must still match the
+          // snapshot we are about to rely on. Never overwrite later credential
+          // changes from a stale local state file.
+          if (!originalSource || !originalEnv) throw new Fail(E.PHASE_MISMATCH);
+        } else {
+          assertPreparedDomain(domain);
+          // Legitimate crash-resume points are narrowly enumerated: domain
+          // disabled before source update; source updated before env; or both
+          // updated before the queued deploy. Any other drift stops.
+          if ((!originalSource && !releaseSource) || (!originalEnv && !preparedEnv)) {
+            throw new Fail(E.PHASE_MISMATCH);
+          }
+        }
 
         // Disable first so the exact pre-build service-name validator skips
         // the old frontend key, which is absent from the candidate compose.
@@ -742,8 +761,8 @@ async function orchestrate({ phase, readTokenFn, assertContextFn, openForwardFn,
             serviceName: OLD_DOMAIN_SERVICE, port: OLD_DOMAIN_PORT, enabled: false,
           })));
         }
-        await call(requestSpec('source'));
-        if (current.env !== expected || current.branch !== RELEASE_BRANCH) {
+        if (!releaseSource) await call(requestSpec('source'));
+        if (!preparedEnv) {
           await call(requestSpec('env', expected));
         }
         await call(requestSpec('deploy'));

@@ -171,6 +171,40 @@ test('prepare snapshots before first mutation, disables old domain, pins source,
   assert.equal(parseState(saved).compose.env, oldEnv);
 });
 
+test('prepare resumes only exact crash states and never overwrites credential drift', async () => {
+  const state = serializeState(compose(), domain());
+  const cases = [
+    { // domain disabled before source update
+      composeBody: compose(), expectedPosts: 3,
+    },
+    { // source updated before env update
+      composeBody: compose({ branch: RELEASE_BRANCH, autoDeploy: false }), expectedPosts: 2,
+    },
+    { // source and env updated before deploy queue call
+      composeBody: compose({ branch: RELEASE_BRANCH, autoDeploy: false,
+        env: reconcilePrepareEnv(oldEnv).env }), expectedPosts: 1,
+    },
+  ];
+  for (const c of cases) {
+    const seen = [];
+    assert.equal(await orchestrate({ phase: 'prepare', ...deps({
+      requestFn: makeRequest({ composeBody: c.composeBody,
+        domainBody: domain({ enabled: false }), seen }),
+      readStateFn() { return state; }, publishStateFn() {},
+    }) }), OK_PREPARE);
+    assert.equal(seen.filter((x) => x.method === 'POST').length, c.expectedPosts);
+  }
+
+  const seen = [];
+  await assert.rejects(orchestrate({ phase: 'prepare', ...deps({
+    requestFn: makeRequest({ composeBody: compose({
+      env: oldEnv.replace('QUIZ_DB_PASSWORD=fixture_a', 'QUIZ_DB_PASSWORD=changed'),
+    }), domainBody: domain({ enabled: false }), seen }),
+    readStateFn() { return state; }, publishStateFn() {},
+  }) }), /E_PHASE_MISMATCH/);
+  assert.equal(seen.some((x) => x.method === 'POST'), false);
+});
+
 test('wrong project stops before snapshot and every mutation', async () => {
   const seen = []; let published = false;
   await assert.rejects(orchestrate({ phase: 'prepare', ...deps({
