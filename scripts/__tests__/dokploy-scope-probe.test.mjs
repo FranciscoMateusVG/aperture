@@ -24,6 +24,7 @@ import {
   withAbsoluteDeadline, classifyRuntime, assertSafeRuntime, assertQuizScope,
   orchestrate, SSH_ARGS, E, Fail, OK_RECEIPT,
   QUIZ_PROJECT_ID, QUIZ_ORG_ID, TOKEN_KEY, P_PROJECT_ONE,
+  classifyOwnedDir, buildRequestOptions,
 } from '../dokploy-scope-probe.mjs';
 
 const run = promisify(execFile);
@@ -86,13 +87,31 @@ test('SSH context is asserted BEFORE the token is ever read', async () => {
   assert.deepEqual(calls, ['context'], 'a bad SSH context must stop before the secret is read');
 });
 
-test('the token is passed ONLY as x-api-key, never in a URL or another header', async () => {
+test('REAL header proof: exact GET path and exact header set, token only in x-api-key', () => {
+  // The previous version of this test asserted the claim against the injected
+  // seam, which observes {token} BEFORE any header is constructed — it could
+  // not have failed. This asserts the actual wire options instead.
+  const opts = buildRequestOptions({ socketPath: '/s', token: TOKEN_CANARY, timeoutMs: 1000 });
+  assert.equal(opts.method, 'GET');
+  assert.equal(opts.path, P_PROJECT_ONE + '?projectId=' + QUIZ_PROJECT_ID);
+  assert.deepEqual(Object.keys(opts.headers).sort(), ['accept', 'x-api-key']);
+  assert.equal(opts.headers['x-api-key'], TOKEN_CANARY);
+  assert.ok(!opts.path.includes(TOKEN_CANARY), 'token must never enter the path');
+  for (const [k, v] of Object.entries(opts.headers)) {
+    if (k === 'x-api-key') continue;
+    assert.ok(!String(v).includes(TOKEN_CANARY), 'token leaked into header ' + k);
+  }
+  assert.ok(!('authorization' in opts.headers) && !('cookie' in opts.headers));
+});
+
+test('composed run: the seam args build exactly those wire options', async () => {
   const h = harness({ body: { projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID } });
   await orchestrate(h.args);
-  const opts = h.seen[0];
-  assert.equal(opts.token, TOKEN_CANARY);
+  const opts = buildRequestOptions(h.seen[0]);
   assert.equal(opts.socketPath, '/fake/socket');
-  assert.ok(!JSON.stringify({ p: opts.socketPath }).includes(TOKEN_CANARY));
+  assert.equal(opts.path, P_PROJECT_ONE + '?projectId=' + QUIZ_PROJECT_ID);
+  assert.deepEqual(Object.keys(opts.headers).sort(), ['accept', 'x-api-key']);
+  assert.equal(opts.headers['x-api-key'], TOKEN_CANARY);
 });
 
 test('a wrong organization fails and still cleans up the forward', async () => {
@@ -124,6 +143,44 @@ test('canary never appears in any failure surface of the composed run', async ()
   const e = await orchestrate(h.args).then(() => null, (err) => err);
   assert.equal(e.code, E.PROJECT_MISMATCH);
   assert.ok(!surface(e).includes(TOKEN_CANARY), 'token canary must not leak');
+});
+
+const LATE = { projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID };
+test('DEADLINE with an active forward: E_DEADLINE and cleanup exactly once', { timeout: 5000 }, async () => {
+  let cleaned = 0;
+  let requested = 0;
+  await assert.rejects(() => orchestrate({
+    deadlineMs: 20,
+    assertContextFn: () => true,
+    readTokenFn: () => TOKEN_CANARY,
+    // forward is UP — this is the case a process.exit timer would strand
+    openForwardFn: () => ({ ready: Promise.resolve('/s'), cleanup: () => { cleaned += 1; } }),
+    // Settles LATE rather than never: if the deadline is broken this test FAILS
+    // cleanly instead of hanging. A hung test is cancelled by the runner and
+    // silently drops out of the count, so "fail 0" would stay green on a
+    // broken deadline — a gate that disappears is not a gate.
+    requestFn: () => { requested += 1; return new Promise((r) => setTimeout(() => r(LATE), 400)); },
+  }), (e) => e.code === E.DEADLINE);
+  assert.equal(requested, 1);
+  assert.equal(cleaned, 1, 'cleanup must run exactly once when the deadline wins');
+  await new Promise((r) => setTimeout(r, 40)); // a late loser must not throw
+});
+
+test('a deadline that does NOT fire leaves the success path intact', async () => {
+  const h = harness({ body: { projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID } });
+  assert.equal(await orchestrate({ ...h.args, deadlineMs: 30_000 }), OK_RECEIPT);
+  assert.equal(h.cleanedCount(), 1);
+});
+
+// ══ Directory ownership policy (C1/C4a) ═════════════════════════════════
+const DIR = { isDirectory: () => true, uid: process.getuid(), mode: 0o40700 };
+test('owned-dir policy accepts 0700 self-owned, refuses group/other bits and non-dirs', () => {
+  assert.equal(classifyOwnedDir(DIR), true);
+  assert.equal(classifyOwnedDir({ ...DIR, mode: 0o40750 }), false, 'group-readable refused');
+  assert.equal(classifyOwnedDir({ ...DIR, mode: 0o40707 }), false, 'other bits refused');
+  assert.equal(classifyOwnedDir({ ...DIR, uid: process.getuid() + 1 }), false, 'foreign uid refused');
+  assert.equal(classifyOwnedDir({ ...DIR, isDirectory: () => false }), false, 'symlink/file refused');
+  assert.equal(classifyOwnedDir(null), false);
 });
 
 // ══ Token file parsing ══════════════════════════════════════════════════
@@ -193,12 +250,21 @@ test('scope assertion requires exact project AND org', () => {
 });
 
 // ══ Deadline ════════════════════════════════════════════════════════════
-test('deadline beats a synchronous abort callback and settles once', async () => {
+test('deadline beats a synchronous abort callback and settles once', { timeout: 5000 }, async () => {
   let captured = null; let aborts = 0;
-  await assert.rejects(() => withAbsoluteDeadline({
-    ms: 5, abort: () => { aborts += 1; if (captured) captured(new Fail(E.NETWORK)); },
-    start: (ok, bad) => { captured = bad; },
-  }), (e) => e.code === E.DEADLINE);
+  // Self-bounded: a broken deadline strands the promise (the abort path marks
+  // it settled, so no late success can rescue it). Racing against our own
+  // sentinel turns that stall into a clean FAILURE instead of a cancelled test
+  // that silently drops out of the count.
+  const outcome = await Promise.race([
+    withAbsoluteDeadline({
+      ms: 5,
+      abort: () => { aborts += 1; if (captured) captured(new Fail(E.NETWORK)); },
+      start: (ok, bad) => { captured = bad; },
+    }).then(() => 'RESOLVED', (e) => e.code),
+    new Promise((res) => setTimeout(() => res('HUNG'), 300)),
+  ]);
+  assert.equal(outcome, E.DEADLINE, 'deadline must reject with E_DEADLINE, not stall');
   assert.equal(aborts, 1);
 });
 
@@ -255,6 +321,31 @@ test('socket readiness uses lstat only — no HTTP probe crosses the forward', (
   assert.ok(fwd.includes('lstatSync(sock)'), 'readiness is lstat-based');
   assert.ok(fwd.includes('isSocket()'), 'requires an actual socket');
   assert.ok(!fwd.includes('http.request'), 'no HTTP request may be made during readiness');
+});
+
+test('C1: temp dir is mkdtemp under a VERIFIED parent, with no pre-delete', () => {
+  const fwd = CODE.slice(CODE.indexOf('function openForward'), CODE.indexOf('function buildRequestOptions'));
+  assert.ok(fwd.includes('mkdtempSync(join(TEMP_PARENT'), 'unpredictable dir name');
+  assert.ok(fwd.includes('assertOwnedDir(TEMP_PARENT'), 'parent verified before use');
+  assert.ok(!fwd.includes('process.pid'), 'no predictable pid-derived path');
+  const preDelete = fwd.indexOf('rmSync');
+  const create = fwd.indexOf('mkdtempSync');
+  assert.ok(preDelete > create, 'nothing may be removed before this run creates it');
+});
+
+test('C4a: the fixed token parent is validated before the token is read', () => {
+  const rt = CODE.slice(CODE.indexOf('function readToken'), CODE.indexOf('function parseTokenFile'));
+  assert.ok(rt.includes('assertOwnedDir(TOKEN_PARENT'), 'parent checked');
+  assert.ok(rt.indexOf('assertOwnedDir') < rt.indexOf('openSync'), 'checked BEFORE opening');
+});
+
+test('C2: no process.exit anywhere — it would skip the cleanup finally', () => {
+  assert.ok(!CODE.includes('process.exit('), 'must use exitCode, never process.exit');
+});
+
+test('C3: ssh reads no config files (-F none)', () => {
+  const i = SSH_ARGS.indexOf('-F');
+  assert.ok(i >= 0 && SSH_ARGS[i + 1] === 'none', 'must pass -F none');
 });
 
 test('temp parent is pwd-derived, never os.tmpdir()', () => {

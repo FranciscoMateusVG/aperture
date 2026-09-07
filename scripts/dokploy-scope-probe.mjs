@@ -30,7 +30,7 @@
  *   after the reference drops, and this process cannot scrub it.
  */
 
-import { openSync, fstatSync, lstatSync, readSync, closeSync, mkdirSync,
+import { openSync, fstatSync, lstatSync, readSync, closeSync, mkdirSync, mkdtempSync,
          rmSync, constants as FS } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -41,7 +41,8 @@ import http from 'node:http';
 // ─── COMPILED CONSTANTS. No argument, env var, or override reaches any of it.
 const ACCOUNT = userInfo();
 const HOME = ACCOUNT.homedir;                       // pwd-derived, not $HOME
-const TOKEN_PATH = join(HOME, 'Downloads', 'secret copy.txt');
+const TOKEN_PARENT = join(HOME, 'Downloads');
+const TOKEN_PATH = join(TOKEN_PARENT, 'secret copy.txt');
 const TOKEN_KEY = 'DOKPLOY_TOKEN_INCLUIR_XEROX';
 
 // Temp parent lives under an owned, already-verified directory — NOT
@@ -118,7 +119,26 @@ function assertSafeRuntime() {
 }
 
 // ─── Token file: lstat, then open O_NOFOLLOW and re-verify the SAME fd.
+// Pure ownership policy for a directory we are about to trust. Exported so the
+// policy is provable without touching the filesystem. A symlink fails here
+// because lstat of a symlink is not a directory.
+function classifyOwnedDir(st) {
+  return Boolean(st) && st.isDirectory() && st.uid === ACCOUNT.uid
+    && (st.mode & 0o077) === 0;
+}
+
+function assertOwnedDir(path, code) {
+  let st;
+  try { st = lstatSync(path); } catch { throw new Fail(code); }
+  if (!classifyOwnedDir(st)) throw new Fail(code);
+  return true;
+}
+
 function readToken() {
+  // The fixed source parent must be validated too: the file checks below are
+  // worthless if a writable parent lets someone swap the file underneath.
+  // Fail closed on drift rather than trusting a once-observed state.
+  assertOwnedDir(TOKEN_PARENT, E.TOKEN_PERMS);
   let pre;
   try { pre = lstatSync(TOKEN_PATH); } catch { throw new Fail(E.TOKEN_MISSING); }
   if (pre.isSymbolicLink()) throw new Fail(E.TOKEN_PERMS);
@@ -245,6 +265,10 @@ function assertSshContext() {
 // an explicit identity with IdentitiesOnly, an explicit known_hosts file, and
 // strict host-key checking that can only verify — never prompt or accept-new.
 const SSH_ARGS = [
+  // -F none: read NO config files. Without it, mutable per-user/system
+  // ssh_config can still inject ProxyJump/ProxyCommand/HostName/control paths,
+  // so the pins below would not actually pin the connection.
+  '-F', 'none',
   '-N',
   '-o', 'BatchMode=yes',
   '-o', 'StrictHostKeyChecking=yes',
@@ -261,12 +285,14 @@ const SSH_ARGS = [
 // Readiness is decided by lstat on the socket ONLY. No HTTP probe: project.one
 // must be the SOLE request that ever crosses this forward.
 function openForward() {
+  // No pre-delete of a predictable path: destroying a path before proving this
+  // run owns it is a destructive act on someone else's file. mkdirSync is
+  // idempotent and does NOT repair perms on an existing dir, so the parent is
+  // verified explicitly, then mkdtemp yields a fresh 0700 dir owned by this run.
   mkdirSync(TEMP_PARENT, { recursive: true, mode: 0o700 });
-  const dir = join(TEMP_PARENT, `.dkscope-${process.pid}`);
-  rmSync(dir, { recursive: true, force: true });
-  mkdirSync(dir, { mode: 0o700 });
-  const dst = lstatSync(dir);
-  if (!dst.isDirectory() || dst.uid !== ACCOUNT.uid || (dst.mode & 0o077) !== 0) {
+  assertOwnedDir(TEMP_PARENT, E.FORWARD_FAILED);
+  const dir = mkdtempSync(join(TEMP_PARENT, 'dkscope-'));
+  if (!classifyOwnedDir(lstatSync(dir))) {
     rmSync(dir, { recursive: true, force: true });
     throw new Fail(E.FORWARD_FAILED);
   }
@@ -304,6 +330,19 @@ function openForward() {
 
 // ─── The ONE request. Private agent; the ambient globalAgent is never used, so
 // a patched global cannot observe this traffic even with a stock constructor.
+// Pure: the exact wire shape of the ONE request. Exported so tests can assert
+// the real path and header set. The seam alone cannot prove this — it observes
+// {token} before any header exists.
+function buildRequestOptions({ socketPath, token, timeoutMs }) {
+  return {
+    socketPath,
+    method: 'GET',
+    path: `${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`,
+    headers: { accept: 'application/json', 'x-api-key': token },
+    timeout: timeoutMs,
+  };
+}
+
 function requestProjectOne({ socketPath, token, timeoutMs }) {
   let active = null;
   return withAbsoluteDeadline({
@@ -312,12 +351,8 @@ function requestProjectOne({ socketPath, token, timeoutMs }) {
     start: (ok, bad) => {
       const agent = new http.Agent({ keepAlive: false, maxSockets: 1 });
       const req = http.request({
-        socketPath,
+        ...buildRequestOptions({ socketPath, token, timeoutMs }),
         agent,
-        method: 'GET',
-        path: `${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`,
-        headers: { accept: 'application/json', 'x-api-key': token },
-        timeout: timeoutMs,
       }, (res) => {
         try { classifyStatus(res.statusCode); }
         catch (e) { res.destroy(); bad(e); return; }
@@ -336,15 +371,29 @@ function requestProjectOne({ socketPath, token, timeoutMs }) {
 // provable in tests. None of the injected functions can discover the real
 // reader, the real host, or the real transport — they are supplied by the
 // caller, and the live path below supplies the private ones.
-async function orchestrate({ readTokenFn, assertContextFn, openForwardFn, requestFn }) {
+async function orchestrate({ readTokenFn, assertContextFn, openForwardFn, requestFn,
+                             deadlineMs = ACTION_DEADLINE_MS }) {
   assertContextFn();
   const token = readTokenFn();
   const fwd = openForwardFn();
+  let timer = null;
   try {
-    const socketPath = await fwd.ready;
-    const body = await requestFn({ socketPath, token, timeoutMs: REQUEST_TIMEOUT_MS });
-    assertQuizScope(body);
+    // The action deadline lives HERE, not in a process.exit timer: exiting the
+    // process skips this finally and can strand the ssh child and its socket
+    // dir. Losing the race rejects normally, so cleanup still runs exactly once.
+    const budget = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Fail(E.DEADLINE)), deadlineMs);
+      timer.unref?.();
+    });
+    const work = (async () => {
+      const socketPath = await fwd.ready;
+      const body = await requestFn({ socketPath, token, timeoutMs: REQUEST_TIMEOUT_MS });
+      assertQuizScope(body);
+    })();
+    work.catch(() => { /* a late loser must not raise an unhandled rejection */ });
+    await Promise.race([work, budget]);
   } finally {
+    if (timer) clearTimeout(timer);
     fwd.cleanup();
   }
   return OK_RECEIPT;
@@ -356,11 +405,6 @@ async function main() {
     process.exitCode = 2;
     return;
   }
-  const deadline = setTimeout(() => {
-    process.stdout.write(E.DEADLINE + '\n');
-    process.exit(1);
-  }, ACTION_DEADLINE_MS);
-  deadline.unref?.();
   try {
     assertSafeRuntime();
     const receipt = await orchestrate({
@@ -369,10 +413,8 @@ async function main() {
       openForwardFn: openForward,
       requestFn: requestProjectOne,
     });
-    clearTimeout(deadline);
     process.stdout.write(receipt + '\n');
   } catch (err) {
-    clearTimeout(deadline);
     process.stdout.write((err instanceof Fail ? err.code : E.INTERNAL) + '\n');
     process.exitCode = 1;
   }
@@ -385,5 +427,6 @@ export {
   parseTokenFile, classifyStatus, parseBounded, consumeBoundedStream,
   withAbsoluteDeadline, classifyRuntime, assertSafeRuntime, assertQuizScope,
   E, Fail, OK_RECEIPT, QUIZ_PROJECT_ID, QUIZ_ORG_ID, TOKEN_KEY, P_PROJECT_ONE,
+  classifyOwnedDir, buildRequestOptions,
   orchestrate, SSH_ARGS,
 };
