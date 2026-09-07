@@ -38,7 +38,7 @@ const ENV_ID = 'env_staging_QUIZ_1';
 const COMPOSE_ID = 'cmp_staging_QUIZ_1';
 const NONCE = 'a1b2c3d4e5f60718';
 const APPNAME_SUFFIXED = intendedAppName(NONCE) + '-ab12cd';
-const GOOD_LSREMOTE = '26d6a9eb25b8653356d1aae4659382a62d479c41\trefs/heads/aperture-ztid5-staging\n';
+const GOOD_LSREMOTE = '22fcd937c30edd418918aca2288dd3fa1f0cc991\trefs/heads/aperture-ztid5-staging\n';
 
 const surface = (e) => {
   let j = ''; try { j = JSON.stringify(e); } catch { j = ''; }
@@ -787,7 +787,7 @@ test('C4: the revision gate accepts only the exact reviewed SHA on the exact bra
   assert.equal(assertInfraRevision(GOOD_LSREMOTE), true);
   for (const bad of [
     '0000000000000000000000000000000000000000\trefs/heads/aperture-ztid5-staging\n', // moved
-    '26d6a9eb25b8653356d1aae4659382a62d479c41\trefs/heads/main\n',                    // wrong branch
+    '22fcd937c30edd418918aca2288dd3fa1f0cc991\trefs/heads/main\n',                    // wrong branch
     '',                                                                                // deleted
     'not-a-sha\trefs/heads/aperture-ztid5-staging\n',
     GOOD_LSREMOTE + GOOD_LSREMOTE,                                                     // ambiguous
