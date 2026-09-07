@@ -416,3 +416,67 @@ ssh xerox 'docker exec dokploy-postgres.1.zos6qj3u1fm7t10d72r5yzpc0 psql -U dokp
 ```
 
 This returns every public host bound to the active Incluir Main App compose. Always run this discovery once at the start of a verify chain if the URL isn't already banked above.
+
+---
+
+## 14. Dokploy v0.30.2 deploy mechanics — read from the running build (2026-09-07)
+
+These were verified by grepping the running Dokploy container's compiled artifacts, not assumed. They determine the only safe ordering for a domain/service cutover.
+
+### The domain validator runs PRE-BUILD and only sees enabled rows
+
+In `/app/.next/server/chunks/5194.js`, while Traefik labels are written into the compose object:
+
+```
+for (let e of b.filter(a => a.enabled)) {
+  if (!serviceName) throw Error(`Domain "${host}" is missing a service name`);
+  if (!c?.services?.[serviceName])
+    throw Error(`Domain "${host}" is attached to service "${serviceName}" which does not exist in the compose`);
+}
+```
+
+Three consequences:
+1. It throws **before any build**, so a rejected deploy produces no build output and leaves `composeStatus=error`.
+2. It iterates **only enabled** rows — a disabled domain is skipped and cannot block a deploy.
+3. The lookup is an exact key match against the compose services map; no prefix matching.
+
+### The deploy command
+
+`/app/.next/server/chunks/8772.js` builds:
+
+```
+compose -p <appName> -f <composePath> up -d --build --remove-orphans
+```
+
+`--remove-orphans` is **unconditional**. `--force-recreate` does not appear anywhere. So any service removed from the compose has its container deleted on the next successful deploy.
+
+### Labels are baked at deploy time
+
+Editing a domain row does **not** move live traffic. The running container keeps the labels it was created with until a deploy replaces it. A row update must therefore be followed by a deploy to take effect.
+
+### Safe cutover ordering (retargeting a domain to a different service)
+
+Derived from the three facts above:
+
+1. Set required env first (a service that fails validation on startup will not come up).
+2. Retarget the domain row **before** deploying — the validator then passes, and live traffic is unaffected because labels are still baked into the old container.
+3. Deploy. This is the irreversible step: orphaned services are removed and new labels take effect.
+4. Verify from **inside** the new container before trusting it.
+
+The inverse order fails: deploying while the domain still targets a service absent from the compose is rejected pre-build, which is exactly the failure mode that blocked Quiz production deploys from 2026-09-05.
+
+Alternative when you must verify before any public exposure: disable the domain row (fact 2 removes it from validation), deploy privately, verify internally, then re-enable/retarget and **deploy again** to bake the labels. Costs a longer outage; buys verification before traffic.
+
+### autoDeploy
+
+`autoDeploy` is a `z.boolean()` in the compose schema, so `compose.update` can set it. As of 2026-09-07 there is **no `dokploy` CLI installed on the host**, so the dashboard is the practical native path unless an already-reviewed action exposes the field.
+
+### Verify from the source side, not from config
+
+A compose file, a rendered `docker compose config`, and a review of both can all be correct while the deployed container resolves a name somewhere else entirely — Dokploy injects `dokploy-network` at deploy time, and an alias that is unique in your project may collide with another service there. Always confirm from inside the running container:
+
+```
+docker exec <service> getent ahosts <configured-host>
+```
+
+and compare against the intended target's actual address. On 2026-09-07 this check caught a staging service whose auth was resolving to the **production** hono because production held the same alias on the shared network. Nothing in the source or the rendered config showed it.
