@@ -142,6 +142,13 @@ test('DB verification failure stops seed and cleans both resources', async () =>
   assert.equal(h.fwdClean(), 1); assert.equal(h.treeClean(), 1);
 });
 
+test('synchronous forward construction failure still removes the private run tree', async () => {
+  const h = harness({ failAt: 'forward' });
+  await assert.rejects(() => orchestrate(h.args), Fail);
+  assert.equal(h.fwdClean(), 0, 'no forward handle existed');
+  assert.equal(h.treeClean(), 1, 'created run tree must not survive a forward failure');
+});
+
 test('seed failure is not retried and resources clean exactly once', async () => {
   const h = harness({ failAt: 'seed' });
   await assert.rejects(() => orchestrate(h.args), Fail);

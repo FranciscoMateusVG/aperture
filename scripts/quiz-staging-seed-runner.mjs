@@ -265,23 +265,28 @@ function createRunTree(source) {
   mkdirSync(TEMP_PARENT, { recursive: true, mode: 0o700 });
   assertOwnedDir(TEMP_PARENT, E.LOCAL_CONTEXT);
   const dir = mkdtempSync(join(TEMP_PARENT, 'quiz-seed-'));
-  if (!ownedDir(lstatSync(dir))) throw new Fail(E.LOCAL_CONTEXT);
-  const app = join(dir, 'apps', 'hono-app');
-  const scripts = join(app, 'scripts');
-  mkdirSync(scripts, { recursive: true, mode: 0o700 });
-  writeFileSync(join(app, 'package.json'), '{"type":"module"}\n', { mode: 0o600, flag: 'wx' });
-  writeFileSync(join(scripts, 'seed-e2e.ts'), source, { mode: 0o600, flag: 'wx' });
-  symlinkSync(APP_MODULES, join(app, 'node_modules'), 'dir');
-  const verify = [
-    "import pg from 'pg';",
-    "const c=new pg.Client({connectionString:process.env.DATABASE_URL,connectionTimeoutMillis:5000,query_timeout:5000});",
-    "try{await c.connect();const r=await c.query(\"select current_database() db,current_user usr,(select count(*)::int from information_schema.tables where table_schema='public' and table_type='BASE TABLE') tables\");const x=r.rows[0];if(x.db!=='incluir'||x.usr!=='e2e'||x.tables!==67)process.exitCode=1;}catch{process.exitCode=1;}finally{await c.end().catch(()=>{});}",
-  ].join('\n');
-  writeFileSync(join(app, 'verify-db.mjs'), verify, { mode: 0o600, flag: 'wx' });
-  return {
-    dir, app, seed: join(scripts, 'seed-e2e.ts'), verify: join(app, 'verify-db.mjs'),
-    cleanup: () => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* cleanup */ } },
-  };
+  try {
+    if (!ownedDir(lstatSync(dir))) throw new Fail(E.LOCAL_CONTEXT);
+    const app = join(dir, 'apps', 'hono-app');
+    const scripts = join(app, 'scripts');
+    mkdirSync(scripts, { recursive: true, mode: 0o700 });
+    writeFileSync(join(app, 'package.json'), '{"type":"module"}\n', { mode: 0o600, flag: 'wx' });
+    writeFileSync(join(scripts, 'seed-e2e.ts'), source, { mode: 0o600, flag: 'wx' });
+    symlinkSync(APP_MODULES, join(app, 'node_modules'), 'dir');
+    const verify = [
+      "import pg from 'pg';",
+      "const c=new pg.Client({connectionString:process.env.DATABASE_URL,connectionTimeoutMillis:5000,query_timeout:5000});",
+      "try{await c.connect();const r=await c.query(\"select current_database() db,current_user usr,(select count(*)::int from information_schema.tables where table_schema='public' and table_type='BASE TABLE') tables\");const x=r.rows[0];if(x.db!=='incluir'||x.usr!=='e2e'||x.tables!==67)process.exitCode=1;}catch{process.exitCode=1;}finally{await c.end().catch(()=>{});}",
+    ].join('\n');
+    writeFileSync(join(app, 'verify-db.mjs'), verify, { mode: 0o600, flag: 'wx' });
+    return {
+      dir, app, seed: join(scripts, 'seed-e2e.ts'), verify: join(app, 'verify-db.mjs'),
+      cleanup: () => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* cleanup */ } },
+    };
+  } catch {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* cleanup */ }
+    throw new Fail(E.LOCAL_CONTEXT);
+  }
 }
 
 function runHidden(executable, args, env, timeoutMs, code) {
@@ -324,16 +329,17 @@ async function orchestrate({ assertLocalFn, assertSshFn, topologyFn, escrowFn,
   const topology = topologyFn();       // target proof BEFORE secret read
   const password = escrowFn();
   const source = sourceFn();
-  const tree = treeFn(source);
-  const fwd = forwardFn(topology);
+  let tree = null; let fwd = null;
   try {
+    tree = treeFn(source);
+    fwd = forwardFn(topology);
     await fwd.ready;
     const env = childEnvironment(password);
     await runVerifyFn(tree, env);
     await runSeedFn(tree, env);
   } finally {
-    fwd.cleanup();
-    tree.cleanup();
+    fwd?.cleanup();
+    tree?.cleanup();
   }
   return OK_RECEIPT;
 }
