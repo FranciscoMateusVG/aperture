@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -341,6 +341,23 @@ test('C4a: the fixed token parent is validated before the token is read', () => 
 
 test('C2: no process.exit anywhere — it would skip the cleanup finally', () => {
   assert.ok(!CODE.includes('process.exit('), 'must use exitCode, never process.exit');
+});
+
+// OFFLINE: `ssh -G` resolves effective config and EXITS. It opens no
+// connection, authenticates nothing and creates no socket. This is the one
+// property the pure and source tests cannot see: whether the composed argv
+// actually yields the forward we intend. ClearAllForwardings=yes passed every
+// source-level check while silently deleting the -L.
+test('C3b: composed argv yields EXACTLY one localforward, to 127.0.0.1:3000', () => {
+  const sock = '/tmp/dkscope-effective-config-probe';
+  const argv = ['-G', ...SSH_ARGS, '-L', sock + ':127.0.0.1:3000', 'ubuntu@100.85.254.44'];
+  const out = execFileSync('/usr/bin/ssh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const fwd = out.split('\n').filter((l) => /^localforward /i.test(l.trim()));
+  assert.equal(fwd.length, 1, 'expected exactly one localforward, got: ' + JSON.stringify(fwd));
+  assert.match(fwd[0].trim(), /^localforward \/tmp\/dkscope-effective-config-probe \[127\.0\.0\.1\]:3000$/);
+  const clears = out.split('\n').filter((l) => /^clearallforwardings /i.test(l.trim()));
+  assert.deepEqual(clears.map((l) => l.trim()), ['clearallforwardings no'],
+    'ClearAllForwardings must resolve to no; yes deletes our own -L');
 });
 
 test('C3: ssh reads no config files (-F none)', () => {

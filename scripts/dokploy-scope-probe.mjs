@@ -265,6 +265,11 @@ function assertSshContext() {
 // an explicit identity with IdentitiesOnly, an explicit known_hosts file, and
 // strict host-key checking that can only verify — never prompt or accept-new.
 const SSH_ARGS = [
+  // ClearAllForwardings is deliberately ABSENT. Setting it to yes also clears
+  // the -L below (verified on this host's OpenSSH_9.9p2 via `ssh -G`: with it,
+  // no localforward is emitted at all), so ssh would authenticate and then
+  // never create the socket. -F none is the actual control against
+  // config-injected forwardings: no config file is read in the first place.
   // -F none: read NO config files. Without it, mutable per-user/system
   // ssh_config can still inject ProxyJump/ProxyCommand/HostName/control paths,
   // so the pins below would not actually pin the connection.
@@ -275,7 +280,6 @@ const SSH_ARGS = [
   '-o', 'PasswordAuthentication=no',
   '-o', 'KbdInteractiveAuthentication=no',
   '-o', 'PermitLocalCommand=no',
-  '-o', 'ClearAllForwardings=yes',
   '-o', 'ExitOnForwardFailure=yes',
   '-o', 'IdentitiesOnly=yes',
   '-o', `UserKnownHostsFile=${SSH_KNOWN_HOSTS}`,
