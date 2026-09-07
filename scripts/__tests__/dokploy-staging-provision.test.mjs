@@ -19,6 +19,7 @@ import {
   assertComposeIdentity, composeMatchesTarget, projectDomainRows,
   domainMatchesTarget, classifyDomainState, buildRequestOptions,
   bodyComposeCreate, bodyComposeSource, bodyDomainCreate, bodyComposeDeploy,
+  bodyEnvironmentCreate, projectCreatedEnvironment,
   extractComposeId, generateStagingEnv, envToBlock, parseEscrowBlock, ESCROW_KEYS,
   escrowDecision, assertAdoptable, isUntouchedStub, assertId, assertInfraRevision,
   intendedAppName, appNameCarriesNonce,
@@ -26,6 +27,7 @@ import {
   QUIZ_PROJECT_ID, QUIZ_ORG_ID,
   PROD_DENYLIST, COMPOSE_APPNAME, DOMAIN_HOST, DOMAIN_PORT, DOMAIN_SERVICE,
   INFRA_BRANCH, PINNED_HONO_IMAGE_ID, P_PROJECT_ONE, P_COMPOSE_ONE,
+  P_ENVIRONMENT_CREATE, DEFAULT_COMPOSE_PATH,
   P_COMPOSE_CREATE, P_COMPOSE_UPDATE, P_DOMAIN_BY_COMPOSE, P_DOMAIN_CREATE,
   P_COMPOSE_DEPLOY,
 } from '../dokploy-staging-provision.mjs';
@@ -72,11 +74,13 @@ const DOMAIN_ROW = {
 };
 
 function harness({ prior = null, intent = { nonce: NONCE }, existingRows = [], domains = [],
-                   composeRow = COMPOSE_ROW, failAt = null, lsRemote = GOOD_LSREMOTE } = {}) {
+                   composeRow = COMPOSE_ROW, failAt = null, lsRemote = GOOD_LSREMOTE,
+                   projectResponses = null, environmentRow = null } = {}) {
   const calls = [];
   const escrowReads = [];
   const savedBindings = [];
   let cleaned = 0;
+  let projectRead = 0;
   const args = {
     assertContextFn: () => { calls.push('context'); return true; },
     readTokenFn: () => { calls.push('readToken'); return TOKEN_CANARY; },
@@ -94,7 +98,16 @@ function harness({ prior = null, intent = { nonce: NONCE }, existingRows = [], d
       const key = path.split('?')[0];
       calls.push(`${method} ${key}`);
       if (failAt === key) return Promise.reject(new Fail(E.UPSTREAM_STATUS));
-      if (key === P_PROJECT_ONE) return Promise.resolve(projectBody({ composes: existingRows }));
+      if (key === P_PROJECT_ONE) {
+        const body = projectResponses
+          ? projectResponses[Math.min(projectRead++, projectResponses.length - 1)]
+          : projectBody({ composes: existingRows });
+        return Promise.resolve(body);
+      }
+      if (key === P_ENVIRONMENT_CREATE) return Promise.resolve(environmentRow ?? {
+        environmentId: ENV_ID, name: 'staging', projectId: QUIZ_PROJECT_ID,
+        isDefault: false, env: `LEAK=${SECRET_CANARY}`,
+      });
       if (key === P_COMPOSE_ONE) return Promise.resolve(composeRow);
       if (key === P_COMPOSE_CREATE) return Promise.resolve({ composeId: COMPOSE_ID });
       if (key === P_DOMAIN_BY_COMPOSE) return Promise.resolve(domains);
@@ -289,7 +302,8 @@ test('RECOVERY: create succeeds, binding write fails, second run adopts it', asy
 
   // Run 2: no local binding, one suffixed orphan present, escrow REUSED.
   const h2 = harness({ existingRows: EXISTING, prior: null,
-                       composeRow: { ...COMPOSE_ROW, repository: null, owner: null, branch: null } });
+                       composeRow: { ...COMPOSE_ROW, composePath: DEFAULT_COMPOSE_PATH,
+                                     repository: null, owner: null, branch: null } });
   h2.args.escrowFn = () => ({ env: { ...ESCROW_ENV }, reused: true });
   const sent = [];
   const inner = h2.args.requestFn;
@@ -306,7 +320,7 @@ test('RECOVERY: create succeeds, binding write fails, second run adopts it', asy
 test('adoption is refused when the candidate is someone else shape, or ambiguous', () => {
   // The stub shape now REQUIRES the documented sourceType and composePath too.
   assert.equal(assertAdoptable({ sourceType: 'github',
-    composePath: './docker-compose.staging.yml',
+    composePath: DEFAULT_COMPOSE_PATH,
     repository: null, owner: null, branch: null }), true);
   assert.equal(assertAdoptable(projectComposeState(COMPOSE_ROW)), true);
   assert.throws(() => assertAdoptable({ repository: 'other', owner: 'x', branch: 'main',
@@ -378,13 +392,95 @@ test('zero/multiple staging environments stop; production is never a fallback', 
   assert.throws(() => projectStagingBinding({ projectId: QUIZ_PROJECT_ID,
     organizationId: QUIZ_ORG_ID, environments: [PROD_ENV] }), (e) => e.code === E.NO_STAGING_ENV);
   assert.throws(() => projectStagingBinding(projectBody({ extraEnvs: [
-    { environmentId: 'env_s2', name: 'Staging', compose: [] }] })),
+    { environmentId: 'env_s2', name: 'Staging', isDefault: false, compose: [] }] })),
     (e) => e.code === E.MULTI_STAGING_ENV);
 });
 
 test('binding never projects environment env values', () => {
   const b = projectStagingBinding(projectBody({ extraEnvs: [PROD_ENV] }));
   assert.ok(!JSON.stringify(b).includes(SECRET_CANARY));
+});
+
+test('existing staging environment skips environment.create', async () => {
+  const h = harness();
+  await orchestrate(h.args);
+  assert.equal(h.calls.filter((c) => c === `POST ${P_ENVIRONMENT_CREATE}`).length, 0);
+});
+
+test('no staging environment creates one, re-reads, and binds the returned id', async () => {
+  const before = {
+    projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID,
+    environments: [PROD_ENV],
+  };
+  const after = projectBody({ extraEnvs: [PROD_ENV] });
+  const h = harness({ projectResponses: [before, after], intent: null });
+  const bodies = [];
+  const inner = h.args.requestFn;
+  h.args.requestFn = (o) => { bodies.push([o.path.split('?')[0], o.body]); return inner(o); };
+  const r = await orchestrate(h.args);
+  assert.equal(r.environmentId, ENV_ID);
+  assert.equal(h.calls.filter((c) => c === `POST ${P_ENVIRONMENT_CREATE}`).length, 1);
+  assert.deepEqual(bodies.find(([p]) => p === P_ENVIRONMENT_CREATE)[1],
+    { name: 'staging', projectId: QUIZ_PROJECT_ID });
+  const firstRead = h.calls.indexOf(`GET ${P_PROJECT_ONE}`);
+  const create = h.calls.indexOf(`POST ${P_ENVIRONMENT_CREATE}`);
+  const secondRead = h.calls.indexOf(`GET ${P_PROJECT_ONE}`, firstRead + 1);
+  const composeCreate = h.calls.indexOf(`POST ${P_COMPOSE_CREATE}`);
+  assert.ok(firstRead < create && create < secondRead && secondRead < composeCreate);
+});
+
+test('ambiguous staging state and foreign project stop before environment.create', async () => {
+  const ambiguous = projectBody({ extraEnvs: [
+    { environmentId: 'env_s2', name: 'staging', isDefault: false, compose: [] },
+  ] });
+  const foreign = { projectId: 'foreign', organizationId: QUIZ_ORG_ID,
+                    environments: [PROD_ENV] };
+  for (const [body, code] of [[ambiguous, E.MULTI_STAGING_ENV], [foreign, E.PROJECT_MISMATCH]]) {
+    const h = harness({ projectResponses: [body] });
+    await assert.rejects(() => orchestrate(h.args), (e) => e.code === code);
+    assert.deepEqual(h.posts(), []);
+  }
+});
+
+test('environment.create failure stops before service mutations', async () => {
+  const h = harness({ projectResponses: [{
+    projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID, environments: [PROD_ENV],
+  }], failAt: P_ENVIRONMENT_CREATE });
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.UPSTREAM_STATUS);
+  assert.deepEqual(h.posts(), [`POST ${P_ENVIRONMENT_CREATE}`]);
+});
+
+test('created environment must be exact, non-default, and present on re-read', async () => {
+  const before = { projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID,
+                   environments: [PROD_ENV] };
+  const cases = [
+    { environmentId: ENV_ID, name: 'production', projectId: QUIZ_PROJECT_ID, isDefault: false },
+    { environmentId: ENV_ID, name: 'staging', projectId: 'foreign', isDefault: false },
+    { environmentId: ENV_ID, name: 'staging', projectId: QUIZ_PROJECT_ID, isDefault: true },
+  ];
+  for (const environmentRow of cases) {
+    const h = harness({ projectResponses: [before], environmentRow });
+    await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.ENVIRONMENT_MISMATCH);
+    assert.deepEqual(h.posts(), [`POST ${P_ENVIRONMENT_CREATE}`]);
+  }
+
+  const h = harness({
+    projectResponses: [before, projectBody({ envOverride: { environmentId: 'env_other' } })],
+  });
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.ENVIRONMENT_MISMATCH);
+  assert.deepEqual(h.posts(), [`POST ${P_ENVIRONMENT_CREATE}`]);
+});
+
+test('created environment projection drops env and rejects malformed rows', () => {
+  const projected = projectCreatedEnvironment({ environmentId: ENV_ID, name: 'staging',
+    projectId: QUIZ_PROJECT_ID, isDefault: false, env: SECRET_CANARY });
+  assert.deepEqual(projected, { environmentId: ENV_ID, name: 'staging',
+    projectId: QUIZ_PROJECT_ID, isDefault: false });
+  assert.ok(!JSON.stringify(projected).includes(SECRET_CANARY));
+  for (const body of [null, {}, { environmentId: '', name: 'staging',
+    projectId: QUIZ_PROJECT_ID, isDefault: false }]) {
+    assert.throws(() => projectCreatedEnvironment(body), (e) => e.code === E.BAD_SHAPE);
+  }
 });
 
 // ══ Target selection: no prefix acceptance, no first-of-many ════════════
@@ -498,7 +594,7 @@ test('production identifiers are refused structurally', () => {
 
 test('mixed project permits read-only production siblings and selects safe staging', () => {
   const production = {
-    environmentId: 'env_prod_1', name: 'production',
+    environmentId: 'env_prod_1', name: 'production', isDefault: true,
     compose: [{ composeId: 'cmp_prod_1', appName: 'quiz-incluir-e17b8a-w3hpak' }],
   };
   const selected = projectStagingBinding(projectBody({ extraEnvs: [production] }));
@@ -509,7 +605,7 @@ test('mixed project permits read-only production siblings and selects safe stagi
 test('zero staging reports E_NO_STAGING_ENV even when production siblings are present', () => {
   const onlyProduction = {
     projectId: QUIZ_PROJECT_ID, organizationId: QUIZ_ORG_ID,
-    environments: [{ environmentId: 'env_prod_1', name: 'production',
+    environments: [{ environmentId: 'env_prod_1', name: 'production', isDefault: true,
       compose: [{ composeId: 'cmp_prod_1', appName: 'quiz-incluir-e17b8a-w3hpak' }] }],
   };
   assert.throws(() => projectStagingBinding(onlyProduction),
@@ -578,7 +674,10 @@ test('token rides only in x-api-key', () => {
 });
 
 test('fixed bodies pin the intended target', () => {
-  assert.equal(bodyComposeCreate(ENV_ID).environmentId, ENV_ID);
+  const create = bodyComposeCreate(ENV_ID, NONCE);
+  assert.equal(create.environmentId, ENV_ID);
+  assert.ok(!('composePath' in create), 'compose.create schema strips composePath');
+  assert.deepEqual(bodyEnvironmentCreate(), { name: 'staging', projectId: QUIZ_PROJECT_ID });
   assert.equal(bodyComposeSource(COMPOSE_ID).branch, INFRA_BRANCH);
   const d = bodyDomainCreate(COMPOSE_ID);
   assert.equal(d.host, DOMAIN_HOST);
@@ -629,7 +728,7 @@ test('C1 REPRO: a create returning a foreign source shape is REFUSED', async () 
 });
 
 test('C1: the untouched-stub grammar is exact, not truthiness', () => {
-  const stub = { sourceType: 'github', composePath: './docker-compose.staging.yml',
+  const stub = { sourceType: 'github', composePath: DEFAULT_COMPOSE_PATH,
                  repository: null, owner: null, branch: null };
   assert.equal(isUntouchedStub(stub), true);
   assert.equal(isUntouchedStub({ ...stub, sourceType: 'gitlab' }), false, 'wrong sourceType');
@@ -716,7 +815,7 @@ test('C1: a fresh create returning the UNTOUCHED STUB is accepted and proceeds',
   // gate observable.
   const stub = { composeId: COMPOSE_ID, appName: intendedAppName(NONCE),
                  environmentId: ENV_ID, sourceType: 'github',
-                 composePath: './docker-compose.staging.yml',
+                 composePath: DEFAULT_COMPOSE_PATH,
                  repository: null, owner: null, branch: null };
   assert.equal(isUntouchedStub(projectComposeState(stub)), true);
   assert.equal(assertAdoptable(projectComposeState(stub)), true);
@@ -727,7 +826,7 @@ test('C1: a fresh create returning the UNTOUCHED STUB is accepted and proceeds',
 test('C1: fresh create end-to-end with a stub response completes all mutations', async () => {
   const stub = { composeId: COMPOSE_ID, appName: intendedAppName(NONCE),
                  environmentId: ENV_ID, sourceType: 'github',
-                 composePath: './docker-compose.staging.yml',
+                 composePath: DEFAULT_COMPOSE_PATH,
                  repository: null, owner: null, branch: null };
   const h = harness({ intent: null, composeRow: stub });
   const r = await orchestrate(h.args);
@@ -742,7 +841,7 @@ test('C2 REPRO: created row whose re-read appName carries a FOREIGN nonce is ref
   // Request nonce A, compose.one returns an exact untouched stub with nonce B.
   const foreign = { composeId: COMPOSE_ID, appName: COMPOSE_APPNAME + '-ffffffffffffffff',
                     environmentId: ENV_ID, sourceType: 'github',
-                    composePath: './docker-compose.staging.yml',
+                    composePath: DEFAULT_COMPOSE_PATH,
                     repository: null, owner: null, branch: null };
   const h = harness({ intent: null, composeRow: foreign });
   await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.ADOPT_NO_MARKER);

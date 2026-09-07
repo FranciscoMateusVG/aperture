@@ -6,15 +6,17 @@
  *
  * Gate 1 is project.one: it binds identity (exact projectId AND organizationId)
  * and selects exactly one staging environment by the server's own declared
- * environment name. Zero or multiple matches is a hard stop -- never a guess,
- * and never a fallback to production. Two further fixed read-only endpoints,
+ * environment name. Zero matches triggers one fixed environment.create and an
+ * authoritative re-read; multiple matches is a hard stop, never a guess or a
+ * fallback to production. Two further fixed read-only endpoints,
  * compose.one and domain.byComposeId, establish the state project.one cannot
  * prove; their procedure names and field allowlists were read from the running
- * Dokploy v0.30.2 build. Every addressable state is read BEFORE the mutations.
+ * Dokploy v0.30.2 build. Every addressable service/domain state is read before
+ * service or domain mutation; environment.create is the bounded prerequisite.
  *
- * Mutations run only after that binding AND after the pinned Hono image and
- * the pushed infra revision are both known. Production identifiers are refused
- * structurally, not by convention.
+ * Service/domain mutations run only after that binding AND after the pinned
+ * Hono image and pushed infra revision are both known. Production identifiers
+ * are refused structurally, not by convention.
  *
  * Controls carried unchanged from the Cipher-PASSed probe (d5b65f0): literal
  * token source with no-follow/owner/mode/nlink checks and bounded printable
@@ -59,6 +61,7 @@ const STAGING_ENV_NAME = 'staging';           // server-declared discriminator
 const COMPOSE_NAME = 'Quiz Staging';
 const COMPOSE_APPNAME = 'quiz-incluir-staging';
 const COMPOSE_PATH = './docker-compose.staging.yml';
+const DEFAULT_COMPOSE_PATH = './docker-compose.yml';
 const REPO_OWNER = 'FranciscoMateusVG';
 const REPO_NAME = 'quiz-incluir';
 const INFRA_BRANCH = 'aperture-ztid5-staging';
@@ -85,6 +88,7 @@ const PROD_DENYLIST = Object.freeze([
 ]);
 
 const P_PROJECT_ONE = '/api/project.one';
+const P_ENVIRONMENT_CREATE = '/api/environment.create';
 const P_COMPOSE_CREATE = '/api/compose.create';
 const P_COMPOSE_UPDATE = '/api/compose.update';
 const P_DOMAIN_CREATE = '/api/domain.create';
@@ -118,6 +122,7 @@ const E = Object.freeze({
   ESCROW_CORRUPT: 'E_ESCROW_CORRUPT', ESCROW_WRITE: 'E_ESCROW_WRITE',
   ESCROW_MISSING: 'E_ESCROW_MISSING', ADOPT_AMBIGUOUS: 'E_ADOPT_AMBIGUOUS',
   ADOPT_NO_MARKER: 'E_ADOPT_NO_MARKER', INFRA_REV_MISMATCH: 'E_INFRA_REV_MISMATCH',
+  ENVIRONMENT_MISMATCH: 'E_ENVIRONMENT_MISMATCH',
   IDENTITY_UNPROVEN: 'E_IDENTITY_UNPROVEN',
   INTERNAL: 'E_INTERNAL',
 });
@@ -370,11 +375,13 @@ function projectStagingBinding(body) {
     if (!e || typeof e !== 'object') throw new Fail(E.BAD_SHAPE);
     const id = e.environmentId;
     const name = e.name;
+    const isDefault = e.isDefault;
     assertId(id, E.BAD_SHAPE);                       // bounded, printable, no controls
     if (typeof name !== 'string' || name.length === 0 || name.length > MAX_ID_LEN
         || !/^[\x20-\x7e]+$/.test(name)) {
       throw new Fail(E.BAD_SHAPE);
     }
+    if (typeof isDefault !== 'boolean') throw new Fail(E.BAD_SHAPE);
     if (!Array.isArray(e.compose)) throw new Fail(E.BAD_SHAPE);  // never default to []
     const composes = e.compose.map((c) => {
       if (!c || typeof c !== 'object') throw new Fail(E.BAD_SHAPE);
@@ -382,13 +389,14 @@ function projectStagingBinding(body) {
       assertId(c.appName, E.BAD_SHAPE);
       return { composeId: c.composeId, appName: c.appName };
     });
-    return { environmentId: id, name, composes };
+    return { environmentId: id, name, isDefault, composes };
   });
 
   const matches = projected.filter((e) => e.name.toLowerCase() === STAGING_ENV_NAME);
   if (matches.length === 0) throw new Fail(E.NO_STAGING_ENV);
   if (matches.length > 1) throw new Fail(E.MULTI_STAGING_ENV);
   const selected = matches[0];
+  if (selected.isDefault) throw new Fail(E.ENVIRONMENT_MISMATCH);
   // A project.one response legitimately contains read-only production siblings.
   // Refuse production identifiers only at the selected staging mutation
   // boundary; applying the denylist to every sibling made this action
@@ -398,6 +406,21 @@ function projectStagingBinding(body) {
   return { environmentId: selected.environmentId,
            environmentCount: projected.length,
            composes: selected.composes };
+}
+
+// Dokploy v0.30.2: environment.create input is exactly {name, description?,
+// projectId}. The returned row is projected to structural fields only; its
+// encrypted `env` column is never read or returned here.
+function projectCreatedEnvironment(body) {
+  if (!body || typeof body !== 'object') throw new Fail(E.BAD_SHAPE);
+  assertId(body.environmentId, E.BAD_SHAPE);
+  if (body.name !== STAGING_ENV_NAME || body.projectId !== QUIZ_PROJECT_ID
+      || body.isDefault !== false) {
+    throw new Fail(E.ENVIRONMENT_MISMATCH);
+  }
+  assertNoProdIds([body.environmentId]);
+  return { environmentId: body.environmentId, name: body.name,
+           projectId: body.projectId, isDefault: body.isDefault };
 }
 
 // Selects the remote object to act on, WITHOUT guessing.
@@ -436,7 +459,7 @@ function selectTarget(binding, priorBinding, intent) {
 // silently widening the gate.
 function isUntouchedStub(st) {
   return st.sourceType === 'github'
-    && st.composePath === COMPOSE_PATH
+    && st.composePath === DEFAULT_COMPOSE_PATH
     && st.repository === null && st.owner === null && st.branch === null;
 }
 
@@ -766,8 +789,11 @@ export { projectComposeState, composeMatchesTarget, assertComposeIdentity, selec
 function bodyComposeCreate(environmentId, nonce) {
   return {
     name: COMPOSE_NAME, appName: intendedAppName(nonce), environmentId,
-    composeType: 'docker-compose', composePath: COMPOSE_PATH, sourceType: 'github',
+    composeType: 'docker-compose', sourceType: 'github',
   };
+}
+function bodyEnvironmentCreate() {
+  return { name: STAGING_ENV_NAME, projectId: QUIZ_PROJECT_ID };
 }
 function bodyComposeSource(composeId) {
   return {
@@ -867,8 +893,24 @@ async function orchestrate({
 
       // ── READ PHASE ──────────────────────────────────────────────────
       // Gate 1: identity + exactly one staging environment.
-      const binding = projectStagingBinding(
-        await call(`${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`, 'GET', undefined));
+      const firstProject = await call(
+        `${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`, 'GET', undefined);
+      let binding;
+      try {
+        binding = projectStagingBinding(firstProject);
+      } catch (err) {
+        if (!(err instanceof Fail) || err.code !== E.NO_STAGING_ENV) throw err;
+        // The exact project/org was verified before E_NO_STAGING_ENV. Create
+        // one fixed, non-default staging environment, then re-read the project
+        // and bind the returned id before any service mutation.
+        const made = projectCreatedEnvironment(
+          await call(P_ENVIRONMENT_CREATE, 'POST', bodyEnvironmentCreate()));
+        binding = projectStagingBinding(
+          await call(`${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`, 'GET', undefined));
+        if (binding.environmentId !== made.environmentId) {
+          throw new Fail(E.ENVIRONMENT_MISMATCH);
+        }
+      }
       const target = selectTarget(binding, priorBinding, priorIntent);
 
       let composeId = target.composeId;
@@ -986,7 +1028,9 @@ async function main() {
 }
 
 export { orchestrate, bodyComposeCreate, bodyComposeSource, bodyComposeEnv,
-         bodyDomainCreate, bodyComposeDeploy, extractComposeId,
-         parseEscrowBlock, ESCROW_KEYS, assertInfraRevision };
+         bodyDomainCreate, bodyComposeDeploy, bodyEnvironmentCreate,
+         extractComposeId, projectCreatedEnvironment,
+         parseEscrowBlock, ESCROW_KEYS, assertInfraRevision,
+         P_ENVIRONMENT_CREATE, DEFAULT_COMPOSE_PATH };
 
 if (import.meta.url === `file://${process.argv[1]}`) { await main(); }
