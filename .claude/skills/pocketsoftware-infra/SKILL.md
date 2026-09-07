@@ -183,16 +183,22 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ---
 
-### Agent access to Infisical — READ THIS FIRST (status: HOLD, NOT operational)
+### Agent access to Infisical — READ THIS FIRST (status: WORKING for metadata, 2026-09-07)
 
-> **STATUS: HOLD — not operational.** Note the distinction, because it matters:
-> the helper CODE has **PASSED** security review (Cipher, `aperture-5nxd8`, exact head
-> `5e575f4`, 57/57 offline regressions). What is still missing is an approved credential
-> BOOTSTRAP, so there is nothing to authenticate with and NO live authentication has ever
-> been performed against this instance by this tool. Code approved, operation held. The
-> helper exists and is reviewable; the credential bootstrap that would feed it does NOT
-> exist. Do not run it against real credentials, and do not plan work that assumes agent
-> Infisical access. Bead: `aperture-a4ph5`.
+> **STATUS: WORKING for METADATA — verified live 2026-09-07.** An agent CAN authenticate
+> to Infisical with the existing `peppy-admin` machine identity and enumerate project /
+> environment / secret **NAMES**. Proven by a real run, not by inspection: 5 projects, 116
+> secret names, exit 0, zero values emitted.
+>
+> **This is METADATA access, NOT provider readiness.** You can see that a secret named
+> `OPENAI_API_KEY` exists in a given project/environment. You CANNOT tell from this whether
+> two same-named secrets in different projects hold the same value, whether any given key is
+> suitable for a new consumer, or whether it is compromised. Those questions require
+> separate authorization and a different mechanism. Do not let "I can list the names" become
+> "the key is ready".
+>
+> **Injection is still NOT implemented.** This reads metadata. It cannot deliver a secret to
+> any runtime. Bead: `aperture-a4ph5`.
 
 **What exists.** `scripts/infisical-metadata.mjs` in the aperture repo — a fixed-purpose,
 single-action helper that authenticates with the EXISTING `peppy-admin` Universal Auth
@@ -224,12 +230,25 @@ before this process starts has defeated it. It is a guard against accidental ins
 runs — `NODE_DEBUG=http` printing HTTP internals, a stray `--inspect`, an inherited
 `NODE_OPTIONS` — not a sandbox.
 
-**⛔ THE MISSING PIECE — credential bootstrap is UNRESOLVED.** Nothing currently populates
-that `0600` file, and no approved non-model handoff has been identified to do so. The
-credential registry is reachable in principle but reading it is NOT authorized, and
-bootstrapping the file from a model-visible drawer call is explicitly forbidden. Until an
-operator or an approved mechanism provisions the file, `list-metadata` returns
-`E_CRED_MISSING` **before any network call**. That is the intended fail-closed behavior.
+**Credential bootstrap — SOLVED 2026-09-07, and how.** The `0600` file is populated by a
+one-shot non-model transfer from an operator-supplied file, never by a model-visible read.
+The operator places `client_id=` and `new_secret=` in a private file; a reviewed Python
+action opens it read-only under a verified directory descriptor, maps the two fields to
+`INFISICAL_CLIENT_ID` / `INFISICAL_CLIENT_SECRET`, and publishes via `O_EXCL` temp plus
+hard-link (never a rename-over), emitting only the constant receipt `TRANSFER_OK`. If the
+file is absent the helper still returns `E_CRED_MISSING` **before any network call** — the
+intended fail-closed behavior.
+
+> **TWO TRAPS THAT COST THREE ATTEMPTS. Read these before repeating the bootstrap.**
+> 1. **A GUI editor saves `secret.txt`, not `secret`,** and it saves with a default umask
+>    that leaves the file **group/other-readable**. The transfer refuses on
+>    `st_mode & 0o077` — correctly — so it fails before reading a byte. Fix the MODE
+>    (`chmod 600`), do not weaken the check.
+> 2. **A constant-receipt design cannot be debugged by retrying it.** `TRANSFER_FAILED`
+>    yields exactly one bit, which is right for a live credential and useless for
+>    diagnosis. Pair it with a bounded **metadata-only** `lstat` probe (exists / regular /
+>    symlink / owner / no-group-other-bits / link-count) and the failing prerequisite falls
+>    out immediately. Two blind retries bought two bits; one probe bought the answer.
 
 **Pre-authorised scope for the eventual first live run** (Cipher, binding): exactly **ONE**
 `list-metadata` invocation, and only after GLaDOS/the operator has selected and completed an
