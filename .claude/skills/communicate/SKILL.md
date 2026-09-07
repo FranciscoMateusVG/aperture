@@ -153,3 +153,16 @@ If your model starts with `codex/`, everything here applies directly: you call `
 - Don't send the same update twice; don't update every 5 minutes unless something changed.
 - DO update when a task runs longer than expected; DO update immediately when blocked — silence is worse than a blocker report.
 - One BEADS update per significant milestone, not per line of code.
+
+
+## 10. Bounded finder repair — ask for the pen, not another round trip
+
+Operator retrospective 2026-09-07: during assigned work, the finder of an easy/medium, clearly scoped issue may implement the correction instead of sending successive patch instructions back to the owner.
+
+1. Send the current owner one BEADS request: defect, why the fix is bounded, exact file set, proposed fix/regression, and existing bead. Await explicit consent; silence is not consent.
+2. Owner cedes that file set and stops editing it. Record ownership on the existing bead; use your own task worktree/branch and do not reset another writer's files. This transfers only the bounded repair, not ownership of the whole specialist task.
+3. Implement the agreed fix plus the smallest faithful regression. No new harness, framework change, security/infra operation, live secret use, or broader product decision is implied.
+4. Return one immutable diff/PR and evidence to the owner or assigned independent reviewer. If you changed the code, you cannot self-approve that change. GLaDOS gets the outcome or a real scope blocker, not every intermediate acknowledgment.
+5. An architectural, security, infrastructure, unclear-contract or non-trivial scope expansion routes to GLaDOS before editing. If the current approval requires a specific security author/reviewer, this shortcut cannot replace it. New beads still require operator acknowledgment and GLaDOS filing.
+
+Send only actionable messages to the next actor, decision owner or materially affected colleague. No all-agent FYIs, repeated ready messages, or acknowledgments of acknowledgments. `mark_as_read` is enough for receipt. Explicit STOP/withdrawal is different: notify every actual holder of the affected execution target promptly.

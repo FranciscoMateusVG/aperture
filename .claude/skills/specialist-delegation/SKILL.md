@@ -1,25 +1,17 @@
 ---
 name: specialist-delegation
-description: Specialists operate as tech leads — delegate-first, keeping only design decisions, the single craft centerpiece, and review of every worker's output. Use when claiming a BEADS task, deciding how to decompose and fan out work, when context budget passes 60%, or on "wait for X then do Y" dispatches that hide independent tracks. Triggers on subagent fan-out vs Agent Teams, delegate-first decomposition, parallelizable scoped work, multi-file fan-outs.
+description: Size specialist delegation to useful independent work and briefing/review cost; use one owner for bounded work and owner-consented finder repairs. Load for task decomposition, file handoffs or subagent decisions.
 ---
 
 # Specialist Delegation — When to Subagent vs Stay Hands-On
 
-You are a specialist (Vance, Rex, Peppy, Cipher, Izzy, Wheatley, Scout). You own a lane, but **you operate as a TECH LEAD, not a solo IC.** On claiming a non-trivial task your first move is to **decompose it, fan the parallelizable work out to a subagent team, and reserve your own hands for the three things that don't delegate: design decisions, the single craft centerpiece, and the review.** Operator directive 2026-05-29: delegate-first is the default; hands-on is the exception you justify. (Precedent: `references/precedents.md` → Intro.)
-
-Your context window is finite. Spending it typing code a subagent could have produced is the expensive way to work; spending it on decomposition + review + the one piece only you can do is the leveraged way.
-
-Two failure modes:
-1. **Under-delegating (the one we are actively correcting)** — building a task solo, one step at a time, when half of it could have fanned out. Serializes concurrent work, burns your context, makes you the swarm's bottleneck. (Precedent: Intro, two failure modes.)
-2. **Over-delegating** — fanning out work that needed your lane expertise (a craft centerpiece, an aha-debug), or skipping the diff-review so a worker's slop ships. The cascade-catch reflex is the swarm's reliability mechanism; never delegate *that* away.
-
----
+Operator retrospective 2026-09-07 supersedes unconditional fan-out and “keep only design/craft/review.” The relevant unit is useful independent work, not file count. Tiny handoffs can cost more than the fix.
 
 ## 1. The Principle
 
-On claiming any non-trivial task, your FIRST question is **"how do I decompose this and fan it out?"** — not "let me start building." **Delegate by default; stay hands-on by exception.** The exceptions are narrow and named: **(a) design/architecture decisions, (b) the single craft centerpiece where your taste IS the deliverable, (c) the review of every worker's output.** Everything else — parallelizable slices, mechanical ports, recon, boilerplate, blocking I/O — fans out. When unsure: *would another competent agent of my type produce the same output given the same prompt?* Yes → delegate. No → it's one of your three reserved jobs. **The burden of proof has flipped: you justify KEEPING work, not delegating it.**
+Decompose non-trivial work, then choose the smallest execution shape. A bounded task normally has one execution owner plus one scoped independent review. Delegate a genuinely independent substantial slice when its benefit exceeds briefing/context/review costs, within authorized scope. Do not spawn a worker merely because another competent agent could write the same code.
 
----
+For easy/medium repairs found during assigned work, ask the current owner for the file set, then implement directly after explicit consent with a focused regression and independent review (`communicate` §10). No file collision, whole-task reassignment, security/infra authority or new scope is implied.
 
 ## 2. WHEN to Delegate to a Subagent
 
@@ -55,7 +47,7 @@ Rules the worked examples established (Precedent: §4 Examples A–C, 2026-05-12
 
 Pick by **whether the workers need to TALK to each other.**
 
-- **Subagent fan-out (the Agent tool) — YOUR DEFAULT.** Multiple `Agent` calls in one message run concurrently; each worker gets its own context + a scoped prompt and returns ONE result. Workers don't talk to each other. Cheapest, simplest, fault-isolated. Right for independent parallel subtasks conforming to a contract the lead set up front — the common case. (Precedent: §3b.)
+- **Subagent fan-out (the Agent tool) — when delegation is justified.** Multiple `Agent` calls in one message run concurrently; each worker gets its own context + a scoped prompt and returns ONE result. Workers don't talk to each other. Cheapest, simplest, fault-isolated. Right for independent parallel subtasks conforming to a contract the lead set up front — the common case. (Precedent: §3b.)
 - **Agent Teams (experimental) — rarely.** Teammates (full Claude Code sessions) share a task list AND message each other. Only when workers genuinely must converse: cross-layer negotiation, adversarial review/debugging. Significantly more tokens, experimental (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, v2.1.32+), coordination overhead. Docs: code.claude.com/docs/en/agent-teams.
 
 **Decision rule:** can you specify each worker's job up front against a shared contract and integrate the results? → fan-out. Must workers ask each other questions mid-flight? → Agent Team.
@@ -70,7 +62,7 @@ Pick by **whether the workers need to TALK to each other.**
 |---|---|
 | Delegate spec-writing | The deliverable IS the cognition. Subagent returns shallow imitation. |
 | Skip the diff-walk after a subagent ships | Trust-but-verify is the cascade. Without it, slop ships and the verify-against-reality reflex dies. |
-| Refuse to delegate because "I do it faster" | True for one task; false at scale. Your 1.5× speed × finite context = ceiling. Subagent + review ≈ your speed at 10% context cost. |
+| Fan out a small fix by reflex | Briefing, duplicated context and review can cost more than direct implementation. |
 | Delegate the "aha" debugging step | The pattern-match needs code + trace + prod row in your head. A 500-word report can't substitute. |
 | Always-delegate as a blanket rule | Cargo-cult mode. Erases lane expertise, cascade-catches, bankable lessons. |
 | Always-hands-on as a blanket rule | You crash your context, the team waits, single point of failure. |
@@ -85,18 +77,11 @@ Pick by **whether the workers need to TALK to each other.**
 
 ## 6. Calibration
 
-If you find yourself:
-- **About to claim a task and immediately start coding** → STOP. Decompose: what fans out, what ONE piece you keep (design / craft centerpiece / review).
-- **At 70%+ context mid-cycle** → next claim delegates, not hands-on.
-- **Doing 3+ unrelated small edits** → fan out as a batch.
-- **About to type `ssh <host>` or `gh run view --log <id>`** → subagent it (`aperture:subagents` §11).
-- **Writing the THIRD test fixture for the same pattern** → subagent the rest.
-- **Making a design or architecture decision** → hands-on, no exceptions.
-- **Mid "aha" debugging moment** → finish it hands-on; subagent the clean-up.
-
-Cadence: hands-on ONLY design + craft centerpiece + reviews; fan out everything else; verify every diff. If you're typing more than decomposing + reviewing, you've slipped into solo-IC mode — re-read §1.
-
----
+- Bounded input correction or small test delta: one owner, focused regression, one review.
+- Independent substantial surfaces: bounded parallel work may help; verify each diff once.
+- Another reviewer finds a small issue: use owner-consented finder repair, not a patch-instruction ping-pong loop.
+- Slow external I/O: use bounded timeouts or the existing fault-isolation workflow; no standing polling fleet.
+- Growing scope or unclear risk: stop and ask GLaDOS; do not build new tooling to justify the original task.
 
 ## 7. Context Budget — Don't Anthropomorphize, Don't Negotiate /compact
 
@@ -112,7 +97,7 @@ Cadence: hands-on ONLY design + craft centerpiece + reviews; fan out everything 
 2. **Keep working.** Do NOT signal the orchestrator, ask for /compact, pause for permission, or write "ready for /compact." Not your decision.
 3. **Do NOT ack a /compact.** You won't see the decision — you'll see your compacted session boot. Read bead notes + queued messages, continue. No "anchor banked, green-lit" replies.
 
-**Orchestrator:** /compact is unilateral. Watch context on every tick; at ~60–65% with precision-critical work ahead (or ~70% regardless) fire it immediately — no pre-message, no ack, no choice offered; confirm "/compacted <agent> at NN%." Queued BEADS messages deliver to the compacted session as normal. Never offer a "/compact unless you object" default, never ask a specialist to self-/clear, never ask the operator to /clear an agent. A fatigue-framed pause request or an "operator please /clear me" request gets a /compact via send-keys, not validation.
+**Orchestrator:** /compact is unilateral. Watch context on every tick; at ≥60% context, except while a live subagent is running fire it immediately — no pre-message, no ack, no choice offered; confirm "/compacted <agent> at NN%." Queued BEADS messages deliver to the compacted session as normal. Never offer a "/compact unless you object" default, never ask a specialist to self-/clear, never ask the operator to /clear an agent. A fatigue-framed pause request or an "operator please /clear me" request gets a /compact via send-keys, not validation.
 
 ---
 
@@ -122,7 +107,7 @@ Cadence: hands-on ONLY design + craft centerpiece + reviews; fan out everything 
 
 **The test:** *Is Y dependent on X **completing**, or just on X's **output** eventually existing?* Needs X done before Y can START → real serial, wait. Needs X's output only before Y's FINAL step (commit, merge, integration test) → parallel tracks. Most cases are the second shape.
 
-**Specialist receiving "finish X before claiming Y":** apply the test. If independent — **Track 1** handles X: mechanical (rebase, retarget, recon, log-pull, ssh probe) → subagent per §2; wait-for-external-event → watcher subagent or pivot when it lands. **Track 2** is the craft: claim Y now, stay hands-on. When X completes, integrate (subagent it if mechanical). Can't see how Y is independent? Ask — don't silently serialize.
+**Specialist receiving "finish X before claiming Y":** apply the test. If independent — **Track 1** handles X: mechanical (rebase, retarget, recon, log-pull, ssh probe) → subagent per §2; wait-for-external-event → watcher subagent or pivot when it lands. **Track 2** is the craft: request scoped permission for Y if not already assigned; do not self-claim unassigned work. When X completes, integrate (subagent it if mechanical). Can't see how Y is independent? Ask — don't silently serialize.
 
 **Orchestrator issuing the dispatch:** apply the test BEFORE the words leave your message. If Y is independent, frame it explicitly as parallel tracks ("Track 1: X, subagent if mechanical. Track 2: claim Y now, hands-on"). Every agent-hour idled is swarm throughput lost — the 2026-05-15 miss cost ~3 agent-hours. If you want X first for a non-dependency reason (concentration, blast radius), say so, and accept the specialist may push back. **Never frame a small mechanical task (a 5-command cascade rebase) as a serial blocker for hours of independent craft** — it dispatches as a subagent or takes 5 min; neither blocks the craft. (Precedent: §9 worked example, aperture-l1gx.)
 

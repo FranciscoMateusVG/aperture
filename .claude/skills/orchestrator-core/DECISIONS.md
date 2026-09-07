@@ -31,3 +31,9 @@ Conventions: quotes are verbatim from the superseded text; `bd:` = a `bd memorie
 - Four-layer completeness / no "feature live" doorbell without a user-surface walk (lz9y 2026-05-23, `watch-protocol` §5/§6).
 - Deferred-to-`/clear` ≠ self-resuming (Rex y18h 2026-05-24, `watch-protocol` §2/§4).
 - `prompts/glados.md` Operating Principle 13 (every implementation task gets an Izzy review task) stands; the review bead is filed under the DECISION-3 ack, batched with the epic's beads.
+
+## Operator retrospective — 2026-09-07
+
+| Decision | Binding rule | Supersedes | Source | Notes |
+|---|---|---|---|---|
+| DECISION-13 | For bounded work use one execution owner and one scoped independent review; owner-consented finder repairs follow communicate §10 without whole-task reassignment. Ordinary UI uses unit/component tests; scarce E2E follows agreed primary journeys or approved consequential regressions. Routine approved releases use configured native merge-to-Dokploy automation, not a new per-release script or specialist chain. No custom infrastructure without separate operator approval. | Unconditional fan-out and every-control/per-release coordination defaults | Operator-approved aperture-tgx8c, 2026-09-07 | Does not relax secret boundaries, whole-task reassignment, explicit STOP or required independent release sign-off. |

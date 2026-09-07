@@ -29,6 +29,8 @@ Provenance, superseded text and sources: `DECISIONS.md` in this skill (review-on
 - **DECISION-11** — Specialists do not self-authorise scope (new investigation tracks, tooling/harnesses, "while I'm at it" hardening, non-trivial `bd ready` self-claims) — they ask GLaDOS first; GLaDOS authorises directly only what is genuinely small and brings anything non-trivial to the operator BEFORE authorising; identical gate for Codex/GPT-backed specialists.
 - **DECISION-12** — Loop cadence and agent count are sized to the serial-engineer anchor (< 2 h: 1 agent, no standing loop; ~half day: 2–3 agents, loop only if unattended at ≥ 20–30 min; multi-day parallel: full fan-out, 10 min only while the operator actively waits) and re-sized at every scope pivot.
 
+- **DECISION-13** — For bounded work use one execution owner and one scoped independent review; owner-consented finder repairs follow communicate §10 without whole-task reassignment. Ordinary UI uses unit/component tests; scarce E2E follows agreed primary journeys or approved consequential regressions. Routine approved releases use configured native merge-to-Dokploy automation, not a new per-release script or specialist chain. No custom infrastructure without separate operator approval.
+
 ## 1. Loop contract
 
 **Tick = orchestrator wakeup, NOT a status poll.** The cron makes you wake at the right cadence; your job on waking is intervention, not enumeration. Role on every tick: *a proactive, cunning strategist of operations and deployments — you seize the responsibility.* A queue that isn't moving is a problem to SOLVE, not a state to REPORT. (Precedent: precedents.md → watch-protocol §0)
@@ -102,7 +104,7 @@ Treating the three alike is the failure this section prevents. `get_presence` an
 
 Timing floors: in_progress with no indicator > 30 min → deep-peek, then ping with context if still idle; post-/clear empty prompt > 15 min, or dispatched bead unclaimed > 15 min → re-dispatch / ping. **Substantive pane content byte-identical across two consecutive ticks is a stall SIGNAL** that forces deep-peek + classification now — not neutral evidence of "still working", and not by itself an auto-interrupt (D1). (Precedent: precedents.md → cost-proportional §3)
 
-**Solo-grinding is a stall on the conveyor:** a specialist hand-editing many files / long sequential tool chains on work that decomposes → ping "Tech Lead Mode — fan this out; what are you keeping (design / centerpiece / review)?" per `specialist-delegation` §1.
+**Repeated serial work can be a throughput problem:** assess genuinely independent work and coordination cost before proposing fan-out (`specialist-delegation` §1). File count or time spent typing alone is not a stall, and a bounded finder repair normally stays hands-on (D13).
 
 **Subagents (Agent tool)** run in YOUR context, have no pane, notify on completion, and carry a ~600 s watchdog. No notification after 10–15 min ≠ still working — deep-check; recovery is `TaskStop` then re-dispatch fresh or take it hands-on. Never read "no notification yet" as progress.
 
@@ -127,9 +129,9 @@ Timing floors: in_progress with no indicator > 30 min → deep-peek, then ping w
 
 ## 5. Delegation & cost proportionality
 
-**Three surfaces:** yourself (small edits, single-file, < 5 min, needs your conversation context) · Agent-tool subagents (scoped, parallelisable, fire-and-return: research, audits, specifiable implementations) · specialists via a BEADS task (lane work needing persistent memory, expertise, launcher visibility). Parallelisable and self-contained → subagent; squarely in a lane → specialist; trivially small or context-bound → yourself.
+**Three surfaces:** yourself (small edits, single-file, < 5 min, needs your conversation context) · Agent-tool subagents (scoped, parallelisable, fire-and-return: research, audits, specifiable implementations) · specialists via a BEADS task (lane work needing persistent memory, expertise, launcher visibility). Substantial, independently useful and self-contained → consider a subagent; persistent lane work → specialist; bounded or context-bound work → one hands-on owner. Compare the briefing/review cost first.
 
-**Parallelism mandate:** independent tasks go out as multiple `Agent` calls in ONE message; sequential calls for independent work lose the win — stop and re-batch. Tasks that depend on another in-flight subagent are sequenced, not parallelised.
+**Cost-proportional parallelism:** when independent substantial work justifies delegation, dispatch the bounded slices together. A small change stays with one execution owner; do not fan out by file count or send three agents the same readiness message (D13). Tasks that depend on another in-flight subagent are sequenced, not parallelised.
 
 **Types:** `Explore` read-only recon (can't write) · `Plan` design/strategy · `general-purpose` anything mixing search/edit/execute (default when unsure) · `claude-code-guide` questions about Claude Code / SDK / API.
 
