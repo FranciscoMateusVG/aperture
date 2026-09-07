@@ -19,7 +19,8 @@ import {
   domainMatchesTarget, classifyDomainState, buildRequestOptions,
   bodyComposeCreate, bodyComposeSource, bodyDomainCreate, bodyComposeDeploy,
   extractComposeId, generateStagingEnv, envToBlock, parseEscrowBlock, ESCROW_KEYS,
-  escrowDecision, assertAdoptable,
+  escrowDecision, assertAdoptable, isUntouchedStub, assertId, assertInfraRevision,
+  intendedAppName, appNameCarriesNonce,
   assertNoProdIds, E, Fail, OK_RECEIPT, QUIZ_PROJECT_ID, QUIZ_ORG_ID,
   PROD_DENYLIST, COMPOSE_APPNAME, DOMAIN_HOST, DOMAIN_PORT, DOMAIN_SERVICE,
   INFRA_BRANCH, PINNED_HONO_IMAGE_ID, P_PROJECT_ONE, P_COMPOSE_ONE,
@@ -31,7 +32,9 @@ const TOKEN_CANARY = 'CANARY_STAGING_TOKEN_4f81ac02';
 const SECRET_CANARY = 'CANARY_ENV_VALUE_9d33be71';
 const ENV_ID = 'env_staging_QUIZ_1';
 const COMPOSE_ID = 'cmp_staging_QUIZ_1';
-const APPNAME_SUFFIXED = COMPOSE_APPNAME + '-ab12cd';
+const NONCE = 'a1b2c3d4e5f60718';
+const APPNAME_SUFFIXED = intendedAppName(NONCE) + '-ab12cd';
+const GOOD_LSREMOTE = '26d6a9eb25b8653356d1aae4659382a62d479c41\trefs/heads/aperture-ztid5-staging\n';
 
 const surface = (e) => {
   let j = ''; try { j = JSON.stringify(e); } catch { j = ''; }
@@ -66,8 +69,8 @@ const DOMAIN_ROW = {
   composeId: COMPOSE_ID, enabled: true,
 };
 
-function harness({ prior = null, existingRows = [], domains = [],
-                   composeRow = COMPOSE_ROW, failAt = null } = {}) {
+function harness({ prior = null, intent = { nonce: NONCE }, existingRows = [], domains = [],
+                   composeRow = COMPOSE_ROW, failAt = null, lsRemote = GOOD_LSREMOTE } = {}) {
   const calls = [];
   const escrowReads = [];
   const savedBindings = [];
@@ -77,6 +80,9 @@ function harness({ prior = null, existingRows = [], domains = [],
     readTokenFn: () => { calls.push('readToken'); return TOKEN_CANARY; },
     escrowFn: () => { escrowReads.push('escrow'); return { env: { ...ESCROW_ENV }, reused: prior !== null }; },
     loadBindingFn: () => prior,
+    loadIntentFn: () => intent,
+    createIntentFn: () => { calls.push('createIntent'); return { nonce: NONCE }; },
+    infraRevFn: () => lsRemote,
     saveBindingFn: (id) => { calls.push('saveBinding'); savedBindings.push(id); return '/fake/b'; },
     openForwardFn: () => {
       calls.push('openForward');
@@ -100,12 +106,12 @@ const EXISTING = [{ composeId: COMPOSE_ID, appName: APPNAME_SUFFIXED }];
 
 // ══ Sequence: every read precedes the mutations ═════════════════════════
 test('fresh provision: create, rebind, read domain, THEN mutate', async () => {
-  const h = harness();
+  const h = harness({ intent: null });   // no prior intent: one is minted first
   const r = await orchestrate(h.args);
   assert.deepEqual(h.calls, [
     'context', 'readToken', 'openForward',
     `GET ${P_PROJECT_ONE}`,
-    `POST ${P_COMPOSE_CREATE}`, 'saveBinding',
+    'createIntent', `POST ${P_COMPOSE_CREATE}`, 'saveBinding',
     `GET ${P_COMPOSE_ONE}`, `GET ${P_DOMAIN_BY_COMPOSE}`,
     `POST ${P_COMPOSE_UPDATE}`, `POST ${P_COMPOSE_UPDATE}`,
     `POST ${P_DOMAIN_CREATE}`, `POST ${P_COMPOSE_DEPLOY}`,
@@ -115,7 +121,7 @@ test('fresh provision: create, rebind, read domain, THEN mutate', async () => {
 });
 
 test('the binding is saved BEFORE any further mutation, so a crash can rebind', async () => {
-  const h = harness();
+  const h = harness({ intent: null });
   await orchestrate(h.args);
   assert.deepEqual(h.savedBindings, [COMPOSE_ID]);
   assert.ok(h.calls.indexOf('saveBinding') < h.calls.indexOf(`POST ${P_COMPOSE_UPDATE}`));
@@ -279,14 +285,17 @@ test('RECOVERY: create succeeds, binding write fails, second run adopts it', asy
 });
 
 test('adoption is refused when the candidate is someone else shape, or ambiguous', () => {
-  assert.equal(assertAdoptable({ repository: null, owner: null, branch: null }), true);
+  // The stub shape now REQUIRES the documented sourceType and composePath too.
+  assert.equal(assertAdoptable({ sourceType: 'github',
+    composePath: './docker-compose.staging.yml',
+    repository: null, owner: null, branch: null }), true);
   assert.equal(assertAdoptable(projectComposeState(COMPOSE_ROW)), true);
   assert.throws(() => assertAdoptable({ repository: 'other', owner: 'x', branch: 'main',
     sourceType: 'github', composePath: './x.yml' }), (e) => e.code === E.COMPOSE_CONFLICT);
   const two = [{ composeId: 'a', appName: COMPOSE_APPNAME + '-1' },
                { composeId: 'b', appName: COMPOSE_APPNAME + '-2' }];
   const b = projectStagingBinding(projectBody({ composes: two }));
-  assert.throws(() => selectTarget(b, null), (e) => e.code === E.ADOPT_AMBIGUOUS);
+  assert.throws(() => selectTarget(b, null, { nonce: NONCE }), (e) => e.code === E.ADOPT_AMBIGUOUS);
 });
 
 // ── Cipher F4: strict escrow grammar ────────────────────────────────────
@@ -365,10 +374,10 @@ test('a single prefix collision is ADOPTED, never duplicated; two are ambiguous'
   // second service, but only after compose.one proves its shape (asserted in
   // the recovery test). More than one is unresolvable.
   const b = projectStagingBinding(projectBody({ composes: EXISTING }));
-  assert.deepEqual(selectTarget(b, null), { composeId: COMPOSE_ID, create: false, adopt: true });
+  assert.deepEqual(selectTarget(b, null, { nonce: NONCE }), { composeId: COMPOSE_ID, create: false, adopt: true });
   const two = projectStagingBinding(projectBody({ composes: [
     { composeId: 'a', appName: COMPOSE_APPNAME }, { composeId: 'b', appName: COMPOSE_APPNAME + '-2' }] }));
-  assert.throws(() => selectTarget(two, null), (e) => e.code === E.ADOPT_AMBIGUOUS);
+  assert.throws(() => selectTarget(two, null, { nonce: NONCE }), (e) => e.code === E.ADOPT_AMBIGUOUS);
 });
 
 test('two rows matching a prior binding stop; exactly one is required', () => {
@@ -380,8 +389,8 @@ test('two rows matching a prior binding stop; exactly one is required', () => {
 
 test('a prior binding that no longer exists stops, never silently recreates', () => {
   const b = projectStagingBinding(projectBody({ composes: [] }));
-  assert.throws(() => selectTarget(b, { composeId: 'gone' }), (e) => e.code === E.COMPOSE_CONFLICT);
-  assert.deepEqual(selectTarget(b, null), { composeId: null, create: true, adopt: false });
+  assert.throws(() => selectTarget(b, { composeId: 'gone' }, null), (e) => e.code === E.COMPOSE_CONFLICT);
+  assert.deepEqual(selectTarget(b, null, null), { composeId: null, create: true, adopt: false });
 });
 
 // ══ Ownership binding ═══════════════════════════════════════════════════
@@ -549,4 +558,127 @@ test('the success receipt carries no secret and no token', async () => {
   const receipt = [OK_RECEIPT, r.composeId, r.environmentId, r.credPath,
                    r.domainAction, r.escrowReused].join('|');
   assert.ok(!receipt.includes(SECRET_CANARY) && !receipt.includes(TOKEN_CANARY));
+});
+
+
+// ══ Cipher C1: the CREATED row is held to the documented shape ══════════
+test('C1 REPRO: a create returning a foreign source shape is REFUSED', async () => {
+  // Exactly Cipher's probe: correct new id/environment/appName, but
+  // sourceType=gitlab, composePath=./foreign.yml, repository/owner/branch null.
+  const h = harness({ composeRow: { ...COMPOSE_ROW, sourceType: 'gitlab',
+                                    composePath: './foreign.yml',
+                                    repository: null, owner: null, branch: null } });
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.COMPOSE_CONFLICT);
+  assert.ok(!h.calls.includes(`POST ${P_COMPOSE_UPDATE}`), 'no update on a foreign shape');
+  assert.ok(!h.calls.includes(`POST ${P_DOMAIN_CREATE}`));
+  assert.ok(!h.calls.includes(`POST ${P_COMPOSE_DEPLOY}`));
+});
+
+test('C1: the untouched-stub grammar is exact, not truthiness', () => {
+  const stub = { sourceType: 'github', composePath: './docker-compose.staging.yml',
+                 repository: null, owner: null, branch: null };
+  assert.equal(isUntouchedStub(stub), true);
+  assert.equal(isUntouchedStub({ ...stub, sourceType: 'gitlab' }), false, 'wrong sourceType');
+  assert.equal(isUntouchedStub({ ...stub, composePath: './foreign.yml' }), false, 'wrong path');
+  // Empty strings are NOT unset: `!x` accepted these before.
+  assert.equal(isUntouchedStub({ ...stub, repository: '' }), false);
+  assert.equal(isUntouchedStub({ ...stub, owner: '' }), false);
+  assert.equal(isUntouchedStub({ ...stub, branch: '' }), false);
+});
+
+// ══ Cipher C2: escrow.reused is not ownership ═══════════════════════════
+test('C2: an unbound candidate with NO intent marker is refused', () => {
+  const b = projectStagingBinding(projectBody({ composes: EXISTING }));
+  assert.throws(() => selectTarget(b, null, null), (e) => e.code === E.ADOPT_NO_MARKER);
+});
+
+test('C2: a candidate whose appName does not carry OUR nonce is refused', () => {
+  const foreign = [{ composeId: 'cmp_x', appName: COMPOSE_APPNAME + '-ffffffffffffffff-zz' }];
+  const b = projectStagingBinding(projectBody({ composes: foreign }));
+  assert.throws(() => selectTarget(b, null, { nonce: NONCE }), (e) => e.code === E.ADOPT_NO_MARKER);
+  assert.equal(appNameCarriesNonce(intendedAppName(NONCE), NONCE), true);
+  assert.equal(appNameCarriesNonce(intendedAppName(NONCE) + '-ab12cd', NONCE), true);
+  assert.equal(appNameCarriesNonce(COMPOSE_APPNAME + '-deadbeefdeadbeef', NONCE), false);
+});
+
+test('C2: the create request carries the nonce-bearing appName', async () => {
+  const h = harness();
+  const bodies = [];
+  const inner = h.args.requestFn;
+  h.args.requestFn = (o) => { bodies.push([o.path.split('?')[0], o.body]); return inner(o); };
+  await orchestrate(h.args);
+  const create = bodies.find(([p]) => p === P_COMPOSE_CREATE);
+  assert.equal(create[1].appName, intendedAppName(NONCE));
+});
+
+// ══ Cipher C3: bounded printable identifier grammar ═════════════════════
+test('C3 REPRO: control-bearing and oversize identifiers are rejected', () => {
+  for (const bad of ['env-ok\nXEROX_QUIZ_STAGING_PROVISIONED',
+                     '\u001b[2Jenv', 'a'.repeat(200), '', 'sp ace', 'quote"x']) {
+    assert.throws(() => assertId(bad, E.BAD_SHAPE), (e) => e.code === E.BAD_SHAPE,
+      JSON.stringify(bad).slice(0, 40));
+  }
+  assert.equal(assertId('env_staging_QUIZ-1.a:b@c+d', E.BAD_SHAPE), 'env_staging_QUIZ-1.a:b@c+d');
+});
+
+test('C3: a forged environmentId cannot reach the receipt', () => {
+  assert.throws(() => projectStagingBinding(projectBody({
+    envOverride: { environmentId: 'env\nXEROX_QUIZ_STAGING_PROVISIONED' } })),
+    (e) => e.code === E.BAD_SHAPE);
+  assert.throws(() => projectStagingBinding(projectBody({
+    composes: [{ composeId: 'ok', appName: 'bad\u001b[2J' }] })), (e) => e.code === E.BAD_SHAPE);
+});
+
+// ══ Cipher C4: the reviewed revision is enforced ════════════════════════
+test('C4: the revision gate accepts only the exact reviewed SHA on the exact branch', () => {
+  assert.equal(assertInfraRevision(GOOD_LSREMOTE), true);
+  for (const bad of [
+    '0000000000000000000000000000000000000000\trefs/heads/aperture-ztid5-staging\n', // moved
+    '26d6a9eb25b8653356d1aae4659382a62d479c41\trefs/heads/main\n',                    // wrong branch
+    '',                                                                                // deleted
+    'not-a-sha\trefs/heads/aperture-ztid5-staging\n',
+    GOOD_LSREMOTE + GOOD_LSREMOTE,                                                     // ambiguous
+  ]) {
+    assert.throws(() => assertInfraRevision(bad), (e) => e.code === E.INFRA_REV_MISMATCH);
+  }
+});
+
+test('C4: a moved branch aborts BEFORE the forward and before any call', async () => {
+  let forwards = 0;
+  const h = harness({ lsRemote: '0000000000000000000000000000000000000000\trefs/heads/aperture-ztid5-staging\n' });
+  h.args.openForwardFn = () => { forwards += 1; return { ready: Promise.resolve('/s'), cleanup: () => {} }; };
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.INFRA_REV_MISMATCH);
+  assert.equal(forwards, 0, 'must abort before the forward opens');
+  assert.deepEqual(h.posts(), []);
+  assert.ok(!h.calls.includes('readToken'), 'and before the token is read');
+});
+
+
+test('C1: a fresh create returning the UNTOUCHED STUB is accepted and proceeds', () => {
+  // The realistic create response: Dokploy returns an unconfigured stub, not a
+  // fully-configured row. Without this case the shape gate could be removed
+  // entirely and every other test would still pass, because a configured row
+  // also satisfies the exact-target branch. This is the case that makes the
+  // gate observable.
+  const stub = { composeId: COMPOSE_ID, appName: intendedAppName(NONCE),
+                 environmentId: ENV_ID, sourceType: 'github',
+                 composePath: './docker-compose.staging.yml',
+                 repository: null, owner: null, branch: null };
+  assert.equal(isUntouchedStub(projectComposeState(stub)), true);
+  assert.equal(assertAdoptable(projectComposeState(stub)), true);
+  // and it must NOT satisfy the configured-target test
+  assert.equal(composeMatchesTarget(projectComposeState(stub)), false);
+});
+
+test('C1: fresh create end-to-end with a stub response completes all mutations', async () => {
+  const stub = { composeId: COMPOSE_ID, appName: intendedAppName(NONCE),
+                 environmentId: ENV_ID, sourceType: 'github',
+                 composePath: './docker-compose.staging.yml',
+                 repository: null, owner: null, branch: null };
+  const h = harness({ intent: null, composeRow: stub });
+  const r = await orchestrate(h.args);
+  assert.equal(r.composeId, COMPOSE_ID);
+  for (const p of [P_COMPOSE_UPDATE, P_DOMAIN_CREATE, P_COMPOSE_DEPLOY]) {
+    assert.ok(h.calls.includes(`POST ${p}`), 'expected ' + p);
+  }
 });

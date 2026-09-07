@@ -33,7 +33,7 @@ import { openSync, fstatSync, lstatSync, readSync, writeSync, closeSync, fsyncSy
 import { constants as FS } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import http from 'node:http';
 
@@ -117,6 +117,7 @@ const E = Object.freeze({
   COMPOSE_CONFLICT: 'E_COMPOSE_CONFLICT', DOMAIN_CONFLICT: 'E_DOMAIN_CONFLICT',
   ESCROW_CORRUPT: 'E_ESCROW_CORRUPT', ESCROW_WRITE: 'E_ESCROW_WRITE',
   ESCROW_MISSING: 'E_ESCROW_MISSING', ADOPT_AMBIGUOUS: 'E_ADOPT_AMBIGUOUS',
+  ADOPT_NO_MARKER: 'E_ADOPT_NO_MARKER', INFRA_REV_MISMATCH: 'E_INFRA_REV_MISMATCH',
   IDENTITY_UNPROVEN: 'E_IDENTITY_UNPROVEN',
   INTERNAL: 'E_INTERNAL',
 });
@@ -371,13 +372,16 @@ function projectStagingBinding(body) {
     if (!e || typeof e !== 'object') throw new Fail(E.BAD_SHAPE);
     const id = e.environmentId;
     const name = e.name;
-    if (typeof id !== 'string' || id.length === 0) throw new Fail(E.BAD_SHAPE);
-    if (typeof name !== 'string' || name.length === 0) throw new Fail(E.BAD_SHAPE);
+    assertId(id, E.BAD_SHAPE);                       // bounded, printable, no controls
+    if (typeof name !== 'string' || name.length === 0 || name.length > MAX_ID_LEN
+        || !/^[\x20-\x7e]+$/.test(name)) {
+      throw new Fail(E.BAD_SHAPE);
+    }
     if (!Array.isArray(e.compose)) throw new Fail(E.BAD_SHAPE);  // never default to []
     const composes = e.compose.map((c) => {
       if (!c || typeof c !== 'object') throw new Fail(E.BAD_SHAPE);
-      if (typeof c.composeId !== 'string' || c.composeId.length === 0) throw new Fail(E.BAD_SHAPE);
-      if (typeof c.appName !== 'string' || c.appName.length === 0) throw new Fail(E.BAD_SHAPE);
+      assertId(c.composeId, E.BAD_SHAPE);
+      assertId(c.appName, E.BAD_SHAPE);
       return { composeId: c.composeId, appName: c.appName };
     });
     return { environmentId: id, name, composes };
@@ -400,7 +404,7 @@ function projectStagingBinding(body) {
 //    is ours or is prefixed with ours. Dokploy appends a random suffix to
 //    appName on create, so a prefix hit means a prior run already created one
 //    and we lost the binding -- ambiguous, therefore a stop, never a create.
-function selectTarget(binding, priorBinding) {
+function selectTarget(binding, priorBinding, intent) {
   if (priorBinding) {
     const hits = binding.composes.filter((c) => c.composeId === priorBinding.composeId);
     if (hits.length !== 1) throw new Fail(E.COMPOSE_CONFLICT);
@@ -415,14 +419,29 @@ function selectTarget(binding, priorBinding) {
   // compose.one proves it sits in the selected staging environment and still
   // has an allowed shape. More than one candidate is unresolvable.
   if (collide.length !== 1) throw new Fail(E.ADOPT_AMBIGUOUS);
+  // Ownership marker is mandatory: escrow.reused alone is NOT adoption proof.
+  if (!intent) throw new Fail(E.ADOPT_NO_MARKER);
+  if (!appNameCarriesNonce(collide[0].appName, intent.nonce)) {
+    throw new Fail(E.ADOPT_NO_MARKER);
+  }
   return { composeId: collide[0].composeId, create: false, adopt: true };
 }
 
-// An adoptable row is either an untouched create stub (source fields still
-// unset) or already exactly our target. Anything else is someone else's object.
+// The DOCUMENTED untouched-create shape. `!x` was too loose: it accepted a row
+// whose sourceType or composePath pointed somewhere else entirely, and treated
+// an empty string as unset. Null is required strictly -- if a live create ever
+// returns empty strings this fails closed and gets re-reviewed rather than
+// silently widening the gate.
+function isUntouchedStub(st) {
+  return st.sourceType === 'github'
+    && st.composePath === COMPOSE_PATH
+    && st.repository === null && st.owner === null && st.branch === null;
+}
+
+// An adoptable row is either the untouched create stub or already exactly our
+// target. Anything else belongs to someone else.
 function assertAdoptable(st) {
-  const stub = !st.repository && !st.owner && !st.branch;
-  if (stub || composeMatchesTarget(st)) return true;
+  if (isUntouchedStub(st) || composeMatchesTarget(st)) return true;
   throw new Fail(E.COMPOSE_CONFLICT);
 }
 
@@ -441,6 +460,8 @@ function projectComposeState(body) {
     if (v !== null && v !== undefined && typeof v !== 'string') throw new Fail(E.BAD_SHAPE);
     out[k] = v ?? null;
   }
+  assertId(out.composeId, E.BAD_SHAPE);
+  assertId(out.appName, E.BAD_SHAPE);
   assertNoProdIds([out.composeId, out.appName]);
   return out;
 }
@@ -516,6 +537,7 @@ function classifyDomainState(rows, expectedComposeId) {
 // set is created once, published atomically, and strictly reused thereafter.
 const ESCROW_PATH = join(TEMP_PARENT, 'quiz-staging-fixture.env');
 const BINDING_PATH = join(TEMP_PARENT, 'quiz-staging-binding.json');
+const INTENT_PATH = join(TEMP_PARENT, 'quiz-staging-intent.json');
 const ESCROW_KEYS = Object.freeze([
   'QUIZ_DB_PASSWORD', 'SECRET_KEY', 'ADMIN_USERNAME', 'ADMIN_PASSWORD',
   'STAGING_HONO_IMAGE', 'STAGING_HONO_DB_PASSWORD', 'STAGING_BETTER_AUTH_SECRET',
@@ -535,6 +557,19 @@ function generateStagingEnv() {
 function envToBlock(env) {
   return ESCROW_KEYS.map((k) => `${k}=${env[k]}`).join('\n');
 }
+const MAX_ID_LEN = 128;
+// Identifiers come from a remote response and are used for matching and
+// printed in the receipt. An unbounded or control-bearing value could forge a
+// receipt line or rewrite the terminal, so the grammar is enforced before any
+// identifier is matched on or emitted.
+function assertId(v, code) {
+  if (typeof v !== 'string' || v.length === 0 || v.length > MAX_ID_LEN
+      || !/^[A-Za-z0-9._:@+-]+$/.test(v)) {
+    throw new Fail(code);
+  }
+  return v;
+}
+
 const MAX_ESCROW_VALUE = 512;
 const MAX_ESCROW_BYTES = 8192;
 
@@ -650,6 +685,42 @@ function loadOrCreateEscrow() {
   });
 }
 
+// OWNERSHIP MARKER. A reused escrow proves only that some earlier run existed;
+// it says nothing about whether an unbound remote service is ours. The intent
+// nonce is persisted BEFORE compose.create and is embedded in the appName we
+// ask Dokploy to create, so an adopted candidate can be tied back to this
+// escrow by an exact non-secret remote discriminator. Without a marker, an
+// unbound candidate is refused outright.
+function intendedAppName(nonce) {
+  return `${COMPOSE_APPNAME}-${nonce}`;
+}
+function loadIntent() {
+  const t = readOwnedFile(INTENT_PATH, E.ESCROW_CORRUPT);
+  if (t === null) return null;
+  let v;
+  try { v = JSON.parse(t); } catch { throw new Fail(E.ESCROW_CORRUPT); }
+  if (!v || typeof v !== 'object' || Object.keys(v).length !== 1
+      || typeof v.nonce !== 'string' || !/^[a-f0-9]{16}$/.test(v.nonce)) {
+    throw new Fail(E.ESCROW_CORRUPT);
+  }
+  return v;
+}
+function createIntent() {
+  assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
+  const nonce = randomBytes(8).toString('hex');
+  publishFile(INTENT_PATH, JSON.stringify({ nonce }) + '\n', E.ESCROW_WRITE);
+  const back = loadIntent();
+  if (back === null) throw new Fail(E.ESCROW_WRITE);
+  return back;
+}
+// Adoption requires the candidate's appName to carry OUR nonce. Dokploy may
+// append its own suffix, so an exact match or our name plus a suffix both
+// qualify; anything else is not ours.
+function appNameCarriesNonce(appName, nonce) {
+  const mine = intendedAppName(nonce);
+  return appName === mine || appName.startsWith(mine + '-');
+}
+
 // Durable record of the remote object this run bound to, so a retry rebinds
 // by exact composeId instead of guessing from a suffixed appName.
 function loadBinding() {
@@ -676,7 +747,8 @@ function saveBinding(composeId) {
 }
 
 export { projectComposeState, composeMatchesTarget, assertComposeIdentity, selectTarget,
-         assertAdoptable, escrowDecision, projectDomainRows,
+         assertAdoptable, isUntouchedStub, assertId, escrowDecision,
+         intendedAppName, appNameCarriesNonce, projectDomainRows,
          domainMatchesTarget, classifyDomainState, COMPOSE_FIELDS, DOMAIN_FIELDS,
          P_COMPOSE_ONE, P_DOMAIN_BY_COMPOSE,
          assertSshContext, SSH_ARGS, buildRequestOptions, projectStagingBinding,
@@ -689,9 +761,9 @@ export { projectComposeState, composeMatchesTarget, assertComposeIdentity, selec
 
 
 // ── Fixed mutation bodies. Every field is pinned here; nothing is caller-fed.
-function bodyComposeCreate(environmentId) {
+function bodyComposeCreate(environmentId, nonce) {
   return {
-    name: COMPOSE_NAME, appName: COMPOSE_APPNAME, environmentId,
+    name: COMPOSE_NAME, appName: intendedAppName(nonce), environmentId,
     composeType: 'docker-compose', composePath: COMPOSE_PATH, sourceType: 'github',
   };
 }
@@ -719,6 +791,7 @@ function extractComposeId(body) {
   const id = body && typeof body === 'object'
     ? (typeof body.composeId === 'string' ? body.composeId : null) : null;
   if (!id) throw new Fail(E.BAD_SHAPE);
+  assertId(id, E.BAD_SHAPE);
   assertNoProdIds([id]);
   return id;
 }
@@ -726,18 +799,41 @@ function extractComposeId(body) {
 // ── The single fixed-purpose action, with injected seams for testing ─────
 // Order is: read gate -> [create] -> source -> env -> domain -> deploy.
 // No mutation may precede the identity and staging-environment binding.
+// C4: INFRA_REV was documentary — exported but never checked, while
+// compose.update deploys a MUTABLE branch. Dokploy's compose source has no
+// immutable-ref field available here, so the reviewed revision is enforced as a
+// fresh remote branch-SHA gate immediately before execution; a mismatch aborts
+// before the forward opens and before any remote side effect.
+function assertInfraRevision(lsRemoteOutput) {
+  if (typeof lsRemoteOutput !== 'string' || lsRemoteOutput.length === 0
+      || lsRemoteOutput.length > 4096) {
+    throw new Fail(E.INFRA_REV_MISMATCH);
+  }
+  const lines = lsRemoteOutput.split('\n').filter((l) => l.trim() !== '');
+  if (lines.length !== 1) throw new Fail(E.INFRA_REV_MISMATCH);   // zero or many refs
+  const m = /^([0-9a-f]{40})\s+refs\/heads\/(.+)$/.exec(lines[0].trim());
+  if (!m) throw new Fail(E.INFRA_REV_MISMATCH);
+  if (m[2] !== INFRA_BRANCH) throw new Fail(E.INFRA_REV_MISMATCH);
+  if (m[1] !== INFRA_REV) throw new Fail(E.INFRA_REV_MISMATCH);   // branch moved
+  return true;
+}
+
 async function orchestrate({
   assertContextFn, readTokenFn, openForwardFn, requestFn,
-  escrowFn, loadBindingFn, saveBindingFn,
+  escrowFn, loadBindingFn, saveBindingFn, loadIntentFn, createIntentFn, infraRevFn,
   deadlineMs = ACTION_DEADLINE_MS,
 }) {
   // No live defaults: every secret-capable seam must be supplied by the caller,
   // and only main() supplies the private live ones. An importer therefore
   // cannot reach the real escrow through this function.
   for (const fn of [assertContextFn, readTokenFn, openForwardFn, requestFn,
-                    escrowFn, loadBindingFn, saveBindingFn]) {
+                    escrowFn, loadBindingFn, saveBindingFn, loadIntentFn,
+                    createIntentFn, infraRevFn]) {
     if (typeof fn !== 'function') throw new Fail(E.BAD_SHAPE);
   }
+  // Revision gate FIRST: a moved branch must abort before the forward opens
+  // and long before any remote side effect.
+  assertInfraRevision(infraRevFn());
   assertContextFn();
   const token = readTokenFn();
 
@@ -748,6 +844,7 @@ async function orchestrate({
   if (env.STAGING_HONO_IMAGE !== PINNED_HONO_IMAGE_ID) throw new Fail(E.IMAGE_NOT_PINNED);
   if ('TRUSTED_PROXY_CIDRS' in env) throw new Fail(E.BAD_SHAPE);
   const priorBinding = loadBindingFn();
+  const priorIntent = loadIntentFn();
   // Coupling: a pre-existing remote object may only be touched with the SAME
   // escrow that created it. Binding present with a freshly generated escrow
   // means the escrow was lost, and proceeding would rotate the live stack's
@@ -770,7 +867,7 @@ async function orchestrate({
       // Gate 1: identity + exactly one staging environment.
       const binding = projectStagingBinding(
         await call(`${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`, 'GET', undefined));
-      const target = selectTarget(binding, priorBinding);
+      const target = selectTarget(binding, priorBinding, priorIntent);
 
       let composeId = target.composeId;
       const created = target.create;
@@ -781,8 +878,12 @@ async function orchestrate({
       // Creating the stub is the only mutation allowed before the remaining
       // reads, and it is unavoidable: the object must exist to be read.
       if (created) {
+        // Persist the ownership nonce BEFORE the create it names, so a crash
+        // in that window still leaves a marker the next run can match on.
+        const intent = priorIntent ?? createIntentFn();
         composeId = extractComposeId(
-          await call(P_COMPOSE_CREATE, 'POST', bodyComposeCreate(binding.environmentId)));
+          await call(P_COMPOSE_CREATE, 'POST',
+                     bodyComposeCreate(binding.environmentId, intent.nonce)));
         // Durably record the binding BEFORE anything else, so a crash here
         // still lets a retry rebind by exact id instead of creating again.
         saveBindingFn(composeId);
@@ -792,12 +893,16 @@ async function orchestrate({
       const st = projectComposeState(
         await call(`${P_COMPOSE_ONE}?composeId=${composeId}`, 'GET', undefined));
       assertComposeIdentity(st, composeId, binding.environmentId);
-      if (target.adopt) {
-        // Adopting a crash orphan: allowed shapes only, then persist the
-        // binding BEFORE any mutation so the window cannot reopen.
+      if (created || target.adopt) {
+        // BOTH paths are held to the documented shape. Previously a created
+        // row skipped this entirely, so a create returning a foreign
+        // sourceType/composePath was updated and deployed.
         assertAdoptable(st);
-        saveBindingFn(composeId);
-      } else if (!created && !composeMatchesTarget(st)) {
+        // The created path already persisted its binding immediately after the
+        // create, and publication is no-overwrite, so saving again here would
+        // throw. Only the adopted path still needs to record its binding.
+        if (target.adopt) saveBindingFn(composeId);
+      } else if (!composeMatchesTarget(st)) {
         // A previously bound service must still be exactly our target.
         throw new Fail(E.COMPOSE_CONFLICT);
       }
@@ -828,6 +933,13 @@ async function orchestrate({
   }
 }
 
+// PRIVATE. Fixed argv, fixed remote, no shell. Never exported.
+function readInfraRevision() {
+  return execFileSync('/usr/bin/git',
+    ['ls-remote', `https://github.com/${REPO_OWNER}/${REPO_NAME}`, `refs/heads/${INFRA_BRANCH}`],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 65_536, stdio: ['ignore', 'pipe', 'ignore'] });
+}
+
 async function main() {
   if (process.argv.slice(2).length !== 0) {
     process.stdout.write(E.BAD_ACTION + '\n');
@@ -845,6 +957,9 @@ async function main() {
       escrowFn: loadOrCreateEscrow,
       loadBindingFn: loadBinding,
       saveBindingFn: saveBinding,
+      loadIntentFn: loadIntent,
+      createIntentFn: createIntent,
+      infraRevFn: readInfraRevision,
     });
     // Fixed receipt plus the minimum non-secret IDs evidencing the binding.
     process.stdout.write(`${OK_RECEIPT}\n`);
@@ -861,6 +976,6 @@ async function main() {
 
 export { orchestrate, bodyComposeCreate, bodyComposeSource, bodyComposeEnv,
          bodyDomainCreate, bodyComposeDeploy, extractComposeId,
-         parseEscrowBlock, ESCROW_KEYS };
+         parseEscrowBlock, ESCROW_KEYS, assertInfraRevision };
 
 if (import.meta.url === `file://${process.argv[1]}`) { await main(); }
