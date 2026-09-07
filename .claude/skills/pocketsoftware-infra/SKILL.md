@@ -183,6 +183,66 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ---
 
+### Agent access to Infisical — READ THIS FIRST (status: NOT end-to-end operational)
+
+> **Current status, stated plainly so nobody rediscovers this the hard way: an agent CANNOT
+> read Infisical metadata end-to-end today.** The helper exists and is reviewable; the
+> credential bootstrap that would feed it does NOT. Do not plan work that assumes agent
+> Infisical access until the bootstrap below is resolved. Bead: `aperture-a4ph5`.
+
+**What exists.** `scripts/infisical-metadata.mjs` in the aperture repo — a fixed-purpose,
+single-action helper that authenticates with the EXISTING `peppy-admin` Universal Auth
+machine identity and emits ONLY project / environment / secret-KEY-NAME metadata as one
+bounded JSON receipt. Invocation is exactly:
+
+```bash
+node scripts/infisical-metadata.mjs list-metadata
+```
+
+No other action exists. There is no `inject`, no path/URL/query argument, no shell
+passthrough, and no generic read mode — by design, per Cipher's ruling.
+
+**Prerequisites, all of which must hold or the helper fails closed.**
+
+| Requirement | Detail |
+|---|---|
+| Tailnet | Must be connected. Infisical is tailnet-only at `http://100.102.73.112:3005` (pocketsoftware). Publicly closed — that is correct posture, not a fault. |
+| Server compatibility | Infisical **v0.146** (`infisical/infisical:v0.146.0-postgres`). The CLI, if ever used, is pinned `@infisical/cli@0.42.6` — v4/latest mismatches this server. |
+| Credential source | A `0600` file at `~/.config/aperture/infisical-peppy-admin.env` containing exactly `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`, inside an owned `0700` parent. The path is HARDCODED; there is no override. |
+| Identity | Logical reference only: the `peppy-admin` machine identity registered in the `peppy/secrets` drawer "PocketSoftware Infisical". **Never open that drawer through a model-visible tool.** |
+
+**⛔ THE MISSING PIECE — credential bootstrap is UNRESOLVED.** Nothing currently populates
+that `0600` file, and no approved non-model handoff has been identified to do so. The
+credential registry is reachable in principle but reading it is NOT authorized, and
+bootstrapping the file from a model-visible drawer call is explicitly forbidden. Until an
+operator or an approved mechanism provisions the file, `list-metadata` returns
+`E_CRED_MISSING` **before any network call**. That is the intended fail-closed behavior.
+
+**⛔ INJECTION IS NOT IMPLEMENTED.** This helper only READS metadata. It cannot deliver a
+secret to any runtime. Anything that needs a secret injected into an app — Quiz included —
+is NOT served by this and requires separate design and review.
+
+**Success evidence looks like** a single JSON line with `ok: true`, project/environment
+names and secret KEY names, and the value-boundary statement: *"Infisical returned
+value-bearing responses; zero values were emitted, logged, persisted, fingerprinted, or
+placed in model-visible output."* Note the honesty of that wording — v0.146 list-secrets
+responses DO contain `secretValue`, so the claim is about emission, never about retrieval.
+
+**Failure and recovery.** All failures are stable codes; upstream status, bodies and headers
+are never reflected. `E_CRED_MISSING` / `E_CRED_PERMS` / `E_CRED_OWNER` / `E_CRED_SYMLINK` /
+`E_CRED_LINKS` / `E_CRED_RACE` — fix the file or its parent, never work around the guard.
+`E_AUTH_REJECTED` — the identity is invalid, expired, or lost its grant: **STOP and report.
+Do not retry, do not re-provision, do not create a new identity or key.** `E_NETWORK` —
+check the tailnet first. `E_REDIRECT_REFUSED` / `E_UPSTREAM_STATUS` / `E_BAD_SHAPE` /
+`E_BODY_TOO_LARGE` — treat as a server or compatibility change and re-verify against this
+section before touching the helper.
+
+**Source of truth vs documentation.** This section documents the INTENDED access path. It is
+not evidence that the path currently works: the `peppy-admin` identity is a DOCUMENTED
+REFERENCE that authenticated on 2026-08-23 but has NOT been re-verified live since. Treat a
+successful `list-metadata` run as the only proof, and update this section with the verified
+command and date when one lands.
+
 ## 10. Databases (platform-postgres)
 
 Central shared Postgres 17 for all pocketsoftware apps. Live since 2026-07-14 (BEADS `aperture-sazvl`).
