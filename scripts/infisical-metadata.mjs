@@ -322,8 +322,19 @@ function withAbsoluteDeadline({ start, abort, ms }) {
       fn(arg);
     };
     timer = setTimeout(() => {
-      try { if (abort) abort(); } catch { /* best effort */ }
-      settle(reject, new Fail(E.DEADLINE));
+      // Cipher r4: CLAIM the settlement and clear the timer BEFORE aborting.
+      // A transport teardown is permitted to invoke its error callback
+      // SYNCHRONOUSLY (destroy-style teardown does exactly this in some
+      // implementations). If abort() ran first, that callback would settle the
+      // promise with E_NETWORK and the deadline outcome would be lost — the
+      // caller would be told the connection failed when in fact we timed it
+      // out. Claiming first makes the outcome atomic: any callback abort
+      // triggers is ignored by settle(), and the deadline always wins.
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      try { if (abort) abort(); } catch { /* abort failure must not mask the deadline */ }
+      reject(new Fail(E.DEADLINE));
     }, ms);
     try {
       start((v) => settle(resolve, v), (e) => settle(reject, e));

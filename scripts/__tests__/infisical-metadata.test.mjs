@@ -575,3 +575,60 @@ test('a lone surrogate / truncated multibyte sequence is rejected', () => {
   assert.throws(() => decodeCredentialBytes(Buffer.from([0xe4, 0xb8])), (e) => e.code === E.CRED_ENCODING);
 });
 
+// ══ Cipher r4: deadline PRECEDENCE — the deadline must win the race ═════
+test('a SYNCHRONOUS abort callback cannot steal the outcome from the deadline', async () => {
+  // Cipher's exact reproduction: teardown invokes the operation's error
+  // callback synchronously. Before the fix this settled E_NETWORK.
+  let captured = null;
+  let aborts = 0;
+  await assert.rejects(
+    () => withAbsoluteDeadline({
+      ms: 5,
+      abort: () => { aborts += 1; if (captured) captured(new Fail(E.NETWORK)); },
+      start: (ok, bad) => { captured = bad; },
+    }),
+    (e) => e.code === E.DEADLINE);
+  assert.equal(aborts, 1, 'abort still runs exactly once');
+});
+
+test('an abort that THROWS does not mask the deadline', async () => {
+  let aborts = 0;
+  await assert.rejects(
+    () => withAbsoluteDeadline({
+      ms: 5,
+      abort: () => { aborts += 1; throw new Error('teardown blew up'); },
+      start: () => {},
+    }),
+    (e) => e.code === E.DEADLINE);
+  assert.equal(aborts, 1);
+});
+
+test('a LATE success after expiry cannot overwrite the deadline outcome', async () => {
+  let captured = null;
+  const p = withAbsoluteDeadline({
+    ms: 5, abort: () => {}, start: (ok) => { captured = ok; },
+  });
+  await assert.rejects(() => p, (e) => e.code === E.DEADLINE);
+  captured('too late');                       // must be ignored
+  await assert.rejects(() => p, (e) => e.code === E.DEADLINE, 'outcome stays E_DEADLINE');
+});
+
+test('a LATE error after expiry cannot overwrite the deadline outcome', async () => {
+  let captured = null;
+  const p = withAbsoluteDeadline({
+    ms: 5, abort: () => {}, start: (ok, bad) => { captured = bad; },
+  });
+  await assert.rejects(() => p, (e) => e.code === E.DEADLINE);
+  captured(new Fail(E.NETWORK));              // must be ignored
+  await assert.rejects(() => p, (e) => e.code === E.DEADLINE);
+});
+
+test('a normal settle still wins when it happens before the deadline', async () => {
+  let aborts = 0;
+  const v = await withAbsoluteDeadline({
+    ms: 500, abort: () => { aborts += 1; }, start: (ok) => ok('fast'),
+  });
+  assert.equal(v, 'fast');
+  assert.equal(aborts, 0, 'abort must NOT run when the operation settled in time');
+});
+
