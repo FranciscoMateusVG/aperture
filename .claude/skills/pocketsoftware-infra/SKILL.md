@@ -185,9 +185,11 @@ Full DR commands and gotchas in `pocketsoftware-terraform/AGENTS.md § 8. Secret
 
 ### Agent access to Infisical — READ THIS FIRST (status: HOLD, NOT operational)
 
-> **STATUS: HOLD — not approved for live use, not operational.** Security review
-> (Cipher, `aperture-5nxd8`) has NOT passed the helper for live credential use, and NO
-> live authentication has ever been performed against this instance by this tool. The
+> **STATUS: HOLD — not operational.** Note the distinction, because it matters:
+> the helper CODE has **PASSED** security review (Cipher, `aperture-5nxd8`, exact head
+> `5e575f4`, 57/57 offline regressions). What is still missing is an approved credential
+> BOOTSTRAP, so there is nothing to authenticate with and NO live authentication has ever
+> been performed against this instance by this tool. Code approved, operation held. The
 > helper exists and is reviewable; the credential bootstrap that would feed it does NOT
 > exist. Do not run it against real credentials, and do not plan work that assumes agent
 > Infisical access. Bead: `aperture-a4ph5`.
@@ -228,6 +230,13 @@ credential registry is reachable in principle but reading it is NOT authorized, 
 bootstrapping the file from a model-visible drawer call is explicitly forbidden. Until an
 operator or an approved mechanism provisions the file, `list-metadata` returns
 `E_CRED_MISSING` **before any network call**. That is the intended fail-closed behavior.
+
+**Pre-authorised scope for the eventual first live run** (Cipher, binding): exactly **ONE**
+`list-metadata` invocation, and only after GLaDOS/the operator has selected and completed an
+approved non-model bootstrap into the reviewed fixed file. **No retries** after an auth,
+schema, or network failure — a failure code STOPS the run and is reported as-is. No
+model-visible drawer call, no registry adapter, no mutation, no injection, no key creation,
+no rotation. Return only the single bounded JSON receipt for Cipher's final review.
 
 **⛔ INJECTION IS NOT IMPLEMENTED.** This helper only READS metadata. It cannot deliver a
 secret to any runtime. Anything that needs a secret injected into an app — Quiz included —
