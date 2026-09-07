@@ -1,6 +1,6 @@
 # Aperture V4 — Project Teams: seats, incarnations, presets, safe replacement
 
-**Bead:** aperture-nap3u. **Author:** Wheatley. **Status:** v2.3 — revised against GLaDOS's architecture batch, Izzy's testability HOLD (12 findings) and her narrow recheck (4 bounded fixes), plus GLaDOS's precision corrections; the resolution table is §11. Gates in §8 are **recommended defaults pending final spec approval** — the operator has not yet chosen them. **Implementation:** not before the operator resumes Thursday (token reset); nothing in this document authorizes code, installs or a demo before then.
+**Bead:** aperture-nap3u. **Author:** Wheatley. **Status:** v2.4 (gates 4/7 approval recorded) — revised against GLaDOS's architecture batch, Izzy's testability HOLD (12 findings) and her narrow recheck (4 bounded fixes), plus GLaDOS's precision corrections; the resolution table is §11. Gates 4 and 7 in §8 were **approved by the operator on 2026-09-06** (relayed via GLaDOS); the remaining gates are recommended defaults pending final spec approval. **Implementation:** not before the operator resumes Thursday (token reset); nothing in this document authorizes code, installs or a demo before then.
 
 Baseline: master `4fb8cad` (v3.2.0 released and canonical 2026-09-06). **verified** = read in that tree by a read-only recon pass; **hypothesis** = not exercised end-to-end; **GATE** = an unresolved product choice that changes tests and must be decided (with the recommendation given) before the phase that depends on it starts.
 
@@ -95,7 +95,7 @@ Checklist gate (§4.7). Archive is a single state transition with an explicit ro
 
 ## 4. Architecture
 
-### 4.1 Names (GATE #7 — proposed design choice, recommended default)
+### 4.1 Names (GATE #7 — approved by operator 2026-09-06)
 Proposed canonical seat-name rule (a technical bound, offered as the recommended default), one literal regex used by hub, Rust, presence-hint and the UI: **`^[a-z0-9][a-z0-9_-]{0,30}$` — total length 1–31 characters.** Rationale: 31 stays under the tightest existing gate (presence-hint's 32), under the ≈62-char `sun_path` ceiling with room for `~/.aperture/run/` + `.sock`, and leaves headroom for generated suffixes. Team name ≤ 16, role ≤ 10, optional `-<n>` (n ≤ 99) → `16 + 1 + 10 + 3 = 30 ≤ 31`; the wizard enforces the per-part limits so the composed name can never exceed 31. **Collision handling:** the composed name must not equal (a) an existing registry folder (active or archived team), (b) a coordination-trio name, (c) reserved principals (`operator`, `watchdog`, `shared`), (d) any `_`-prefixed name; duplicates within a team append `-2`, `-3` only when the operator adds two seats of the same role. Boundary fixtures: length 1, 31 (pass), 32 (fail), leading `-`/`_`/digit-then-upper, `.`/`:`/space/`<` (fail), `t1-backend`, `team-fullstack-lead` (pass). **Defense-in-depth seam for the `<` fixture:** the loader (`agent_loader.rs`) applies the same regex and rejects the folder with a warning; the UI additionally escapes `agent.name` before `innerHTML`; the visual fixture injects an invalid name **below the loader** through the `list_agents` test double so the escaping path is exercised even though a real folder can never carry it.
 
 ### 4.2 Where things live
@@ -137,7 +137,7 @@ Blocked swap **invariants** (tested): no new owner record, no new token, no new 
 ### 4.6 Permissions, recipients, messaging semantics
 - **Recipient validation** (P0): `send_message.to` is valid iff the name is in the **enabled seat registry** (the same folders `agent_loader` loads, `enabled:true`, plus `operator`) — existence in the registry, **not** a live token, defines a recipient. Messages to an **enabled, never-booted** or **stopped-between-incarnations** seat are stored in BEADS and replayed on that seat's next hello (existing replay path); messages to an **archived/disabled/unknown** seat fail closed with `E_UNKNOWN_RECIPIENT`. A seat can only send as its own authenticated identity (hello token ↔ `AGENT_NAME` must match; mismatch closes with 4002).
 - **BEADS**: a new seat must round-trip `update_task(claim)` and `assignee` through the real `bd` binary (P0 test) — the hub round-trip alone does not prove it.
-- **Authority** (GATE #4 — recommended default, not yet operator-decided): swaps whose target model is on the team's **operator-approved fallback list** are authorized by the lead or GLaDOS; any other model, harness change, or budget change needs operator acknowledgement (the dialog waits). Create team: operator via UI, epic filed by GLaDOS after ack. Archive: GLaDOS after the checklist. Delete: nobody.
+- **Authority** (GATE #4 — approved by operator 2026-09-06): swaps whose target model is on the team's **operator-approved fallback list** are authorized by the lead or GLaDOS; any other model, harness change, or budget change needs operator acknowledgement (the dialog waits). Create team: operator via UI, epic filed by GLaDOS after ack. Archive: GLaDOS after the checklist. Delete: nobody.
 - **Lead as contact:** GLaDOS dispatches to the lead; seats keep the Constitution (no sweeps, await scoped dispatch, process-then-ack).
 
 ### 4.7 Archive — one canonical state
@@ -205,12 +205,12 @@ Sizing (honest): P0 ½ day; P1 1½–2 days (lock/staging semantics are the bulk
 | 1 | Operator-edited presets location | `~/.aperture/teams/presets/`; shipped defaults in repo | P1 |
 | 2 | Personas per role | keep (already preferred) | P1 templates |
 | 3 | Ownership storage | §4.3 lock + generation record; validate on APFS in P1 before relying on it | P1/P3 |
-| 4 | Swap authority | recommended default (not yet operator-decided): **operator-approved fallback list per team, enforced by lead/GLaDOS; anything else waits for operator ack** | P3 |
+| 4 | Swap authority | **APPROVED by operator 2026-09-06:** lead/GLaDOS may replace within the operator-approved per-team fallback list; anything outside the list requires operator approval | P3 |
 | 5 | Specialists' future | standing seats stay **temporarily**; retire/re-home in M3 at the operator's timing | M3 |
 | 6 | Foundation demo before UI | only if the operator wants it Thursday | scheduling |
-| 7 | Name ceiling | proposed technical bound (recommended default): **`^[a-z0-9][a-z0-9_-]{0,30}$`, 31 chars total, per-part limits 16/10/3** | P0 |
+| 7 | Name ceiling | **APPROVED by operator 2026-09-06:** 31-character internal seat-ID bound — `^[a-z0-9][a-z0-9_-]{0,30}$`, per-part limits 16/10/3 | P0 |
 
-Gates 4 and 7 must be decided at final spec approval, before P0/P3 start — until then they are recommended defaults, not decisions; the others may be accepted as recommended or left non-gating.
+Gates 4 and 7 are decided (operator approval 2026-09-06, approval status only — no architecture change); the others may be accepted as recommended or left non-gating at final spec approval.
 
 ## 9. Out of scope (V4.0)
 Multi-machine ownership; tool-level write fencing or credential revocation; embeddings/transcript memory; agent-initiated team creation; cross-team memory policy; automatic destructive cleanup; renaming the coordination trio.
