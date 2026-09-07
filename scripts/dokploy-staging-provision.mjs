@@ -4,10 +4,13 @@
  * identifier and body field below is fixed at authoring time. There is no
  * caller-supplied path, body, host or action.
  *
- * Gate 1 is the SOLE read: project.one. It binds identity (exact projectId AND
- * organizationId) and selects exactly one staging environment by the server's
- * own declared environment name. Zero or multiple matches is a hard stop --
- * never a guess, and never a fallback to production.
+ * Gate 1 is project.one: it binds identity (exact projectId AND organizationId)
+ * and selects exactly one staging environment by the server's own declared
+ * environment name. Zero or multiple matches is a hard stop -- never a guess,
+ * and never a fallback to production. Two further fixed read-only endpoints,
+ * compose.one and domain.byComposeId, establish the state project.one cannot
+ * prove; their procedure names and field allowlists were read from the running
+ * Dokploy v0.30.2 build. Every addressable state is read BEFORE the mutations.
  *
  * Mutations run only after that binding AND after the pinned Hono image and
  * the pushed infra revision are both known. Production identifiers are refused
@@ -26,7 +29,7 @@
  * value or raw response body.
  */
 import { openSync, fstatSync, lstatSync, readSync, closeSync, mkdirSync, mkdtempSync,
-         rmSync, writeFileSync } from 'node:fs';
+         rmSync, writeFileSync, linkSync } from 'node:fs';
 import { constants as FS } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -112,6 +115,8 @@ const E = Object.freeze({
   NO_STAGING_ENV: 'E_NO_STAGING_ENV', MULTI_STAGING_ENV: 'E_MULTI_STAGING_ENV',
   PROD_ID_REFUSED: 'E_PROD_ID_REFUSED', IMAGE_NOT_PINNED: 'E_IMAGE_NOT_PINNED',
   COMPOSE_CONFLICT: 'E_COMPOSE_CONFLICT', DOMAIN_CONFLICT: 'E_DOMAIN_CONFLICT',
+  ESCROW_CORRUPT: 'E_ESCROW_CORRUPT', ESCROW_WRITE: 'E_ESCROW_WRITE',
+  IDENTITY_UNPROVEN: 'E_IDENTITY_UNPROVEN',
   INTERNAL: 'E_INTERNAL',
 });
 const OK_RECEIPT = 'XEROX_QUIZ_STAGING_PROVISIONED';
@@ -336,7 +341,7 @@ function requestOnce({ socketPath, token, path, method, body }) {
   });
 }
 
-// ── Gate 1: identity + staging binding, the SOLE read ───────────────────
+// ── Gate 1: identity + staging environment binding ───────────────────────
 // Refuses any production identifier appearing anywhere in the projection.
 function assertNoProdIds(values) {
   for (const v of values) {
@@ -346,54 +351,72 @@ function assertNoProdIds(values) {
 }
 
 // Projects ONLY identifiers and the environment's server-declared name. Never
-// reads, returns or inspects environment VALUES.
+// reads, returns or inspects environment VALUES (the environment row carries
+// its own `env` column holding secrets).
+//
+// The `compose` relation name and its {composeId, appName} columns were read
+// from the RUNNING Dokploy v0.30.2 build, not assumed. A missing or non-array
+// relation is a HARD STOP, never an empty list: treating unknown state as
+// "absent" is what would let this create a duplicate over a live service.
 function projectStagingBinding(body) {
   if (!body || typeof body !== 'object') throw new Fail(E.BAD_SHAPE);
   if (body.projectId !== QUIZ_PROJECT_ID) throw new Fail(E.PROJECT_MISMATCH);
   if (body.organizationId !== QUIZ_ORG_ID) throw new Fail(E.ORG_MISMATCH);
 
   const envs = body.environments;
-  if (!Array.isArray(envs)) throw new Fail(E.BAD_SHAPE);
+  if (!Array.isArray(envs) || envs.length === 0) throw new Fail(E.BAD_SHAPE);
 
   const projected = envs.map((e) => {
     if (!e || typeof e !== 'object') throw new Fail(E.BAD_SHAPE);
     const id = e.environmentId;
     const name = e.name;
-    if (typeof id !== 'string' || typeof name !== 'string') throw new Fail(E.BAD_SHAPE);
-    const composes = Array.isArray(e.compose) ? e.compose : [];
-    return {
-      environmentId: id,
-      name,
-      composes: composes.map((c) => ({
-        composeId: typeof c?.composeId === 'string' ? c.composeId : null,
-        appName: typeof c?.appName === 'string' ? c.appName : null,
-      })),
-    };
+    if (typeof id !== 'string' || id.length === 0) throw new Fail(E.BAD_SHAPE);
+    if (typeof name !== 'string' || name.length === 0) throw new Fail(E.BAD_SHAPE);
+    if (!Array.isArray(e.compose)) throw new Fail(E.BAD_SHAPE);  // never default to []
+    const composes = e.compose.map((c) => {
+      if (!c || typeof c !== 'object') throw new Fail(E.BAD_SHAPE);
+      if (typeof c.composeId !== 'string' || c.composeId.length === 0) throw new Fail(E.BAD_SHAPE);
+      if (typeof c.appName !== 'string' || c.appName.length === 0) throw new Fail(E.BAD_SHAPE);
+      return { composeId: c.composeId, appName: c.appName };
+    });
+    return { environmentId: id, name, composes };
   });
 
   assertNoProdIds(projected.flatMap((e) =>
     [e.environmentId, ...e.composes.flatMap((c) => [c.composeId, c.appName])]));
 
   const matches = projected.filter((e) => e.name.toLowerCase() === STAGING_ENV_NAME);
-  // Zero or multiple is a hard stop. Never guess, never fall back to production.
   if (matches.length === 0) throw new Fail(E.NO_STAGING_ENV);
   if (matches.length > 1) throw new Fail(E.MULTI_STAGING_ENV);
+  return { environmentId: matches[0].environmentId,
+           environmentCount: projected.length,
+           composes: matches[0].composes };
+}
 
-  const target = matches[0];
-  const existing = target.composes.find((c) => c.appName === COMPOSE_APPNAME
-    || (c.appName && c.appName.startsWith(COMPOSE_APPNAME + '-')));
-  return {
-    environmentId: target.environmentId,
-    environmentCount: projected.length,
-    existingComposeId: existing ? existing.composeId : null,
-  };
+// Selects the remote object to act on, WITHOUT guessing.
+//  - a durable binding from a previous run wins, matched by exact composeId;
+//  - otherwise the staging environment must contain NO service whose appName
+//    is ours or is prefixed with ours. Dokploy appends a random suffix to
+//    appName on create, so a prefix hit means a prior run already created one
+//    and we lost the binding -- ambiguous, therefore a stop, never a create.
+function selectTarget(binding, priorBinding) {
+  if (priorBinding) {
+    const hits = binding.composes.filter((c) => c.composeId === priorBinding.composeId);
+    if (hits.length !== 1) throw new Fail(E.COMPOSE_CONFLICT);
+    return { composeId: hits[0].composeId, create: false };
+  }
+  const collide = binding.composes.filter((c) => c.appName === COMPOSE_APPNAME
+    || c.appName.startsWith(COMPOSE_APPNAME + '-'));
+  if (collide.length !== 0) throw new Fail(E.COMPOSE_CONFLICT);
+  return { composeId: null, create: true };
 }
 
 // The compose and environment rows both carry an `env` column holding secret
 // values. These projections read an explicit ALLOWLIST of structural fields and
 // never touch `env`, so no secret can reach a comparison, a log or an error.
 const COMPOSE_FIELDS = Object.freeze(
-  ['composeId', 'appName', 'sourceType', 'repository', 'owner', 'branch', 'composePath']);
+  ['composeId', 'appName', 'environmentId', 'sourceType', 'repository', 'owner',
+   'branch', 'composePath']);
 
 function projectComposeState(body) {
   if (!body || typeof body !== 'object') throw new Fail(E.BAD_SHAPE);
@@ -407,7 +430,24 @@ function projectComposeState(body) {
   return out;
 }
 
-// Exact-match => verified no-op. Anything partial or conflicting stops.
+// OWNERSHIP proof, distinct from configuration match. A finite prod denylist is
+// defense-in-depth, not evidence that a returned id belongs to us: this binds
+// the row to the exact id requested AND to the staging environment selected at
+// gate 1, so an arbitrary non-denylisted id can never be mutated.
+function assertComposeIdentity(st, expectedComposeId, expectedEnvironmentId) {
+  if (st.composeId !== expectedComposeId) throw new Fail(E.IDENTITY_UNPROVEN);
+  if (st.environmentId !== expectedEnvironmentId) throw new Fail(E.IDENTITY_UNPROVEN);
+  if (typeof st.appName !== 'string' || st.appName.length === 0) {
+    throw new Fail(E.IDENTITY_UNPROVEN);
+  }
+  // Dokploy may append a random suffix to appName at create time.
+  if (st.appName !== COMPOSE_APPNAME && !st.appName.startsWith(COMPOSE_APPNAME + '-')) {
+    throw new Fail(E.IDENTITY_UNPROVEN);
+  }
+  return true;
+}
+
+// Exact configuration match => verified no-op. Partial or conflicting stops.
 function composeMatchesTarget(st) {
   return st.sourceType === 'github' && st.repository === REPO_NAME
     && st.owner === REPO_OWNER && st.branch === INFRA_BRANCH
@@ -436,44 +476,140 @@ function domainMatchesTarget(d) {
     && d.domainType === 'compose';
 }
 
-// Returns 'create' (no domain yet), 'noop' (exactly our domain already), or
-// throws on conflict. Never returns 'create' on unknown state.
-function classifyDomainState(rows) {
+// 'create' (no domain yet), 'noop' (exactly ours and enabled), else throws.
+// Never returns 'create' for unknown state.
+function classifyDomainState(rows, expectedComposeId) {
+  if (typeof expectedComposeId !== 'string' || expectedComposeId.length === 0) {
+    throw new Fail(E.IDENTITY_UNPROVEN);
+  }
   const projected = projectDomainRows(rows);
+  // Every row returned for our composeId query must actually BE ours.
+  for (const d of projected) {
+    if (d.composeId !== expectedComposeId) throw new Fail(E.IDENTITY_UNPROVEN);
+  }
   if (projected.length === 0) return 'create';
-  const ours = projected.filter((d) => d.host === DOMAIN_HOST);
-  if (ours.length === 1 && projected.length === 1 && domainMatchesTarget(ours[0])) return 'noop';
+  if (projected.length === 1 && domainMatchesTarget(projected[0])
+      && projected[0].enabled === true) {
+    return 'noop';                       // a DISABLED row is not a no-op
+  }
   throw new Fail(E.DOMAIN_CONFLICT);
 }
 
-// ── Synthetic staging secrets: generated here, NEVER printed ────────────
-// Delivered to the operator by writing one 0600 file; the value never enters
-// stdout, stderr, an error, or this process's own logs.
+// ── Synthetic staging secrets: escrowed BEFORE the first mutation ───────
+// A retry must never regenerate. Regenerating after a remote side effect
+// would rotate auth material and strand the existing Postgres volumes, so the
+// set is created once, published atomically, and strictly reused thereafter.
+const ESCROW_PATH = join(TEMP_PARENT, 'quiz-staging-fixture.env');
+const BINDING_PATH = join(TEMP_PARENT, 'quiz-staging-binding.json');
+const ESCROW_KEYS = Object.freeze([
+  'QUIZ_DB_PASSWORD', 'SECRET_KEY', 'ADMIN_USERNAME', 'ADMIN_PASSWORD',
+  'STAGING_HONO_IMAGE', 'STAGING_HONO_DB_PASSWORD', 'STAGING_BETTER_AUTH_SECRET',
+]);
+
 function generateStagingEnv() {
   const pw = () => randomBytes(24).toString('base64url');
   return {
-    QUIZ_DB_PASSWORD: pw(),
-    SECRET_KEY: pw(),
-    ADMIN_USERNAME: 'staging-admin@incluir.test',
-    ADMIN_PASSWORD: pw(),
-    STAGING_HONO_IMAGE: PINNED_HONO_IMAGE,
-    STAGING_HONO_DB_PASSWORD: pw(),
-    STAGING_BETTER_AUTH_SECRET: pw(),
-    // TRUSTED_PROXY_CIDRS deliberately UNSET: empty is deny-all. It is set only
-    // after the exact Traefik peer /32 or /128 has been OBSERVED on the running
-    // service. A range such as 10.0.1.0/24 is forbidden by contract.
+    QUIZ_DB_PASSWORD: pw(), SECRET_KEY: pw(),
+    ADMIN_USERNAME: 'staging-admin@incluir.test', ADMIN_PASSWORD: pw(),
+    STAGING_HONO_IMAGE: PINNED_HONO_IMAGE_ID,
+    STAGING_HONO_DB_PASSWORD: pw(), STAGING_BETTER_AUTH_SECRET: pw(),
+    // TRUSTED_PROXY_CIDRS stays absent: empty is deny-all until the exact
+    // Traefik peer /32 or /128 has been OBSERVED on the running service.
   };
 }
 function envToBlock(env) {
-  return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n');
+  return ESCROW_KEYS.map((k) => `${k}=${env[k]}`).join('\n');
 }
-function writeCredentialFile(env) {
+function parseEscrowBlock(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    if (line === '') continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) throw new Fail(E.ESCROW_CORRUPT);
+    out[line.slice(0, eq)] = line.slice(eq + 1);
+  }
+  for (const k of ESCROW_KEYS) {
+    if (typeof out[k] !== 'string' || out[k].length === 0) throw new Fail(E.ESCROW_CORRUPT);
+  }
+  if (Object.keys(out).length !== ESCROW_KEYS.length) throw new Fail(E.ESCROW_CORRUPT);
+  if ('TRUSTED_PROXY_CIDRS' in out) throw new Fail(E.ESCROW_CORRUPT);
+  if (out.STAGING_HONO_IMAGE !== PINNED_HONO_IMAGE_ID) throw new Fail(E.IMAGE_NOT_PINNED);
+  return out;
+}
+function readOwnedFile(path, code) {
+  let fd;
+  try { fd = openSync(path, FS.O_RDONLY | FS.O_NOFOLLOW); }
+  catch (e) { if (e && e.code === 'ENOENT') return null; throw new Fail(code); }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.uid !== ACCOUNT.uid || (st.mode & 0o077) !== 0
+        || st.nlink !== 1 || st.size === 0 || st.size > MAX_TOKEN_FILE_BYTES) {
+      throw new Fail(code);
+    }
+    const buf = Buffer.allocUnsafe(st.size);
+    if (readSync(fd, buf, 0, st.size, 0) !== st.size) throw new Fail(code);
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+    catch { throw new Fail(code); }
+  } finally { try { closeSync(fd); } catch { /* cleanup only */ } }
+}
+// Atomic no-overwrite publication: write a private temp, then hard-link it
+// into place. link() fails if the destination exists, so a concurrent run can
+// never clobber an escrow that is already authoritative.
+function publishFile(path, contents, code) {
+  const tmp = `${path}.tmp-${randomBytes(8).toString('hex')}`;
+  try {
+    writeFileSync(tmp, contents, { mode: 0o600, flag: 'wx' });
+    linkSync(tmp, path);
+  } catch { throw new Fail(code); }
+  finally { try { rmSync(tmp, { force: true }); } catch { /* cleanup only */ } }
+  return path;
+}
+// Returns the SAME secret set on every invocation once created. The read and
+// publish primitives are seams so the REUSE decision itself is testable without
+// touching the real escrow file; the defaults are the hardcoded paths and are
+// the only thing the live action ever uses.
+function defaultEscrowRead() {
   assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
-  const path = join(TEMP_PARENT, 'quiz-staging-fixture.env');
-  writeFileSync(path, envToBlock(env) + '\n', { mode: 0o600, flag: 'wx' });
-  return path;  // path only; never the contents
+  return readOwnedFile(ESCROW_PATH, E.ESCROW_CORRUPT);
 }
-export { projectComposeState, composeMatchesTarget, projectDomainRows,
+function defaultEscrowPublish(text) {
+  assertOwnedDir(TEMP_PARENT, E.TOKEN_PERMS);
+  return publishFile(ESCROW_PATH, text, E.ESCROW_WRITE);
+}
+function loadOrCreateEscrow({ readFn = defaultEscrowRead,
+                              publishFn = defaultEscrowPublish } = {}) {
+  const existing = readFn();
+  // An escrow that already exists is AUTHORITATIVE. Regenerating here would
+  // rotate auth material and strand the Postgres volumes of a live stack.
+  if (existing !== null && existing !== undefined) {
+    return { env: parseEscrowBlock(existing), reused: true };
+  }
+  const env = generateStagingEnv();
+  publishFn(envToBlock(env) + '\n');
+  // Re-read what actually landed, so a partial write can never be used.
+  const back = readFn();
+  if (back === null || back === undefined) throw new Fail(E.ESCROW_WRITE);
+  return { env: parseEscrowBlock(back), reused: false };
+}
+
+// Durable record of the remote object this run bound to, so a retry rebinds
+// by exact composeId instead of guessing from a suffixed appName.
+function loadBinding() {
+  const t = readOwnedFile(BINDING_PATH, E.ESCROW_CORRUPT);
+  if (t === null) return null;
+  let v;
+  try { v = JSON.parse(t); } catch { throw new Fail(E.ESCROW_CORRUPT); }
+  if (!v || typeof v.composeId !== 'string' || v.composeId.length === 0) {
+    throw new Fail(E.ESCROW_CORRUPT);
+  }
+  assertNoProdIds([v.composeId]);
+  return v;
+}
+function saveBinding(composeId) {
+  return publishFile(BINDING_PATH, JSON.stringify({ composeId }) + '\n', E.ESCROW_WRITE);
+}
+
+export { projectComposeState, composeMatchesTarget, assertComposeIdentity, selectTarget, projectDomainRows,
          domainMatchesTarget, classifyDomainState, COMPOSE_FIELDS, DOMAIN_FIELDS,
          P_COMPOSE_ONE, P_DOMAIN_BY_COMPOSE,
          assertSshContext, SSH_ARGS, buildRequestOptions, projectStagingBinding,
@@ -525,11 +661,20 @@ function extractComposeId(body) {
 // No mutation may precede the identity and staging-environment binding.
 async function orchestrate({
   assertContextFn, readTokenFn, openForwardFn, requestFn,
-  envFn = generateStagingEnv, writeCredsFn = writeCredentialFile,
+  escrowFn = loadOrCreateEscrow, loadBindingFn = loadBinding, saveBindingFn = saveBinding,
   deadlineMs = ACTION_DEADLINE_MS,
 }) {
   assertContextFn();
   const token = readTokenFn();
+
+  // Secrets are escrowed BEFORE any remote side effect and strictly reused on
+  // every later invocation. Nothing below may regenerate them.
+  const escrow = escrowFn();
+  const env = escrow.env;
+  if (env.STAGING_HONO_IMAGE !== PINNED_HONO_IMAGE_ID) throw new Fail(E.IMAGE_NOT_PINNED);
+  if ('TRUSTED_PROXY_CIDRS' in env) throw new Fail(E.BAD_SHAPE);
+  const priorBinding = loadBindingFn();
+
   const fwd = openForwardFn();
   let timer = null;
   try {
@@ -542,47 +687,53 @@ async function orchestrate({
       const call = (path, method, body) =>
         requestFn({ socketPath, token, path, method, body });
 
-      // GATE 1 — the sole read. Binds identity and exactly one staging env.
+      // ── READ PHASE ──────────────────────────────────────────────────
+      // Gate 1: identity + exactly one staging environment.
       const binding = projectStagingBinding(
         await call(`${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`, 'GET', undefined));
+      const target = selectTarget(binding, priorBinding);
 
-      // Idempotency preflight from AUTHORITATIVE state, before any mutation.
-      let composeId = binding.existingComposeId;
-      const created = composeId === null;
-      if (!created) {
-        // A service already exists: prove it is exactly ours before touching it.
-        const st = projectComposeState(
-          await call(`${P_COMPOSE_ONE}?composeId=${composeId}`, 'GET', undefined));
-        if (!composeMatchesTarget(st)) throw new Fail(E.COMPOSE_CONFLICT);
-      } else {
+      let composeId = target.composeId;
+      const created = target.create;
+
+      // Creating the stub is the only mutation allowed before the remaining
+      // reads, and it is unavoidable: the object must exist to be read.
+      if (created) {
         composeId = extractComposeId(
           await call(P_COMPOSE_CREATE, 'POST', bodyComposeCreate(binding.environmentId)));
+        // Durably record the binding BEFORE anything else, so a crash here
+        // still lets a retry rebind by exact id instead of creating again.
+        saveBindingFn(composeId);
       }
-      assertNoProdIds([composeId]);
 
-      await call(P_COMPOSE_UPDATE, 'POST', bodyComposeSource(composeId));
+      // Rebind the row we will mutate, on BOTH paths, and prove ownership.
+      const st = projectComposeState(
+        await call(`${P_COMPOSE_ONE}?composeId=${composeId}`, 'GET', undefined));
+      assertComposeIdentity(st, composeId, binding.environmentId);
+      // A freshly created stub is not yet configured, so only an existing
+      // service is held to the exact-configuration test.
+      if (!created && !composeMatchesTarget(st)) throw new Fail(E.COMPOSE_CONFLICT);
 
-      const env = envFn();
-      if (env.STAGING_HONO_IMAGE !== PINNED_HONO_IMAGE) throw new Fail(E.IMAGE_NOT_PINNED);
-      if ('TRUSTED_PROXY_CIDRS' in env) throw new Fail(E.BAD_SHAPE); // must stay unset
-      await call(P_COMPOSE_UPDATE, 'POST', bodyComposeEnv(composeId, envToBlock(env)));
-
-      // Domain state from the authoritative read, never inferred.
+      // Domain state is read BEFORE the update mutations, so a conflict on an
+      // existing service is discovered with ZERO POSTs issued.
       const domainAction = classifyDomainState(
-        await call(`${P_DOMAIN_BY_COMPOSE}?composeId=${composeId}`, 'GET', undefined));
+        await call(`${P_DOMAIN_BY_COMPOSE}?composeId=${composeId}`, 'GET', undefined),
+        composeId);
+
+      // ── MUTATION PHASE ──────────────────────────────────────────────
+      await call(P_COMPOSE_UPDATE, 'POST', bodyComposeSource(composeId));
+      await call(P_COMPOSE_UPDATE, 'POST', bodyComposeEnv(composeId, envToBlock(env)));
       if (domainAction === 'create') {
         await call(P_DOMAIN_CREATE, 'POST', bodyDomainCreate(composeId));
       }
-
       await call(P_COMPOSE_DEPLOY, 'POST', bodyComposeDeploy(composeId));
 
-      const credPath = writeCredsFn(env);
-      return { composeId, environmentId: binding.environmentId, credPath,
+      return { composeId, environmentId: binding.environmentId,
+               credPath: ESCROW_PATH, escrowReused: escrow.reused,
                reusedExisting: !created, domainAction };
     })();
     work.catch(() => { /* a late loser must not raise an unhandled rejection */ });
-    const out = await Promise.race([work, budget]);
-    return out;
+    return await Promise.race([work, budget]);
   } finally {
     if (timer) clearTimeout(timer);
     fwd.cleanup();   // unconditional
@@ -608,6 +759,8 @@ async function main() {
     process.stdout.write(`environmentId=${r.environmentId}\n`);
     process.stdout.write(`composeId=${r.composeId}\n`);
     process.stdout.write(`fixture_file=${r.credPath}\n`);
+    process.stdout.write(`escrow_reused=${r.escrowReused}\n`);
+    process.stdout.write(`domain_action=${r.domainAction}\n`);
   } catch (err) {
     process.stdout.write((err instanceof Fail ? err.code : E.INTERNAL) + '\n');
     process.exitCode = 1;
@@ -615,6 +768,7 @@ async function main() {
 }
 
 export { orchestrate, bodyComposeCreate, bodyComposeSource, bodyComposeEnv,
-         bodyDomainCreate, bodyComposeDeploy, extractComposeId };
+         bodyDomainCreate, bodyComposeDeploy, extractComposeId,
+         parseEscrowBlock, ESCROW_KEYS, loadOrCreateEscrow };
 
 if (import.meta.url === `file://${process.argv[1]}`) { await main(); }
