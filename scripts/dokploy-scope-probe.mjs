@@ -1,78 +1,75 @@
 #!/usr/bin/env node
 /**
- * dokploy-scope-probe — ONE read-only check: does the existing
- * DOKPLOY_TOKEN_INCLUIR_XEROX carry the Quiz organization on the XEROX
- * Dokploy installation?
+ * dokploy-scope-probe — ONE read-only question: does the operator-supplied
+ * xerox Dokploy token carry the Quiz organization?
  *
- * Bead: aperture-ztid5. Design: Cipher (approved), implementation gated on his
- * exact-code review plus a fresh execution dispatch. NOTHING here has been run
- * against a live host.
+ * Bead: aperture-ztid5. Design and code gate: Cipher. NOT RUN against any live
+ * host; requires his exact-head PASS plus a GLaDOS execution dispatch.
  *
  * WHAT THIS IS
- *   A single fixed-purpose, NO-ARGUMENT action. It fetches exactly one pinned
- *   secret, uses it transiently as an API key over a protected local socket,
- *   makes exactly one read-only call, and prints one constant.
+ *   A single fixed-purpose, NO-ARGUMENT action. Reads one pinned local file,
+ *   opens a strict SSH Unix-socket forward, makes EXACTLY ONE read-only HTTP
+ *   request, and prints one constant.
  *
  * WHAT THIS IS NOT
- *   Not a general helper. Not a credential mover — nothing is written to disk.
- *   Not a Dokploy client: `project.one` for one pinned project id is the only
- *   endpoint reachable, and no mutation method exists in this file.
+ *   No Infisical code of any kind — no auth, no retrieval, no constants. No
+ *   POST capability exists anywhere in this file. No list, search, retry,
+ *   fallback, mutation, or second endpoint. The token file is READ ONLY and
+ *   never modified.
  *
- * WHY THE SSH FORWARD (Cipher, and it matters)
+ * WHY THE SSH FORWARD
  *   xerox Dokploy is also reachable on a PUBLIC PLAIN-HTTP port. Sending an API
- *   key there would put the credential on the wire in clear text across the
- *   internet. This connects ONLY through an authenticated SSH local
- *   Unix-socket forward to the host's own 127.0.0.1:3000, so the key never
- *   leaves an encrypted channel and never touches the public endpoint.
+ *   key there would put it in clear text on the wire. This reaches only the
+ *   host's own 127.0.0.1:3000 through an authenticated forward, and the pinned
+ *   address is the tailnet one.
  *
- * VALUE BOUNDARY / ZEROIZATION — stated, not implied
- *   The secret exists transiently in this process's memory only. It is never
- *   written to disk, never placed in argv or environment, never logged, never
- *   fingerprinted, and never attached to an error. Node cannot guarantee
- *   zeroization: the value may persist in the allocator or OS memory after the
- *   reference is dropped, and this process cannot scrub it. The process exits
- *   immediately after the single check.
+ * ZEROIZATION — stated, not implied
+ *   The token exists transiently in this process's memory. It is never written,
+ *   logged, echoed, fingerprinted, measured, or attached to an error. Node
+ *   cannot guarantee zeroization: it may persist in the allocator or OS memory
+ *   after the reference drops, and this process cannot scrub it.
  */
 
-import { openSync, fstatSync, lstatSync, readSync, closeSync, mkdtempSync,
+import { openSync, fstatSync, lstatSync, readSync, closeSync, mkdirSync,
          rmSync, constants as FS } from 'node:fs';
-import { userInfo, tmpdir } from 'node:os';
+import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 
-// ─── COMPILED CONSTANTS. Nothing here is caller-supplied. ─────────────────
+// ─── COMPILED CONSTANTS. No argument, env var, or override reaches any of it.
 const ACCOUNT = userInfo();
-const CRED_DIR = join(ACCOUNT.homedir, '.config', 'aperture');
-const CRED_PATH = join(CRED_DIR, 'infisical-peppy-admin.env');
+const HOME = ACCOUNT.homedir;                       // pwd-derived, not $HOME
+const TOKEN_PATH = join(HOME, 'Downloads', 'secret copy.txt');
+const TOKEN_KEY = 'DOKPLOY_TOKEN_INCLUIR_XEROX';
 
-const INFISICAL_HOST = '100.102.73.112';
-const INFISICAL_PORT = 3005;
-const P_LOGIN = '/api/v1/auth/universal-auth/login';
-// Legacy single-secret retrieve. Pinned name, workspace, environment, path.
-const SECRET_NAME = 'DOKPLOY_TOKEN_INCLUIR_XEROX';
-const WORKSPACE_ID = 'b4a65c24-dd50-4e93-b323-41d472e7cf46';
-const ENVIRONMENT = 'prod';
-const SECRET_PATH = '/';
+// Temp parent lives under an owned, already-verified directory — NOT
+// os.tmpdir(), which follows an ambient TMPDIR and could be redirected.
+const TEMP_PARENT = join(HOME, '.config', 'aperture');
 
-// xerox Dokploy, reached ONLY over the SSH forward. Never the public endpoint.
+// Pinned SSH context. Structurally verified: ubuntu@100.85.254.44 is the
+// tailnet address, exactly one known_hosts entry exists, and id_ed25519 is the
+// only default private key present.
 const SSH_BIN = '/usr/bin/ssh';
-const SSH_TARGET = 'xerox';
+const SSH_USER = 'ubuntu';
+const SSH_HOST = '100.85.254.44';
+const SSH_IDENTITY = join(HOME, '.ssh', 'id_ed25519');
+const SSH_KNOWN_HOSTS = join(HOME, '.ssh', 'known_hosts');
 const REMOTE_ADDR = '127.0.0.1:3000';
+
 const QUIZ_PROJECT_ID = 'w4FraIVPC0PfP2fZxVtaT';
 const QUIZ_ORG_ID = 'GME9CAd599FWcInMNTZ2F';
 const P_PROJECT_ONE = '/api/project.one';
 
 const OK_RECEIPT = 'XEROX_QUIZ_SCOPE_CONFIRMED';
 
-const MAX_CRED_BYTES = 4096;
-const MAX_CRED_VALUE_LEN = 512;
+const MAX_TOKEN_FILE_BYTES = 8192;
+const MAX_TOKEN_LEN = 4096;
 const MAX_BODY_BYTES = 1_000_000;
-const MAX_SECRET_LEN = 4096;
 const REQUEST_TIMEOUT_MS = 10_000;
 const ACTION_DEADLINE_MS = 60_000;
-const FORWARD_READY_MS = 15_000;
+const SOCKET_READY_MS = 15_000;
 
 class Fail extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -80,10 +77,13 @@ class Fail extends Error {
 const E = {
   BAD_ACTION: 'E_BAD_ACTION',
   UNSAFE_RUNTIME: 'E_UNSAFE_RUNTIME',
-  CRED_MISSING: 'E_CRED_MISSING',
-  CRED_PERMS: 'E_CRED_PERMS',
-  CRED_PARSE: 'E_CRED_PARSE',
-  CRED_ENCODING: 'E_CRED_ENCODING',
+  TOKEN_MISSING: 'E_TOKEN_MISSING',
+  TOKEN_PERMS: 'E_TOKEN_PERMS',
+  TOKEN_ENCODING: 'E_TOKEN_ENCODING',
+  TOKEN_PARSE: 'E_TOKEN_PARSE',
+  TOKEN_INVALID: 'E_TOKEN_INVALID',
+  SSH_CONTEXT: 'E_SSH_CONTEXT',
+  FORWARD_FAILED: 'E_FORWARD_FAILED',
   NETWORK: 'E_NETWORK',
   AUTH_REJECTED: 'E_AUTH_REJECTED',
   REDIRECT_REFUSED: 'E_REDIRECT_REFUSED',
@@ -91,19 +91,14 @@ const E = {
   BODY_TOO_LARGE: 'E_BODY_TOO_LARGE',
   BAD_ENCODING: 'E_BAD_ENCODING',
   BAD_SHAPE: 'E_BAD_SHAPE',
-  SECRET_INVALID: 'E_SECRET_INVALID',
-  FORWARD_FAILED: 'E_FORWARD_FAILED',
   PROJECT_MISMATCH: 'E_PROJECT_MISMATCH',
   ORG_MISMATCH: 'E_ORG_MISMATCH',
   DEADLINE: 'E_DEADLINE',
   INTERNAL: 'E_INTERNAL',
 };
 
-// ─── Runtime refusal, before any secret is read. Detects unsafe invocation;
-// does NOT defeat code already imported.
-// Pure classifier so every case is testable without mutating this process.
-// Note this refuses a non-empty execArgv, which means the probe legitimately
-// refuses to run under `node --test` — the guard is doing its job.
+// ─── Runtime refusal. Detects unsafe invocation; does NOT defeat code already
+// imported before this runs.
 function classifyRuntime({ env, execArgv, globalAgentIsStock }) {
   const e = env ?? {};
   if (String(e.NODE_OPTIONS ?? '') !== '') throw new Fail(E.UNSAFE_RUNTIME);
@@ -114,7 +109,6 @@ function classifyRuntime({ env, execArgv, globalAgentIsStock }) {
   if (globalAgentIsStock === false) throw new Fail(E.UNSAFE_RUNTIME);
   return true;
 }
-
 function assertSafeRuntime() {
   return classifyRuntime({
     env: process.env,
@@ -123,71 +117,65 @@ function assertSafeRuntime() {
   });
 }
 
-// ─── Credential file. Same guards as the approved helper; its reader is
-// deliberately NOT exported there, so the checks are mirrored, not imported.
-function readCredentials() {
-  let dirSt;
-  try { dirSt = lstatSync(CRED_DIR); } catch { throw new Fail(E.CRED_MISSING); }
-  if (!dirSt.isDirectory() || dirSt.uid !== ACCOUNT.uid || (dirSt.mode & 0o077)) {
-    throw new Fail(E.CRED_PERMS);
-  }
+// ─── Token file: lstat, then open O_NOFOLLOW and re-verify the SAME fd.
+function readToken() {
   let pre;
-  try { pre = lstatSync(CRED_PATH); } catch { throw new Fail(E.CRED_MISSING); }
-  if (pre.isSymbolicLink()) throw new Fail(E.CRED_PERMS);
+  try { pre = lstatSync(TOKEN_PATH); } catch { throw new Fail(E.TOKEN_MISSING); }
+  if (pre.isSymbolicLink()) throw new Fail(E.TOKEN_PERMS);
 
   let fd;
-  try { fd = openSync(CRED_PATH, FS.O_RDONLY | FS.O_NOFOLLOW); }
-  catch { throw new Fail(E.CRED_MISSING); }
+  try { fd = openSync(TOKEN_PATH, FS.O_RDONLY | FS.O_NOFOLLOW); }
+  catch { throw new Fail(E.TOKEN_MISSING); }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile() || st.uid !== ACCOUNT.uid || (st.mode & 0o077)
-        || st.nlink !== 1 || st.size === 0 || st.size > MAX_CRED_BYTES) {
-      throw new Fail(E.CRED_PERMS);
+    if (!st.isFile() || st.uid !== ACCOUNT.uid || (st.mode & 0o077) !== 0
+        || st.nlink !== 1 || st.size === 0 || st.size > MAX_TOKEN_FILE_BYTES) {
+      throw new Fail(E.TOKEN_PERMS);
     }
-    if (st.ino !== pre.ino || st.dev !== pre.dev) throw new Fail(E.CRED_PERMS);
+    if (st.ino !== pre.ino || st.dev !== pre.dev) throw new Fail(E.TOKEN_PERMS);
     const buf = Buffer.allocUnsafe(st.size);
-    if (readSync(fd, buf, 0, st.size, 0) !== st.size) throw new Fail(E.CRED_PERMS);
+    if (readSync(fd, buf, 0, st.size, 0) !== st.size) throw new Fail(E.TOKEN_PERMS);
     let text;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf); }
-    catch { throw new Fail(E.CRED_ENCODING); }
-    return parseCredentials(text);
+    catch { throw new Fail(E.TOKEN_ENCODING); }
+    return parseTokenFile(text);
   } finally {
     try { closeSync(fd); } catch { /* cleanup only */ }
   }
 }
 
-function parseCredentials(text) {
-  const want = ['INFISICAL_CLIENT_ID', 'INFISICAL_CLIENT_SECRET'];
-  const got = new Map();
-  for (const raw of String(text).split('\n')) {
-    const line = raw.trim();
-    if (line === '' || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) throw new Fail(E.CRED_PARSE);
-    const key = line.slice(0, eq).trim();
-    const val = line.slice(eq + 1).trim();
-    if (!want.includes(key) || got.has(key)) throw new Fail(E.CRED_PARSE);
-    if (val.length === 0 || val.length > MAX_CRED_VALUE_LEN) throw new Fail(E.CRED_PARSE);
-    got.set(key, val);
+// Pure. EXACTLY one non-blank line, exactly the pinned key, nothing else.
+// A BOM, a comment, a second entry, a duplicate or trailing data all fail.
+function parseTokenFile(text) {
+  if (typeof text !== 'string') throw new Fail(E.TOKEN_PARSE);
+  if (text.charCodeAt(0) === 0xfeff) throw new Fail(E.TOKEN_PARSE);   // BOM
+  const lines = text.split('\n').filter((l) => l.trim() !== '');
+  if (lines.length !== 1) throw new Fail(E.TOKEN_PARSE);
+  const line = lines[0];
+  if (line.startsWith('#')) throw new Fail(E.TOKEN_PARSE);
+  const prefix = TOKEN_KEY + '=';
+  if (!line.startsWith(prefix)) throw new Fail(E.TOKEN_PARSE);
+  const value = line.slice(prefix.length);
+  if (value.length === 0 || value.length > MAX_TOKEN_LEN) throw new Fail(E.TOKEN_INVALID);
+  for (const ch of value) {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x21 || cp > 0x7e) throw new Fail(E.TOKEN_INVALID);
   }
-  if (got.size !== want.length) throw new Fail(E.CRED_PARSE);
-  return { clientId: got.get(want[0]), clientSecret: got.get(want[1]) };
+  return value;
 }
 
-// ─── Pure response handling. No URL, method or header is caller-controllable.
+// ─── Pure response handling.
 function classifyStatus(status) {
   if (status >= 300 && status < 400) throw new Fail(E.REDIRECT_REFUSED);
   if (status === 401 || status === 403) throw new Fail(E.AUTH_REJECTED);
   if (status !== 200) throw new Fail(E.UPSTREAM_STATUS);
   return true;
 }
-
 function parseBounded(text) {
   if (typeof text !== 'string') throw new Fail(E.BAD_SHAPE);
   if (text.length > MAX_BODY_BYTES) throw new Fail(E.BODY_TOO_LARGE);
   try { return JSON.parse(text); } catch { throw new Fail(E.BAD_SHAPE); }
 }
-
 function consumeBoundedStream(readable, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []; let total = 0; let settled = false;
@@ -211,8 +199,8 @@ function consumeBoundedStream(readable, maxBytes) {
   });
 }
 
-// Absolute wall-clock bound. node:http `timeout` is socket INACTIVITY only, so
-// a drip response would never trip it. Settles once; timer always cleared.
+// Absolute wall clock. node:http `timeout` is socket INACTIVITY only, so a
+// drip response would never trip it. Settles once; the deadline always wins.
 function withAbsoluteDeadline({ start, abort, ms }) {
   return new Promise((resolve, reject) => {
     let settled = false; let timer = null;
@@ -233,51 +221,29 @@ function withAbsoluteDeadline({ start, abort, ms }) {
   });
 }
 
-function makeBudget() { return { startedAt: Date.now() }; }
-function remainingMs(b) { return ACTION_DEADLINE_MS - (Date.now() - b.startedAt); }
-function charge(b) {
-  const left = remainingMs(b);
-  if (left <= 0) throw new Fail(E.DEADLINE);
-  return Math.min(REQUEST_TIMEOUT_MS, left);
+function assertQuizScope(body) {
+  if (!body || typeof body !== 'object') throw new Fail(E.BAD_SHAPE);
+  if (body.projectId !== QUIZ_PROJECT_ID) throw new Fail(E.PROJECT_MISMATCH);
+  if (body.organizationId !== QUIZ_ORG_ID) throw new Fail(E.ORG_MISMATCH);
+  return true;
 }
 
-// ─── One request primitive. `where` selects a PINNED destination; it is not a
-// URL and cannot address an arbitrary host.
-function request({ where, method, path, headers, body, timeoutMs, socketPath }) {
-  let active = null;
-  return withAbsoluteDeadline({
-    ms: timeoutMs,
-    abort: () => { try { if (active) active.destroy(); } catch { /* best effort */ } },
-    start: (ok, bad) => {
-      const payload = body ? Buffer.from(JSON.stringify(body), 'utf8') : null;
-      const hdrs = { accept: 'application/json', ...headers };
-      if (payload) {
-        hdrs['content-type'] = 'application/json';
-        hdrs['content-length'] = String(payload.length);
-      }
-      const opts = socketPath
-        ? { socketPath, method, path, headers: hdrs, timeout: timeoutMs }
-        : { host: where.host, port: where.port, method, path, headers: hdrs, timeout: timeoutMs };
-      const req = http.request(opts, (res) => {
-        try { classifyStatus(res.statusCode); }
-        catch (e) { res.destroy(); bad(e); return; }
-        consumeBoundedStream(res, MAX_BODY_BYTES).then(
-          (text) => { try { ok(parseBounded(text)); } catch (e) { bad(e); } }, bad);
-      });
-      active = req;
-      req.on('timeout', () => { req.destroy(); bad(new Fail(E.NETWORK)); });
-      req.on('error', () => bad(new Fail(E.NETWORK)));
-      if (payload) req.write(payload);
-      req.end();
-    },
-  });
+// ─── SSH context validated STRUCTURALLY before the token is ever read, so a
+// broken identity or known_hosts fails before a secret is in memory.
+function assertSshContext() {
+  for (const [path, wantMode] of [[SSH_IDENTITY, 0o077], [SSH_KNOWN_HOSTS, 0o022]]) {
+    let st;
+    try { st = lstatSync(path); } catch { throw new Fail(E.SSH_CONTEXT); }
+    if (!st.isFile() || st.uid !== ACCOUNT.uid) throw new Fail(E.SSH_CONTEXT);
+    if ((st.mode & wantMode) !== 0) throw new Fail(E.SSH_CONTEXT);
+    if (st.size === 0) throw new Fail(E.SSH_CONTEXT);
+  }
+  return true;
 }
 
-// ─── SSH local Unix-socket forward to xerox's OWN 127.0.0.1:3000.
-// The alias `xerox` resolves to the TAILNET address, so this never touches the
-// public plain-HTTP endpoint. Strict host-key checking is REQUIRED, not
-// relaxed: the host key is already known, so it verifies rather than prompts.
-// The secret is never in this child's argv, env or stdin.
+// Strict, pinned, and not overridable from ssh_config: an explicit user@host,
+// an explicit identity with IdentitiesOnly, an explicit known_hosts file, and
+// strict host-key checking that can only verify — never prompt or accept-new.
 const SSH_ARGS = [
   '-N',
   '-o', 'BatchMode=yes',
@@ -287,15 +253,28 @@ const SSH_ARGS = [
   '-o', 'PermitLocalCommand=no',
   '-o', 'ClearAllForwardings=yes',
   '-o', 'ExitOnForwardFailure=yes',
+  '-o', 'IdentitiesOnly=yes',
+  '-o', `UserKnownHostsFile=${SSH_KNOWN_HOSTS}`,
+  '-i', SSH_IDENTITY,
 ];
 
-function startForward() {
-  // Owned 0700 directory for the socket; removed on every exit path.
-  const dir = mkdtempSync(join(tmpdir(), 'dkscope-'));
+// Readiness is decided by lstat on the socket ONLY. No HTTP probe: project.one
+// must be the SOLE request that ever crosses this forward.
+function openForward() {
+  mkdirSync(TEMP_PARENT, { recursive: true, mode: 0o700 });
+  const dir = join(TEMP_PARENT, `.dkscope-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { mode: 0o700 });
+  const dst = lstatSync(dir);
+  if (!dst.isDirectory() || dst.uid !== ACCOUNT.uid || (dst.mode & 0o077) !== 0) {
+    rmSync(dir, { recursive: true, force: true });
+    throw new Fail(E.FORWARD_FAILED);
+  }
   const sock = join(dir, 's');
+
   const child = spawn(SSH_BIN,
-    [...SSH_ARGS, '-L', `${sock}:${REMOTE_ADDR}`, SSH_TARGET],
-    // Empty env: nothing of ours, and certainly no secret, reaches the child.
+    [...SSH_ARGS, '-L', `${sock}:${REMOTE_ADDR}`, `${SSH_USER}@${SSH_HOST}`],
+    // Empty env and no stdio: the token cannot reach argv, env or stdin.
     { stdio: ['ignore', 'ignore', 'ignore'], env: {} });
 
   const cleanup = () => {
@@ -311,89 +290,59 @@ function startForward() {
     const started = Date.now();
     const poll = () => {
       if (done) return;
-      if (Date.now() - started > FORWARD_READY_MS) { finish(reject, new Fail(E.FORWARD_FAILED)); return; }
-      const probe = http.request({ socketPath: sock, method: 'GET', path: '/', timeout: 1000 }, (res) => {
-        res.destroy(); finish(resolve, sock);
-      });
-      probe.on('error', () => setTimeout(poll, 250));
-      probe.on('timeout', () => { probe.destroy(); setTimeout(poll, 250); });
-      probe.end();
+      let st = null;
+      try { st = lstatSync(sock); } catch { st = null; }
+      if (st && st.isSocket() && st.uid === ACCOUNT.uid) { finish(resolve, sock); return; }
+      if (Date.now() - started > SOCKET_READY_MS) { finish(reject, new Fail(E.FORWARD_FAILED)); return; }
+      setTimeout(poll, 100);
     };
     poll();
   });
 
-  return { ready, cleanup, sock };
+  return { ready, cleanup };
 }
 
-// ─── Fetch EXACTLY ONE pinned secret. No list, no search, no fallback, no
-// import expansion, no reference expansion.
-async function fetchPinnedSecret(budget) {
-  const { clientId, clientSecret } = readCredentials();
-  const auth = await request({
-    where: { host: INFISICAL_HOST, port: INFISICAL_PORT },
-    method: 'POST', path: P_LOGIN,
-    body: { clientId, clientSecret }, timeoutMs: charge(budget),
+// ─── The ONE request. Private agent; the ambient globalAgent is never used, so
+// a patched global cannot observe this traffic even with a stock constructor.
+function requestProjectOne({ socketPath, token, timeoutMs }) {
+  let active = null;
+  return withAbsoluteDeadline({
+    ms: timeoutMs,
+    abort: () => { try { if (active) active.destroy(); } catch { /* best effort */ } },
+    start: (ok, bad) => {
+      const agent = new http.Agent({ keepAlive: false, maxSockets: 1 });
+      const req = http.request({
+        socketPath,
+        agent,
+        method: 'GET',
+        path: `${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`,
+        headers: { accept: 'application/json', 'x-api-key': token },
+        timeout: timeoutMs,
+      }, (res) => {
+        try { classifyStatus(res.statusCode); }
+        catch (e) { res.destroy(); bad(e); return; }
+        consumeBoundedStream(res, MAX_BODY_BYTES).then(
+          (text) => { try { ok(parseBounded(text)); } catch (e) { bad(e); } }, bad);
+      });
+      active = req;
+      req.on('timeout', () => { req.destroy(); bad(new Fail(E.NETWORK)); });
+      req.on('error', () => bad(new Fail(E.NETWORK)));   // cause never surfaced
+      req.end();
+    },
   });
-  if (!auth || typeof auth.accessToken !== 'string' || auth.accessToken.length === 0) {
-    throw new Fail(E.BAD_SHAPE);
-  }
-  const q = new URLSearchParams({
-    workspaceId: WORKSPACE_ID,
-    environment: ENVIRONMENT,
-    secretPath: SECRET_PATH,
-    type: 'shared',
-    expandSecretReferences: 'false',
-    include_imports: 'false',
-  }).toString();
-  const body = await request({
-    where: { host: INFISICAL_HOST, port: INFISICAL_PORT },
-    method: 'GET',
-    path: `/api/v3/secrets/raw/${SECRET_NAME}?${q}`,
-    headers: { authorization: `Bearer ${auth.accessToken}` },
-    timeoutMs: charge(budget),
-  });
-  return extractSecretValue(body);
 }
 
-// Pure: validates the envelope and returns the value. Never logs it.
-function extractSecretValue(body) {
-  if (!body || typeof body !== 'object') throw new Fail(E.BAD_SHAPE);
-  const sec = body.secret;
-  if (!sec || typeof sec !== 'object') throw new Fail(E.BAD_SHAPE);
-  if (sec.secretKey !== SECRET_NAME) throw new Fail(E.BAD_SHAPE);
-  const v = sec.secretValue;
-  if (typeof v !== 'string' || v.length === 0 || v.length > MAX_SECRET_LEN) {
-    throw new Fail(E.SECRET_INVALID);
-  }
-  for (const ch of v) {
-    const cp = ch.codePointAt(0);
-    if (cp < 0x20 || cp === 0x7f) throw new Fail(E.SECRET_INVALID);
-  }
-  return v;
-}
-
-// Pure: the only thing we assert about the Dokploy response.
-function assertQuizScope(body) {
-  if (!body || typeof body !== 'object') throw new Fail(E.BAD_SHAPE);
-  if (body.projectId !== QUIZ_PROJECT_ID) throw new Fail(E.PROJECT_MISMATCH);
-  if (body.organizationId !== QUIZ_ORG_ID) throw new Fail(E.ORG_MISMATCH);
-  return true;
-}
-
-// ─── The single action. PRIVATE — importing this module cannot run it.
-async function probe() {
-  assertSafeRuntime();
-  const budget = makeBudget();
-  const token = await fetchPinnedSecret(budget);
-  const fwd = startForward();
+// ─── Composed orchestration with INJECTED seams, so the exact call sequence is
+// provable in tests. None of the injected functions can discover the real
+// reader, the real host, or the real transport — they are supplied by the
+// caller, and the live path below supplies the private ones.
+async function orchestrate({ readTokenFn, assertContextFn, openForwardFn, requestFn }) {
+  assertContextFn();
+  const token = readTokenFn();
+  const fwd = openForwardFn();
   try {
-    const sock = await fwd.ready;
-    const body = await request({
-      socketPath: sock, method: 'GET',
-      path: `${P_PROJECT_ONE}?projectId=${QUIZ_PROJECT_ID}`,
-      headers: { 'x-api-key': token },
-      timeoutMs: charge(budget),
-    });
+    const socketPath = await fwd.ready;
+    const body = await requestFn({ socketPath, token, timeoutMs: REQUEST_TIMEOUT_MS });
     assertQuizScope(body);
   } finally {
     fwd.cleanup();
@@ -402,16 +351,28 @@ async function probe() {
 }
 
 async function main() {
-  // No-argument action: any argument at all is refused before anything runs.
   if (process.argv.slice(2).length !== 0) {
     process.stdout.write(E.BAD_ACTION + '\n');
     process.exitCode = 2;
     return;
   }
+  const deadline = setTimeout(() => {
+    process.stdout.write(E.DEADLINE + '\n');
+    process.exit(1);
+  }, ACTION_DEADLINE_MS);
+  deadline.unref?.();
   try {
-    process.stdout.write((await probe()) + '\n');
+    assertSafeRuntime();
+    const receipt = await orchestrate({
+      assertContextFn: assertSshContext,
+      readTokenFn: readToken,
+      openForwardFn: openForward,
+      requestFn: requestProjectOne,
+    });
+    clearTimeout(deadline);
+    process.stdout.write(receipt + '\n');
   } catch (err) {
-    // Only our stable code. Never the caught object, never an upstream body.
+    clearTimeout(deadline);
     process.stdout.write((err instanceof Fail ? err.code : E.INTERNAL) + '\n');
     process.exitCode = 1;
   }
@@ -421,9 +382,8 @@ const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === proces
 if (isDirectRun) main();
 
 export {
-  parseCredentials, classifyStatus, parseBounded, consumeBoundedStream,
-  withAbsoluteDeadline, makeBudget, remainingMs, charge,
-  E, Fail, OK_RECEIPT, QUIZ_PROJECT_ID, QUIZ_ORG_ID,
-  SECRET_NAME, WORKSPACE_ID, ENVIRONMENT, SECRET_PATH, P_PROJECT_ONE,
-  extractSecretValue, assertQuizScope, assertSafeRuntime, classifyRuntime, SSH_ARGS,
+  parseTokenFile, classifyStatus, parseBounded, consumeBoundedStream,
+  withAbsoluteDeadline, classifyRuntime, assertSafeRuntime, assertQuizScope,
+  E, Fail, OK_RECEIPT, QUIZ_PROJECT_ID, QUIZ_ORG_ID, TOKEN_KEY, P_PROJECT_ONE,
+  orchestrate, SSH_ARGS,
 };
