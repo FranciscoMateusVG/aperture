@@ -203,6 +203,17 @@ test('prepare resumes only exact crash states and never overwrites credential dr
     readStateFn() { return state; }, publishStateFn() {},
   }) }), /E_PHASE_MISMATCH/);
   assert.equal(seen.some((x) => x.method === 'POST'), false);
+
+  // Impossible under prepare's source-before-env order: an original source
+  // paired with the prepared env is drift, not a legitimate resume point.
+  const crossed = [];
+  await assert.rejects(orchestrate({ phase: 'prepare', ...deps({
+    requestFn: makeRequest({ composeBody: compose({
+      env: reconcilePrepareEnv(oldEnv).env,
+    }), domainBody: domain({ enabled: false }), seen: crossed }),
+    readStateFn() { return state; }, publishStateFn() {},
+  }) }), /E_PHASE_MISMATCH/);
+  assert.equal(crossed.some((x) => x.method === 'POST'), false);
 });
 
 test('wrong project stops before snapshot and every mutation', async () => {

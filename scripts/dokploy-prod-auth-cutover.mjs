@@ -749,7 +749,10 @@ async function orchestrate({ phase, readTokenFn, assertContextFn, openForwardFn,
           // Legitimate crash-resume points are narrowly enumerated: domain
           // disabled before source update; source updated before env; or both
           // updated before the queued deploy. Any other drift stops.
-          if ((!originalSource && !releaseSource) || (!originalEnv && !preparedEnv)) {
+          const validResume = (originalSource && originalEnv)
+            || (releaseSource && originalEnv)
+            || (releaseSource && preparedEnv);
+          if (!validResume) {
             throw new Fail(E.PHASE_MISMATCH);
           }
         }
