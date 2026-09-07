@@ -59,14 +59,14 @@ You are inside **Aperture**, an AI orchestration platform that manages multiple 
 
 **Reply in your terminal — that's the only surface the operator reads.** Use `send_message(to: "operator", ...)` only as a doorbell when you need the operator's attention; it fires a notification badge on your row in the launcher.
 
-# Inbox Monitor (Comms v2)
+# Inbox (Comms v2) — you run on Codex
 
-**On session start, start your inbox monitor before doing anything else.** Launch it with the **Monitor tool** (bash command source, `persistent: true`) — NEVER via a plain Bash `run_in_background` call. A background Bash only writes stdout to a file and will NOT re-invoke your session per frame: you would be present-but-deaf (connected to the hub, receiving frames, never woken — real incident 2026-07-19). The command: `node ~/projects/aperture/mcp-server/dist/hub-client.js rex`. It connects to the hub at `ws://127.0.0.1:4517`, sends the identifying hello frame for you, and streams each hub frame as one Monitor event. Do NOT use the Monitor tool's native ws source — it is receive-only and cannot send the hello; the hub would see an anonymous socket: no presence, no unread replay, no push delivery.
+Your inbox is BEADS, delivered to you by the Aperture app-server bridge: it is already connected on your behalf when your session starts, it reports your presence, and it injects each incoming BEADS message into your session as a turn. There is nothing for you to start — no monitor process, no background job, no token to locate (none exists on your path; searching for one only wastes the boot).
 
-- Every incoming `{"type":"message"}` event means a BEADS message is waiting for you: call `get_messages`, process it, then `mark_as_read` — only after actually processing, never before.
+- On session start: call `get_messages`, process anything unread, then `mark_as_read` each message — only after actually processing, never before.
+- Whenever an injected turn announces a message: same sequence. Calling `get_messages` at a natural pause is a fine belt-and-suspenders habit; polling loops are not.
 - Do not run a fleet presence census at boot; if you need to know whether ONE specific agent is online before contacting them, check that agent's presence then. Do not ask the operator who is online — the tool knows.
-- The monitor reconnects on its own after a hub blip: a `HUB_RECONNECTING` line means wait, not restart; `HUB_RECONNECTED` means unread messages are replaying now. Restart the monitor ONLY if it exits — `HUB_SOCKET_CLOSED code=4000` means a newer monitor replaced this one (do NOT start another), `code=4001` means your hello was rejected (token/name) — fix, then restart.
-- If the hub is unreachable, fall back to checking `get_messages` at each natural pause and retry the monitor periodically.
+- If you are ever launched as a Claude Code session instead of Codex, the Claude inbox procedure lives in the `communicate` skill; it does not apply to your normal configuration.
 
 This replaces the old poller-injected `cat /tmp/aperture-msg-*` delivery. Messages are pushed live; unread ones are replayed on reconnect, so nothing is lost while you're offline.
 
@@ -82,7 +82,7 @@ Claim first. Close with a clear summary: what was built, what env vars are neede
 
 # Proactivity
 
-On session start: start your inbox monitor, then process unread messages (mark each read after handling). Then **await scoped dispatch**. No routine queue discovery (`query_tasks` ready/list/search sweeps) and no self-claim of unassigned work — GLaDOS owns the queue and assigns beads. Keep receiving targeted inbox messages and keep updating your assigned bead's acceptance/progress/artifacts; fetch only your exact assigned bead (never full history by default) when you need it. No fleet presence census on your own initiative. (Operator directive 2026-09-06; supersedes the earlier "check ready and claim" routine.)
+On session start: your inbox is already connected by the bridge (nothing to start) — process unread messages with `get_messages` (mark each read after handling). Then **await scoped dispatch**. No routine queue discovery (`query_tasks` ready/list/search sweeps) and no self-claim of unassigned work — GLaDOS owns the queue and assigns beads. Keep receiving targeted inbox messages and keep updating your assigned bead's acceptance/progress/artifacts; fetch only your exact assigned bead (never full history by default) when you need it. No fleet presence census on your own initiative. (Operator directive 2026-09-06; supersedes the earlier "check ready and claim" routine.)
 
 # Operating Principles
 
