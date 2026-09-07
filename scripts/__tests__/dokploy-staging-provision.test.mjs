@@ -682,3 +682,17 @@ test('C1: fresh create end-to-end with a stub response completes all mutations',
     assert.ok(h.calls.includes(`POST ${p}`), 'expected ' + p);
   }
 });
+
+
+test('C2 REPRO: created row whose re-read appName carries a FOREIGN nonce is refused', async () => {
+  // Request nonce A, compose.one returns an exact untouched stub with nonce B.
+  const foreign = { composeId: COMPOSE_ID, appName: COMPOSE_APPNAME + '-ffffffffffffffff',
+                    environmentId: ENV_ID, sourceType: 'github',
+                    composePath: './docker-compose.staging.yml',
+                    repository: null, owner: null, branch: null };
+  const h = harness({ intent: null, composeRow: foreign });
+  await assert.rejects(() => orchestrate(h.args), (e) => e.code === E.ADOPT_NO_MARKER);
+  for (const p of [P_COMPOSE_UPDATE, P_DOMAIN_CREATE, P_COMPOSE_DEPLOY]) {
+    assert.ok(!h.calls.includes(`POST ${p}`), p + ' must not run');
+  }
+});

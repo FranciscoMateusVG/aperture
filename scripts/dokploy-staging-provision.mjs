@@ -871,6 +871,9 @@ async function orchestrate({
 
       let composeId = target.composeId;
       const created = target.create;
+      // The intent that authorizes THIS invocation, kept in scope so the
+      // re-read row can be bound to it on both paths.
+      let activeIntent = priorIntent;
       // Same coupling rule for an adopted orphan: it was created by a previous
       // run, so its secrets must be the escrowed ones, not a fresh set.
       if (!created && !escrow.reused) throw new Fail(E.ESCROW_MISSING);
@@ -880,10 +883,10 @@ async function orchestrate({
       if (created) {
         // Persist the ownership nonce BEFORE the create it names, so a crash
         // in that window still leaves a marker the next run can match on.
-        const intent = priorIntent ?? createIntentFn();
+        activeIntent = priorIntent ?? createIntentFn();
         composeId = extractComposeId(
           await call(P_COMPOSE_CREATE, 'POST',
-                     bodyComposeCreate(binding.environmentId, intent.nonce)));
+                     bodyComposeCreate(binding.environmentId, activeIntent.nonce)));
         // Durably record the binding BEFORE anything else, so a crash here
         // still lets a retry rebind by exact id instead of creating again.
         saveBindingFn(composeId);
@@ -898,6 +901,12 @@ async function orchestrate({
         // row skipped this entirely, so a create returning a foreign
         // sourceType/composePath was updated and deployed.
         assertAdoptable(st);
+        // ...and BOTH must carry THIS invocation's nonce. Checking the marker
+        // only at candidate selection left the create response unbound: a
+        // re-read row with a foreign nonce was accepted and mutated.
+        if (!activeIntent || !appNameCarriesNonce(st.appName, activeIntent.nonce)) {
+          throw new Fail(E.ADOPT_NO_MARKER);
+        }
         // The created path already persisted its binding immediately after the
         // create, and publication is no-overwrite, so saving again here would
         // throw. Only the adopted path still needs to record its binding.
