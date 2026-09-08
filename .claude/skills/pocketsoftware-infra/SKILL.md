@@ -363,7 +363,7 @@ Capture `-w '%{http_code}'` into a variable and require **exactly 200** before p
 turns a missing field into a non-zero exit so an empty header is never sent downstream. Never add
 `set -x`, never `echo` a variable, never `-L`, never a detached `ssh -f` you "kill later".
 
-**Bindings.** A consumer is the four configuration values; nothing else changes.
+**Bindings.** A consumer is the four configuration values; nothing else changes. Dokploy is the *verified example*, not the pattern's limit — another service still needs its own locator, its own target, and its own authorized operation before a first run.
 
 | Consumer | `<PROJECT_ID>` / `<ENV>` / `<SECRET_NAME>` | header | origin | assertion |
 |---|---|---|---|---|
@@ -384,8 +384,9 @@ Three attempts before it failed on preconditions, none of which sent a value any
 identity in the credential file was accepted, the named secret was readable, and the consumer
 accepted it. It does **not** attest *which* identity the server authenticated (no server field
 reports it), does not make any *other* secret "ready", and is not permission to repeat the call —
-each live run is a scoped dispatch. Value-boundary statement to use verbatim: *"value-bearing
-responses were received; zero values were emitted, logged, persisted or placed in model-visible output."*
+each live run is a scoped dispatch. Value-boundary statement to use verbatim: *"no values emitted to model, logs or argv; private temporary
+responses were written to a `0700` scratch directory and removed; no retained response files."* Do not
+write "never persisted" — the bodies do touch private disk for the life of the run.
 
 **Failure handling.** Stop on the first non-2xx and report the status only. 401/403 on step 1 →
 identity invalid/expired/lost grant: **stop, do not re-provision or rotate**. 404 on step 2 → wrong
