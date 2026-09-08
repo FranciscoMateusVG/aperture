@@ -366,7 +366,8 @@ jq -e '.projectId=="w4FraIVPC0PfP2fZxVtaT" and .organizationId=="GME9CAd599FWcIn
 ```
 
 Capture `-w '%{http_code}'` into a variable and require **exactly 200** before parsing each body (`--fail` alone accepts 3xx). The Bash tool shell on the Mac is **zsh**, which does not word-split a `$FLAGS` string — keep flags inline on every curl. `jq -e`
-turns a missing field into a non-zero exit so an empty header is never sent downstream. Never add
+alone only fails on `false`/`null` — an empty string passes it — which is why each extraction carries an
+explicit `type=="string" and length>0` predicate; that is what keeps an empty header from being sent downstream. Never add
 `set -x`, never `echo` a variable, never `-L`, never an *unowned* detached `ssh -f` you "kill later" — the `-fN -M -S` form above is owned by its control socket and closed by the trap.
 
 **Bindings.** A consumer is the four configuration values; nothing else changes. Dokploy is the *verified example*, not the pattern's limit — another service still needs its own locator, its own target, and its own authorized operation before a first run.
@@ -382,9 +383,11 @@ turns a missing field into a non-zero exit so an empty header is never sent down
 `hop1 infisical login http=200` · `hop2 infisical secret http=200` · `hop3 dokploy project.one http=200` ·
 `assertion: project+org exact match — PROOF_OK` · `cleanup: control socket closed` · `cleanup: scratch removed` · `exit=0`.
 Environment that produced it: macOS, Bash tool shell **zsh 5.9**, curl 8.7.1, jq 1.7.1, key **`~/.ssh/id_ed25519`**.
-Three attempts before it failed on preconditions, none of which sent a value anywhere: an unexported variable
-(curl `--variable %NAME` reads the *environment*), a `$FLAGS` string zsh would not word-split, and a pinned
-`id_rsa` that does not exist. Each is now baked into the chain above.
+Three earlier attempts failed on preconditions; none emitted a value to model, logs or argv, but they were
+not effect-free: attempt #2 completed a universal-auth login (HTTP 200) before failing at hop 2 on an
+unexported variable (curl `--variable %NAME` reads the *environment*); attempt #3 sent no request at all
+(a `$FLAGS` string zsh would not word-split, and a pinned `id_rsa` that does not exist). Each lesson is
+baked into the chain above.
 
 **What a passing proof proves — and does not.** A `http=200` plus a projected name/id list proves the
 identity in the credential file was accepted, the named secret was readable, and the consumer

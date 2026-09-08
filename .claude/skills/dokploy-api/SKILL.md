@@ -28,11 +28,12 @@ environment variable and never touches argv:
 # KEY is populated by the Infisical HTTP chain in pocketsoftware-infra §9
 # "Native HTTP consumer chain" — that section is the full, copy-ready command.
 # `--variable %KEY` imports from the ENVIRONMENT, so the chain exports KEY first. Never echo it.
-curl -sS --fail --max-redirs 0 --connect-timeout 5 --max-time 20 \
+S=$(curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 \
   --variable %KEY --expand-header 'x-api-key: {{KEY}}' \
-  -o "$T/out.json" -w 'http=%{http_code}\n' \
-  'http://127.0.0.1:13000/api/project.one?projectId=<ID>'
-jq -e '.projectId=="<ID>" and .organizationId=="<ORG>"' "$T/out.json" >/dev/null && echo OK
+  -o "$T/out.json" -w '%{http_code}' \
+  'http://127.0.0.1:13000/api/project.one?projectId=<ID>')
+echo "http=$S"; [ "$S" = 200 ] || { echo "not 200 — STOP"; exit 1; }
+jq -e '.projectId=="<ID>" and .organizationId=="<ORG>"' "$T/out.json" >/dev/null 2>&1 && echo OK
 ```
 
 - Transport is the skill's SSH→`localhost:3000` path, but as a **local forward** (`ssh -N -L 127.0.0.1:13000:localhost:3000 … ubuntu@100.85.254.44`)
