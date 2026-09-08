@@ -336,32 +336,38 @@ set -a; . ~/.config/aperture/infisical-peppy-admin.env; set +a      # 0. bootstr
 INF=http://100.102.73.112:3005
 
 # 1. Universal Auth login. `{{VAR:json}}` escapes quotes/backslashes but does NOT add quotes (curl 8.7.1, verified).
-curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 -H 'Content-Type: application/json' \
+S1=$(curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 -H 'Content-Type: application/json' \
   --variable %INFISICAL_CLIENT_ID --variable %INFISICAL_CLIENT_SECRET \
   --expand-data '{"clientId":"{{INFISICAL_CLIENT_ID:json}}","clientSecret":"{{INFISICAL_CLIENT_SECRET:json}}"}' \
-  -o "$T/1.json" -w 'hop1 login http=%{http_code}\n' "$INF/api/v1/auth/universal-auth/login"
-TOKEN=$(jq -er .accessToken "$T/1.json"); export TOKEN; unset INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
+  -o "$T/1.json" -w '%{http_code}' "$INF/api/v1/auth/universal-auth/login")
+echo "hop1 login http=$S1"; [ "$S1" = 200 ] || { echo "hop1 not 200 — STOP"; exit 1; }
+TOKEN=$(jq -er 'select(.accessToken|type=="string" and length>0)|.accessToken' "$T/1.json" 2>/dev/null) || { echo "hop1: token field absent — STOP"; exit 1; }
+export TOKEN; unset INFISICAL_CLIENT_ID INFISICAL_CLIENT_SECRET
 
 # 2. ONE designated secret by name — never a list. `--variable %NAME` imports from the ENVIRONMENT: export first.
-curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 \
+S2=$(curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 \
   --variable %TOKEN --expand-header 'Authorization: Bearer {{TOKEN}}' \
-  -o "$T/2.json" -w 'hop2 secret http=%{http_code}\n' \
-  "$INF/api/v3/secrets/raw/DOKPLOY_TOKEN_INCLUIR_XEROX?workspaceId=b4a65c24-dd50-4e93-b323-41d472e7cf46&environment=prod"
-KEY=$(jq -er .secret.secretValue "$T/2.json"); export KEY; unset TOKEN
+  -o "$T/2.json" -w '%{http_code}' \
+  "$INF/api/v3/secrets/raw/DOKPLOY_TOKEN_INCLUIR_XEROX?workspaceId=b4a65c24-dd50-4e93-b323-41d472e7cf46&environment=prod")
+echo "hop2 secret http=$S2"; [ "$S2" = 200 ] || { echo "hop2 not 200 — STOP"; exit 1; }
+KEY=$(jq -er 'select(.secret.secretValue|type=="string" and length>0)|.secret.secretValue' "$T/2.json" 2>/dev/null) || { echo "hop2: value field absent — STOP"; exit 1; }
+export KEY; unset TOKEN
 
-# 3. Native consumer. Header from env via curl expansion; body to scratch; -w goes to stdout, never mixed into JSON.
-curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 \
+# 3. Native consumer. Header from env via curl expansion; body to scratch; status captured separately, gated before parse.
+S3=$(curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 \
   --variable %KEY --expand-header 'x-api-key: {{KEY}}' \
-  -o "$T/3.json" -w 'hop3 dokploy http=%{http_code}\n' \
-  'http://127.0.0.1:13000/api/project.one?projectId=w4FraIVPC0PfP2fZxVtaT'
+  -o "$T/3.json" -w '%{http_code}' \
+  'http://127.0.0.1:13000/api/project.one?projectId=w4FraIVPC0PfP2fZxVtaT')
+echo "hop3 dokploy http=$S3"; [ "$S3" = 200 ] || { echo "hop3 not 200 — STOP"; exit 1; }
 unset KEY
 # 4. Assert exact ids; emit a constant receipt only.
-jq -e '.projectId=="w4FraIVPC0PfP2fZxVtaT" and .organizationId=="GME9CAd599FWcInMNTZ2F"' "$T/3.json" >/dev/null && echo PROOF_OK
+jq -e '.projectId=="w4FraIVPC0PfP2fZxVtaT" and .organizationId=="GME9CAd599FWcInMNTZ2F"' "$T/3.json" >/dev/null 2>&1 \
+  && echo PROOF_OK || { echo "assertion FAILED"; exit 1; }
 ```
 
 Capture `-w '%{http_code}'` into a variable and require **exactly 200** before parsing each body (`--fail` alone accepts 3xx). The Bash tool shell on the Mac is **zsh**, which does not word-split a `$FLAGS` string — keep flags inline on every curl. `jq -e`
 turns a missing field into a non-zero exit so an empty header is never sent downstream. Never add
-`set -x`, never `echo` a variable, never `-L`, never a detached `ssh -f` you "kill later".
+`set -x`, never `echo` a variable, never `-L`, never an *unowned* detached `ssh -f` you "kill later" — the `-fN -M -S` form above is owned by its control socket and closed by the trap.
 
 **Bindings.** A consumer is the four configuration values; nothing else changes. Dokploy is the *verified example*, not the pattern's limit — another service still needs its own locator, its own target, and its own authorized operation before a first run.
 
