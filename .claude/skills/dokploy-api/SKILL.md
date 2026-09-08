@@ -13,22 +13,39 @@ Quick reference for Dokploy REST API operations on the Aperture server. All call
 
 There are **two separate Dokploy organizations** on the same server, each with its own API token:
 
-### Xerox Org (BH Escape, Aperture Test, CROSS, FITT)
+| Org | Projects | Designated Infisical secret (project / env / key) |
+|---|---|---|
+| Incluir — **PROD CUSTOMER-FACING** | Main App, Infra, Waha, Quiz | **General** (`b4a65c24-dd50-4e93-b323-41d472e7cf46`) / `prod` / `DOKPLOY_TOKEN_INCLUIR_XEROX` — confirmed by metadata 2026-09-07 |
+| Xerox | BH Escape, Aperture Test, CROSS, FITT | none found by name in Infisical (2026-09-07); server-side recipes read `/home/ubuntu/.config/@dokploy/cli/config.json` on xerox. Add a key before using the chain from the Mac. |
+
+**Credential supply is non-model (rule since 2026-08-28, binding).** Never look a token up
+through `mempalace_search`/`get_drawer`, never `cat` it, never put it in a `-H "x-api-key: $TOKEN"`
+argument — argv is visible to `ps`, shell history and traces. The token is fetched from Infisical
+inside the same shell and handed to curl through **curl's own variable expansion**, which reads an
+environment variable and never touches argv:
+
 ```bash
-TOKEN=$(python3 -c "import json; print(json.load(open('/home/ubuntu/.config/@dokploy/cli/config.json'))['token'])")
+# KEY is populated by the Infisical HTTP chain in pocketsoftware-infra §9
+# "Native HTTP consumer chain" — that section is the full, copy-ready command.
+# `--variable %KEY` imports from the ENVIRONMENT, so the chain exports KEY first. Never echo it.
+S=$(curl -q -sS --noproxy '*' --max-redirs 0 --connect-timeout 5 --max-time 20 \
+  --variable %KEY --expand-header 'x-api-key: {{KEY}}' \
+  -o "$T/out.json" -w '%{http_code}' \
+  'http://127.0.0.1:13000/api/project.one?projectId=<ID>')
+echo "http=$S"; [ "$S" = 200 ] || { echo "not 200 — STOP"; exit 1; }
+jq -e '.projectId=="<ID>" and .organizationId=="<ORG>"' "$T/out.json" >/dev/null 2>&1 && echo OK
 ```
 
-### Incluir Org (Main App, Infra, Waha) — PROD CUSTOMER-FACING
-```bash
-# Source of truth: peppy/secrets drawer in mempalace.
-# The token rotates; never inline it here.
-# Look it up via: mcp__mempalace__mempalace_search query="dokploy api tokens"
-TOKEN="<from peppy/secrets drawer>"
-```
+- Transport is the skill's SSH→`localhost:3000` path, but as a **local forward** (`ssh -N -L 127.0.0.1:13000:localhost:3000 … ubuntu@100.85.254.44`)
+  so curl runs on the Mac and the token never appears on a remote command line (`ssh xerox "curl -H …"` does).
+- `--max-redirs 0`: a redirect must fail, never forward the credential.
+- Assert `http=` explicitly; a 401 with the wrong org's token returns an **empty project list**, not an error.
+- **Project the response.** `compose.one` and `project.all` can carry `env` blocks with secrets; pipe
+  through `jq` to the fields you need and never dump a full body into a report.
 
-(The token `lZMOoQgl...` previously documented inline here is rotated/dead — do NOT use.)
-
-Pass the appropriate token as: `-H "x-api-key: $TOKEN"`
+(The token `lZMOoQgl...` previously documented inline here is rotated/dead — do NOT use. The
+server-side file `/home/ubuntu/.config/@dokploy/cli/config.json` is the justfile recipes' source on
+xerox itself; agents on the Mac do not read it.)
 
 **Use the correct token for the org you're operating on.** The wrong token will return an empty project list.
 
