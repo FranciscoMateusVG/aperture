@@ -121,6 +121,8 @@ pub enum ReplacementError {
     RepoBindingUnavailable,
     CheckpointUnavailable,
     LaunchUnavailable,
+    Deadline,
+    OutcomeUnknown,
 }
 impl ReplacementError {
     pub fn code(&self) -> &'static str {
@@ -138,6 +140,8 @@ impl ReplacementError {
             Self::RepoBindingUnavailable => "E_REPO_BINDING_UNAVAILABLE",
             Self::CheckpointUnavailable => "E_CHECKPOINT_UNAVAILABLE",
             Self::LaunchUnavailable => "E_LAUNCH_UNAVAILABLE",
+            Self::Deadline => "E_RUNTIME_DEADLINE",
+            Self::OutcomeUnknown => "E_CONTROL_UNKNOWN",
         }
     }
 }
@@ -509,3 +513,6 @@ pub(crate) mod native;
 
 #[path = "team_repository_native.rs"]
 pub(crate) mod repository;
+
+#[path = "team_runtime_deadline.rs"]
+pub(crate) mod deadline;

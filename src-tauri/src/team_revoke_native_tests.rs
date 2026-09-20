@@ -168,9 +168,53 @@ fn cleanup_error_or_unverified_ack_fails_without_negative_reconnect_or_retry() {
 fn nonloopback_destination_is_rejected_before_connect() {
     let address = SocketAddr::from(([192, 0, 2, 1], 4517));
     assert!(matches!(
-        connect_at(address),
+        connect_at(address, Instant::now() + DEADLINE),
         Err(ReplacementError::RevocationUnverified)
     ));
+}
+
+#[test]
+fn fragmented_handshake_cannot_renew_absolute_deadline() {
+    use std::io::Write;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        for byte in b"HTTP/1.1 101 Switching Protocols\r\n" {
+            if socket.write_all(&[*byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let started = Instant::now();
+    assert!(connect_at(address, started + Duration::from_millis(25)).is_err());
+    assert!(started.elapsed() < Duration::from_millis(500));
+    server.join().unwrap();
+}
+
+#[test]
+fn fragmented_frame_cannot_renew_absolute_deadline() {
+    use std::io::Write;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let mut ws = tungstenite::accept(socket).unwrap();
+        ws.get_mut().write_all(&[0x81, 64]).unwrap();
+        for _ in 0..64 {
+            if ws.get_mut().write_all(b"x").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let mut ws = connect_at(address, Instant::now() + DEADLINE).unwrap();
+    let started = Instant::now();
+    assert!(read_before(&mut ws, started + Duration::from_millis(25)).is_err());
+    assert!(started.elapsed() < Duration::from_millis(500));
+    drop(ws);
+    server.join().unwrap();
 }
 #[test]
 fn private_reader_is_bounded_and_rejects_symlink_or_unsafe_mode() {

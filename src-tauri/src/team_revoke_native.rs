@@ -70,44 +70,86 @@ fn read_bearer(home: &Path, seat: &str) -> Result<Bearer, ReplacementError> {
     }
     Ok(Bearer(value))
 }
-fn connect_at(address: SocketAddr) -> Result<WebSocket<TcpStream>, ReplacementError> {
+fn remaining(deadline: Instant) -> Result<Duration, ReplacementError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(failure)
+}
+fn would_block(error: &tungstenite::Error) -> bool {
+    matches!(error, tungstenite::Error::Io(e) if e.kind()==std::io::ErrorKind::WouldBlock)
+}
+fn pause(deadline: Instant) -> Result<(), ReplacementError> {
+    std::thread::sleep(remaining(deadline)?.min(Duration::from_millis(2)));
+    remaining(deadline).map(|_| ())
+}
+fn connect_at(
+    address: SocketAddr,
+    deadline: Instant,
+) -> Result<WebSocket<TcpStream>, ReplacementError> {
     if !address.ip().is_loopback() {
         return Err(failure());
     }
-    let stream = TcpStream::connect_timeout(&address, DEADLINE).map_err(|_| failure())?;
-    stream
-        .set_read_timeout(Some(DEADLINE))
-        .map_err(|_| failure())?;
-    stream
-        .set_write_timeout(Some(DEADLINE))
-        .map_err(|_| failure())?;
+    let stream =
+        TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(|_| failure())?;
+    stream.set_nonblocking(true).map_err(|_| failure())?;
     let config = tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(FRAME_CAP),
         max_frame_size: Some(FRAME_CAP),
         ..Default::default()
     };
-    tungstenite::client::client_with_config(format!("ws://{address}"), stream, Some(config))
-        .map(|(ws, _)| ws)
-        .map_err(|_| failure())
+    let mut result =
+        tungstenite::client::client_with_config(format!("ws://{address}"), stream, Some(config));
+    loop {
+        remaining(deadline)?;
+        match result {
+            Ok((ws, _)) => return Ok(ws),
+            Err(tungstenite::HandshakeError::Interrupted(handshake)) => {
+                pause(deadline)?;
+                result = handshake.handshake();
+            }
+            Err(_) => return Err(failure()),
+        }
+    }
 }
-fn send(ws: &mut WebSocket<TcpStream>, value: serde_json::Value) -> Result<(), ReplacementError> {
+fn send(
+    ws: &mut WebSocket<TcpStream>,
+    value: serde_json::Value,
+    deadline: Instant,
+) -> Result<(), ReplacementError> {
     let text = serde_json::to_string(&value).map_err(|_| failure())?;
     if text.len() > FRAME_CAP {
         return Err(failure());
     }
-    ws.send(Message::Text(text)).map_err(|_| failure())
+    remaining(deadline)?;
+    // write queues this frame once. WouldBlock retains its queued remainder;
+    // only flush is retried, never the revoke/hello frame itself.
+    match ws.write(Message::Text(text)) {
+        Ok(()) => {}
+        Err(e) if would_block(&e) => {}
+        Err(_) => return Err(failure()),
+    }
+    loop {
+        remaining(deadline)?;
+        match ws.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if would_block(&e) => pause(deadline)?,
+            Err(_) => return Err(failure()),
+        }
+    }
 }
 fn read_before(
     ws: &mut WebSocket<TcpStream>,
     deadline: Instant,
 ) -> Result<Message, ReplacementError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(failure)?;
-    ws.get_mut()
-        .set_read_timeout(Some(remaining))
-        .map_err(|_| failure())?;
-    ws.read().map_err(|_| failure())
+    loop {
+        remaining(deadline)?;
+        match ws.read() {
+            Ok(message) => return Ok(message),
+            Err(e) if would_block(&e) => pause(deadline)?,
+            Err(_) => return Err(failure()),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,17 +192,22 @@ fn exchange(
     generation: u64,
     token_id: &str,
 ) -> Result<RevocationProof, ReplacementError> {
-    let mut control = connect_at(address)?;
+    // One total bound across both handshakes/reads/writes. Per-read socket
+    // timeouts alone could be renewed forever by a fragmented handshake/frame.
+    let total_deadline = Instant::now() + Duration::from_secs(3);
+    let mut control = connect_at(address, total_deadline)?;
     send(
         &mut control,
         serde_json::json!({"type":"hello","role":"subscriber","agent":"watchdog","token":watchdog.0}),
+        total_deadline,
     )?;
     let started = Instant::now();
-    let deadline = started + DEADLINE;
+    let deadline = (started + DEADLINE).min(total_deadline);
     // Exactly one mutation request; uncertain outcome never causes a retry.
     send(
         &mut control,
         serde_json::json!({"type":"revoke_generation","seat":seat,"generation":generation,"token_id":token_id}),
+        deadline,
     )?;
     let mut proof = None;
     for _ in 0..FRAME_COUNT_CAP {
@@ -189,13 +236,14 @@ fn exchange(
     let _ = control.close(None);
     // One negative reconnect with the original in-memory bearer. Never rewrite
     // the deleted file and never substitute a newer generation/token.
-    let mut denied = connect_at(address)?;
+    let mut denied = connect_at(address, total_deadline)?;
     send(
         &mut denied,
         serde_json::json!({"type":"hello","role":"producer","agent":seat,
         "generation":generation,"token_id":token_id,"token":old.0}),
+        total_deadline,
     )?;
-    let reconnect_deadline = Instant::now() + DEADLINE;
+    let reconnect_deadline = (Instant::now() + DEADLINE).min(total_deadline);
     let mut rejected = false;
     for _ in 0..FRAME_COUNT_CAP {
         match read_before(&mut denied, reconnect_deadline)? {

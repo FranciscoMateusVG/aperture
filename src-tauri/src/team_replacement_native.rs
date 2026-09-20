@@ -42,8 +42,9 @@ struct RepositoryBinding(super::repository::BoundRepository);
 fn require_repository_binding(
     home: &Path,
     target: &remote::RemoteTarget,
+    budget: &deadline::Deadline,
 ) -> Result<RepositoryBinding, ReplacementError> {
-    super::repository::resolve_native(home, &target.team, Instant::now() + Duration::from_secs(10))
+    super::repository::resolve_native(home, &target.team, budget.forward_until(Duration::from_secs(10))?)
         .map(RepositoryBinding)
         .map_err(|_| ReplacementError::RepoBindingUnavailable)
 }
@@ -77,23 +78,26 @@ pub(crate) fn replace_authorized(
     selection: &StartSelection,
     sentinels: &[String],
 ) -> Result<StartedReplacement, ReplacementError> {
+    let budget = deadline::Deadline::new();
     selectors(&target)?;
-    let binding = require_repository_binding(home, &target)?;
+    let binding = require_repository_binding(home, &target, &budget)?;
     require_launch_composition()?;
-    let mut runtime = NativeRuntime::new(home, authority, target, sentinels, binding)?;
+    let mut runtime = NativeRuntime::new(home, authority, target, sentinels, binding, budget)?;
     let seat = runtime.target.seat.clone();
     let generation = runtime.target.expected_generation;
-    let snapshot = runtime.snapshot(&seat, generation)?;
-    runtime.authorize_selection(&snapshot, selection)?;
-    let prepared = prepare(
-        &mut runtime,
-        &seat,
-        generation,
-        &ReplacementPolicy::default(),
-    )?;
-    // Binding must also survive the stop/checkpoint/reconciliation interval.
-    require_repository_binding(home, &runtime.target)?;
-    start(&mut runtime, prepared, selection)
+    let result = (|| {
+        let snapshot = runtime.snapshot(&seat, generation)?;
+        runtime.authorize_selection(&snapshot, selection)?;
+        let prepared = prepare(&mut runtime, &seat, generation, &ReplacementPolicy::default())?;
+        // Binding must survive reconciliation too; never reset total budget.
+        runtime.attempt.budget().forward(Duration::from_secs(10))?;
+        require_repository_binding(home, &runtime.target, runtime.attempt.budget())?;
+        start(&mut runtime, prepared, selection)
+    })();
+    match result {
+        Ok(value) => { runtime.attempt.finish_active()?; Ok(value) }
+        Err(error) => { runtime.attempt.finish_failed()?; Err(error) }
+    }
 }
 
 struct NativeRuntime<'a> {
@@ -106,6 +110,7 @@ struct NativeRuntime<'a> {
     snapshot: Option<OwnershipSnapshot>,
     revoked: Option<RevocationProof>,
     phases: Vec<ReplacementPhase>,
+    attempt: deadline::RuntimeAttempt,
 }
 impl<'a> NativeRuntime<'a> {
     fn new(
@@ -114,7 +119,13 @@ impl<'a> NativeRuntime<'a> {
         target: remote::RemoteTarget,
         sentinels: &'a [String],
         binding: RepositoryBinding,
+        budget: deadline::Deadline,
     ) -> Result<Self, ReplacementError> {
+        authority.revalidate(&target)?;
+        remote::inspect_authorized(home, authority.remote(), &target, sentinels)
+            .map_err(|_| ReplacementError::AuthorizationRequired)?;
+        let attempt = deadline::RuntimeAttempt::begin(home, &AuthenticatedActor::launcher(),
+            &target.team, &target.seat, target.expected_generation, budget)?;
         let runtime = Self {
             home,
             authority,
@@ -125,11 +136,13 @@ impl<'a> NativeRuntime<'a> {
             snapshot: None,
             revoked: None,
             phases: vec![],
+            attempt,
         };
         runtime.admission()?;
         Ok(runtime)
     }
     fn admission(&self) -> Result<(), ReplacementError> {
+        self.attempt.budget().forward(Duration::ZERO)?;
         self.authority.revalidate(&self.target)?;
         // Uses the SAME team -> lexical seat locks and immutable lead identity
         // as resolution. This does not accept or synthesize remote authorization.
@@ -227,7 +240,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
             .unwrap_or(u64::MAX)
     }
     fn wait_ms(&mut self, ms: u64) {
-        std::thread::sleep(Duration::from_millis(ms));
+        std::thread::sleep(Duration::from_millis(ms).min(self.attempt.budget().remaining()));
     }
     fn event(&mut self, phase: ReplacementPhase) {
         self.phases.push(phase);
@@ -244,6 +257,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         generation: u64,
     ) -> Result<OwnershipSnapshot, ReplacementError> {
         self.expected_owner(seat, generation)?;
+        self.attempt.budget().forward(Duration::from_secs(10))?;
         let snapshot =
             team_process::native::collect_native(self.home, &self.target.team, seat, generation)?;
         self.snapshot = Some(snapshot.clone());
@@ -272,6 +286,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         process: &ProcessIdentity,
         signal: Signal,
     ) -> Result<(), ReplacementError> {
+        self.attempt.admit_effects()?;
         let snapshot = self
             .snapshot
             .as_ref()
@@ -286,6 +301,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
     fn unowned_matches(&mut self, snapshot: &OwnershipSnapshot) -> Result<bool, ReplacementError> {
         self.matches_target(snapshot)?;
         self.admission()?;
+        self.attempt.budget().forward(Duration::from_secs(10))?;
         let fresh = team_process::native::collect_native(
             self.home,
             &self.target.team,
@@ -302,6 +318,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         &mut self,
         snapshot: &OwnershipSnapshot,
     ) -> Result<RevocationProof, ReplacementError> {
+        self.attempt.admit_effects()?;
         let proof = self.with_stop_guard(snapshot, |guard| {
             crate::ws_hub::managed_control::revoke_stopped(self.home, guard)
         })?;
@@ -382,7 +399,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         // Do not mark_stale/reserve merely because preparation once succeeded.
         // Authoritative binding and full partial-start cleanup must be wired
         // before this can create a LaunchSpec or enter generation g+1.
-        require_repository_binding(self.home, &self.target)?;
+        require_repository_binding(self.home, &self.target, self.attempt.budget())?;
         Err(ReplacementError::NativeFailure)
     }
     fn activate_started(&mut self, _candidate: &StartedCandidate) -> Result<(), ReplacementError> {
