@@ -11,6 +11,36 @@ use std::sync::{Arc, Mutex};
 
 use crate::state::AgentDef;
 
+#[path = "team_legacy_guard.rs"]
+mod legacy_lifecycle_guard;
+
+fn require_legacy_lifecycle_at(
+    home: &std::path::Path,
+    agents_root: &std::path::Path,
+    name: &str,
+) -> Result<(), String> {
+    let membership = match crate::teams::classify_managed_seat(home, name) {
+        Ok(None) => legacy_lifecycle_guard::Membership::Standing,
+        Ok(Some(_)) => legacy_lifecycle_guard::Membership::Team,
+        Err(_) => legacy_lifecycle_guard::Membership::Unknown,
+    };
+    legacy_lifecycle_guard::ensure_legacy(agents_root, name, membership)
+}
+
+/// Authoritative native classification, independent of UI visibility or cached
+/// AppState. Only a proven standing seat may enter legacy lifecycle effects.
+fn require_legacy_lifecycle(name: &str) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| legacy_lifecycle_guard::DENIED.to_string())?;
+    let agents_root = std::env::var_os("APERTURE_AGENTS_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude/aperture"));
+    require_legacy_lifecycle_at(&home, &agents_root, name)
+}
+
 /// One assignee's resolved current-work summary (aperture-nr65b).
 struct CurrentTask {
     id: String,
@@ -102,6 +132,7 @@ fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
 
 #[tauri::command]
 pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
     // Extract all needed data while holding the lock briefly, then release it
     // before doing any expensive I/O (subprocess calls, file writes). This
     // prevents the global state mutex from blocking list_agents polling and
@@ -162,6 +193,7 @@ pub fn boot_agent_process(
     mcp_sentry_server_path: String,
     project_dir: String,
 ) -> Result<String, String> {
+    require_legacy_lifecycle(&agent.name)?;
     let name = agent.name.clone();
 
     // Create a dedicated tmux window for this agent
@@ -489,6 +521,7 @@ fn teardown_agent(name: &str, window_id: Option<String>) {
 
 #[tauri::command]
 pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
     // Extract needed data and release the lock before the blocking sleep calls
     let (window_id_opt, is_running) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
@@ -535,6 +568,7 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
 /// write the outcome.
 #[tauri::command]
 pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
     let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         let agent = app_state
@@ -780,6 +814,7 @@ pub fn update_agent_model(
     model: String,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
     if !is_valid_model(&model) {
         return Err(format!(
             "Invalid model '{}'. Must be one of {} or codex/<model>",
@@ -1457,3 +1492,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agents_team_tests.rs"]
+mod team_lifecycle_guard_tests;
