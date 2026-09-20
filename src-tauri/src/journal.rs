@@ -135,19 +135,30 @@ fn c_string(value: &std::ffi::OsStr) -> Result<CString, String> {
 /// while opening the child makes a path-component swap observable rather than
 /// following a newly inserted symlink between validation and use.
 fn open_dir_nofollow(path: &Path) -> Result<File, String> {
-    // Resolve operating-system aliases above the managed root (macOS `/var`
-    // is normally a symlink), then walk the resolved path without following
-    // any component that can be swapped by a caller inside the managed tree.
-    let canonical = fs::canonicalize(path).map_err(|e| format!("E_PATH_UNSAFE: cannot resolve directory: {e}"))?;
-    let expected = fs::metadata(&canonical).map_err(|e| format!("E_PATH_UNSAFE: cannot stat directory: {e}"))?;
-    let absolute = canonical.is_absolute();
+    // macOS exposes /var and /tmp as fixed operating-system aliases. Resolve
+    // only that trusted prefix; canonicalizing the whole caller path would
+    // follow a symlink swapped into a managed component before openat.
+    #[cfg(target_os = "macos")]
+    let walked = [Path::new("/var"), Path::new("/tmp")]
+        .into_iter()
+        .find_map(|prefix| path.strip_prefix(prefix).ok().map(|rest| (prefix, rest)))
+        .map(|(prefix, rest)| {
+            fs::canonicalize(prefix)
+                .map(|resolved| resolved.join(rest))
+                .map_err(|e| format!("E_PATH_UNSAFE: cannot resolve OS path alias: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| path.to_path_buf());
+    #[cfg(not(target_os = "macos"))]
+    let walked = path.to_path_buf();
+    let absolute = walked.is_absolute();
     let start = if absolute { c_string(std::ffi::OsStr::new("/"))? } else { c_string(std::ffi::OsStr::new("."))? };
     let initial = unsafe { libc::open(start.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if initial < 0 {
         return Err(format!("E_PATH_UNSAFE: cannot open path root: {}", std::io::Error::last_os_error()));
     }
     let mut current = unsafe { File::from_raw_fd(initial) };
-    for component in canonical.components() {
+    for component in walked.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => c_string(name)?,
@@ -166,7 +177,8 @@ fn open_dir_nofollow(path: &Path) -> Result<File, String> {
         current = unsafe { File::from_raw_fd(fd) };
     }
     let opened = current.metadata().map_err(|e| format!("E_PATH_UNSAFE: cannot stat opened directory: {e}"))?;
-    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+    let current_path = fs::symlink_metadata(&walked).map_err(|e| format!("E_PATH_UNSAFE: cannot stat directory path: {e}"))?;
+    if current_path.file_type().is_symlink() || opened.dev() != current_path.dev() || opened.ino() != current_path.ino() {
         return Err("E_PATH_UNSAFE: directory identity changed while opening".into());
     }
     Ok(current)
@@ -513,5 +525,31 @@ mod tests {
 
         fs::remove_dir_all(base).unwrap();
         fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn private_json_io_never_follows_a_managed_parent_swapped_to_a_symlink() {
+        let base = root("parent-swap");
+        let managed = base.join("managed");
+        let displaced = base.join("managed-old");
+        let outside = base.parent().unwrap().join(format!("aperture-outside-dir-{}", Uuid::new_v4()));
+        ensure_private_dir(&managed).unwrap();
+        ensure_private_dir(&outside).unwrap();
+        write_private_json_atomic(&managed.join("state.json"), &json!({"inside": true}), false).unwrap();
+        write_private_json_atomic(&outside.join("state.json"), &json!({"outside": true}), false).unwrap();
+
+        fs::rename(&managed, &displaced).unwrap();
+        symlink(&outside, &managed).unwrap();
+        assert!(read_private_json::<serde_json::Value>(&managed.join("state.json"))
+            .unwrap_err()
+            .contains("E_PATH_UNSAFE"));
+        assert!(write_private_json_atomic(&managed.join("state.json"), &json!({"inside": false}), true)
+            .unwrap_err()
+            .contains("E_PERMISSION_UNSAFE"));
+        assert_eq!(fs::read_to_string(outside.join("state.json")).unwrap(), "{\n  \"outside\": true\n}\n");
+
+        fs::remove_file(&managed).unwrap();
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }
