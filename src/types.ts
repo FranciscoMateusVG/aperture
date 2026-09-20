@@ -60,3 +60,24 @@ export interface AgentDef {
    *  latter is non-empty. */
   current_task_extra_count?: number | null;
 }
+
+// V4 P1 contract mirrors aperture-4yk4o v1. Rust remains authoritative.
+export type TeamHarness = "claude" | "codex";
+export interface ExecutionTuple {
+  harness: TeamHarness;
+  model: string;
+  reasoning: string | null;
+}
+export interface PresetSeat extends ExecutionTuple {
+  role: string;
+}
+export interface CreateTeamInput {
+  team: string;
+  project: string;
+  mission: string;
+  acceptance: string;
+  preset_id: string | null;
+  seats: PresetSeat[];
+  lead_index: number;
+  fallbacks: ExecutionTuple[];
+}

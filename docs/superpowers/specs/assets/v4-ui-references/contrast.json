@@ -1,0 +1,50 @@
+[
+  {
+    "token": "primary text",
+    "foreground": "#e0e0e0",
+    "background": "#1a1a2e",
+    "ratio": 12.92,
+    "minimum": 4.5,
+    "pass": true
+  },
+  {
+    "token": "muted text",
+    "foreground": "#a6a6c0",
+    "background": "#222240",
+    "ratio": 6.45,
+    "minimum": 4.5,
+    "pass": true
+  },
+  {
+    "token": "primary button",
+    "foreground": "#0f0f1a",
+    "background": "#f39c12",
+    "ratio": 8.68,
+    "minimum": 4.5,
+    "pass": true
+  },
+  {
+    "token": "error",
+    "foreground": "#ff8b85",
+    "background": "#1a1a2e",
+    "ratio": 7.54,
+    "minimum": 4.5,
+    "pass": true
+  },
+  {
+    "token": "control border",
+    "foreground": "#666684",
+    "background": "#141428",
+    "ratio": 3.27,
+    "minimum": 3,
+    "pass": true
+  },
+  {
+    "token": "focus",
+    "foreground": "#8dccff",
+    "background": "#1a1a2e",
+    "ratio": 9.92,
+    "minimum": 3,
+    "pass": true
+  }
+]

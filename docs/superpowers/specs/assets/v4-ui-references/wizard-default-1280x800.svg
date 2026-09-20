@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800" role="img" aria-label="Aperture V4 wizard default design reference">
+<rect width="1280" height="800" fill="#0f0f1a"/>
+<rect x="0" y="0" width="1280" height="64" rx="0" fill="#0c0c18" stroke="#2a2a4a"/>
+<text x="24" y="39" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="700">APERTURE</text>
+<text x="205" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Sessions</text>
+<text x="308" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Presets</text>
+<text x="1036" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">DESIGN • synthetic fixture</text>
+<text x="32" y="110" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="28" font-weight="600">New team</text>
+<text x="32" y="138" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">From Fullstack · creating a team requests approval; it does not start workers.</text>
+<text x="32" y="177" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Team name</text>
+<rect x="32" y="187" width="598.0" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="44" y="215" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">fitt-relaunch</text>
+<text x="650.0" y="177" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Project</text>
+<rect x="650.0" y="187" width="598.0" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="662.0" y="215" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">project:incluir</text>
+<text x="32" y="258" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Mission</text>
+<rect x="32" y="268" width="1216" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="44" y="296" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Rebuild the booking experience within the approved scope.</text>
+<text x="32" y="339" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Acceptance</text>
+<rect x="32" y="349" width="1216" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="44" y="377" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Review passed; agreed journey verified; evidence attached.</text>
+<text x="32" y="419" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="20" font-weight="600">Seats</text>
+<text x="250" y="419" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Exactly one lead. Names are derived, never typed independently.</text>
+<rect x="32" y="438" width="1216" height="44" rx="6" fill="#141428" stroke="#2a2a4a"/>
+<text x="46" y="466" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">● fitt-relaunch-backend</text>
+<text x="550.4" y="466" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">backend</text>
+<text x="729.5999999999999" y="466" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Codex</text>
+<text x="870.4000000000001" y="466" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">gpt-6-astra</text>
+<text x="1113.6" y="466" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">high</text>
+<rect x="32" y="488" width="1216" height="44" rx="6" fill="#141428" stroke="#2a2a4a"/>
+<text x="46" y="516" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">○ fitt-relaunch-frontend</text>
+<text x="550.4" y="516" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">frontend</text>
+<text x="729.5999999999999" y="516" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Claude</text>
+<text x="870.4000000000001" y="516" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">opus</text>
+<text x="1113.6" y="516" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">—</text>
+<rect x="32" y="538" width="1216" height="44" rx="6" fill="#141428" stroke="#2a2a4a"/>
+<text x="46" y="566" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">○ fitt-relaunch-qa</text>
+<text x="550.4" y="566" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">qa</text>
+<text x="729.5999999999999" y="566" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Claude</text>
+<text x="870.4000000000001" y="566" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">sonnet</text>
+<text x="1113.6" y="566" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">—</text>
+<rect x="32" y="596" width="136" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="46" y="624" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">+ Add seat</text>
+<text x="188" y="623" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Fallback: gpt-5.6-sol · gpt-5.6-terra (approved list)</text>
+<rect x="976" y="712" width="120" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="990" y="740" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Cancel</text>
+<rect x="1112" y="712" width="136" height="44" rx="6" fill="#f39c12" stroke="#666684"/>
+<text x="1126" y="740" fill="#0f0f1a" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Create team</text>
+<text x="24" y="784" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="11" font-weight="400">Design reference only · no command invoked · not an installed-app capture</text>
+</svg>

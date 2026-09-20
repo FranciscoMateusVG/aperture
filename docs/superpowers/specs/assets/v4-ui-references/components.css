@@ -1,0 +1,18 @@
+/* Base component contract for V4; design-only until reference approval. */
+.v4-card { background: var(--v4-card); border: 1px solid var(--v4-divider); border-radius: var(--v4-radius); padding: var(--v4-space-6); }
+.v4-button { min-height: var(--v4-target); min-width: var(--v4-target); padding: 10px 14px; border: 1px solid var(--v4-border); border-radius: var(--v4-radius); background: var(--v4-panel); color: var(--v4-text); font: 600 var(--v4-type-body)/var(--v4-leading) var(--v4-font); cursor: pointer; }
+.v4-button--primary { background: var(--v4-accent); color: var(--v4-canvas); }
+.v4-button:disabled { background: var(--v4-panel); color: var(--v4-muted); cursor: not-allowed; }
+.v4-field { display: grid; gap: var(--v4-space-2); }
+.v4-field input, .v4-field select, .v4-field textarea { min-height: var(--v4-target); min-width: 0; width: 100%; padding: 10px 12px; border: 1px solid var(--v4-border); border-radius: var(--v4-radius); background: var(--v4-panel); color: var(--v4-text); font: var(--v4-type-body)/var(--v4-leading) var(--v4-font); }
+.v4-field label, .v4-meta { color: var(--v4-muted); font: var(--v4-type-small)/var(--v4-leading) var(--v4-font); }
+.v4-field [aria-invalid="true"] { border-color: var(--v4-danger); }
+.v4-error { color: var(--v4-danger); }
+.v4-badge { display: inline-flex; gap: var(--v4-space-1); color: var(--v4-muted); font: 600 var(--v4-type-small)/var(--v4-leading) var(--v4-font); }
+.v4-dialog { width: min(850px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow: auto; border: 1px solid var(--v4-border); border-radius: var(--v4-dialog-radius); background: var(--v4-card); color: var(--v4-text); box-shadow: var(--v4-shadow); }
+.v4-dialog__actions { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--v4-space-3); padding: var(--v4-space-4); background: var(--v4-card); border-top: 1px solid var(--v4-divider); }
+.v4-button:focus-visible, .v4-field :focus-visible, .v4-tab:focus-visible { outline: 2px solid var(--v4-focus); outline-offset: 3px; }
+.v4-tab { min-height: var(--v4-target); min-width: var(--v4-target); color: var(--v4-muted); }
+.v4-tab[aria-selected="true"] { color: var(--v4-text); border-bottom: 2px solid var(--v4-accent); }
+.v4-icon { width: 20px; height: 20px; stroke-width: 1.5; }
+@media (prefers-reduced-motion: reduce) { .v4-dialog, .v4-button { animation: none; transition: none; } }

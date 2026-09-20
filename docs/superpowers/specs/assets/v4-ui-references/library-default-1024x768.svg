@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="768" viewBox="0 0 1024 768" role="img" aria-label="Aperture V4 library default design reference">
+<rect width="1024" height="768" fill="#0f0f1a"/>
+<rect x="0" y="0" width="1024" height="64" rx="0" fill="#0c0c18" stroke="#2a2a4a"/>
+<text x="24" y="39" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="700">APERTURE</text>
+<text x="205" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Sessions</text>
+<text x="308" y="39" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Presets</text>
+<text x="780" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">DESIGN • synthetic fixture</text>
+<text x="32" y="117" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="28" font-weight="600">A team starts with a clear mission.</text>
+<text x="32" y="149" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Reusable presets. Independent team snapshots. Your standing roster stays intact.</text>
+<rect x="813" y="174" width="179" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="827" y="202" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">New blank preset</text>
+<rect x="32.0" y="242" width="306.6666666666667" height="374" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="52.0" y="279" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="20" font-weight="600">Fullstack</text>
+<text x="52.0" y="307" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Build and verify a product slice.</text>
+<text x="52.0" y="352" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Backend · lead · Codex</text>
+<text x="52.0" y="382" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Frontend · Claude</text>
+<text x="52.0" y="412" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">QA · Claude</text>
+<text x="52.0" y="458" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Models are configuration, not observation.</text>
+<rect x="52.0" y="478" width="266.6666666666667" height="44" rx="6" fill="#f39c12" stroke="#666684"/>
+<text x="66.0" y="506" fill="#0f0f1a" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">New team from preset</text>
+<rect x="52.0" y="540" width="129.33333333333334" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="66.0" y="568" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Edit</text>
+<rect x="189.33333333333334" y="540" width="129.33333333333334" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="203.33333333333334" y="568" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Duplicate</text>
+<rect x="358.6666666666667" y="242" width="306.6666666666667" height="374" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="378.6666666666667" y="279" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="20" font-weight="600">Review</text>
+<text x="378.6666666666667" y="307" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Independent, bounded review.</text>
+<text x="378.6666666666667" y="352" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Reviewer · lead · Codex</text>
+<text x="378.6666666666667" y="382" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">QA · Claude</text>
+<text x="378.6666666666667" y="458" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Models are configuration, not observation.</text>
+<rect x="378.6666666666667" y="478" width="266.6666666666667" height="44" rx="6" fill="#f39c12" stroke="#666684"/>
+<text x="392.6666666666667" y="506" fill="#0f0f1a" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">New team from preset</text>
+<rect x="378.6666666666667" y="540" width="129.33333333333334" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="392.6666666666667" y="568" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Edit</text>
+<rect x="516.0" y="540" width="129.33333333333334" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="530.0" y="568" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Duplicate</text>
+<rect x="685.3333333333334" y="242" width="306.6666666666667" height="374" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="705.3333333333334" y="279" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="20" font-weight="600">Custom preset</text>
+<text x="705.3333333333334" y="307" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Define your own team shape.</text>
+<text x="705.3333333333334" y="352" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Choose roles and a lead</text>
+<text x="705.3333333333334" y="382" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Set model and reasoning</text>
+<text x="705.3333333333334" y="458" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Models are configuration, not observation.</text>
+<rect x="705.3333333333334" y="478" width="266.6666666666667" height="44" rx="6" fill="#f39c12" stroke="#666684"/>
+<text x="719.3333333333334" y="506" fill="#0f0f1a" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">New team from preset</text>
+<rect x="705.3333333333334" y="540" width="129.33333333333334" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="719.3333333333334" y="568" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Edit</text>
+<rect x="842.6666666666667" y="540" width="129.33333333333334" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="856.6666666666667" y="568" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Duplicate</text>
+<text x="32" y="668" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Edits affect future teams only. Existing teams retain their original snapshot.</text>
+<text x="24" y="752" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="11" font-weight="400">Design reference only · no command invoked · not an installed-app capture</text>
+</svg>
