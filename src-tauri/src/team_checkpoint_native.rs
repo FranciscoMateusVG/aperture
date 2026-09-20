@@ -48,7 +48,8 @@ impl<'a> NativeStore<'a> {
         let owner: OwnerRecord = read_private_json(&owners.record_path(&ctx.seat))
             .map_err(|_| CheckpointError::Corrupt)?;
         let actual = owner.incarnation.as_ref().ok_or(CheckpointError::Corrupt)?;
-        if actual.harness != owner.requested.harness
+        if !actual.observed
+            || actual.harness != owner.requested.harness
             || actual.model != owner.requested.model
             || actual.reasoning != owner.requested.reasoning
         {
@@ -256,6 +257,7 @@ mod tests {
                         harness: crate::state::Harness::Codex,
                         model: "gpt-6-astra".into(),
                         reasoning: Some(crate::state::ReasoningEffort::High),
+                        observed: true,
                         processes: vec![crate::owner::ProcessIdentity {
                             pid: 999999,
                             start_time: 1,
@@ -415,7 +417,7 @@ mod tests {
         let f = Fixture::new();
         let path = f.0.join(".aperture/run/owner/t1-backend.json");
         let mut owner: OwnerRecord = read_private_json(&path).unwrap();
-        owner.incarnation = None;
+        owner.incarnation.as_mut().unwrap().observed = false;
         write_private_json_atomic(&path, &owner, true).unwrap();
         assert_eq!(
             write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())),

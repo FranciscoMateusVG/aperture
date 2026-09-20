@@ -192,7 +192,7 @@ fn validate_open_private_file(file: &File) -> Result<std::fs::Metadata, String> 
     Ok(meta)
 }
 
-fn open_private_file_nofollow(path: &Path) -> Result<File, String> {
+pub(crate) fn open_private_file_nofollow(path: &Path) -> Result<File, String> {
     let parent = path.parent().ok_or_else(|| "E_PATH_UNSAFE: file has no parent".to_string())?;
     let name = c_string(path.file_name().ok_or_else(|| "E_PATH_UNSAFE: file has no name".to_string())?)?;
     let directory = open_dir_nofollow(parent)?;

@@ -75,16 +75,20 @@ pub struct Incarnation {
     pub harness: crate::state::Harness,
     pub model: String,
     pub reasoning: Option<crate::state::ReasoningEffort>,
+    /// False while process ownership is durable but the harness tuple has not
+    /// yet been observed from an authoritative runtime event.
+    #[serde(default)]
+    pub observed: bool,
     pub processes: Vec<ProcessIdentity>,
 }
 
 impl Incarnation {
-    fn execution_tuple(&self) -> ExecutionTuple {
-        ExecutionTuple {
+    fn execution_tuple(&self) -> Option<ExecutionTuple> {
+        self.observed.then(|| ExecutionTuple {
             harness: self.harness.clone(),
             model: self.model.clone(),
             reasoning: self.reasoning.clone(),
-        }
+        })
     }
 }
 
@@ -226,6 +230,28 @@ impl OwnerStore {
         Ok(record)
     }
 
+    /// Persist the native harness observation while the exact candidate is
+    /// still Starting. Caller payloads cannot reach this seam.
+    pub(crate) fn record_observed_tuple(
+        &self,
+        actor: &AuthenticatedActor,
+        reservation: &StartReservation,
+        actual: ExecutionTuple,
+    ) -> Result<OwnerRecord, String> {
+        if !actor.is_launcher() { return Err("E_CONTROL_UNAUTHORIZED: launcher actor required".into()); }
+        let _lock = self.lock(&reservation.seat)?;
+        let mut record = self.read_unlocked(&reservation.seat)?;
+        require_reservation(&record, reservation)?;
+        let incarnation = record.incarnation.as_mut().ok_or_else(|| "E_STATE_CONFLICT: process identity not recorded".to_string())?;
+        incarnation.harness = actual.harness;
+        incarnation.model = actual.model;
+        incarnation.reasoning = actual.reasoning;
+        incarnation.observed = true;
+        record.writer = actor.principal().into();
+        self.write_unlocked(&record, true)?;
+        Ok(record)
+    }
+
     /// Commit does not release the child. The runtime releases its gate only
     /// after this returns an exact-tuple active owner.
     pub(crate) fn commit_start(
@@ -236,7 +262,8 @@ impl OwnerStore {
         let _lock = self.lock(&reservation.seat)?;
         let mut record = self.read_unlocked(&reservation.seat)?;
         require_reservation(&record, reservation)?;
-        let actual = record.incarnation.as_ref().ok_or_else(|| "E_STATE_CONFLICT: process identity not recorded".to_string())?.execution_tuple();
+        let actual = record.incarnation.as_ref().ok_or_else(|| "E_STATE_CONFLICT: process identity not recorded".to_string())?
+            .execution_tuple().ok_or_else(|| "E_MODEL_UNVERIFIED: execution tuple is not observed".to_string())?;
         if actual != record.requested {
             return Err("E_MODEL_MISMATCH: observed execution tuple differs".into());
         }
@@ -327,7 +354,7 @@ impl OwnerStore {
 
     pub(crate) fn summary(&self, seat: &str) -> Result<OwnerSummary, String> {
         let record = self.read_owner(seat)?;
-        let actual = record.incarnation.as_ref().map(Incarnation::execution_tuple);
+        let actual = record.incarnation.as_ref().and_then(Incarnation::execution_tuple);
         if record.state == OwnerState::Active && actual.as_ref() != Some(&record.requested) {
             return Err("E_OWNER_CORRUPT: active owner tuple is not the observed tuple".into());
         }
@@ -389,7 +416,7 @@ mod tests {
         path
     }
     fn tuple(model: &str) -> ExecutionTuple { ExecutionTuple { harness: Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High) } }
-    fn incarnation(model: &str) -> Incarnation { Incarnation { pid:123, start_time:456, thread_id:"thread".into(), token_id:"token-id".into(), harness:Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High), processes:vec![ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/work".into() }] } }
+    fn incarnation(model: &str) -> Incarnation { Incarnation { pid:123, start_time:456, thread_id:"thread".into(), token_id:"token-id".into(), harness:Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High), observed:true, processes:vec![ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/work".into() }] } }
 
     #[test]
     fn generation_cas_and_model_observation_gate() {
@@ -404,6 +431,25 @@ mod tests {
         let quarantined = store.abort_start(&actor, &reservation).unwrap();
         assert_eq!(quarantined.state, OwnerState::Quarantined);
         assert_eq!(quarantined.generation, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gated_candidate_is_not_actual_until_native_observation() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let actor = AuthenticatedActor::launcher();
+        store.initialize_owner(&actor, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+        let mut candidate = incarnation("gpt-6-astra");
+        candidate.observed = false;
+        store.record_start_candidate(&actor, &reservation, candidate).unwrap();
+        assert!(store.summary("t1-backend").unwrap().actual.is_none());
+        assert!(store.commit_start(&actor, &reservation).unwrap_err().contains("E_MODEL_UNVERIFIED"));
+        store.record_observed_tuple(&actor, &reservation, tuple("gpt-6-astra")).unwrap();
+        let committed = store.commit_start(&actor, &reservation).unwrap();
+        assert_eq!(committed.state, OwnerState::Active);
+        assert_eq!(store.summary("t1-backend").unwrap().actual, Some(tuple("gpt-6-astra")));
         fs::remove_dir_all(root).unwrap();
     }
 

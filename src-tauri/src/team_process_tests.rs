@@ -60,6 +60,7 @@ impl Fixture {
                     harness: Harness::Codex,
                     model: "gpt-6-astra".into(),
                     reasoning: Some(ReasoningEffort::High),
+                    observed: true,
                     processes: vec![
                         owner_process(900001, 1_000_001, 1),
                         owner_process(900002, 1_000_002, 900001),

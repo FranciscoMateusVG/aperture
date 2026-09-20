@@ -14,7 +14,8 @@ use crate::journal::{
 };
 use crate::owner::{try_lock, AdvisoryLock, OwnerStore};
 use crate::state::{AppState, ExecutionTuple, Harness, OwnerSummary, ReasoningEffort};
-use crate::team_auth::{authenticate_glados_control, AuthenticatedActor};
+use crate::team_auth::{authenticate_glados_control, authenticate_seat_control, AuthenticatedActor};
+use crate::team_checkpoint::{CheckpointContext, CheckpointError, CheckpointPayload, CheckpointWriter};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -337,11 +338,35 @@ pub struct ActivateTeamInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WriteCheckpointInput {
+    pub schema_version: u32,
+    pub payload: CheckpointPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointReceipt {
+    pub checkpoint_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReplaceInput {
+    pub target_seat: String,
+    /// Target owner-generation CAS selector, never caller authority.
+    pub expected_generation: u64,
+    pub selection: ExecutionTuple,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", content = "input", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TeamControlRequest {
     ListPending,
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
+    Checkpoint(WriteCheckpointInput),
+    Replace(AgentReplaceInput),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -350,6 +375,7 @@ pub enum TeamControlResponse {
     ListPending(Vec<TeamView>),
     Approve(TeamView),
     Cancel(CancelPendingResult),
+    Checkpoint(CheckpointReceipt),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1433,16 +1459,55 @@ pub fn team_cancel_pending(input: CancelPendingInput, state: tauri::State<'_, Ar
 /// `AuthenticatedActor`.
 pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse> {
     let request: TeamControlRequest = serde_json::from_str(input_json).map_err(|_| TeamError::state("invalid team control request"))?;
-    let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or_else(|| TeamError::io("project root unavailable"))?.to_path_buf();
     let engine = TeamEngine::new(home, project);
     match request {
-        TeamControlRequest::ListPending => engine
-            .list_teams()
-            .map(|teams| TeamControlResponse::ListPending(teams.into_iter().filter(|team| team.state.state == TeamLifecycle::Pending).collect())),
-        TeamControlRequest::Approve(input) => engine.activate(&actor, input).map(TeamControlResponse::Approve),
-        TeamControlRequest::Cancel(input) => engine.cancel_pending(&actor, input).map(TeamControlResponse::Cancel),
+        TeamControlRequest::ListPending => {
+            authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.list_teams().map(|teams| TeamControlResponse::ListPending(teams.into_iter().filter(|team| team.state.state == TeamLifecycle::Pending).collect()))
+        }
+        TeamControlRequest::Approve(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.activate(&actor, input).map(TeamControlResponse::Approve)
+        }
+        TeamControlRequest::Cancel(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.cancel_pending(&actor, input).map(TeamControlResponse::Cancel)
+        }
+        TeamControlRequest::Checkpoint(input) => {
+            let actor = authenticate_seat_control().map_err(TeamError::from_message)?;
+            let view = engine.read_team_view(actor.team())?;
+            if view.state.state != TeamLifecycle::Active || !view.snapshot.seats.iter().any(|seat| seat.name == actor.seat()) {
+                return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "managed seat is not active in its team"));
+            }
+            let configured = view.snapshot.seats.iter().find(|seat| seat.name == actor.seat())
+                .ok_or_else(|| TeamError::new("E_CONTROL_UNAUTHORIZED", "managed seat is not in its team"))?;
+            let harness = serde_json::to_value(&configured.harness).map_err(|_| TeamError::io("checkpoint context unavailable"))?
+                .as_str().ok_or_else(|| TeamError::io("checkpoint context unavailable"))?.to_string();
+            let context = CheckpointContext {
+                team: actor.team().to_string(), seat: actor.seat().to_string(), generation: actor.generation(),
+                authenticated_generation: actor.generation(), harness, writer: CheckpointWriter::Explicit,
+            };
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| TeamError::io("checkpoint clock unavailable"))?.as_millis().try_into()
+                .map_err(|_| TeamError::io("checkpoint clock unavailable"))?;
+            let entry = crate::team_checkpoint::native::write_native(
+                &engine.paths.home, &context, input.schema_version, input.payload, now, &[],
+                || actor.revalidate_before_effect().map_err(|_| CheckpointError::Generation),
+            ).map_err(checkpoint_error)?;
+            Ok(TeamControlResponse::Checkpoint(CheckpointReceipt { checkpoint_id: entry.checkpoint_id, status: "pending".into() }))
+        }
+        TeamControlRequest::Replace(_input) => Err(TeamError::new("E_CONTROL_UNAVAILABLE", "native replacement adapter is not integrated")),
+    }
+}
+
+fn checkpoint_error(error: CheckpointError) -> TeamError {
+    match error {
+        CheckpointError::Invalid | CheckpointError::Unsafe | CheckpointError::HookHarness => TeamError::new("E_CHECKPOINT_INVALID", "checkpoint payload is invalid"),
+        CheckpointError::Generation => TeamError::new("E_CONTROL_UNAUTHORIZED", "checkpoint authority changed"),
+        CheckpointError::Io => TeamError::new("E_CHECKPOINT_IO", "checkpoint could not be persisted"),
+        CheckpointError::Corrupt => TeamError::new("E_CHECKPOINT_CORRUPT", "checkpoint history is invalid"),
     }
 }
 
@@ -1501,13 +1566,31 @@ mod tests {
     struct EnvRestore { values: Vec<(&'static str, Option<std::ffi::OsString>)> }
     impl EnvRestore {
         fn set(home: &Path) -> Self {
-            let keys = ["HOME", "APERTURE_AGENTS_DIR", "APERTURE_TEAMS_DIR"];
+            let keys = ["HOME", "APERTURE_AGENTS_DIR", "APERTURE_TEAMS_DIR", "APERTURE_HUB_TOKEN_FILE"];
             let values = keys.into_iter().map(|key| (key, std::env::var_os(key))).collect();
             std::env::set_var("HOME", home);
             std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
             std::env::set_var("APERTURE_TEAMS_DIR", home.join(".aperture/teams"));
             Self { values }
         }
+    }
+
+    fn bind_active_worker(home: &Path, seat: &TeamSeat) -> PathBuf {
+        let token_path = home.join(".aperture/run/hub-tokens").join(format!("{}.token", seat.name));
+        let token = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        fs::write(&token_path, token).unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let owner_path = home.join(".aperture/run/owner").join(format!("{}.json", seat.name));
+        let mut owner: crate::owner::OwnerRecord = read_private_json(&owner_path).unwrap();
+        owner.generation = 1;
+        owner.state = crate::state::OwnerState::Active;
+        owner.incarnation = Some(crate::owner::Incarnation {
+            pid:123, start_time:456, thread_id:"thread-1".into(), token_id:format!("{:x}", Sha256::digest(token)),
+            harness:seat.harness.clone(), model:seat.model.clone(), reasoning:seat.reasoning.clone(), observed:true,
+            processes:vec![crate::owner::ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/worktree".into() }],
+        });
+        write_private_json_atomic(&owner_path, &owner, true).unwrap();
+        token_path
     }
     impl Drop for EnvRestore {
         fn drop(&mut self) {
@@ -1731,6 +1814,65 @@ mod tests {
         })).unwrap()).unwrap();
         assert!(matches!(cancelled, TeamControlResponse::Cancel(CancelPendingResult { cancelled: true, .. })));
         assert!(!home.join(".aperture/teams/t8").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn managed_worker_checkpoint_derives_identity_and_rejects_authority_fields() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("worker-checkpoint");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t9")).unwrap();
+        engine.activate(&authenticate_glados_control().unwrap(), ActivateTeamInput { team:"t9".into(), expected_generation:0, creation_request_id:created.creation_request.request_id, epic_id:"aperture-4rsnc".into() }).unwrap();
+        let seat = created.team.snapshot.seats[0].clone();
+        let token_path = bind_active_worker(&home, &seat);
+        std::env::set_var("APERTURE_HUB_TOKEN_FILE", &token_path);
+        let payload = CheckpointPayload {
+            task_id:"aperture-fixture".into(), worktree:"aperture-worktrees/aperture-fixture".into(), branch:"aperture-fixture".into(), head_sha:"a".repeat(40),
+            dirty_files:vec![], open_pr:None, running_procs:vec![], decisions:vec![], next_step:"Continue the approved bounded implementation.".into(), remote_effects:vec![],
+        };
+        let request = TeamControlRequest::Checkpoint(WriteCheckpointInput { schema_version:1, payload });
+        let request_json = serde_json::to_string(&request).unwrap();
+        let response = team_control_headless(&request_json).unwrap();
+        assert!(matches!(response, TeamControlResponse::Checkpoint(CheckpointReceipt { status, .. }) if status == "pending"));
+        let checkpoint_dir = home.join(".aperture/teams/t9/checkpoints").join(&seat.name);
+        assert_eq!(fs::read_dir(&checkpoint_dir).unwrap().count(), 1);
+
+        let same_inode = authenticate_seat_control().unwrap();
+        fs::write(&token_path, b"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc").unwrap();
+        assert!(same_inode.revalidate_before_effect().unwrap_err().contains("contents changed"));
+        fs::write(&token_path, b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let replaced_inode = authenticate_seat_control().unwrap();
+        let replacement = token_path.with_file_name("replacement.token");
+        fs::write(&replacement, b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &token_path).unwrap();
+        assert!(replaced_inode.revalidate_before_effect().unwrap_err().contains("canonical capability changed"));
+
+        let forged = serde_json::json!({"action":"checkpoint","input":{
+            "schema_version":1,
+            "payload":serde_json::to_value(match request { TeamControlRequest::Checkpoint(value) => value.payload, _ => unreachable!() }).unwrap(),
+            "writer":"glados"
+        }});
+        assert_eq!(team_control_headless(&forged.to_string()).unwrap_err().code, "E_STATE_CONFLICT");
+        assert_eq!(fs::read_dir(&checkpoint_dir).unwrap().count(), 1);
+
+        let copied = token_path.with_file_name("t9-qa.token");
+        fs::copy(&token_path, &copied).unwrap();
+        fs::set_permissions(&copied, fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var("APERTURE_HUB_TOKEN_FILE", &copied);
+        assert_eq!(team_control_headless(&request_json).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
+
+        std::env::set_var("APERTURE_HUB_TOKEN_FILE", &token_path);
+        ensure_private_dir(&home.join(".aperture/run/revocations")).unwrap();
+        write_private_json_atomic(&home.join(".aperture/run/revocations").join(format!("{}.json", seat.name)), &serde_json::json!({
+            "schema_version":1, "seat":seat.name.clone(), "revoked_through_generation":1,
+            "revoked_token_ids":[format!("{:x}", Sha256::digest(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))]
+        }), false).unwrap();
+        assert_eq!(team_control_headless(&request_json).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
+        assert_eq!(fs::read_dir(&checkpoint_dir).unwrap().count(), 1);
         fs::remove_dir_all(home).unwrap();
     }
 
