@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   assertActivationMatchesPending,
   assertAuthorizedEpic,
   invokeTeamControl,
   parsePendingList,
+  teamControlWatchdogMs,
 } from "../dist/team-control.js";
 
 const requestId = "11111111-1111-4111-8111-111111111111";
@@ -66,6 +68,49 @@ printf '%s\n' '{"action":"list_pending","result":[]}'
       result: [],
     });
   } finally {
+    if (old === undefined) delete process.env.APERTURE_TEAM_CONTROL_BIN;
+    else process.env.APERTURE_TEAM_CONTROL_BIN = old;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("control watchdog is fixed by action and replacement timeout is unknown after admission", async (t) => {
+  assert.equal(teamControlWatchdogMs("list_pending"), 15_000);
+  assert.equal(teamControlWatchdogMs("approve"), 15_000);
+  assert.equal(teamControlWatchdogMs("cancel"), 15_000);
+  assert.equal(teamControlWatchdogMs("replace"), 180_000);
+
+  const root = mkdtempSync(join(tmpdir(), "aperture-team-control-timeout-"));
+  const bin = join(root, "control");
+  const admitted = join(root, "admitted");
+  writeFileSync(bin, `#!/bin/sh
+[ "$#" -eq 0 ] || exit 70
+IFS= read -r request
+printf '%s' "$request" | grep -q '"action":"replace"' || exit 71
+: > '${admitted}'
+sleep 999
+`);
+  chmodSync(bin, 0o700);
+  const old = process.env.APERTURE_TEAM_CONTROL_BIN;
+  process.env.APERTURE_TEAM_CONTROL_BIN = bin;
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pending = invokeTeamControl({
+      action: "replace",
+      input: {
+        target_seat: "alpha-worker",
+        expected_generation: 1,
+        selection: { harness: "codex", model: "gpt-6-astra", reasoning: "high" },
+      },
+    });
+    for (let i = 0; i < 100 && !existsSync(admitted); i += 1) {
+      await delay(5);
+    }
+    assert.equal(existsSync(admitted), true, "fixture child must cross its admission marker");
+    t.mock.timers.tick(180_000);
+    await assert.rejects(pending, /E_CONTROL_UNKNOWN: team control outcome is incomplete/);
+  } finally {
+    t.mock.timers.reset();
     if (old === undefined) delete process.env.APERTURE_TEAM_CONTROL_BIN;
     else process.env.APERTURE_TEAM_CONTROL_BIN = old;
     rmSync(root, { recursive: true, force: true });

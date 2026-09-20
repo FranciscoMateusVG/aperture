@@ -6,7 +6,11 @@ import { isAbsolute, join } from "node:path";
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 4 * 1024;
-const TIMEOUT_MS = 15_000;
+const ORDINARY_TIMEOUT_MS = 15_000;
+// The native replace child owns a 170s absolute deadline and reserves its
+// final 30s for cleanup. This parent watchdog is deliberately larger and is
+// only a last-resort crash boundary; expiry never means rollback succeeded.
+const REPLACE_TIMEOUT_MS = 180_000;
 
 export interface ActivationSelectors {
   team: string;
@@ -21,10 +25,21 @@ export interface CancelSelectors {
   creation_request_id: string;
 }
 
+export interface ReplacementSelectors {
+  target_seat: string;
+  expected_generation: number;
+  selection: {
+    harness: "claude" | "codex";
+    model: string;
+    reasoning: "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
+  };
+}
+
 export type TeamControlRequest =
   | { action: "list_pending" }
   | { action: "approve"; input: ActivationSelectors }
-  | { action: "cancel"; input: CancelSelectors };
+  | { action: "cancel"; input: CancelSelectors }
+  | { action: "replace"; input: ReplacementSelectors };
 
 export interface PendingTeamView {
   snapshot: {
@@ -83,6 +98,23 @@ function parseObject(text: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+export function teamControlWatchdogMs(action: TeamControlRequest["action"]): number {
+  return action === "replace" ? REPLACE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
+}
+
+function killControlProcessGroup(child: ReturnType<typeof spawn>, isolated: boolean): void {
+  if (isolated && child.pid !== undefined) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+      return;
+    } catch {
+      // The group may have exited between the timer and signal. Fall through
+      // to the exact child without treating either path as cleanup proof.
+    }
+  }
+  child.kill("SIGKILL");
+}
+
 export async function invokeTeamControl(request: TeamControlRequest): Promise<Record<string, unknown>> {
   const input = `${JSON.stringify(request)}\n`;
   if (Buffer.byteLength(input) > MAX_REQUEST_BYTES) {
@@ -91,12 +123,21 @@ export async function invokeTeamControl(request: TeamControlRequest): Promise<Re
   const path = binaryPath();
   validateBinary(path);
   return await new Promise((resolve, reject) => {
-    const child = spawn(path, [], { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+    const isolated = request.action === "replace";
+    const child = spawn(path, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+      detached: isolated,
+    });
     const stdout: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let overflow = false;
-    const timer = setTimeout(() => child.kill("SIGKILL"), TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killControlProcessGroup(child, isolated);
+    }, teamControlWatchdogMs(request.action));
     child.stdout.on("data", (chunk: Buffer) => {
       stdoutBytes += chunk.length;
       if (stdoutBytes > MAX_STDOUT_BYTES) {
@@ -116,6 +157,10 @@ export async function invokeTeamControl(request: TeamControlRequest): Promise<Re
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error("E_CONTROL_UNKNOWN: team control outcome is incomplete; explicit reconciliation is required"));
+        return;
+      }
       if (overflow || stderrBytes > MAX_STDERR_BYTES) {
         reject(new Error("E_CONTROL_FAILED: team control output exceeded limit"));
         return;
