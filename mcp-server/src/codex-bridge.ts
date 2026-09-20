@@ -38,6 +38,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import WebSocket from "ws";
 import { getUnreadMessages } from "./beads.js";
+import { isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
 
 const AGENTS_DIR = process.env.APERTURE_AGENTS_DIR ?? resolve(homedir(), ".claude", "aperture");
 const RUN_DIR = process.env.APERTURE_RUN_DIR ?? resolve(homedir(), ".aperture", "run");
@@ -108,8 +109,10 @@ export function discoverCodexAgents(
     return [];
   }
   const overrides = readModelOverrides(configPath);
+  const registry = loadSeatRegistry({ agentsRoot: dir });
   const out: string[] = [];
   for (const name of entries) {
+    if (!registry.seats.has(name)) continue;
     try {
       const raw = readFileSync(join(dir, name, "manifest.json"), "utf8");
       const manifest = JSON.parse(raw) as Record<string, unknown>;
@@ -514,7 +517,7 @@ export class CodexBridgeClient {
   }
 
   private threadReadyPath(): string {
-    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(this.agent)) {
+    if (!isValidSeatName(this.agent)) {
       throw new Error("invalid agent name for thread handoff");
     }
     return join(RUN_DIR, `${this.agent}.thread-id`);

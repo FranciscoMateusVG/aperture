@@ -69,6 +69,10 @@ const TOKENS = {
   // aperture-trgpo: the codex-bridged agent needs a token too, so a producer
   // (hook hint client) can authenticate as it.
   cbx: "06".repeat(32),
+  operator: "07".repeat(32),
+  "p1-a-lead": "08".repeat(32),
+  "p1-a-worker": "09".repeat(32),
+  "p1-b-lead": "0a".repeat(32),
 };
 
 /**
@@ -85,9 +89,10 @@ const TOKENS = {
  * Returns { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, stop }.
  * stderrEvents is the live array of parsed JSON log lines from hub stderr.
  */
-async function spawnHub({ codexAgent = null, staleSnapshot = null } = {}) {
+async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry = false } = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-test-agents-"));
+  const teamsDir = mkdtempSync(join(tmpdir(), "hub-test-teams-"));
   const tokenDir = mkdtempSync(join(tmpdir(), "hub-test-tokens-"));
   // Short prefix: the codex app-server unix socket lives here and sun_path is
   // ~104 bytes on macOS.
@@ -95,10 +100,42 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null } = {}) {
   const presenceFile = join(runDir, "presence.json");
   for (const [principal, token] of Object.entries(TOKENS)) {
     writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
+    if (principal !== "watchdog" && principal !== "operator") {
+      mkdirSync(join(emptyAgentsDir, principal), { recursive: true });
+      writeFileSync(
+        join(emptyAgentsDir, principal, "manifest.json"),
+        JSON.stringify({ model: principal === codexAgent ? "codex/gpt-5-codex" : "claude/test", role: "test", enabled: true }),
+      );
+    }
   }
-  if (codexAgent) {
-    mkdirSync(join(emptyAgentsDir, codexAgent));
-    writeFileSync(join(emptyAgentsDir, codexAgent, "manifest.json"), JSON.stringify({ model: "codex/gpt-5-codex" }));
+  mkdirSync(join(emptyAgentsDir, "nobody-home"), { recursive: true });
+  writeFileSync(
+    join(emptyAgentsDir, "nobody-home", "manifest.json"),
+    JSON.stringify({ model: "claude/test", role: "test", enabled: true }),
+  );
+  if (teamRegistry) {
+    for (const name of ["p1-a-lead", "p1-a-worker", "p1-b-lead"]) {
+      writeFileSync(join(emptyAgentsDir, name, "TEAM"), "");
+      writeFileSync(join(emptyAgentsDir, name, ".complete"), "");
+    }
+    for (const [teamName, lead, seats] of [
+      ["p1-a", "p1-a-lead", [
+        { name: "p1-a-lead", role: "lead" },
+        { name: "p1-a-worker", role: "backend" },
+      ]],
+      ["p1-b", "p1-b-lead", [{ name: "p1-b-lead", role: "lead" }]],
+    ]) {
+      const dir = join(teamsDir, teamName);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "state.json"), JSON.stringify({ state: "active", generation: 1 }));
+      writeFileSync(join(dir, "team.json"), JSON.stringify({
+        team: teamName,
+        project: "project:aperture",
+        lead,
+        seats,
+        grants: [],
+      }));
+    }
   }
   if (staleSnapshot) writeFileSync(presenceFile, JSON.stringify(staleSnapshot));
   const proc = spawn(process.execPath, [hubPath], {
@@ -107,6 +144,7 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null } = {}) {
       APERTURE_WS_PORT: String(port),
       APERTURE_HUB_SKIP_REPLAY: "1",
       APERTURE_AGENTS_DIR: emptyAgentsDir,
+      APERTURE_TEAMS_DIR: teamsDir,
       APERTURE_HUB_TOKEN_DIR: tokenDir,
       APERTURE_RUN_DIR: runDir,
       // Never let the developer's real ~/.aperture/agent-config.json model
@@ -171,6 +209,7 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null } = {}) {
   function stop() {
     proc.kill("SIGKILL");
     rmSync(emptyAgentsDir, { recursive: true, force: true });
+    rmSync(teamsDir, { recursive: true, force: true });
     rmSync(tokenDir, { recursive: true, force: true });
     rmSync(runDir, { recursive: true, force: true });
   }
@@ -333,19 +372,24 @@ test("hello authentication fails closed for missing, invalid, and wrong-principa
   const hub = await spawnHub();
   try {
     const cases = [
-      { type: "hello", role: "agent", agent: "izzy-test" },
-      { type: "hello", role: "agent", agent: "izzy-test", token: "ff".repeat(32) },
-      { type: "hello", role: "agent", agent: "izzy-test", token: TOKENS.glados },
-      { type: "hello", role: "subscriber", agent: "watchdog" },
-      { type: "hello", role: "producer", agent: "glados", token: "malformed" },
+      [{ type: "hello", role: "agent", agent: "izzy-test" }, 4001],
+      [{ type: "hello", role: "agent", agent: "izzy-test", token: "ff".repeat(32) }, 4001],
+      [{ type: "hello", role: "agent", agent: "izzy-test", token: TOKENS.glados }, 4002],
+      [{ type: "hello", role: "subscriber", agent: "watchdog" }, 4001],
+      [{ type: "hello", role: "producer", agent: "glados", token: "malformed" }, 4001],
+      [{ type: "hello", role: "subscriber", agent: "operator", token: TOKENS.operator }, 4002],
     ];
-    for (const frame of cases) {
+    for (const [frame, expectedCode] of cases) {
       const ws = await connect(hub.port);
       const closed = waitForClose(ws, "unauthenticated hello close");
       ws.send(JSON.stringify(frame));
       const result = await closed;
-      assert.equal(result.code, 4001, "auth failure uses the generic hello rejection code");
-      assert.equal(result.reason, "expected hello", "auth failure does not disclose credential details");
+      assert.equal(result.code, expectedCode, "forged principal/token binding uses 4002; other auth failures use 4001");
+      assert.equal(
+        result.reason,
+        expectedCode === 4002 ? "principal mismatch" : "expected hello",
+        "close reason identifies only the principal-binding class, never credential details",
+      );
     }
     assert.equal(
       hub.stderrEvents.some((e) => e.event === "presence" && e.agent === "izzy-test"),
@@ -465,6 +509,54 @@ test("producer notify to offline agent: acked ok with outcome:'offline', notify_
     assert.equal((await okAgain).outcome, "offline", "second ack also reports offline");
     assert.equal(hub.proc.exitCode, null, "hub process still alive");
     closeAll(producer);
+  } finally {
+    hub.stop();
+  }
+});
+
+test("team registry is enforced at the hub: dynamic hello, lead route, and non-lead withholding", async () => {
+  const hub = await spawnHub({ teamRegistry: true });
+  try {
+    const leadProducer = await connect(hub.port);
+    await authenticate(hub, leadProducer, "producer", "p1-a-lead");
+
+    const leadAck = waitFor(
+      leadProducer,
+      (m) => m.type === "ok" && m.id === "lead-route",
+      "same-project lead routing ack",
+    );
+    leadProducer.send(JSON.stringify({
+      type: "notify",
+      to: "p1-b-lead",
+      id: "lead-route",
+      from: "p1-a-lead",
+      preview: "metadata only",
+    }));
+    assert.deepEqual(await leadAck, { type: "ok", id: "lead-route", outcome: "offline" });
+
+    const workerProducer = await connect(hub.port);
+    await authenticate(hub, workerProducer, "producer", "p1-a-worker");
+    const deniedAck = waitFor(
+      workerProducer,
+      (m) => m.type === "ok" && m.id === "worker-route",
+      "cross-team worker withholding ack",
+    );
+    workerProducer.send(JSON.stringify({
+      type: "notify",
+      to: "p1-b-lead",
+      id: "worker-route",
+      from: "p1-a-worker",
+      preview: "must not be delivered",
+    }));
+    assert.deepEqual(await deniedAck, { type: "ok", id: "worker-route", outcome: "withheld" });
+    await hub.waitForEvent(
+      (e) => e.event === "notify_withheld"
+        && e.from === "p1-a-worker"
+        && e.to === "p1-b-lead"
+        && e.reason === "nonlead",
+      "metadata-only nonlead withholding log",
+    );
+    closeAll(leadProducer, workerProducer);
   } finally {
     hub.stop();
   }

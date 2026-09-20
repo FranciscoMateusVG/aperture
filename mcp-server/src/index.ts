@@ -9,6 +9,7 @@ import { formatUpdateAck, formatCloseAck, createTask, updateTask, closeTask, que
 import { notifyHub } from "./hub-notify.js";
 import { presenceReport, describePresence, type PresenceReport } from "./presence-snapshot.js";
 import { buildIndex, recall, recallFull, recallStats, RECALL_K_MAX, RECALL_FULL_MAX_BYTES } from "./memory-index.js";
+import { authorizeMessage, hasAuthenticatedMcpIdentity, loadSeatRegistry } from "./seat-registry.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
 if (!AGENT_NAME) {
@@ -54,43 +55,44 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-const PERMANENT_RECIPIENTS = ["glados", "wheatley", "peppy", "izzy", "vance", "rex", "scout", "cipher", "operator"];
-
 // Decommissioned 2026-07-19. Kept only so a message addressed to one of them
 // gets a routing hint instead of a bare "unknown recipient".
 const RETIRED_RECIPIENTS = ["sage", "atlas", "sterling"];
 const RETIRED_HINT = "sage/atlas/sterling were retired 2026-07-19 — route SEO/content to vance, docs to the implementing agent, QA sign-off to izzy.";
 
-function isValidRecipient(name: string): boolean {
-  return PERMANENT_RECIPIENTS.includes(name);
-}
-
 // ── Messaging ──
 
 server.tool(
   "send_message",
-  "Send a message to another agent or the human operator. Valid recipients: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, operator. Use 'operator' to reach the human (lights up an attention badge — does not deliver text to a UI). Agent-to-agent messages are persisted to BEADS and pushed over the hub; the reply tells you the recipient's current presence (online/busy/idle/offline/unknown) so you know whether to expect a prompt response.",
-  { to: z.string().describe("Recipient: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, or operator"), message: z.string().describe("Message content. NOTE: avoid literal XML/HTML close-tag patterns like `</message>`, `</reason>` inside the body — they can be misread as parameter terminators by the tool-argument wire format. Use `&lt;/...&gt;` or paraphrase.") },
+  "Send a message to an enabled registry seat or the human operator. Routing is authorized from the current trusted seat/team registry; enabled offline seats receive unread replay on their next session. Use 'operator' only as a one-way human doorbell.",
+  { to: z.string().describe("Exact canonical recipient seat id, or operator"), message: z.string().describe("Message content. NOTE: avoid literal XML/HTML close-tag patterns like `</message>`, `</reason>` inside the body — they can be misread as parameter terminators by the tool-argument wire format. Use `&lt;/...&gt;` or paraphrase.") },
   async ({ to, message }) => {
-    const target = to.toLowerCase().trim();
+    const target = to;
+    if (!hasAuthenticatedMcpIdentity(AGENT_NAME)) {
+      return {
+        content: [{ type: "text", text: "ERROR: E_CROSS_TEAM_DENIED unknown_sender" }],
+        isError: true,
+      };
+    }
+    const registry = loadSeatRegistry();
+    const authorization = authorizeMessage(registry, AGENT_NAME, target);
 
-    if (!isValidRecipient(target)) {
+    if (!authorization.allowed) {
       const hint = RETIRED_RECIPIENTS.includes(target) ? `\n${RETIRED_HINT}` : "";
       return {
         content: [{
           type: "text",
-          text: `ERROR: Unknown recipient "${to}". Valid recipients are: ${PERMANENT_RECIPIENTS.join(", ")}. Use "operator" to message the human.${hint}`,
+          text: `ERROR: ${authorization.code} ${authorization.reason}.${hint}`,
         }],
         isError: true,
       };
     }
 
     if (target === AGENT_NAME) {
-      const allRecipients = PERMANENT_RECIPIENTS.filter(r => r !== AGENT_NAME);
       return {
         content: [{
           type: "text",
-          text: `ERROR: You cannot send a message to yourself. Valid recipients: ${allRecipients.join(", ")}`,
+          text: "ERROR: You cannot send a message to yourself.",
         }],
         isError: true,
       };
@@ -137,6 +139,12 @@ server.tool(
   { message_id: z.string().describe("The BEADS message ID to mark as read (e.g. aperture-abc)") },
   async ({ message_id }) => {
     try {
+      if (!hasAuthenticatedMcpIdentity(AGENT_NAME!)) {
+        return {
+          content: [{ type: "text", text: "ERROR: E_CROSS_TEAM_DENIED unknown_sender" }],
+          isError: true,
+        };
+      }
       await markMessageRead(message_id);
       return { content: [{ type: "text", text: `Message ${message_id} marked as read.` }] };
     } catch (e: any) {
@@ -151,6 +159,12 @@ server.tool(
   {},
   async () => {
     try {
+      if (!hasAuthenticatedMcpIdentity(AGENT_NAME!)) {
+        return {
+          content: [{ type: "text", text: "ERROR: E_CROSS_TEAM_DENIED unknown_sender" }],
+          isError: true,
+        };
+      }
       const result = await getUnreadMessages(AGENT_NAME!);
       const messages = JSON.parse(result);
       // A non-array body is NOT "no messages" — it means the query did not

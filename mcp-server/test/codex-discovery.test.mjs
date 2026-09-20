@@ -7,8 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const TMP = mkdtempSync(join(tmpdir(), "codex-discovery-"));
 const AGENTS = join(TMP, "agents");
+const TEAMS = join(TMP, "teams");
 const CONFIG = join(TMP, "agent-config.json");
 mkdirSync(AGENTS);
+mkdirSync(TEAMS);
+process.env.APERTURE_TEAMS_DIR = TEAMS;
 
 function manifest(name, model) {
   const dir = join(AGENTS, name);

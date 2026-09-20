@@ -25,7 +25,7 @@
 //       the raw dump; show keeps fields:"full" as the raw opt-in.
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,13 +41,23 @@ const TMP = mkdtempSync(join(tmpdir(), "beads-projection-"));
 const HOME = join(TMP, "home");
 const RUN = join(TMP, "run");
 const AGENTS = join(TMP, "agents");
+const TEAMS = join(TMP, "teams");
+const TOKENS = join(TMP, "tokens");
+const AGENT_TOKEN = join(TOKENS, `${AGENT}.token`);
 const BD_STUB = join(TMP, "bd");
 const BD_LOG = join(TMP, "bd-calls.log");
 const SCENARIO = join(TMP, "scenario.out");
 
-for (const d of [HOME, RUN, join(AGENTS, "shared"), join(AGENTS, AGENT), join(AGENTS, "glados")]) {
+for (const d of [HOME, RUN, TEAMS, TOKENS, join(AGENTS, "shared"), join(AGENTS, AGENT), join(AGENTS, "glados"), join(AGENTS, "p1-offline"), join(AGENTS, "disabled")]) {
   mkdirSync(d, { recursive: true });
 }
+for (const name of [AGENT, "glados", "p1-offline", "disabled"]) {
+  writeFileSync(
+    join(AGENTS, name, "manifest.json"),
+    JSON.stringify({ name, model: "codex/test", role: "test", enabled: name !== "disabled" }),
+  );
+}
+writeFileSync(AGENT_TOKEN, "a".repeat(64), { mode: 0o600 });
 // Stub bd: log argv (tab-joined, one line per call), print the scenario file
 // verbatim. The `\t` below are real tab characters once JS writes the file.
 writeFileSync(
@@ -120,6 +130,9 @@ before(async () => {
       APERTURE_MAILBOX: join(TMP, "mailbox"),
       APERTURE_RUN_DIR: RUN,
       APERTURE_AGENTS_DIR: AGENTS,
+      APERTURE_TEAMS_DIR: TEAMS,
+      APERTURE_HUB_TOKEN_DIR: TOKENS,
+      APERTURE_HUB_TOKEN_FILE: AGENT_TOKEN,
       BD_PATH: BD_STUB,
       APERTURE_WS_PORT: "1",
     },
@@ -195,6 +208,69 @@ test("get_messages: non-array bd body is still an ERROR, never an empty inbox (a
   assert.equal(isError, true);
   assert.match(text, /^ERROR: unexpected bd response shape for get_messages — expected a JSON array, got object/);
   assert.match(text, /NOT an empty inbox/);
+});
+
+test("message tools fail before BEADS when the MCP principal token binding is no longer valid", async () => {
+  chmodSync(AGENT_TOKEN, 0o644);
+  try {
+    rmSync(BD_LOG, { force: true });
+    const get = await call("get_messages");
+    assert.equal(get.isError, true);
+    assert.equal(get.text, "ERROR: E_CROSS_TEAM_DENIED unknown_sender");
+    const ack = await call("mark_as_read", { message_id: "aperture-wisp-never" });
+    assert.equal(ack.isError, true);
+    assert.equal(ack.text, "ERROR: E_CROSS_TEAM_DENIED unknown_sender");
+    assert.deepEqual(calls(), [], "neither read nor ack reaches bd for an unauthenticated principal");
+  } finally {
+    chmodSync(AGENT_TOKEN, 0o600);
+  }
+});
+
+test("send_message accepts an enabled never-booted registry recipient and rejects disabled/unknown before write", async () => {
+  rmSync(BD_LOG, { force: true });
+  setScenario({ id: "aperture-wisp-offline" });
+  const queued = await call("send_message", { to: "p1-offline", message: "queued while offline" });
+  assert.equal(queued.isError, false);
+  assert.match(queued.text, /^Queued for p1-offline\./);
+
+  const deadline = Date.now() + 2_000;
+  while (!calls().some((argv) => argv[0] === "create") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls().filter((argv) => argv[0] === "create").length, 1, "offline delivery is durably enqueued once");
+
+  rmSync(BD_LOG, { force: true });
+  const disabled = await call("send_message", { to: "disabled", message: "must not persist" });
+  assert.equal(disabled.isError, true);
+  assert.equal(disabled.text, "ERROR: E_UNKNOWN_RECIPIENT unknown_recipient.");
+  const malformed = await call("send_message", { to: "P1-OFFLINE", message: "must not normalize" });
+  assert.equal(malformed.isError, true);
+  assert.equal(malformed.text, "ERROR: E_UNKNOWN_RECIPIENT unknown_recipient.");
+  assert.deepEqual(calls(), [], "invalid recipients never reach bd");
+});
+
+test("authorization loss withholds the original unread id without delivering or acknowledging its body", async () => {
+  const gladosManifest = join(AGENTS, "glados", "manifest.json");
+  writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", role: "test", enabled: false }));
+  try {
+    rmSync(BD_LOG, { force: true });
+    setScenario([{ ...message(77, "2026-09-01T00:00:00.000Z"), description: "reassign/cancel the target bead" }]);
+    const result = await call("get_messages");
+    assert.equal(result.isError, false);
+    assert.equal(result.text, "No unread messages.");
+    const invoked = calls();
+    assert.equal(invoked[0][0], "query");
+    assert.deepEqual(invoked[1], [
+      "update",
+      "aperture-wisp-0077",
+      "--add-label",
+      "withheld:unknown_sender",
+      "--json",
+    ]);
+    assert.equal(invoked.some((argv) => argv[0] === "close"), false, "withholding is not a synthetic read ack");
+  } finally {
+    writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", role: "test", enabled: true }));
+  }
 });
 
 // ── (b) include_done push-down ───────────────────────────────────────────

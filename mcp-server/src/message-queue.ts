@@ -58,7 +58,7 @@ export interface QueuedMessage {
  */
 export interface FlushReport {
   id: string;
-  outcome: "forwarded" | "codex" | "offline" | "unacked";
+  outcome: "forwarded" | "codex" | "offline" | "withheld" | "unacked";
 }
 
 /** Flushes one message to the backend. Resolves on success (optionally with a
@@ -197,7 +197,9 @@ export class MessageQueue {
           ? "injected into codex bridge"
           : report.outcome === "offline"
             ? "replay on reconnect"
-            : "no hub ack; replay on reconnect";
+            : report.outcome === "withheld"
+              ? "current registry denied live delivery"
+              : "no hub ack; replay on reconnect";
     this.log(`[send-queue] delivered id=${report.id || "?"} to=${msg.to} outcome=${report.outcome} (${note})`);
   }
 

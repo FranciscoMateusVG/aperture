@@ -27,7 +27,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -40,12 +40,23 @@ if (TMP.length > 80) {
 }
 const UNREAD_FILE = join(TMP, "unread.json");
 const BD_STUB = join(TMP, "bd-stub");
+const AGENTS = join(TMP, "agents");
+const TEAMS = join(TMP, "teams");
+mkdirSync(AGENTS);
+mkdirSync(TEAMS);
+mkdirSync(join(AGENTS, "glados"));
+writeFileSync(
+  join(AGENTS, "glados", "manifest.json"),
+  JSON.stringify({ model: "claude/test", role: "orchestrator", enabled: true }),
+);
 writeFileSync(UNREAD_FILE, "[]\n");
 writeFileSync(BD_STUB, `#!/bin/sh\ncat "$FAKE_BD_UNREAD_FILE"\n`, { mode: 0o755 });
 
 // Module-load-time env for dist/codex-bridge.js + dist/beads.js — MUST be set
 // before the dynamic import below.
 process.env.APERTURE_RUN_DIR = TMP; // thread-ready files land here
+process.env.APERTURE_AGENTS_DIR = AGENTS;
+process.env.APERTURE_TEAMS_DIR = TEAMS;
 process.env.BD_PATH = BD_STUB; // beads.ts shells this instead of real bd
 process.env.FAKE_BD_UNREAD_FILE = UNREAD_FILE;
 // aperture-oeb6q pins: shrink the bridge's wall-clock cadences so socket-death
@@ -106,6 +117,11 @@ function makeHooks() {
 let sockCounter = 0;
 async function scenario(t, { threads = [], delays = {}, failures = {} } = {}) {
   const agent = `cbx${++sockCounter}`;
+  mkdirSync(join(AGENTS, agent));
+  writeFileSync(
+    join(AGENTS, agent, "manifest.json"),
+    JSON.stringify({ model: "codex/gpt-test", role: "test", enabled: true }),
+  );
   const sock = join(TMP, `${agent}.sock`);
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
   const server = new FakeAppServer(sock, { threads, delays, failures });
@@ -123,7 +139,7 @@ async function scenario(t, { threads = [], delays = {}, failures = {} } = {}) {
 // ── pins ──
 
 test("happy-bind: existing thread → initialize < thread/list < thread/resume, presence join, injection works after", async (t) => {
-  const { server, bridge, presence } = await scenario(t, { threads: [{ id: "t-exist" }] });
+  const { agent, server, bridge, presence } = await scenario(t, { threads: [{ id: "t-exist" }] });
 
   bridge.start();
   await waitFor(() => bridge.isBound, "bridge bound");
@@ -144,7 +160,7 @@ test("happy-bind: existing thread → initialize < thread/list < thread/resume, 
 
   // Post-bind injection path: a notify (hub → bridge.deliver()) injects the
   // full BEADS body via turn/start on the bound thread.
-  setUnread([msgRow("msg-a1", "glados", "cbx-a", "hello from the happy path")]);
+  setUnread([msgRow("msg-a1", "glados", agent, "hello from the happy path")]);
   bridge.deliver();
   await waitFor(() => server.turnCallsContaining("msg-a1").length > 0, "msg-a1 injected");
   const inj = server.turnCallsContaining("msg-a1");
@@ -158,8 +174,29 @@ test("happy-bind: existing thread → initialize < thread/list < thread/resume, 
   );
 });
 
+test("Codex deliverUnread rechecks current registry and does not inject after recipient authorization loss", async (t) => {
+  const { agent, server, bridge, logs } = await scenario(t, { threads: [{ id: "t-auth-loss" }] });
+  bridge.start();
+  await waitFor(() => bridge.isBound, "bridge bound before authorization loss");
+
+  writeFileSync(
+    join(AGENTS, agent, "manifest.json"),
+    JSON.stringify({ model: "codex/gpt-test", role: "test", enabled: false }),
+  );
+  setUnread([msgRow("m-withheld", "glados", agent, "body must never enter the Codex thread")]);
+  bridge.deliver();
+  await delay(300);
+
+  assert.equal(server.turnCallsContaining("m-withheld").length, 0);
+  assert.equal(
+    server.calls.some((call) => JSON.stringify(call.params).includes("body must never enter")),
+    false,
+  );
+  assert.equal(logs.some((entry) => entry.event === "codex_inject" && entry.ids?.includes("m-withheld")), false);
+});
+
 test("HEADLINE injection-before-bind (existing thread, thread/list delayed): message is NOT lost — refetched on bind, injected exactly once, after thread/resume", async (t) => {
-  const { server, bridge } = await scenario(t, {
+  const { agent, server, bridge } = await scenario(t, {
     threads: [{ id: "t-b" }],
     delays: { "thread/list": 400 },
   });
@@ -167,7 +204,7 @@ test("HEADLINE injection-before-bind (existing thread, thread/list delayed): mes
   // The message is already unread in BEADS and the hub notify fires while
   // joined === false. deliverUnread() early-returns (threadId null) both
   // times — the push itself is a no-op pre-bind.
-  setUnread([msgRow("m-b1", "glados", "cbx-b", "pre-bind message body")]);
+  setUnread([msgRow("m-b1", "glados", agent, "pre-bind message body")]);
   bridge.deliver(); // notify before the socket even connects
   bridge.start();
   await bridge.waitReady(5000);
@@ -199,9 +236,9 @@ test("HEADLINE injection-before-bind (existing thread, thread/list delayed): mes
 });
 
 test("injection-before-bind (fresh session, thread/start bootstrap): pre-bind message is refetched and steered at bind", async (t) => {
-  const { server, bridge, logs } = await scenario(t, { threads: [] });
+  const { agent, server, bridge, logs } = await scenario(t, { threads: [] });
 
-  setUnread([msgRow("m-f1", "glados", "cbx-f", "message racing a fresh session")]);
+  setUnread([msgRow("m-f1", "glados", agent, "message racing a fresh session")]);
   bridge.deliver(); // hub notify while joined === false, no thread exists
   bridge.start();
 
@@ -263,14 +300,14 @@ test("no-thread-at-connect: thread/start failure retried with backoff, no crash,
 });
 
 test("double-injection guard: same message id notified twice → exactly one turn injection", async (t) => {
-  const { server, bridge } = await scenario(t, { threads: [{ id: "t-d" }] });
+  const { agent, server, bridge } = await scenario(t, { threads: [{ id: "t-d" }] });
 
   bridge.start();
   await waitFor(() => bridge.isBound, "bridge bound");
 
   // BEADS still reports the row unread on both fetches (agent hasn't acked) —
   // the in-memory delivered-set must dedupe the second pump.
-  setUnread([msgRow("m-d1", "glados", "cbx-d", "replay-overlap message")]);
+  setUnread([msgRow("m-d1", "glados", agent, "replay-overlap message")]);
   bridge.deliver();
   bridge.deliver();
   await waitFor(() => server.turnCallsContaining("m-d1").length > 0, "m-d1 injected");
@@ -287,7 +324,7 @@ test("double-injection guard: same message id notified twice → exactly one tur
 });
 
 test("turn-state serialization: message during an active turn → turn/steer, not a second turn/start", async (t) => {
-  const { server, bridge } = await scenario(t, { threads: [{ id: "t-e" }] });
+  const { agent, server, bridge } = await scenario(t, { threads: [{ id: "t-e" }] });
 
   bridge.start();
   await waitFor(() => bridge.isBound, "bridge bound");
@@ -295,7 +332,7 @@ test("turn-state serialization: message during an active turn → turn/steer, no
   server.notify("turn/started", { threadId: "t-e" });
   await waitFor(() => bridge.isTurnActive, "turn marked active");
 
-  setUnread([msgRow("m-e1", "glados", "cbx-e", "mid-turn message")]);
+  setUnread([msgRow("m-e1", "glados", agent, "mid-turn message")]);
   bridge.deliver();
   await waitFor(() => server.turnCallsContaining("m-e1").length > 0, "m-e1 injected");
 
@@ -312,8 +349,8 @@ test("turn-state serialization: message during an active turn → turn/steer, no
   server.notify("turn/completed", { threadId: "t-e" });
   await waitFor(() => !bridge.isTurnActive, "turn idle after completion");
   setUnread([
-    msgRow("m-e1", "glados", "cbx-e", "mid-turn message"),
-    msgRow("m-e2", "glados", "cbx-e", "post-turn message"),
+    msgRow("m-e1", "glados", agent, "mid-turn message"),
+    msgRow("m-e2", "glados", agent, "post-turn message"),
   ]);
   bridge.deliver();
   await waitFor(() => server.turnCallsContaining("m-e2").length > 0, "m-e2 injected");
@@ -324,12 +361,12 @@ test("turn-state serialization: message during an active turn → turn/steer, no
 });
 
 test("aperture-oeb6q A — socket death after inject: delivered-set cleared on close, same unread id re-injected after reconnect + rebind", async (t) => {
-  const { server, bridge, logs } = await scenario(t, { threads: [{ id: "t-r" }] });
+  const { agent, server, bridge, logs } = await scenario(t, { threads: [{ id: "t-r" }] });
 
   bridge.start();
   await waitFor(() => bridge.isBound, "bridge bound");
 
-  setUnread([msgRow("m-r1", "glados", "cbx-r", "message riding a turn that dies")]);
+  setUnread([msgRow("m-r1", "glados", agent, "message riding a turn that dies")]);
   bridge.deliver();
   await waitFor(() => server.turnCallsContaining("m-r1").length === 1, "m-r1 injected once");
 
@@ -361,7 +398,7 @@ test("aperture-oeb6q A — socket death after inject: delivered-set cleared on c
 });
 
 test("aperture-oeb6q B — inject error: one re-pump with flipped turn-state after INJECT_RETRY_MS; second failure → codex_inject_retry_exhausted, no third attempt", async (t) => {
-  const { server, bridge, logs } = await scenario(t, {
+  const { agent, server, bridge, logs } = await scenario(t, {
     threads: [{ id: "t-x" }],
     failures: { "turn/start": 1, "turn/steer": 1 },
   });
@@ -369,7 +406,7 @@ test("aperture-oeb6q B — inject error: one re-pump with flipped turn-state aft
   bridge.start();
   await waitFor(() => bridge.isBound, "bridge bound");
 
-  setUnread([msgRow("m-x1", "glados", "cbx-x", "message hitting a stale turn-state")]);
+  setUnread([msgRow("m-x1", "glados", agent, "message hitting a stale turn-state")]);
   bridge.deliver();
   await waitFor(
     () => logs.some((l) => l.event === "codex_inject_error" && l.method === "turn/start"),

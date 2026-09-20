@@ -1,0 +1,4 @@
+Beads Database Information
+===========================
+Database: __DATABASE_PATH__
+Issue Count: 0

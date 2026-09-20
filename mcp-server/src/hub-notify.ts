@@ -13,6 +13,8 @@ import { readFileSync } from "node:fs";
  *   "forwarded" — hub pushed to the recipient's Monitor socket
  *   "codex"     — hub injected a turn into the recipient's Codex bridge
  *   "offline"   — hub acked but nobody was there to push to (replay covers it)
+ *   "withheld"  — current registry policy denied live delivery; unread state
+ *                  remains authoritative and carries durable withheld metadata
  *   "unacked"   — no ack at all: hub down/unreachable, credential missing,
  *                 or timed out (replay covers it too)
  *
@@ -33,9 +35,9 @@ export interface HubNotification {
 }
 
 /** Hub-reported outcomes (on the ok ack) plus the local "no ack" case. */
-export type HubNotifyOutcome = "forwarded" | "codex" | "offline" | "unacked";
+export type HubNotifyOutcome = "forwarded" | "codex" | "offline" | "withheld" | "unacked";
 
-const ACKED_OUTCOMES: ReadonlySet<string> = new Set(["forwarded", "codex", "offline"]);
+const ACKED_OUTCOMES: ReadonlySet<string> = new Set(["forwarded", "codex", "offline", "withheld"]);
 
 export function notifyHub(
   note: HubNotification,

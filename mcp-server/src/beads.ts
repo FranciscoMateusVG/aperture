@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { authorizeMessage, loadSeatRegistry } from "./seat-registry.js";
 
 const BEADS_DIR = resolve(homedir(), ".aperture", ".beads");
 const BD_PATH = process.env.BD_PATH ?? "bd";
@@ -588,13 +589,46 @@ export const UNREAD_LIMIT = 200;
 export async function getUnreadMessages(recipient: string): Promise<string> {
   // Query all open messages, then filter by recipient in title
   // bd query title= does contains search, so title=->recipient matches [sender->recipient]
-  return runBd([
+  const raw = await runBd([
     "query",
     `type=message AND status=open AND title="->${recipient}]"`,
     "--json",
     "-n",
     String(UNREAD_LIMIT),
   ]);
+  const parsed = JSON.parse(raw) as unknown;
+  if (!Array.isArray(parsed)) return raw;
+
+  // §4.10 delivery authorization is current-state authorization. The same
+  // helper feeds MCP get_messages, WS replay and Codex deliverUnread, so an
+  // archived/demoted seat cannot receive an already-stored message through a
+  // different delivery surface. Withholding is durable metadata on the
+  // original open message: it preserves the stable id and is NOT an ack.
+  const registry = loadSeatRegistry();
+  const allowed: Record<string, unknown>[] = [];
+  for (const value of parsed) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    const title = typeof row.title === "string" ? row.title : "";
+    const match = title.match(/^\[([^\]]+)->([^\]]+)\]/);
+    const sender = match?.[1] ?? "";
+    const addressedTo = match?.[2] ?? "";
+    const decision = addressedTo === recipient
+      ? authorizeMessage(registry, sender, recipient)
+      : { allowed: false as const, reason: "unknown_recipient" as const };
+    if (decision.allowed) {
+      allowed.push(row);
+      continue;
+    }
+    const id = typeof row.id === "string" ? row.id : "";
+    if (!id) continue;
+    const label = `withheld:${decision.reason}`;
+    const labels = Array.isArray(row.labels) ? row.labels : [];
+    if (!labels.includes(label)) {
+      await runBd(["update", id, "--add-label", label, "--json"]);
+    }
+  }
+  return JSON.stringify(allowed);
 }
 
 /** The line get_messages appends when the reply hit UNREAD_LIMIT. */

@@ -51,13 +51,14 @@
  *   APERTURE_RUN_DIR        — where presence.json lands (default ~/.aperture/run)
  */
 import { WebSocketServer, WebSocket } from "ws";
-import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
+import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { getUnreadMessages } from "./beads.js";
 import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
 import { writePresenceSnapshot, PRESENCE_FILE, type PresenceEntry, type PresenceState } from "./presence-snapshot.js";
+import { authorizeMessage, isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.APERTURE_WS_PORT ?? 4517);
@@ -65,7 +66,6 @@ const SKIP_REPLAY = process.env.APERTURE_HUB_SKIP_REPLAY === "1";
 const HEARTBEAT_MS = 30_000;
 const MAX_FRAME_BYTES = 16 * 1024;
 const TOKEN_DIR = process.env.APERTURE_HUB_TOKEN_DIR ?? join(homedir(), ".aperture", "run", "hub-tokens");
-const AGENT_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 type Role = "agent" | "subscriber" | "producer";
 
@@ -168,7 +168,7 @@ function broadcastPresence(agent: string, event: PresenceEvent): boolean {
 /** Read a launcher-provisioned token without following symlinks or accepting
  * group/world-readable credentials. The value is never included in logs. */
 function readAgentToken(agent: string): Buffer | null {
-  if (!AGENT_NAME.test(agent)) return null;
+  if (!isValidSeatName(agent)) return null;
   let fd: number | null = null;
   try {
     fd = openSync(join(TOKEN_DIR, `${agent}.token`), constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -193,6 +193,28 @@ function validAgentToken(agent: string, presented: unknown): boolean {
   const actualDigest = createHash("sha256").update(presented).digest();
   const expectedDigest = createHash("sha256").update(expected).digest();
   return timingSafeEqual(actualDigest, expectedDigest);
+}
+
+/** True only when the presented token belongs to a different canonical seat. */
+function tokenBelongsToAnotherAgent(agent: string, presented: unknown): boolean {
+  if (typeof presented !== "string" || presented.length > 256) return false;
+  let names: string[];
+  try {
+    names = readdirSync(TOKEN_DIR);
+  } catch {
+    return false;
+  }
+  const actualDigest = createHash("sha256").update(presented).digest();
+  for (const file of names) {
+    if (!file.endsWith(".token")) continue;
+    const candidate = file.slice(0, -".token".length);
+    if (candidate === agent || !isValidSeatName(candidate)) continue;
+    const token = readAgentToken(candidate);
+    if (!token) continue;
+    const expectedDigest = createHash("sha256").update(token).digest();
+    if (timingSafeEqual(actualDigest, expectedDigest)) return true;
+  }
+  return false;
 }
 
 /**
@@ -231,20 +253,31 @@ async function replayUnread(agent: string, ws: WebSocket): Promise<void> {
   }
 }
 
-function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): boolean {
+type HelloResult = { ok: true } | { ok: false; closeCode: 4001 | 4002 };
+
+function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): HelloResult {
   const role = msg.role;
   if (role !== "agent" && role !== "subscriber" && role !== "producer") {
     log("bad_hello", { reason: "invalid_role", role: String(role) });
-    return false;
+    return { ok: false, closeCode: 4001 };
   }
   const agent = typeof msg.agent === "string" && msg.agent.length > 0 ? msg.agent : null;
   if (!agent) {
     log("bad_hello", { reason: "principal_required", role });
-    return false;
+    return { ok: false, closeCode: 4001 };
+  }
+  if (agent === "operator") {
+    log("bad_hello", { reason: "operator_is_doorbell_only", role, agent });
+    return { ok: false, closeCode: 4002 };
   }
   if (!validAgentToken(agent, msg.token)) {
-    log("bad_hello", { reason: "invalid_token", role, agent });
-    return false;
+    const principalMismatch = tokenBelongsToAnotherAgent(agent, msg.token);
+    log("bad_hello", { reason: principalMismatch ? "principal_mismatch" : "invalid_token", role, agent });
+    return { ok: false, closeCode: principalMismatch ? 4002 : 4001 };
+  }
+  if (role !== "subscriber" && !loadSeatRegistry().seats.has(agent)) {
+    log("bad_hello", { reason: "principal_not_enabled", role, agent });
+    return { ok: false, closeCode: 4002 };
   }
   conn.role = role;
   conn.agent = agent;
@@ -272,7 +305,7 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): b
     broadcastPresence(agent, "join");
     void replayUnread(agent, ws);
   }
-  return true;
+  return { ok: true };
 }
 
 function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): void {
@@ -281,6 +314,13 @@ function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): 
   const from = conn.agent ?? "unknown";
   if (typeof msg.from === "string" && msg.from !== from) {
     log("notify_rejected", { reason: "from_mismatch", agent: from });
+    send(ws, { type: "ok", id, outcome: "withheld" });
+    return;
+  }
+  const authorization = authorizeMessage(loadSeatRegistry(), from, to);
+  if (!authorization.allowed) {
+    log("notify_withheld", { to, id, from, reason: authorization.reason });
+    send(ws, { type: "ok", id, outcome: "withheld" });
     return;
   }
   const preview = typeof msg.preview === "string" ? msg.preview : "";
@@ -307,7 +347,7 @@ function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): 
 }
 
 /** What the hub actually did with a notify — carried on the ok ack. */
-type NotifyOutcome = "forwarded" | "codex" | "offline";
+type NotifyOutcome = "forwarded" | "codex" | "offline" | "withheld";
 
 /**
  * aperture-trgpo: a Claude Code hook (UserPromptSubmit / PreToolUse → busy,
@@ -416,11 +456,13 @@ wss.on("connection", (ws) => {
     }
 
     if (conn.role === null) {
-      if (msg.type !== "hello" || !handleHello(ws, conn, msg)) {
+      if (msg.type !== "hello") {
         ws.close(4001, "expected hello");
-      } else {
-        clearTimeout(helloDeadline);
+        return;
       }
+      const result = handleHello(ws, conn, msg);
+      if (!result.ok) ws.close(result.closeCode, result.closeCode === 4002 ? "principal mismatch" : "expected hello");
+      else clearTimeout(helloDeadline);
       return;
     }
 

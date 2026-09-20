@@ -50,7 +50,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,7 @@ const TOKENS = {
   "rp-empty": "13".repeat(32),
   "rl-test": "14".repeat(32),
   glados: "15".repeat(32),
+  wheatley: "16".repeat(32),
 };
 
 /**
@@ -91,6 +92,7 @@ const TOKENS = {
 async function spawnHub({ bdFail = false } = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-replay-agents-"));
+  const teamsDir = mkdtempSync(join(tmpdir(), "hub-replay-teams-"));
   const dataDir = mkdtempSync(join(tmpdir(), "hub-replay-bdstub-"));
   const tokenDir = mkdtempSync(join(tmpdir(), "hub-replay-tokens-"));
   // aperture-oeb6q: the hub now writes presence.json under APERTURE_RUN_DIR on
@@ -99,12 +101,20 @@ async function spawnHub({ bdFail = false } = {}) {
   const runDir = mkdtempSync(join(tmpdir(), "hub-replay-run-"));
   for (const [principal, token] of Object.entries(TOKENS)) {
     writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
+    if (principal !== "watchdog") {
+      mkdirSync(join(emptyAgentsDir, principal), { recursive: true });
+      writeFileSync(
+        join(emptyAgentsDir, principal, "manifest.json"),
+        JSON.stringify({ model: "claude/test", role: "test", enabled: true }),
+      );
+    }
   }
 
   const env = {
     ...process.env,
     APERTURE_WS_PORT: String(port),
     APERTURE_AGENTS_DIR: emptyAgentsDir,
+    APERTURE_TEAMS_DIR: teamsDir,
     APERTURE_HUB_TOKEN_DIR: tokenDir,
     APERTURE_RUN_DIR: runDir,
     BD_STUB_DIR: dataDir,
@@ -180,13 +190,14 @@ async function spawnHub({ bdFail = false } = {}) {
   function stop() {
     proc.kill("SIGKILL");
     rmSync(emptyAgentsDir, { recursive: true, force: true });
+    rmSync(teamsDir, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
     rmSync(tokenDir, { recursive: true, force: true });
     rmSync(runDir, { recursive: true, force: true });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
-  return { port, proc, dataDir, stderrEvents, waitForEvent, until, stop };
+  return { port, proc, dataDir, agentsDir: emptyAgentsDir, stderrEvents, waitForEvent, until, stop };
 }
 
 /** Seed $BD_STUB_DIR/unread-<agent>.json with unread message rows. */
@@ -343,6 +354,46 @@ test("replay-on-connect: 2 unread rows → exactly 2 message frames, one bd quer
     const calls = bdCalls(hub.dataDir);
     assert.equal(calls.length, 1, "exactly one bd call for the connect");
     assert.deepEqual(calls[0], unreadQueryArgv(RP), "bd argv matches getUnreadMessages shape");
+    closeAll(agent);
+  } finally {
+    hub.stop();
+  }
+});
+
+test("authorization loss withholds replay durably while preserving the original open message and id", async () => {
+  const hub = await spawnHub();
+  try {
+    const original = {
+      id: "ap-withheld-1",
+      title: `[glados->${RP}] reassign/cancel instruction`,
+      description: "reassign/cancel leaves the target bead byte-identical",
+      status: "open",
+      issue_type: "message",
+      labels: [],
+    };
+    seedUnread(hub.dataDir, RP, [original]);
+    const seedPath = join(hub.dataDir, `unread-${RP}.json`);
+    const before = readFileSync(seedPath);
+    writeFileSync(
+      join(hub.agentsDir, "glados", "manifest.json"),
+      JSON.stringify({ model: "claude/test", role: "test", enabled: false }),
+    );
+
+    const agent = await connect(hub.port);
+    const frames = recordFrames(agent);
+    await authenticate(hub, agent, "agent", RP);
+    const replayEv = await hub.waitForEvent(
+      (e) => e.event === "replay" && e.agent === RP,
+      "withheld replay log",
+    );
+    assert.equal(replayEv.count, 0);
+    await sleep(200);
+    assert.deepEqual(frames.filter((f) => f.type === "message"), [], "body is not delivered after authorization loss");
+    assert.deepEqual(bdCalls(hub.dataDir), [
+      unreadQueryArgv(RP),
+      ["update", original.id, "--add-label", "withheld:unknown_sender", "--json"],
+    ]);
+    assert.deepEqual(readFileSync(seedPath), before, "the source row stays byte-identical and open; no reassign/cancel side effect");
     closeAll(agent);
   } finally {
     hub.stop();

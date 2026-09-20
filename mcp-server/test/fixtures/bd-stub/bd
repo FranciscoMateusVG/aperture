@@ -40,7 +40,15 @@ if [[ "${BD_STUB_FAIL:-}" == "1" ]]; then
   exit 1
 fi
 
-# The one recognized shape: query <getUnreadMessages-query> --json -n 200
+# Read-time authorization loss annotates the original open row instead of
+# closing/replacing it. Accept that one mutation shape so replay tests can pin
+# the durable-withheld contract without a real BEADS store.
+if [[ $# -eq 5 && "$1" == "update" && "$3" == "--add-label" && "$5" == "--json" && "$4" == withheld:* ]]; then
+  printf '{"id":"%s","status":"open","labels":["%s"]}\n' "$2" "$4"
+  exit 0
+fi
+
+# The primary recognized shape: query <getUnreadMessages-query> --json -n 200
 if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" == "200" ]]; then
   query="$2"
   re='^type=message AND status=open AND title="->(.+)\]"$'
@@ -56,5 +64,5 @@ if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" ==
   fi
 fi
 
-echo "bd-stub: unrecognized argv shape (contract drift from beads.ts getUnreadMessages?): $*" >&2
+echo "bd-stub: unrecognized argv shape (contract drift from beads.ts unread/withheld contract?): $*" >&2
 exit 2
