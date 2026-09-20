@@ -306,3 +306,9 @@ Multi-machine ownership; tool-level write fencing or credential revocation; embe
 | Izzy recheck 4 | visual 1 % tautological | §7 frozen pre-P2 references with path, conditions, approver |
 | Izzy 11 | negative FS/security fixtures | §7 security acceptance (paths, symlinks, modes, partial staging, forged hello, sentinels, source oracle) |
 | Izzy 12 | decisions #4/#7 | §8 gates 4 and 7 with concrete recommended defaults (pending final approval) |
+
+## 12. UI reference direction clarification (2026-09-20, aperture-zfmd5)
+
+GLaDOS approved preserving the real launcher **dark navy/amber** tokens and components rather than introducing a light redesign solely to satisfy the older §7 capture text (BEADS aperture-wisp-cvx2gl). This supersedes **only the light-theme direction**. Pre-implementation authored SVG/HTML references at `assets/v4-ui-references/` cover logical 1280×800 and 1024×768, with a SHA-256 manifest and explicit root layout-approval state. They derive from §3 mockups and current source tokens; they are not WKWebView screenshots. The final faithful-runner pixel comparison, measured geometry and focus gates remain **NOT_RUN until exercised**, not waived. No app installation/restart is implied by reference creation.
+
+The replacement interaction separates **Prepare / stop / verify** from **Start replacement** (root dispatch aperture-wisp-grx9q0): preparation can request evidence while gates are unresolved; start is permitted only by backend readiness and revalidates generation/ownership. Verification rows are read-only evidence, never operator-ticked authorization. This resolves the old §3.4 circular disabled-until-verified preparation CTA without weakening any lifecycle gate.
