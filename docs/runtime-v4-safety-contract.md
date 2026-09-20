@@ -44,6 +44,24 @@ only authoritative filesystem classification can admit a standing seat.
    Reserve durably before spawn/token creation; attach exact PID/birth while
    the child is gated. Shared owner commit is the only ownership writer.
 
+### Authenticated agent control composition (root decision 8zuo5a)
+
+The same `aperture-team-control` native entrypoint may expose an authenticated
+worker's own checkpoint and a lead's one-shot replacement within immutable team
+policy. Rex owns that authentication/command seam. Authenticated seat, generation
+and actor provenance are derived from canonical authority, never request fields
+or environment assertions. A replacement request's `expected_generation` is
+permitted only as the TARGET owner CAS selector; it is not actor authority.
+Collector/process/model/revocation observations come from native adapters, never
+caller-provided proofs. Self-replacement must prove the control process is outside
+the entire stop set; without that proof, deny and retain the existing operator
+path. Do not kill the control process halfway through its own operation.
+
+This one-shot agent action does not alter the frozen human prepare/start dialog
+contract and never serializes `PreparedReplacement`. Its implementation cannot
+be published or composed as ready before the consolidated owner/hub H1-H4 fixes
+and negative-matrix review. No second broker, capability store or journal.
+
 ### Root decisions D1–D4
 
 - **D1 normative delta:** exact actual model must be observed before replacement
