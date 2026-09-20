@@ -11,6 +11,10 @@ const ORDINARY_TIMEOUT_MS = 15_000;
 // final 30s for cleanup. This parent watchdog is deliberately larger and is
 // only a last-resort crash boundary; expiry never means rollback succeeded.
 const REPLACE_TIMEOUT_MS = 180_000;
+// Archive performs two bounded native projections (30s + 20s) before the
+// journaled fsync/move/readback phase. Expiry is crash/unknown semantics; the
+// durable journal remains the only recovery authority.
+const ARCHIVE_TIMEOUT_MS = 90_000;
 
 export interface ActivationSelectors {
   team: string;
@@ -33,6 +37,11 @@ export interface ReplacementSelectors {
     model: string;
     reasoning: "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
   };
+}
+
+export interface ArchiveSelectors {
+  team: string;
+  expected_generation: number;
 }
 
 export interface CheckpointSelectors {
@@ -73,7 +82,9 @@ export type TeamControlRequest =
   | { action: "checkpoint"; input: CheckpointSelectors }
   | { action: "inspect_remote"; input: RemoteTargetSelectors }
   | { action: "resolve_remote"; input: RemoteResolutionSelectors }
-  | { action: "replace"; input: ReplacementSelectors };
+  | { action: "replace"; input: ReplacementSelectors }
+  | { action: "archive"; input: ArchiveSelectors }
+  | { action: "rollback_archive"; input: ArchiveSelectors };
 
 export interface PendingTeamView {
   snapshot: {
@@ -133,7 +144,7 @@ function parseObject(text: string): Record<string, unknown> {
 }
 
 export function teamControlWatchdogMs(action: TeamControlRequest["action"]): number {
-  return action === "replace" ? REPLACE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
+  return action === "replace" ? REPLACE_TIMEOUT_MS : action === "archive" || action === "rollback_archive" ? ARCHIVE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
 }
 
 function killControlProcessGroup(child: ReturnType<typeof spawn>, isolated: boolean): void {
@@ -157,7 +168,7 @@ export async function invokeTeamControl(request: TeamControlRequest): Promise<Re
   const path = binaryPath();
   validateBinary(path);
   return await new Promise((resolve, reject) => {
-    const isolated = request.action === "replace";
+    const isolated = request.action === "replace" || request.action === "archive" || request.action === "rollback_archive";
     const child = spawn(path, [], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,

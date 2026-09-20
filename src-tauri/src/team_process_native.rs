@@ -112,6 +112,29 @@ pub(crate) fn collect_native_until(
         },
     )
 }
+
+/// Read-only process observation when the archive finalizer already holds the
+/// canonical team and seat locks. The caller supplies the exact locked owner
+/// record, so this seam never reacquires a lock or rereads a different owner.
+pub(crate) fn collect_native_until_locked(
+    record: &OwnerRecord,
+    until: Instant,
+) -> Result<OwnershipSnapshot, ReplacementError> {
+    if Instant::now() >= until
+        || record.schema_version != 1
+        || record.generation == 0
+        || record.seat.is_empty()
+        || !matches!(record.state, OwnerState::Active | OwnerState::Starting)
+    {
+        return Err(ReplacementError::InvalidSnapshot);
+    }
+    collect(
+        record,
+        &mut NativeSource {
+            deadline: until.min(Instant::now() + Duration::from_secs(10)),
+        },
+    )
+}
 /// Metadata for the exact child held by the native pipe gate, before any
 /// harness exec. A caller PID/path cannot construct PendingChild. This observes
 /// no process table and grants no signal authority by itself.

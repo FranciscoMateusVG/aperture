@@ -7,6 +7,7 @@ use crate::state::OwnerState;
 use crate::team_replacement::{remote, repository, ProcessState};
 use crate::teams::{TeamLifecycle, TeamSnapshot, TeamStateFile};
 use serde::Serialize;
+use sha2::Digest;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -18,11 +19,15 @@ pub(crate) struct NativeSeatView {
     pub(crate) never_started: bool,
     pub(crate) owner_sha256: String,
     pub(crate) exact_processes_gone: bool,
+    pub(crate) process_evidence_sha256: Option<String>,
     pub(crate) revocation_metadata_verified: bool,
     pub(crate) remote_reconciled: bool,
     pub(crate) remote_complete_observation: bool,
     pub(crate) remote_source: Option<&'static str>,
     pub(crate) remote_inventory_sha256: Option<String>,
+    pub(crate) remote_evidence_sha256: Option<String>,
+    pub(crate) checkpoint_evidence_sha256: Option<String>,
+    pub(crate) worktree_observation_sha256: Option<String>,
     pub(crate) bound_worktree_count: usize,
     pub(crate) worktrees_clean: bool,
     pub(crate) owner_stale_verified: bool,
@@ -269,6 +274,33 @@ pub(crate) fn inspect_native(
     generation: u64,
     sentinels: &[String],
 ) -> Result<NativeSeatInspection, ArchiveBlocker> {
+    inspect_native_inner(home, team, generation, sentinels, None)
+}
+
+pub(crate) fn inspect_native_locked(
+    home: &Path,
+    team: &str,
+    generation: u64,
+    sentinels: &[String],
+    team_lock: &crate::owner::AdvisoryLock,
+    seat_locks: &[crate::owner::AdvisoryLock],
+) -> Result<NativeSeatInspection, ArchiveBlocker> {
+    inspect_native_inner(
+        home,
+        team,
+        generation,
+        sentinels,
+        Some((team_lock, seat_locks)),
+    )
+}
+
+fn inspect_native_inner(
+    home: &Path,
+    team: &str,
+    generation: u64,
+    sentinels: &[String],
+    held: Option<(&crate::owner::AdvisoryLock, &[crate::owner::AdvisoryLock])>,
+) -> Result<NativeSeatInspection, ArchiveBlocker> {
     if !crate::agent_loader::is_valid_seat_name(team) || team.len() > 16 || generation == 0 {
         return Err(blocker("E_ARCHIVE_BINDING", "archive"));
     }
@@ -300,16 +332,26 @@ pub(crate) fn inspect_native(
     }
     let repo = repository::resolve_native(home, team, until)
         .map_err(|_| blocker("E_REPO_BINDING_UNAVAILABLE", team))?;
+    if held.is_some_and(|(_, locks)| locks.len() != names.len()) {
+        return Err(blocker("E_ARCHIVE_LOCKED", team));
+    }
     let before: Vec<_> = names
         .iter()
-        .map(|n| read_owner(home, n))
+        .map(|n| {
+            if held.is_some() {
+                read_private_json(&home.join(".aperture/run/owner").join(format!("{n}.json")))
+                    .map_err(|_| blocker("E_ARCHIVE_OWNER_INVALID", n))
+            } else {
+                read_owner(home, n)
+            }
+        })
         .collect::<Result<_, _>>()?;
     let lead = before
         .iter()
         .find(|r| r.seat == snapshot.lead)
         .ok_or_else(|| blocker("E_ARCHIVE_OWNER_INVALID", team))?;
     let mut views = vec![];
-    for owner in &before {
+    for (owner_index, owner) in before.iter().enumerate() {
         check_time(until)?;
         let mut view = NativeSeatView {
             seat: owner.seat.clone(),
@@ -317,18 +359,33 @@ pub(crate) fn inspect_native(
             never_started: false,
             owner_sha256: hash(owner)?,
             exact_processes_gone: false,
+            process_evidence_sha256: None,
             revocation_metadata_verified: false,
             remote_reconciled: false,
             remote_complete_observation: false,
             remote_source: None,
             remote_inventory_sha256: None,
+            remote_evidence_sha256: None,
+            checkpoint_evidence_sha256: None,
+            worktree_observation_sha256: None,
             bound_worktree_count: 0,
             worktrees_clean: false,
             owner_stale_verified: owner.state == OwnerState::Stale,
             blockers: vec![],
         };
         if owner.generation == 0 {
-            match inspect_never_started(home, &snapshot, &state, owner) {
+            let never_started = match held {
+                Some((team_lock, seat_locks)) => verify_never_started_locked(
+                    home,
+                    &snapshot,
+                    &state,
+                    owner,
+                    team_lock,
+                    &seat_locks[owner_index],
+                ),
+                None => inspect_never_started(home, &snapshot, &state, owner),
+            };
+            match never_started {
                 Ok(()) => {
                     view.never_started = true;
                 }
@@ -346,16 +403,22 @@ pub(crate) fn inspect_native(
             views.push(view);
             continue;
         }
-        match crate::team_process::native::collect_native_until(
-            home,
-            team,
-            &owner.seat,
-            owner.generation,
-            until,
-        ) {
+        let process_result = if held.is_some() {
+            crate::team_process::native::collect_native_until_locked(owner, until)
+        } else {
+            crate::team_process::native::collect_native_until(
+                home,
+                team,
+                &owner.seat,
+                owner.generation,
+                until,
+            )
+        };
+        match process_result {
             Ok(processes) => {
                 view.exact_processes_gone =
                     processes_gone(owner, &processes, crate::team_process::state);
+                view.process_evidence_sha256 = Some(hash(&processes)?);
                 if view.exact_processes_gone {
                     view.revocation_metadata_verified =
                         crate::team_replacement::native::revoked_metadata(home, &processes)
@@ -373,20 +436,28 @@ pub(crate) fn inspect_native(
                 .push(blocker("E_REVOCATION_UNVERIFIED", &owner.seat));
         }
         check_time(until)?;
-        match remote::project_native(
-            home,
-            &remote::RemoteTarget {
-                team: team.into(),
-                seat: owner.seat.clone(),
-                expected_generation: owner.generation,
-            },
-            sentinels,
-        ) {
+        let remote_target = remote::RemoteTarget {
+            team: team.into(),
+            seat: owner.seat.clone(),
+            expected_generation: owner.generation,
+        };
+        let remote_result = match held {
+            Some((team_lock, seat_locks)) => remote::project_native_locked(
+                home,
+                &remote_target,
+                sentinels,
+                team_lock,
+                seat_locks,
+            ),
+            None => remote::project_native(home, &remote_target, sentinels),
+        };
+        match remote_result {
             Ok(p) => {
                 view.remote_reconciled = p.may_proceed;
                 view.remote_complete_observation = p.inventory.complete_observation;
                 view.remote_source = p.source;
                 view.remote_inventory_sha256 = Some(p.inventory.inventory_hash);
+                view.remote_evidence_sha256 = Some(p.evidence_sha256);
             }
             Err(_) => {}
         }
@@ -399,6 +470,7 @@ pub(crate) fn inspect_native(
         // from payload/process or fall back to the repository root.
         let mut bound = std::collections::BTreeMap::new();
         let mut referenced = std::collections::BTreeSet::new();
+        let mut checkpoint_evidence = Vec::new();
         let mut valid = owner.generation <= 128 && admitted_owner(lead, &snapshot.lead);
         if valid {
             for g in 1..=owner.generation {
@@ -410,13 +482,25 @@ pub(crate) fn inspect_native(
                     lead_seat: snapshot.lead.clone(),
                     lead_generation: lead.generation,
                 };
-                match crate::team_checkpoint::native::validation::validated_entries_native(
-                    home,
-                    &ctx,
-                    sentinels,
-                    || Ok(()),
-                ) {
+                let entries_result = match held {
+                    Some((team_lock, seat_locks)) => {
+                        crate::team_checkpoint::native::validation::validated_entries_native_locked(
+                            home, &ctx, sentinels, team_lock, seat_locks,
+                        )
+                    }
+                    None => crate::team_checkpoint::native::validation::validated_entries_native(
+                        home,
+                        &ctx,
+                        sentinels,
+                        || Ok(()),
+                    ),
+                };
+                match entries_result {
                     Ok(entries) => {
+                        checkpoint_evidence.extend(
+                            serde_json::to_vec(&entries)
+                                .map_err(|_| blocker("E_ARCHIVE_NATIVE_INVALID", &owner.seat))?,
+                        );
                         for entry in entries {
                             referenced.insert(entry.payload.worktree);
                         }
@@ -426,13 +510,20 @@ pub(crate) fn inspect_native(
                         break;
                     }
                 }
-                match crate::team_checkpoint::native::validation::historical_bindings_native(
-                    home,
-                    &ctx,
-                    sentinels,
-                    || Ok(()),
-                ) {
+                let bindings_result = match held {
+                    Some((team_lock, seat_locks)) => crate::team_checkpoint::native::validation::historical_bindings_native_locked(
+                        home, &ctx, sentinels, team_lock, seat_locks,
+                    ),
+                    None => crate::team_checkpoint::native::validation::historical_bindings_native(
+                        home, &ctx, sentinels, || Ok(()),
+                    ),
+                };
+                match bindings_result {
                     Ok(entries) => {
+                        checkpoint_evidence.extend(
+                            serde_json::to_vec(&entries)
+                                .map_err(|_| blocker("E_ARCHIVE_NATIVE_INVALID", &owner.seat))?,
+                        );
                         for e in entries {
                             bound.insert(e.payload.worktree.clone(), e);
                         }
@@ -449,17 +540,27 @@ pub(crate) fn inspect_native(
             }
         }
         view.bound_worktree_count = bound.len();
+        if valid {
+            view.checkpoint_evidence_sha256 =
+                Some(format!("{:x}", sha2::Sha256::digest(&checkpoint_evidence)));
+        }
         view.worktrees_clean =
             valid && bound_coverage(&referenced, &bound.keys().cloned().collect());
+        let mut worktree_observations = Vec::new();
         for entry in bound.values() {
             check_time(until)?;
             match repository::collect_native(&repo, entry, until) {
-                Ok(actual) if actual.dirty_files.is_empty() => {}
+                Ok(actual) if actual.dirty_files.is_empty() => {
+                    worktree_observations.push((entry.payload.worktree.clone(), actual));
+                }
                 _ => {
                     view.worktrees_clean = false;
                     break;
                 }
             }
+        }
+        if view.worktrees_clean {
+            view.worktree_observation_sha256 = Some(hash(&worktree_observations)?);
         }
         if !view.worktrees_clean {
             view.blockers
@@ -469,7 +570,17 @@ pub(crate) fn inspect_native(
     }
     check_time(until)?;
     for owner in &before {
-        if read_owner(home, &owner.seat)? != *owner {
+        let current = if held.is_some() {
+            read_private_json(
+                &home
+                    .join(".aperture/run/owner")
+                    .join(format!("{}.json", owner.seat)),
+            )
+            .map_err(|_| blocker("E_ARCHIVE_OWNER_INVALID", &owner.seat))?
+        } else {
+            read_owner(home, &owner.seat)?
+        };
+        if current != *owner {
             return Err(blocker("E_ARCHIVE_NATIVE_DRIFT", &owner.seat));
         }
     }

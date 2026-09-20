@@ -519,11 +519,28 @@ impl OwnerStore {
         self.mark_stale_locked(actor, seat, expected_generation)
     }
 
-    pub(crate) fn mark_stale_locked(&self, actor: &AuthenticatedActor, seat: &str, expected_generation: u64) -> Result<OwnerRecord, String> {
+    pub(crate) fn mark_stale_locked(
+        &self,
+        actor: &AuthenticatedActor,
+        seat: &str,
+        expected_generation: u64,
+    ) -> Result<OwnerRecord, String> {
+        self.mark_stale_locked_at(actor, seat, expected_generation, &now())
+    }
+
+    pub(crate) fn mark_stale_locked_at(
+        &self,
+        actor: &AuthenticatedActor,
+        seat: &str,
+        expected_generation: u64,
+        transition_at: &str,
+    ) -> Result<OwnerRecord, String> {
+        chrono::DateTime::parse_from_rfc3339(transition_at)
+            .map_err(|_| "E_STATE_CONFLICT: invalid owner transition time".to_string())?;
         let mut record = self.read_unlocked(seat)?;
         if record.generation != expected_generation { return Err("E_GENERATION_MISMATCH: owner generation changed".into()); }
         record.state = OwnerState::Stale;
-        record.since = now();
+        record.since = transition_at.into();
         record.writer = actor.principal().into();
         self.write_unlocked(&record, true)?;
         Ok(record)

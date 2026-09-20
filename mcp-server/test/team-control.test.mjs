@@ -82,6 +82,8 @@ test("control watchdog is fixed by action and replacement timeout is unknown aft
   assert.equal(teamControlWatchdogMs("inspect_remote"), 15_000);
   assert.equal(teamControlWatchdogMs("resolve_remote"), 15_000);
   assert.equal(teamControlWatchdogMs("replace"), 180_000);
+  assert.equal(teamControlWatchdogMs("archive"), 90_000);
+  assert.equal(teamControlWatchdogMs("rollback_archive"), 90_000);
 
   const root = mkdtempSync(join(tmpdir(), "aperture-team-control-timeout-"));
   const bin = join(root, "control");

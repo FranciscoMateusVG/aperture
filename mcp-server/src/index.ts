@@ -516,6 +516,38 @@ server.tool(
   },
 );
 
+server.tool(
+  "team_archive",
+  "GLaDOS-only: recollect the complete archive inventory, durably approve its exact hashes, and archive one active team through the native journal. A blocked checklist performs no archive mutation.",
+  { team: teamIdSchema, expected_generation: z.number().int().positive() },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "archive", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_rollback_archive",
+  "GLaDOS-only manual inverse for an archived or partially archived team. Uses the durable byte manifest and no-replace journal; missing or conflicting evidence fails closed.",
+  { team: teamIdSchema, expected_generation: z.number().int().positive() },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "rollback_archive", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
 // ── V4 managed-seat control ──
 
 // These tools carry selectors and bounded data only. The Rust child is the

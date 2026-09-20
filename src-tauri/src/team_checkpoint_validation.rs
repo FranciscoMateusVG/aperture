@@ -40,7 +40,7 @@ pub(crate) struct ValidationFact {
 struct LockedHistory {
     // Drop seat locks before team lock. Acquire seats in lexical order.
     _seats: Vec<AdvisoryLock>,
-    _team: AdvisoryLock,
+    _team: Option<AdvisoryLock>,
     dir: PathBuf,
 }
 fn open(home: &Path, ctx: &ValidationContext) -> Result<LockedHistory, CheckpointError> {
@@ -103,7 +103,56 @@ fn open(home: &Path, ctx: &ValidationContext) -> Result<LockedHistory, Checkpoin
     .map_err(|_| CheckpointError::Unsafe)?;
     Ok(LockedHistory {
         _seats: locks,
-        _team: team_lock,
+        _team: Some(team_lock),
+        dir,
+    })
+}
+
+fn open_prelocked(
+    home: &Path,
+    ctx: &ValidationContext,
+    _team_lock: &AdvisoryLock,
+    _seat_locks: &[AdvisoryLock],
+) -> Result<LockedHistory, CheckpointError> {
+    use crate::team_checkpoint::identifier;
+    if !identifier(&ctx.team, 16)
+        || !identifier(&ctx.seat, 31)
+        || !identifier(&ctx.lead_seat, 31)
+        || ctx.generation == 0
+        || ctx.lead_generation == 0
+    {
+        return Err(CheckpointError::Generation);
+    }
+    let root = home.join(".aperture/teams");
+    let team_dir =
+        validate_component_path(&root, &ctx.team, false).map_err(|_| CheckpointError::Unsafe)?;
+    let snapshot: TeamSnapshot =
+        read_private_json(&team_dir.join("team.json")).map_err(|_| CheckpointError::Corrupt)?;
+    if snapshot.lead != ctx.lead_seat {
+        return Err(CheckpointError::Generation);
+    }
+    let owners = OwnerStore::new(home.join(".aperture/run/owner"));
+    let lead: OwnerRecord = read_private_json(&owners.record_path(&ctx.lead_seat))
+        .map_err(|_| CheckpointError::Corrupt)?;
+    let target: OwnerRecord =
+        read_private_json(&owners.record_path(&ctx.seat)).map_err(|_| CheckpointError::Corrupt)?;
+    let actual = lead.incarnation.as_ref().ok_or(CheckpointError::Corrupt)?;
+    if lead.generation != ctx.lead_generation
+        || lead.state != OwnerState::Active
+        || target.generation < ctx.generation
+        || !actual.observed
+    {
+        return Err(CheckpointError::Generation);
+    }
+    let dir = validate_component_path(
+        &root,
+        &format!("{}/checkpoints/{}", ctx.team, ctx.seat),
+        false,
+    )
+    .map_err(|_| CheckpointError::Unsafe)?;
+    Ok(LockedHistory {
+        _seats: vec![],
+        _team: None,
         dir,
     })
 }
@@ -345,4 +394,45 @@ where
         .collect();
     revalidate()?;
     Ok(bound)
+}
+
+pub(crate) fn validated_entries_native_locked(
+    home: &Path,
+    ctx: &ValidationContext,
+    sentinels: &[String],
+    team_lock: &AdvisoryLock,
+    seat_locks: &[AdvisoryLock],
+) -> Result<Vec<CheckpointEntry>, CheckpointError> {
+    let history = open_prelocked(home, ctx, team_lock, seat_locks)?;
+    let mut entries = checked_entries(&history, ctx, sentinels)?;
+    for fact in read_facts(&history, ctx, &entries, sentinels)? {
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.checkpoint_id == fact.checkpoint_id)
+            .ok_or(CheckpointError::Corrupt)?;
+        entry.validation = fact.result;
+    }
+    Ok(entries)
+}
+
+pub(crate) fn historical_bindings_native_locked(
+    home: &Path,
+    ctx: &ValidationContext,
+    sentinels: &[String],
+    team_lock: &AdvisoryLock,
+    seat_locks: &[AdvisoryLock],
+) -> Result<Vec<CheckpointEntry>, CheckpointError> {
+    let history = open_prelocked(home, ctx, team_lock, seat_locks)?;
+    let entries = checked_entries(&history, ctx, sentinels)?;
+    let facts = read_facts(&history, ctx, &entries, sentinels)?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| {
+            facts.iter().any(|f| {
+                f.checkpoint_id == e.checkpoint_id
+                    && f.content_hash == e.content_hash
+                    && f.result == CheckpointValidation::Ok
+            })
+        })
+        .collect())
 }

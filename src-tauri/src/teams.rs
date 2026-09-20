@@ -532,6 +532,7 @@ pub enum TeamControlRequest {
     ResolveRemote(ResolveRemoteInput),
     Replace(AgentReplaceInput),
     Archive(ArchiveTeamInput),
+    RollbackArchive(ArchiveTeamInput),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -545,6 +546,7 @@ pub enum TeamControlResponse {
     ResolveRemote(ResolutionReceipt),
     Replace(ReplacementView),
     Archive(ArchiveView),
+    RollbackArchive(TeamView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1138,16 +1140,22 @@ impl TeamEngine {
                     kind: JournalObjectKind::File,
                 });
             }
-            write_journal(&journal_path, &Journal {
-                schema_version: 1,
-                operation: JournalOperation::Activate,
-                team: input.team.clone(),
-                uuid: view.snapshot.staging_uuid.clone(),
-                moves,
-                step: 0,
-                preimage_sha256: request.snapshot_sha256.clone(),
-                archive_approval: None,
-            }).map_err(TeamError::from_message)?;
+            write_journal(
+                &journal_path,
+                &Journal {
+                    schema_version: 1,
+                    operation: JournalOperation::Activate,
+                    team: input.team.clone(),
+                    uuid: view.snapshot.staging_uuid.clone(),
+                    moves,
+                    step: 0,
+                    preimage_sha256: request.snapshot_sha256.clone(),
+                    archive_approval: None,
+                    archive_preimage: vec![],
+                    archive_mutable_files: vec![],
+                },
+            )
+            .map_err(TeamError::from_message)?;
         }
         let roots = JournalRoots {
             teams: self.paths.teams.clone(), staging: self.paths.staging.clone(),
@@ -1834,6 +1842,8 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
             native_sha256: native.sha256,
             owner_sha256,
             owner_states,
+            owner_post_sha256: vec![],
+            transition_at: String::new(),
             approved_by: "glados".into(),
         },
         snapshot: view.snapshot,
@@ -2139,6 +2149,19 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
                     worktrees: RuntimeCheckState::Verified,
                 }, blockers: vec![],
             }))
+        }
+        TeamControlRequest::RollbackArchive(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            crate::team_archive_finalize::rollback(
+                &engine.paths.home,
+                &actor,
+                &input.team,
+                input.expected_generation,
+            )
+            .map_err(TeamError::from_message)?;
+            engine
+                .read_team_view(&input.team)
+                .map(TeamControlResponse::RollbackArchive)
         }
     }
 }
@@ -2509,18 +2532,28 @@ mod tests {
             });
         }
         let team_dir = home.join(".aperture/teams/t7");
-        let request: CreationRequestDTO = read_private_json(&team_dir.join("activation_request.json")).unwrap();
-        write_journal(&team_dir.join("journal.json"), &Journal {
-            schema_version: 1,
-            operation: JournalOperation::Activate,
-            team: "t7".into(),
-            uuid: view.snapshot.staging_uuid.clone(),
-            step: moves.len(),
-            moves,
-            preimage_sha256: request.snapshot_sha256,
-            archive_approval: None,
-        }).unwrap();
-        let marker = home.join(".claude/aperture").join(&seats[0]).join(".complete");
+        let request: CreationRequestDTO =
+            read_private_json(&team_dir.join("activation_request.json")).unwrap();
+        write_journal(
+            &team_dir.join("journal.json"),
+            &Journal {
+                schema_version: 1,
+                operation: JournalOperation::Activate,
+                team: "t7".into(),
+                uuid: view.snapshot.staging_uuid.clone(),
+                step: moves.len(),
+                moves,
+                preimage_sha256: request.snapshot_sha256,
+                archive_approval: None,
+                archive_preimage: vec![],
+                archive_mutable_files: vec![],
+            },
+        )
+        .unwrap();
+        let marker = home
+            .join(".claude/aperture")
+            .join(&seats[0])
+            .join(".complete");
         fs::remove_file(&marker).unwrap();
 
         let recovered = engine.activate(&authenticate_glados_control().unwrap(), input).unwrap();

@@ -2,9 +2,9 @@
 //! seam; only the durable journal may resume an interrupted mutation.
 use crate::journal::{
     apply_or_recover_journal, ensure_private_dir, read_journal, read_private_json, remove_journal,
-    sync_dir, write_journal, write_private_bytes_atomic, write_private_json_atomic,
-    ArchiveJournalApproval, Journal, JournalMove, JournalObjectKind, JournalOperation, JournalRoot,
-    JournalRoots,
+    replace_journal, sync_dir, write_journal, write_private_bytes_atomic,
+    write_private_json_atomic, ArchiveJournalApproval, ArchiveMutableFile, ArchivePreimageEntry,
+    Journal, JournalMove, JournalObjectKind, JournalOperation, JournalRoot, JournalRoots,
 };
 use crate::owner::{try_lock, OwnerStore};
 use crate::state::OwnerState;
@@ -12,6 +12,8 @@ use crate::team_auth::AuthenticatedActor;
 use crate::teams::{TeamLifecycle, TeamSnapshot, TeamStateFile};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -27,15 +29,276 @@ fn owner_hash(value: &crate::owner::OwnerRecord) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn validate_owner_binding(
+    owner: &crate::owner::OwnerRecord,
+    expected_state: Option<&str>,
+    pre_sha256: Option<&String>,
+    post_sha256: Option<&String>,
+    recovering: bool,
+) -> Result<(), String> {
+    let actual = owner_hash(owner)?;
+    match (recovering, expected_state, &owner.state) {
+        (false, Some("active"), OwnerState::Active) | (false, Some("stale"), OwnerState::Stale) => {
+            if pre_sha256 != Some(&actual) {
+                return Err("E_ARCHIVE_APPROVAL_STALE: owner changed".into());
+            }
+        }
+        (true, Some("active"), OwnerState::Active) => {
+            if pre_sha256 != Some(&actual) {
+                return Err("E_ARCHIVE_APPROVAL_STALE: owner changed".into());
+            }
+        }
+        (true, Some("active"), OwnerState::Stale) => {
+            if post_sha256 != Some(&actual) {
+                return Err("E_ARCHIVE_APPROVAL_STALE: owner postimage changed".into());
+            }
+        }
+        (true, Some("stale"), OwnerState::Stale) => {
+            if pre_sha256 != Some(&actual) || post_sha256 != Some(&actual) {
+                return Err("E_ARCHIVE_APPROVAL_STALE: stale owner changed".into());
+            }
+        }
+        _ => return Err("E_ARCHIVE_OWNER_INVALID: owner state changed".into()),
+    }
+    Ok(())
+}
+
 fn journal_path(home: &Path, team: &str) -> PathBuf {
     home.join(".aperture/run/team-journals")
         .join(format!("{team}.archive.json"))
 }
 
-fn preimage(approval: &ArchiveJournalApproval) -> Result<String, String> {
-    let bytes = serde_json::to_vec(approval)
-        .map_err(|_| "E_ARCHIVE_APPROVAL_INVALID: approval encoding failed".to_string())?;
+fn rollback_plan_path(home: &Path, team: &str) -> PathBuf {
+    home.join(".aperture/run/archive-manifests")
+        .join(format!("{team}.json"))
+}
+
+fn preimage_hash(entries: &[ArchivePreimageEntry]) -> Result<String, String> {
+    let bytes = serde_json::to_vec(entries)
+        .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: manifest encoding failed".to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn walk_preimage(
+    root: &Path,
+    root_kind: JournalRoot,
+    relative: &Path,
+    out: &mut Vec<ArchivePreimageEntry>,
+    total_bytes: &mut u64,
+) -> Result<(), String> {
+    if out.len() >= 2048 {
+        return Err("E_ARCHIVE_PREIMAGE_INVALID: path count exceeds limit".into());
+    }
+    let path = root.join(relative);
+    let meta = fs::symlink_metadata(&path)
+        .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: path is unavailable".to_string())?;
+    if meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+    {
+        return Err("E_ARCHIVE_PREIMAGE_INVALID: unsafe path metadata".into());
+    }
+    let rel = relative
+        .to_str()
+        .ok_or_else(|| "E_ARCHIVE_PREIMAGE_INVALID: non-UTF8 path".to_string())?
+        .to_string();
+    if meta.is_dir() {
+        out.push(ArchivePreimageEntry {
+            root: root_kind.clone(),
+            relative: rel,
+            kind: JournalObjectKind::Directory,
+            mode: meta.mode() & 0o777,
+            sha256: None,
+        });
+        let mut children = fs::read_dir(&path)
+            .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: directory unreadable".to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: directory unreadable".to_string())?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            walk_preimage(
+                root,
+                root_kind.clone(),
+                &relative.join(child.file_name()),
+                out,
+                total_bytes,
+            )?;
+        }
+    } else if meta.is_file() && meta.nlink() == 1 {
+        *total_bytes = total_bytes
+            .checked_add(meta.len())
+            .ok_or_else(|| "E_ARCHIVE_PREIMAGE_INVALID: byte count overflow".to_string())?;
+        if *total_bytes > 32 * 1024 * 1024 {
+            return Err("E_ARCHIVE_PREIMAGE_INVALID: byte count exceeds limit".into());
+        }
+        let mut file = crate::journal::open_private_file_nofollow(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: file unreadable".to_string())?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        out.push(ArchivePreimageEntry {
+            root: root_kind,
+            relative: rel,
+            kind: JournalObjectKind::File,
+            mode: meta.mode() & 0o777,
+            sha256: Some(format!("{:x}", hasher.finalize())),
+        });
+    } else {
+        return Err("E_ARCHIVE_PREIMAGE_INVALID: unsupported path kind".into());
+    }
+    Ok(())
+}
+
+fn read_mutable(
+    root: JournalRoot,
+    base: &Path,
+    relative: &str,
+) -> Result<ArchiveMutableFile, String> {
+    let path = base.join(relative);
+    let mut file = crate::journal::open_private_file_nofollow(&path)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: mutable file unreadable".to_string())?;
+    if bytes.len() > 16 * 1024 {
+        return Err("E_ARCHIVE_PREIMAGE_INVALID: mutable file exceeds limit".into());
+    }
+    Ok(ArchiveMutableFile {
+        root,
+        relative: relative.into(),
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        bytes,
+    })
+}
+
+fn collect_preimage(
+    teams: &Path,
+    agents: &Path,
+    team: &str,
+    seats: &[String],
+) -> Result<(Vec<ArchivePreimageEntry>, Vec<ArchiveMutableFile>), String> {
+    let mut entries = Vec::new();
+    let mut total = 0;
+    walk_preimage(
+        teams,
+        JournalRoot::Teams,
+        Path::new(team),
+        &mut entries,
+        &mut total,
+    )?;
+    for seat in seats {
+        walk_preimage(
+            agents,
+            JournalRoot::Agents,
+            Path::new(seat),
+            &mut entries,
+            &mut total,
+        )?;
+    }
+    entries.sort_by(|a, b| {
+        (format!("{:?}", a.root), &a.relative).cmp(&(format!("{:?}", b.root), &b.relative))
+    });
+    let encoded_manifest = serde_json::to_vec(&entries)
+        .map_err(|_| "E_ARCHIVE_PREIMAGE_INVALID: manifest encoding failed".to_string())?;
+    if encoded_manifest.len() > 256 * 1024 {
+        return Err("E_ARCHIVE_PREIMAGE_INVALID: manifest exceeds limit".into());
+    }
+    let mut mutable = vec![read_mutable(
+        JournalRoot::Teams,
+        teams,
+        &format!("{team}/state.json"),
+    )?];
+    for seat in seats {
+        mutable.push(read_mutable(
+            JournalRoot::Agents,
+            agents,
+            &format!("{seat}/manifest.json"),
+        )?);
+    }
+    let mutable_total = mutable
+        .iter()
+        .try_fold(0usize, |total, entry| total.checked_add(entry.bytes.len()))
+        .ok_or_else(|| "E_ARCHIVE_PREIMAGE_INVALID: mutable byte count overflow".to_string())?;
+    if mutable_total > 96 * 1024 {
+        return Err("E_ARCHIVE_PREIMAGE_INVALID: mutable byte count exceeds limit".into());
+    }
+    Ok((entries, mutable))
+}
+
+fn revalidate_evidence_locked(
+    home: &Path,
+    snapshot: &TeamSnapshot,
+    state: &TeamStateFile,
+    approval: &ArchiveJournalApproval,
+    team_lock: &crate::owner::AdvisoryLock,
+    seat_locks: &[crate::owner::AdvisoryLock],
+) -> Result<(), String> {
+    let epic = state
+        .epic_id
+        .as_deref()
+        .ok_or_else(|| "E_RECONCILIATION_INCOMPLETE: archive epic is unavailable".to_string())?;
+    let seats: Vec<_> = snapshot
+        .seats
+        .iter()
+        .map(|seat| seat.name.clone())
+        .collect();
+    // BEADS has no team/owner lock of its own. Holding the lifecycle locks
+    // prevents a concurrent local lifecycle mutation while both complete
+    // external projections are collected and compared immediately before the
+    // archive journal is published.
+    let beads = crate::team_archive::beads::collect_native(
+        home,
+        &snapshot.team,
+        state.generation,
+        epic,
+        &[],
+    )
+    .map_err(|_| "E_ARCHIVE_APPROVAL_STALE: reconciliation recheck failed".to_string())?;
+    let native = crate::team_archive::native::inspect_native_locked(
+        home,
+        &snapshot.team,
+        state.generation,
+        &[],
+        team_lock,
+        seat_locks,
+    )
+    .map_err(|_| "E_ARCHIVE_APPROVAL_STALE: native recheck failed".to_string())?;
+    let mut blockers = beads.structural_blockers(&seats);
+    for seat in &native.seats {
+        blockers.extend(seat.blockers.clone());
+    }
+    validate_evidence_projection(
+        approval,
+        &beads.record_sha256,
+        &beads.inventory_sha256,
+        &native.sha256,
+        blockers.is_empty(),
+    )
+}
+
+fn validate_evidence_projection(
+    approval: &ArchiveJournalApproval,
+    record_sha256: &str,
+    inventory_sha256: &str,
+    native_sha256: &str,
+    blockers_empty: bool,
+) -> Result<(), String> {
+    if !blockers_empty
+        || record_sha256 != approval.record_sha256
+        || inventory_sha256 != approval.inventory_sha256
+        || native_sha256 != approval.native_sha256
+    {
+        return Err("E_ARCHIVE_APPROVAL_STALE: archive evidence changed".into());
+    }
+    Ok(())
 }
 
 fn read_snapshot(home: &Path, team: &str) -> Result<(TeamSnapshot, TeamStateFile), String> {
@@ -64,7 +327,7 @@ pub(crate) fn recover_approval(
     if journal.operation != JournalOperation::Archive
         || journal.team != team
         || approval.generation != generation
-        || journal.preimage_sha256 != preimage(&approval)?
+        || journal.preimage_sha256 != preimage_hash(&journal.archive_preimage)?
     {
         return Err("E_JOURNAL_INCONSISTENT: archive recovery binding mismatch".into());
     }
@@ -77,6 +340,151 @@ pub(crate) fn finalize(
     team: &str,
     generation: u64,
     fresh: Option<FreshArchive<'_>>,
+) -> Result<(), String> {
+    finalize_inner(home, actor, team, generation, fresh, false)
+}
+
+pub(crate) fn rollback(
+    home: &Path,
+    actor: &AuthenticatedActor,
+    team: &str,
+    generation: u64,
+) -> Result<(), String> {
+    if !crate::agent_loader::is_valid_seat_name(team) || team.len() > 16 || generation == 0 {
+        return Err("E_ARCHIVE_BINDING: invalid rollback selector".into());
+    }
+    actor.revalidate_before_mutation()?;
+    let teams = home.join(".aperture/teams");
+    let agents = home.join(".claude/aperture");
+    let owners = OwnerStore::new(home.join(".aperture/run/owner"));
+    let journal_path = journal_path(home, team);
+    let plan_path = rollback_plan_path(home, team);
+    let source = if fs::symlink_metadata(&journal_path).is_ok() {
+        read_journal(&journal_path)?
+    } else {
+        read_journal(&plan_path)?
+    };
+    let approval = source
+        .archive_approval
+        .as_ref()
+        .ok_or_else(|| "E_JOURNAL_INCONSISTENT: rollback approval missing".to_string())?;
+    if source.team != team
+        || approval.generation != generation
+        || source.preimage_sha256 != preimage_hash(&source.archive_preimage)?
+        || !matches!(
+            source.operation,
+            JournalOperation::Archive | JournalOperation::RollbackArchive
+        )
+    {
+        return Err("E_JOURNAL_INCONSISTENT: rollback binding mismatch".into());
+    }
+    let mut seats: Vec<_> = approval
+        .owner_sha256
+        .iter()
+        .map(|(seat, _)| seat.clone())
+        .collect();
+    seats.sort();
+    seats.dedup();
+    if seats.is_empty() || seats.len() != approval.owner_sha256.len() {
+        return Err("E_JOURNAL_INCONSISTENT: rollback seat coverage mismatch".into());
+    }
+    let _team_lock = try_lock(&home.join(".aperture/run/team-locks"), team)?;
+    let mut _seat_locks = Vec::new();
+    for seat in &seats {
+        _seat_locks.push(owners.lock(seat)?);
+    }
+    actor.revalidate_before_mutation()?;
+    let owner_pre: std::collections::BTreeMap<_, _> =
+        approval.owner_sha256.iter().cloned().collect();
+    let owner_states: std::collections::BTreeMap<_, _> =
+        approval.owner_states.iter().cloned().collect();
+    let owner_post: std::collections::BTreeMap<_, _> =
+        approval.owner_post_sha256.iter().cloned().collect();
+    if owner_pre.len() != seats.len()
+        || owner_states.len() != seats.len()
+        || owner_post.len() != seats.len()
+    {
+        return Err("E_JOURNAL_INCONSISTENT: rollback owner coverage mismatch".into());
+    }
+    for seat in &seats {
+        let owner = owners.read_owner_locked(seat)?;
+        validate_owner_binding(
+            &owner,
+            owner_states.get(seat).map(String::as_str),
+            owner_pre.get(seat),
+            owner_post.get(seat),
+            true,
+        )?;
+        if owner.state != OwnerState::Stale {
+            return Err("E_ARCHIVE_OWNER_INVALID: rollback owner is not stale".into());
+        }
+    }
+
+    let rollback_journal = if source.operation == JournalOperation::RollbackArchive {
+        source
+    } else {
+        let mut inverse = source.clone();
+        inverse.operation = JournalOperation::RollbackArchive;
+        inverse.uuid = Uuid::new_v4().to_string();
+        inverse.step = 0;
+        inverse.moves = source
+            .moves
+            .iter()
+            .rev()
+            .map(|mv| JournalMove {
+                from_root: mv.to_root.clone(),
+                from_rel: mv.to_rel.clone(),
+                to_root: mv.from_root.clone(),
+                to_rel: mv.from_rel.clone(),
+                kind: mv.kind.clone(),
+            })
+            .collect();
+        if fs::symlink_metadata(&journal_path).is_ok() {
+            replace_journal(&journal_path, &inverse)?;
+        } else {
+            ensure_private_dir(journal_path.parent().unwrap())?;
+            write_journal(&journal_path, &inverse)?;
+        }
+        inverse
+    };
+    apply_or_recover_journal(
+        &journal_path,
+        &JournalRoots {
+            teams: teams.clone(),
+            staging: teams.join(".staging"),
+            agents: agents.clone(),
+            owner: owners.root.clone(),
+        },
+    )?;
+    for mutable in &rollback_journal.archive_mutable_files {
+        let root = match mutable.root {
+            JournalRoot::Teams => &teams,
+            JournalRoot::Agents => &agents,
+            _ => return Err("E_JOURNAL_INCONSISTENT: invalid mutable root".into()),
+        };
+        if format!("{:x}", Sha256::digest(&mutable.bytes)) != mutable.sha256 {
+            return Err("E_JOURNAL_INCONSISTENT: mutable preimage hash mismatch".into());
+        }
+        write_private_bytes_atomic(&root.join(&mutable.relative), &mutable.bytes, true)?;
+    }
+    let (actual, _) = collect_preimage(&teams, &agents, team, &seats)?;
+    if actual != rollback_journal.archive_preimage {
+        return Err("E_JOURNAL_INCONSISTENT: rollback byte manifest mismatch".into());
+    }
+    remove_journal(&journal_path)?;
+    if fs::symlink_metadata(&plan_path).is_ok() {
+        remove_journal(&plan_path)?;
+    }
+    Ok(())
+}
+
+fn finalize_inner(
+    home: &Path,
+    actor: &AuthenticatedActor,
+    team: &str,
+    generation: u64,
+    fresh: Option<FreshArchive<'_>>,
+    #[cfg_attr(not(test), allow(unused_variables))] skip_external_recheck_for_fixture: bool,
 ) -> Result<(), String> {
     if !crate::agent_loader::is_valid_seat_name(team) || team.len() > 16 || generation == 0 {
         return Err("E_ARCHIVE_BINDING: invalid archive selector".into());
@@ -93,7 +501,7 @@ pub(crate) fn finalize(
     ensure_private_dir(&journals)?;
     let path = journal_path(home, team);
     let recovering = fs::symlink_metadata(&path).is_ok();
-    let approval = if recovering {
+    let mut approval = if recovering {
         recover_approval(home, team, generation)?
     } else {
         fresh
@@ -143,25 +551,63 @@ pub(crate) fn finalize(
         approval.owner_sha256.iter().cloned().collect();
     let approved_states: std::collections::BTreeMap<_, _> =
         approval.owner_states.iter().cloned().collect();
+    let approved_post: std::collections::BTreeMap<_, _> =
+        approval.owner_post_sha256.iter().cloned().collect();
     if approved.len() != seats.len() || approved_states.len() != seats.len() {
         return Err("E_ARCHIVE_APPROVAL_INVALID: owner coverage mismatch".into());
     }
+    let mut current_owners = std::collections::BTreeMap::new();
     for seat in &seats {
         let owner = owners.read_owner_locked(seat)?;
-        match (approved_states.get(seat).map(String::as_str), &owner.state) {
-            (Some("active"), OwnerState::Active) | (Some("stale"), OwnerState::Stale) => {
-                if approved.get(seat) != Some(&owner_hash(&owner)?) {
-                    return Err("E_ARCHIVE_APPROVAL_STALE: owner changed".into());
-                }
-            }
-            // A durable archive journal is written before this exact transition.
-            // Recovery may therefore observe the owner already fenced stale.
-            (Some("active"), OwnerState::Stale) if recovering => {}
-            _ => return Err("E_ARCHIVE_OWNER_INVALID: owner state changed".into()),
-        }
+        validate_owner_binding(
+            &owner,
+            approved_states.get(seat).map(String::as_str),
+            approved.get(seat),
+            approved_post.get(seat),
+            recovering,
+        )?;
+        current_owners.insert(seat.clone(), owner);
     }
     if !recovering {
+        approval.transition_at = chrono::Utc::now().to_rfc3339();
+        approval.owner_post_sha256 = current_owners
+            .iter()
+            .map(|(seat, owner)| {
+                let mut post = owner.clone();
+                if post.state == OwnerState::Active {
+                    post.state = OwnerState::Stale;
+                    post.since = approval.transition_at.clone();
+                    post.writer = actor.principal().into();
+                }
+                owner_hash(&post).map(|hash| (seat.clone(), hash))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    } else if approved_post.len() != seats.len() {
+        return Err("E_ARCHIVE_APPROVAL_INVALID: owner postimage coverage mismatch".into());
+    }
+    let (archive_preimage, archive_mutable_files) = if recovering {
+        let journal = read_journal(&path)?;
+        (journal.archive_preimage, journal.archive_mutable_files)
+    } else {
+        collect_preimage(&teams, &agents, team, &seats)?
+    };
+    if !recovering {
+        // Last read before any archive directory or journal is created. The
+        // held lifecycle locks freeze local facts; both complete external
+        // projections are compared again here so known pre-mutation drift
+        // fails closed.
+        if !skip_external_recheck_for_fixture {
+            revalidate_evidence_locked(
+                home,
+                &snapshot,
+                &state,
+                &approval,
+                &_team_lock,
+                &seat_locks,
+            )?;
+        }
         ensure_private_dir(&teams.join("archive"))?;
+        ensure_private_dir(&home.join(".aperture/run/archive-manifests"))?;
         ensure_private_dir(&agents.join("_archived"))?;
         ensure_private_dir(&agents.join("_archived").join(team))?;
         let mut moves = vec![JournalMove {
@@ -187,15 +633,17 @@ pub(crate) fn finalize(
                 uuid: Uuid::new_v4().to_string(),
                 moves,
                 step: 0,
-                preimage_sha256: preimage(&approval)?,
+                preimage_sha256: preimage_hash(&archive_preimage)?,
                 archive_approval: Some(approval.clone()),
+                archive_preimage: archive_preimage.clone(),
+                archive_mutable_files: archive_mutable_files.clone(),
             },
         )?;
     }
     for seat in &seats {
         let owner = owners.read_owner_locked(seat)?;
         if owner.state == OwnerState::Active {
-            owners.mark_stale_locked(actor, seat, owner.generation)?;
+            owners.mark_stale_locked_at(actor, seat, owner.generation, &approval.transition_at)?;
         }
     }
     let roots = JournalRoots {
@@ -206,6 +654,24 @@ pub(crate) fn finalize(
     };
     apply_or_recover_journal(&path, &roots)?;
     let archived = teams.join("archive").join(team);
+    for seat in &seats {
+        let manifest_path = agents
+            .join("_archived")
+            .join(team)
+            .join(seat)
+            .join("manifest.json");
+        let mut manifest: serde_json::Value = read_private_json(&manifest_path)?;
+        let object = manifest
+            .as_object_mut()
+            .ok_or_else(|| "E_ARCHIVE_MANIFEST_INVALID: manifest is not an object".to_string())?;
+        match object.get("enabled") {
+            Some(serde_json::Value::Bool(_)) => {
+                object.insert("enabled".into(), serde_json::Value::Bool(false));
+            }
+            _ => return Err("E_ARCHIVE_MANIFEST_INVALID: enabled flag is unavailable".into()),
+        }
+        write_private_json_atomic(&manifest_path, &manifest, true)?;
+    }
     let mut archived_state: TeamStateFile = read_private_json(&archived.join("state.json"))?;
     archived_state.state = TeamLifecycle::Archived;
     archived_state.failure = None;
@@ -224,6 +690,15 @@ pub(crate) fn finalize(
     }
     sync_dir(&archived)?;
     sync_dir(&agents.join("_archived").join(team))?;
+    let completed_journal = read_journal(&path)?;
+    let plan_path = rollback_plan_path(home, team);
+    if fs::symlink_metadata(&plan_path).is_ok() {
+        if read_journal(&plan_path)? != completed_journal {
+            return Err("E_JOURNAL_INCONSISTENT: rollback plan conflicts".into());
+        }
+    } else {
+        write_private_json_atomic(&plan_path, &completed_journal, false)?;
+    }
     remove_journal(&path)?;
     drop(seat_locks);
     if teams.join(team).exists() || !archived.is_dir() || path.exists() {
@@ -244,6 +719,16 @@ pub(crate) fn finalize(
         {
             return Err("E_JOURNAL_INCONSISTENT: archived seat readback failed".into());
         }
+        let manifest: serde_json::Value = read_private_json(
+            &agents
+                .join("_archived")
+                .join(team)
+                .join(seat)
+                .join("manifest.json"),
+        )?;
+        if manifest.get("enabled") != Some(&serde_json::Value::Bool(false)) {
+            return Err("E_JOURNAL_INCONSISTENT: archived seat remains enabled".into());
+        }
     }
     Ok(())
 }
@@ -254,6 +739,103 @@ mod tests {
     use crate::journal::{ensure_private_dir, write_private_json_atomic};
     use crate::state::{ExecutionTuple, Harness, ReasoningEffort};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn archive_evidence_requires_all_exact_hashes_and_zero_blockers() {
+        let approval = ArchiveJournalApproval {
+            generation: 1,
+            epic_id: "aperture-epic".into(),
+            record_sha256: "a".repeat(64),
+            inventory_sha256: "b".repeat(64),
+            native_sha256: "c".repeat(64),
+            owner_sha256: vec![("t1-worker".into(), "d".repeat(64))],
+            owner_states: vec![("t1-worker".into(), "stale".into())],
+            owner_post_sha256: vec![("t1-worker".into(), "d".repeat(64))],
+            transition_at: "2026-09-20T00:00:00Z".into(),
+            approved_by: "glados".into(),
+        };
+        assert!(validate_evidence_projection(
+            &approval,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            true,
+        )
+        .is_ok());
+        for (record, inventory, native, blockers_empty) in [
+            ("x".repeat(64), "b".repeat(64), "c".repeat(64), true),
+            ("a".repeat(64), "x".repeat(64), "c".repeat(64), true),
+            ("a".repeat(64), "b".repeat(64), "x".repeat(64), true),
+            ("a".repeat(64), "b".repeat(64), "c".repeat(64), false),
+        ] {
+            assert!(validate_evidence_projection(
+                &approval,
+                &record,
+                &inventory,
+                &native,
+                blockers_empty,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_owner_binding_rejects_generation_tuple_and_incarnation_drift() {
+        let mut owner = OwnerStore::initial_record(
+            &crate::team_auth::AuthenticatedActor::launcher(),
+            "t1-worker",
+            ExecutionTuple {
+                harness: Harness::Codex,
+                model: "gpt-6-astra".into(),
+                reasoning: Some(ReasoningEffort::High),
+            },
+        )
+        .unwrap();
+        owner.state = OwnerState::Active;
+        owner.generation = 1;
+        owner.incarnation = Some(crate::owner::Incarnation {
+            pid: 900001,
+            start_time: 42,
+            thread_id: "thread".into(),
+            token_id: "a".repeat(64),
+            harness: Harness::Codex,
+            model: "gpt-6-astra".into(),
+            reasoning: Some(ReasoningEffort::High),
+            observed: true,
+            processes: vec![crate::owner::ProcessIdentity {
+                pid: 900001,
+                start_time: 42,
+                ppid: 1,
+                pgid: 900001,
+                cmdline_sha256: "b".repeat(64),
+                cwd: "/private".into(),
+            }],
+        });
+        let pre = owner_hash(&owner).unwrap();
+        let mut post = owner.clone();
+        post.state = OwnerState::Stale;
+        post.since = "2026-09-20T00:00:00Z".into();
+        post.writer = "glados".into();
+        let post_hash = owner_hash(&post).unwrap();
+        validate_owner_binding(&owner, Some("active"), Some(&pre), Some(&post_hash), true).unwrap();
+        validate_owner_binding(&post, Some("active"), Some(&pre), Some(&post_hash), true).unwrap();
+        for mode in 0..3 {
+            let mut changed = post.clone();
+            match mode {
+                0 => changed.generation = 2,
+                1 => changed.requested.model = "other".into(),
+                _ => changed.incarnation.as_mut().unwrap().token_id = "c".repeat(64),
+            }
+            assert!(validate_owner_binding(
+                &changed,
+                Some("active"),
+                Some(&pre),
+                Some(&post_hash),
+                true
+            )
+            .is_err());
+        }
+    }
 
     fn setup() -> (
         PathBuf,
@@ -296,6 +878,11 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+        write_private_json_atomic(
+            &home.join(".claude/aperture/t1-worker/manifest.json"),
+            &serde_json::json!({"name":"t1-worker","model":"gpt-6-astra","window":"t1-worker","role":"backend","enabled":true}),
+            false,
+        ).unwrap();
         let snapshot: TeamSnapshot = serde_json::from_value(serde_json::json!({
             "schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture","preset":{"id":null,"sha256":null},
             "lead":"t1-worker","seats":[{"name":"t1-worker","role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],
@@ -341,6 +928,13 @@ mod tests {
         std::env::set_var("HOME", &home);
         std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
         let actor = crate::team_auth::authenticate_glados_control().unwrap();
+        let (preimage_before, _) = collect_preimage(
+            &home.join(".aperture/teams"),
+            &home.join(".claude/aperture"),
+            "t1",
+            &["t1-worker".into()],
+        )
+        .unwrap();
         let approval = ArchiveJournalApproval {
             generation: 1,
             epic_id: "aperture-epic".into(),
@@ -349,9 +943,11 @@ mod tests {
             native_sha256: "c".repeat(64),
             owner_sha256: vec![("t1-worker".into(), owner_hash(&owner).unwrap())],
             owner_states: vec![("t1-worker".into(), "stale".into())],
+            owner_post_sha256: vec![],
+            transition_at: String::new(),
             approved_by: "glados".into(),
         };
-        finalize(
+        finalize_inner(
             &home,
             &actor,
             "t1",
@@ -361,6 +957,7 @@ mod tests {
                 state: &state,
                 approval: &approval,
             }),
+            true,
         )
         .unwrap();
         assert!(!home.join(".aperture/teams/t1").exists());
@@ -368,7 +965,55 @@ mod tests {
         assert!(home
             .join(".claude/aperture/_archived/t1/t1-worker/.complete")
             .is_file());
+        let manifest: serde_json::Value =
+            read_private_json(&home.join(".claude/aperture/_archived/t1/t1-worker/manifest.json"))
+                .unwrap();
+        assert_eq!(
+            manifest.get("enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
         assert!(!has_journal(&home, "t1"));
+        // Simulate a killed manual inverse after its first no-replace move.
+        // Recovery must reconcile physical state, not trust the step hint.
+        let source = read_journal(&rollback_plan_path(&home, "t1")).unwrap();
+        let mut inverse = source.clone();
+        inverse.operation = JournalOperation::RollbackArchive;
+        inverse.uuid = Uuid::new_v4().to_string();
+        inverse.step = 0;
+        inverse.moves = source
+            .moves
+            .iter()
+            .rev()
+            .map(|mv| JournalMove {
+                from_root: mv.to_root.clone(),
+                from_rel: mv.to_rel.clone(),
+                to_root: mv.from_root.clone(),
+                to_rel: mv.from_rel.clone(),
+                kind: mv.kind.clone(),
+            })
+            .collect();
+        write_journal(&journal_path(&home, "t1"), &inverse).unwrap();
+        crate::journal::rename_no_replace(
+            &home.join(".claude/aperture/_archived/t1/t1-worker"),
+            &home.join(".claude/aperture/t1-worker"),
+        )
+        .unwrap();
+        rollback(&home, &actor, "t1", 1).unwrap();
+        let (preimage_after, _) = collect_preimage(
+            &home.join(".aperture/teams"),
+            &home.join(".claude/aperture"),
+            "t1",
+            &["t1-worker".into()],
+        )
+        .unwrap();
+        assert_eq!(preimage_after, preimage_before);
+        let restored_manifest: serde_json::Value =
+            read_private_json(&home.join(".claude/aperture/t1-worker/manifest.json")).unwrap();
+        assert_eq!(
+            restored_manifest.get("enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(!rollback_plan_path(&home, "t1").exists());
         match old_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
@@ -397,6 +1042,8 @@ mod tests {
             native_sha256: "c".repeat(64),
             owner_sha256: vec![("t1-worker".into(), owner_hash(&owner).unwrap())],
             owner_states: vec![("t1-worker".into(), "stale".into())],
+            owner_post_sha256: vec![("t1-worker".into(), owner_hash(&owner).unwrap())],
+            transition_at: "2026-09-20T00:00:00Z".into(),
             approved_by: "glados".into(),
         };
         let teams = home.join(".aperture/teams");
@@ -405,6 +1052,8 @@ mod tests {
         ensure_private_dir(&agents.join("_archived/t1")).unwrap();
         ensure_private_dir(&home.join(".aperture/run/team-journals")).unwrap();
         let path = journal_path(&home, "t1");
+        let (archive_preimage, archive_mutable_files) =
+            collect_preimage(&teams, &agents, "t1", &["t1-worker".into()]).unwrap();
         write_journal(
             &path,
             &Journal {
@@ -413,8 +1062,10 @@ mod tests {
                 team: "t1".into(),
                 uuid: Uuid::new_v4().to_string(),
                 step: 0,
-                preimage_sha256: preimage(&approval).unwrap(),
+                preimage_sha256: preimage_hash(&archive_preimage).unwrap(),
                 archive_approval: Some(approval),
+                archive_preimage,
+                archive_mutable_files,
                 moves: vec![
                     JournalMove {
                         from_root: JournalRoot::Teams,
@@ -436,11 +1087,120 @@ mod tests {
         .unwrap();
         crate::journal::rename_no_replace(&teams.join("t1"), &teams.join("archive/t1")).unwrap();
 
-        finalize(&home, &actor, "t1", 1, None).unwrap();
+        finalize_inner(&home, &actor, "t1", 1, None, true).unwrap();
         assert!(!has_journal(&home, "t1"));
         assert!(teams.join("archive/t1/state.json").is_file());
         assert!(agents.join("_archived/t1/t1-worker/.complete").is_file());
 
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agents {
+            Some(v) => std::env::set_var("APERTURE_AGENTS_DIR", v),
+            None => std::env::remove_var("APERTURE_AGENTS_DIR"),
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn rollback_missing_source_fails_closed_and_retains_recovery_evidence() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let (home, snapshot, state, owner) = setup();
+        let old_home = std::env::var_os("HOME");
+        let old_agents = std::env::var_os("APERTURE_AGENTS_DIR");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
+        let actor = crate::team_auth::authenticate_glados_control().unwrap();
+        let approval = ArchiveJournalApproval {
+            generation: 1,
+            epic_id: "aperture-epic".into(),
+            record_sha256: "a".repeat(64),
+            inventory_sha256: "b".repeat(64),
+            native_sha256: "c".repeat(64),
+            owner_sha256: vec![("t1-worker".into(), owner_hash(&owner).unwrap())],
+            owner_states: vec![("t1-worker".into(), "stale".into())],
+            owner_post_sha256: vec![],
+            transition_at: String::new(),
+            approved_by: "glados".into(),
+        };
+        finalize_inner(
+            &home,
+            &actor,
+            "t1",
+            1,
+            Some(FreshArchive {
+                snapshot: &snapshot,
+                state: &state,
+                approval: &approval,
+            }),
+            true,
+        )
+        .unwrap();
+        let archived_seat = home.join(".claude/aperture/_archived/t1/t1-worker");
+        let displaced = home.join("displaced-seat-evidence");
+        crate::journal::rename_no_replace(&archived_seat, &displaced).unwrap();
+        let error = rollback(&home, &actor, "t1", 1).unwrap_err();
+        assert!(error.contains("E_JOURNAL_INCONSISTENT"));
+        assert!(journal_path(&home, "t1").is_file());
+        assert!(rollback_plan_path(&home, "t1").is_file());
+        assert!(displaced.is_dir());
+        crate::journal::rename_no_replace(&displaced, &archived_seat).unwrap();
+        rollback(&home, &actor, "t1", 1).unwrap();
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_agents {
+            Some(v) => std::env::set_var("APERTURE_AGENTS_DIR", v),
+            None => std::env::remove_var("APERTURE_AGENTS_DIR"),
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn rollback_corrupt_preimage_fails_closed_and_preserves_plan() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let (home, snapshot, state, owner) = setup();
+        let old_home = std::env::var_os("HOME");
+        let old_agents = std::env::var_os("APERTURE_AGENTS_DIR");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
+        let actor = crate::team_auth::authenticate_glados_control().unwrap();
+        let approval = ArchiveJournalApproval {
+            generation: 1,
+            epic_id: "aperture-epic".into(),
+            record_sha256: "a".repeat(64),
+            inventory_sha256: "b".repeat(64),
+            native_sha256: "c".repeat(64),
+            owner_sha256: vec![("t1-worker".into(), owner_hash(&owner).unwrap())],
+            owner_states: vec![("t1-worker".into(), "stale".into())],
+            owner_post_sha256: vec![],
+            transition_at: String::new(),
+            approved_by: "glados".into(),
+        };
+        finalize_inner(
+            &home,
+            &actor,
+            "t1",
+            1,
+            Some(FreshArchive {
+                snapshot: &snapshot,
+                state: &state,
+                approval: &approval,
+            }),
+            true,
+        )
+        .unwrap();
+        let plan = rollback_plan_path(&home, "t1");
+        let mut corrupted: serde_json::Value = read_private_json(&plan).unwrap();
+        corrupted["archive_mutable_files"][0]["sha256"] = serde_json::Value::String("0".repeat(64));
+        write_private_json_atomic(&plan, &corrupted, true).unwrap();
+        assert!(rollback(&home, &actor, "t1", 1)
+            .unwrap_err()
+            .contains("E_JOURNAL_INCONSISTENT"));
+        assert!(plan.is_file());
+        assert!(home.join(".aperture/teams/archive/t1").is_dir());
         match old_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),

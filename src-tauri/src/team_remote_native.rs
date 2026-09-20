@@ -136,6 +136,7 @@ pub(crate) struct RemoteProjection {
     pub authorized_references: Vec<String>,
     pub source: Option<&'static str>,
     pub may_proceed: bool,
+    pub evidence_sha256: String,
 }
 impl RemoteProjection {
     pub(super) fn permits(
@@ -181,7 +182,7 @@ impl RemoteProjection {
 }
 struct Locked {
     _seats: Vec<AdvisoryLock>,
-    _team: AdvisoryLock,
+    _team: Option<AdvisoryLock>,
     team_dir: PathBuf,
     checkpoints: PathBuf,
     lead: String,
@@ -312,7 +313,40 @@ fn open(
     }
     Ok(Locked {
         _seats: locks,
-        _team: team_lock,
+        _team: Some(team_lock),
+        checkpoints: team_dir.join("checkpoints").join(&t.seat),
+        team_dir,
+        lead: snapshot.lead,
+    })
+}
+
+fn open_prelocked(
+    home: &Path,
+    t: &RemoteTarget,
+    _team_lock: &AdvisoryLock,
+    _seat_locks: &[AdvisoryLock],
+) -> Result<Locked, RemoteError> {
+    if !ident(&t.team, 16) || !ident(&t.seat, 31) || t.expected_generation == 0 {
+        return Err(RemoteError::Invalid);
+    }
+    let team_dir = validate_component_path(&home.join(".aperture/teams"), &t.team, false)
+        .map_err(|_| RemoteError::Unsafe)?;
+    let snapshot: TeamSnapshot =
+        read_private_json(&team_dir.join("team.json")).map_err(|_| RemoteError::Corrupt)?;
+    if snapshot.schema_version != 1
+        || snapshot.team != t.team
+        || !snapshot.seats.iter().any(|s| s.name == t.seat)
+    {
+        return Err(RemoteError::Generation);
+    }
+    match classify_managed_seat(home, &t.seat).map_err(|_| RemoteError::Corrupt)? {
+        Some(ManagedSeatState::Active { team, .. }) if team == t.team => {}
+        _ => return Err(RemoteError::Generation),
+    }
+    owner(home, &t.seat, t.expected_generation)?;
+    Ok(Locked {
+        _seats: vec![],
+        _team: None,
         checkpoints: team_dir.join("checkpoints").join(&t.seat),
         team_dir,
         lead: snapshot.lead,
@@ -537,7 +571,7 @@ fn facts(
 fn projection(
     view: RemoteInventoryView,
     all: &[RemoteResolutionAuthorizationFact],
-) -> RemoteProjection {
+) -> Result<RemoteProjection, RemoteError> {
     let matching: Vec<_> = all
         .iter()
         .filter(|f| {
@@ -559,7 +593,9 @@ fn projection(
         .map(|e| e.reference.clone())
         .collect();
     let may_proceed = (view.complete_observation || risk) && refs.len() == view.effects.len();
-    RemoteProjection {
+    let evidence_sha256 =
+        digest(&serde_json::to_vec(&(all, &view)).map_err(|_| RemoteError::Corrupt)?);
+    Ok(RemoteProjection {
         inventory: view,
         inventory_risk_accepted: risk,
         authorized_references: refs,
@@ -569,7 +605,8 @@ fn projection(
             Some("authorized_decision")
         },
         may_proceed,
-    }
+        evidence_sha256,
+    })
 }
 /// Authenticated inventory read for the existing control action. Lead may
 /// inspect only another seat of its current immutable team, under the same
@@ -611,7 +648,20 @@ pub(crate) fn project_native(
     let locked = open(home, t, None)?;
     let view = inventory(&locked, t, sentinels)?;
     let all = facts(&locked, t, sentinels)?;
-    Ok(projection(view, &all))
+    projection(view, &all)
+}
+
+pub(crate) fn project_native_locked(
+    home: &Path,
+    t: &RemoteTarget,
+    sentinels: &[String],
+    team_lock: &AdvisoryLock,
+    seat_locks: &[AdvisoryLock],
+) -> Result<RemoteProjection, RemoteError> {
+    let locked = open_prelocked(home, t, team_lock, seat_locks)?;
+    let view = inventory(&locked, t, sentinels)?;
+    let all = facts(&locked, t, sentinels)?;
+    projection(view, &all)
 }
 fn principal(auth: &ResolutionAuthority<'_>, t: &RemoteTarget) -> Result<Principal, RemoteError> {
     match auth {
