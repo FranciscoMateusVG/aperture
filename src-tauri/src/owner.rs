@@ -280,12 +280,16 @@ impl OwnerStore {
 
     pub(crate) fn summary(&self, seat: &str) -> Result<OwnerSummary, String> {
         let record = self.read_owner(seat)?;
+        let actual = record.incarnation.as_ref().map(Incarnation::execution_tuple);
+        if record.state == OwnerState::Active && actual.as_ref() != Some(&record.requested) {
+            return Err("E_OWNER_CORRUPT: active owner tuple is not the observed tuple".into());
+        }
         Ok(OwnerSummary {
             generation: record.generation,
             state: record.state,
             since: record.since,
             configured: record.requested,
-            actual: record.incarnation.as_ref().map(Incarnation::execution_tuple),
+            actual,
             process_count: record.incarnation.as_ref().map_or(0, |i| i.processes.len() as u32),
             thread_bound: record.incarnation.as_ref().is_some_and(|i| !i.thread_id.is_empty()),
         })
@@ -365,6 +369,22 @@ mod tests {
         assert!(store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap_err().contains("E_OWNER_CORRUPT"));
         write_private_json_atomic(&store.record_path("t1-backend"), &serde_json::json!({"bad":true}), false).unwrap();
         assert!(store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap_err().contains("E_OWNER_CORRUPT"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_owner_rejects_divergent_observed_tuple() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let actor = AuthenticatedActor::launcher();
+        store.initialize_owner(&actor, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+        store.record_start_candidate(&actor, &reservation, incarnation("gpt-6-astra")).unwrap();
+        store.commit_start(&actor, &reservation).unwrap();
+        let mut record: OwnerRecord = read_private_json(&store.record_path("t1-backend")).unwrap();
+        record.incarnation.as_mut().unwrap().model = "gpt-5.6-sol".into();
+        write_private_json_atomic(&store.record_path("t1-backend"), &record, true).unwrap();
+        assert!(store.summary("t1-backend").unwrap_err().contains("E_OWNER_CORRUPT"));
         fs::remove_dir_all(root).unwrap();
     }
 

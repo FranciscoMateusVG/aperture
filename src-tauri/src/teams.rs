@@ -291,7 +291,10 @@ pub struct TeamCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamSeatView {
+    /// Immutable tuple from the activated team snapshot.
     pub configured: TeamSeat,
+    /// Current owner request/observation. `configured` inside OwnerSummary is
+    /// the current incarnation request and may be an approved fallback.
     pub observed_owner: Option<OwnerSummary>,
 }
 
@@ -744,7 +747,16 @@ impl TeamEngine {
         let mut seats = Vec::with_capacity(snapshot.seats.len());
         for configured in &snapshot.seats {
             let observed_owner = match state.state {
-                TeamLifecycle::Active => Some(OwnerStore::new(self.paths.owners.clone()).summary(&configured.name).map_err(TeamError::from_message)?),
+                TeamLifecycle::Active => {
+                    let owner = OwnerStore::new(self.paths.owners.clone()).summary(&configured.name).map_err(TeamError::from_message)?;
+                    let snapshot_tuple = configured.tuple();
+                    if (owner.generation == 0 && owner.configured != snapshot_tuple)
+                        || (owner.generation > 0 && owner.configured != snapshot_tuple && !snapshot.fallbacks.contains(&owner.configured))
+                    {
+                        return Err(TeamError::state("owner requested tuple is outside the immutable team policy"));
+                    }
+                    Some(owner)
+                }
                 _ => None,
             };
             seats.push(TeamSeatView { configured: configured.clone(), observed_owner });
@@ -838,10 +850,33 @@ impl TeamEngine {
             return Err(TeamError::state("activation request changed"));
         }
         let team_dir = self.paths.teams.join(&input.team);
+        let journal_path = team_dir.join("journal.json");
         let request: CreationRequestDTO = read_private_json(&team_dir.join("activation_request.json")).map_err(TeamError::from_message)?;
         validate_request(&view.snapshot, &view.state, &request)?;
         if view.state.state == TeamLifecycle::Active {
             if view.state.generation == input.expected_generation + 1 && view.state.epic_id.as_deref() == Some(&input.epic_id) {
+                if journal_path.exists() {
+                    let mut seat_names: Vec<_> = view.snapshot.seats.iter().map(|seat| seat.name.clone()).collect();
+                    seat_names.sort();
+                    let owner_store = OwnerStore::new(self.paths.owners.clone());
+                    let mut seat_locks: Vec<AdvisoryLock> = Vec::with_capacity(seat_names.len());
+                    for seat in &seat_names { seat_locks.push(owner_store.lock(seat).map_err(TeamError::from_message)?); }
+                    let roots = JournalRoots {
+                        teams: self.paths.teams.clone(), staging: self.paths.staging.clone(),
+                        agents: self.paths.agents.clone(), owner: self.paths.owners.clone(),
+                    };
+                    apply_or_recover_journal(&journal_path, &roots).map_err(TeamError::from_message)?;
+                    for seat in &seat_names {
+                        let marker = self.paths.agents.join(seat).join(".complete");
+                        if !marker.exists() {
+                            write_private_bytes_atomic(&marker, b"complete\n", false).map_err(TeamError::from_message)?;
+                        }
+                    }
+                    remove_journal(&journal_path).map_err(TeamError::from_message)?;
+                    remove_private_tree(&self.paths.staging.join(&view.snapshot.staging_uuid), &self.paths.staging)?;
+                    drop(seat_locks);
+                    return self.read_team_view(&input.team);
+                }
                 return Ok(view);
             }
             return Err(TeamError::new("E_GENERATION_MISMATCH", "team is already active with different authority"));
@@ -855,7 +890,6 @@ impl TeamEngine {
         let owner_store = OwnerStore::new(self.paths.owners.clone());
         let mut _seat_locks: Vec<AdvisoryLock> = Vec::with_capacity(seat_names.len());
         for seat in &seat_names { _seat_locks.push(owner_store.lock(seat).map_err(TeamError::from_message)?); }
-        let journal_path = team_dir.join("journal.json");
         if !journal_path.exists() {
             let owner_stage = self.paths.staging.join(&view.snapshot.staging_uuid).join("owners");
             ensure_private_dir(&owner_stage).map_err(TeamError::from_message)?;
@@ -1542,6 +1576,87 @@ mod tests {
         assert_eq!(classify_managed_seat(&home, "standing").unwrap(), None);
         write_private_bytes_atomic(&home.join(".claude/aperture/standing/TEAM"), b"{}\n", false).unwrap();
         assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_STATE_CONFLICT");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn owner_requested_tuple_must_follow_snapshot_or_approved_fallback_policy() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("owner-policy");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t6")).unwrap();
+        let actor = authenticate_glados_control().unwrap();
+        engine.activate(&actor, ActivateTeamInput { team:"t6".into(), expected_generation:0, creation_request_id:created.creation_request.request_id, epic_id:"aperture-4rsnc".into() }).unwrap();
+        let seat = "t6-backend";
+        let owner_path = home.join(".aperture/run/owner").join(format!("{seat}.json"));
+        let mut record: crate::owner::OwnerRecord = read_private_json(&owner_path).unwrap();
+        record.generation = 1;
+        record.state = crate::state::OwnerState::Starting;
+        record.requested = ExecutionTuple { harness:Harness::Codex, model:"gpt-5.6-sol".into(), reasoning:Some(ReasoningEffort::High) };
+        write_private_json_atomic(&owner_path, &record, true).unwrap();
+        assert!(engine.read_team_view("t6").is_ok(), "approved fallback remains observable");
+        record.requested = ExecutionTuple { harness:Harness::Codex, model:"gpt-5.6-luna".into(), reasoning:Some(ReasoningEffort::High) };
+        write_private_json_atomic(&owner_path, &record, true).unwrap();
+        assert_eq!(engine.read_team_view("t6").unwrap_err().code, "E_STATE_CONFLICT");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn active_replay_finishes_journal_cleanup_before_returning_loadable_team() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("active-recovery");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t7")).unwrap();
+        let input = ActivateTeamInput {
+            team: "t7".into(), expected_generation: 0,
+            creation_request_id: created.creation_request.request_id,
+            epic_id: "aperture-4rsnc".into(),
+        };
+        engine.activate(&authenticate_glados_control().unwrap(), input.clone()).unwrap();
+        let view = engine.read_team_view("t7").unwrap();
+        let mut seats: Vec<_> = view.snapshot.seats.iter().map(|seat| seat.name.clone()).collect();
+        seats.sort();
+        let mut moves = Vec::new();
+        for seat in &seats {
+            moves.push(JournalMove {
+                from_root: JournalRoot::Staging,
+                from_rel: format!("{}/seats/{seat}", view.snapshot.staging_uuid),
+                to_root: JournalRoot::Agents,
+                to_rel: seat.clone(),
+                kind: JournalObjectKind::Directory,
+            });
+        }
+        for seat in &seats {
+            moves.push(JournalMove {
+                from_root: JournalRoot::Staging,
+                from_rel: format!("{}/owners/{seat}.json", view.snapshot.staging_uuid),
+                to_root: JournalRoot::Owner,
+                to_rel: format!("{seat}.json"),
+                kind: JournalObjectKind::File,
+            });
+        }
+        let team_dir = home.join(".aperture/teams/t7");
+        let request: CreationRequestDTO = read_private_json(&team_dir.join("activation_request.json")).unwrap();
+        write_journal(&team_dir.join("journal.json"), &Journal {
+            schema_version: 1,
+            operation: JournalOperation::Activate,
+            team: "t7".into(),
+            uuid: view.snapshot.staging_uuid.clone(),
+            step: moves.len(),
+            moves,
+            preimage_sha256: request.snapshot_sha256,
+        }).unwrap();
+        let marker = home.join(".claude/aperture").join(&seats[0]).join(".complete");
+        fs::remove_file(&marker).unwrap();
+
+        let recovered = engine.activate(&authenticate_glados_control().unwrap(), input).unwrap();
+        assert_eq!(recovered.state.state, TeamLifecycle::Active);
+        assert!(marker.is_file());
+        assert!(!team_dir.join("journal.json").exists());
         fs::remove_dir_all(home).unwrap();
     }
 

@@ -179,7 +179,7 @@ pub(crate) fn authenticate_glados_control() -> Result<AuthenticatedActor, String
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;

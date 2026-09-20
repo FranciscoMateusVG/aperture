@@ -1,14 +1,16 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::ffi::CString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
+const PRIVATE_JSON_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +127,78 @@ pub fn validate_private_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn c_string(value: &std::ffi::OsStr) -> Result<CString, String> {
+    CString::new(value.as_bytes()).map_err(|_| "E_PATH_UNSAFE: NUL path".to_string())
+}
+
+/// Opens a directory one component at a time. Holding every parent descriptor
+/// while opening the child makes a path-component swap observable rather than
+/// following a newly inserted symlink between validation and use.
+fn open_dir_nofollow(path: &Path) -> Result<File, String> {
+    // Resolve operating-system aliases above the managed root (macOS `/var`
+    // is normally a symlink), then walk the resolved path without following
+    // any component that can be swapped by a caller inside the managed tree.
+    let canonical = fs::canonicalize(path).map_err(|e| format!("E_PATH_UNSAFE: cannot resolve directory: {e}"))?;
+    let expected = fs::metadata(&canonical).map_err(|e| format!("E_PATH_UNSAFE: cannot stat directory: {e}"))?;
+    let absolute = canonical.is_absolute();
+    let start = if absolute { c_string(std::ffi::OsStr::new("/"))? } else { c_string(std::ffi::OsStr::new("."))? };
+    let initial = unsafe { libc::open(start.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if initial < 0 {
+        return Err(format!("E_PATH_UNSAFE: cannot open path root: {}", std::io::Error::last_os_error()));
+    }
+    let mut current = unsafe { File::from_raw_fd(initial) };
+    for component in canonical.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => c_string(name)?,
+            Component::ParentDir | Component::Prefix(_) => return Err("E_PATH_UNSAFE: unsafe directory component".into()),
+        };
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("E_PATH_UNSAFE: unsafe directory component: {}", std::io::Error::last_os_error()));
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    let opened = current.metadata().map_err(|e| format!("E_PATH_UNSAFE: cannot stat opened directory: {e}"))?;
+    if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err("E_PATH_UNSAFE: directory identity changed while opening".into());
+    }
+    Ok(current)
+}
+
+fn validate_open_private_file(file: &File) -> Result<std::fs::Metadata, String> {
+    let meta = file.metadata().map_err(|e| format!("E_PERMISSION_UNSAFE: {e}"))?;
+    if !meta.is_file() || meta.uid() != current_uid() || meta.nlink() != 1 || meta.mode() & 0o077 != 0 {
+        return Err("E_PERMISSION_UNSAFE: unsafe open private file".into());
+    }
+    Ok(meta)
+}
+
+fn open_private_file_nofollow(path: &Path) -> Result<File, String> {
+    let parent = path.parent().ok_or_else(|| "E_PATH_UNSAFE: file has no parent".to_string())?;
+    let name = c_string(path.file_name().ok_or_else(|| "E_PATH_UNSAFE: file has no name".to_string())?)?;
+    let directory = open_dir_nofollow(parent)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("E_PERMISSION_UNSAFE: cannot open private file: {}", std::io::Error::last_os_error()));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    validate_open_private_file(&file)?;
+    Ok(file)
+}
+
 pub fn validate_component_path(root: &Path, relative: &str, allow_missing_leaf: bool) -> Result<PathBuf, String> {
     ensure_private_dir(root)?;
     let rel = ensure_relative(relative)?;
@@ -157,33 +231,55 @@ pub fn validate_component_path(root: &Path, relative: &str, allow_missing_leaf: 
 pub fn write_private_bytes_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| "E_PATH_UNSAFE: file has no parent".to_string())?;
     ensure_private_dir(parent)?;
-    if path.exists() {
+    let directory = open_dir_nofollow(parent)?;
+    let target_name = c_string(path.file_name().ok_or_else(|| "E_PATH_UNSAFE: file has no name".to_string())?)?;
+    let existing = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if existing >= 0 {
+        let existing = unsafe { File::from_raw_fd(existing) };
+        validate_open_private_file(&existing)?;
         if !replace {
             return Err(format!("E_NAME_COLLISION: {} already exists", path.display()));
         }
-        validate_private_file(path)?;
+    } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+        return Err(format!("E_PERMISSION_UNSAFE: unsafe destination: {}", std::io::Error::last_os_error()));
     }
-    let temp = parent.join(format!(".{}.{}.tmp", path.file_name().and_then(|v| v.to_str()).unwrap_or("write"), Uuid::new_v4()));
+    let temp_name = format!(".{}.{}.tmp", path.file_name().and_then(|v| v.to_str()).unwrap_or("write"), Uuid::new_v4());
+    let temp_c = c_string(std::ffi::OsStr::new(&temp_name))?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(PRIVATE_FILE_MODE)
-            .open(&temp)
-            .map_err(|e| format!("E_STAGING_IO: {e}"))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temp_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                PRIVATE_FILE_MODE,
+            )
+        };
+        if fd < 0 {
+            return Err(format!("E_STAGING_IO: cannot create private temp: {}", std::io::Error::last_os_error()));
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
         file.write_all(bytes).map_err(|e| format!("E_STAGING_IO: {e}"))?;
         file.sync_all().map_err(|e| format!("E_STAGING_IO: {e}"))?;
-        validate_private_file(&temp)?;
+        validate_open_private_file(&file)?;
         if replace {
-            fs::rename(&temp, path).map_err(|e| format!("E_STAGING_IO: {e}"))?;
+            let rc = unsafe { libc::renameat(directory.as_raw_fd(), temp_c.as_ptr(), directory.as_raw_fd(), target_name.as_ptr()) };
+            if rc != 0 {
+                return Err(format!("E_STAGING_IO: replace rename failed: {}", std::io::Error::last_os_error()));
+            }
         } else {
-            rename_no_replace(&temp, path)?;
+            rename_no_replace_at(directory.as_raw_fd(), &temp_c, &target_name)?;
         }
-        sync_dir(parent)?;
-        validate_private_file(path)
+        directory.sync_all().map_err(|e| format!("E_STAGING_IO: directory fsync failed: {e}"))?;
+        open_private_file_nofollow(path).map(|_| ())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp);
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_c.as_ptr(), 0); }
     }
     result
 }
@@ -195,11 +291,15 @@ pub fn write_private_json_atomic<T: Serialize>(path: &Path, value: &T, replace: 
 }
 
 pub fn read_private_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
-    validate_private_file(path)?;
+    let mut file = open_private_file_nofollow(path)?;
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|mut file| file.read_to_end(&mut bytes))
+    std::io::Read::by_ref(&mut file)
+        .take((PRIVATE_JSON_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("E_STAGING_IO: {e}"))?;
+    if bytes.len() > PRIVATE_JSON_MAX_BYTES {
+        return Err("E_JOURNAL_INCONSISTENT: private JSON exceeds size limit".into());
+    }
     serde_json::from_slice(&bytes).map_err(|_| "E_JOURNAL_INCONSISTENT: malformed private JSON".into())
 }
 
@@ -224,6 +324,12 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
     if rc == 0 { Ok(()) } else { Err(format!("E_NAME_COLLISION: no-replace rename failed: {}", std::io::Error::last_os_error())) }
 }
 
+#[cfg(target_os = "macos")]
+fn rename_no_replace_at(directory_fd: i32, from: &CString, to: &CString) -> Result<(), String> {
+    let rc = unsafe { libc::renameatx_np(directory_fd, from.as_ptr(), directory_fd, to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 { Ok(()) } else { Err(format!("E_NAME_COLLISION: no-replace rename failed: {}", std::io::Error::last_os_error())) }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
     let from = CString::new(from.as_os_str().as_bytes()).map_err(|_| "E_PATH_UNSAFE: NUL path".to_string())?;
@@ -232,8 +338,20 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> Result<(), String> {
     if rc == 0 { Ok(()) } else { Err(format!("E_NAME_COLLISION: no-replace rename failed: {}", std::io::Error::last_os_error())) }
 }
 
+#[cfg(target_os = "linux")]
+fn rename_no_replace_at(directory_fd: i32, from: &CString, to: &CString) -> Result<(), String> {
+    let rc = unsafe { libc::renameat2(directory_fd, from.as_ptr(), directory_fd, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    if rc == 0 { Ok(()) } else { Err(format!("E_NAME_COLLISION: no-replace rename failed: {}", std::io::Error::last_os_error())) }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_no_replace(_from: &Path, _to: &Path) -> Result<(), String> {
+    Err("E_STAGING_IO: no-replace rename unsupported on this platform".into())
+}
+
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_no_replace_at(_directory_fd: i32, _from: &CString, _to: &CString) -> Result<(), String> {
     Err("E_STAGING_IO: no-replace rename unsupported on this platform".into())
 }
 
@@ -333,6 +451,8 @@ pub fn remove_journal(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn root(tag: &str) -> PathBuf {
@@ -371,5 +491,27 @@ mod tests {
         assert!(roots.staging.join("u/seats/s1").exists());
         assert!(roots.agents.join("s1").exists());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn private_json_io_never_follows_a_leaf_swapped_to_a_symlink() {
+        let base = root("leaf-swap");
+        let target = base.join("state.json");
+        let outside = base.parent().unwrap().join(format!("aperture-outside-{}.json", Uuid::new_v4()));
+        fs::write(&outside, b"{\"outside\":true}\n").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        write_private_json_atomic(&target, &json!({"inside": true}), false).unwrap();
+        validate_private_file(&target).unwrap();
+
+        fs::remove_file(&target).unwrap();
+        symlink(&outside, &target).unwrap();
+        assert!(read_private_json::<serde_json::Value>(&target).unwrap_err().contains("E_PERMISSION_UNSAFE"));
+        assert!(write_private_json_atomic(&target, &json!({"inside": false}), true)
+            .unwrap_err()
+            .contains("E_PERMISSION_UNSAFE"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "{\"outside\":true}\n");
+
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_file(outside).unwrap();
     }
 }
