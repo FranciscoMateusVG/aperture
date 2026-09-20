@@ -566,7 +566,9 @@ const checkpointPayloadSchema = z.object({
 server.tool(
   "team_checkpoint",
   "Managed seat only: append one bounded checkpoint for the caller's current owner generation. Team, seat, generation, writer, sequence and validation are derived by the native control child.",
-  { schema_version: z.literal(1), payload: checkpointPayloadSchema },
+  // Unknown u32 schemas reach the native writer and are retained as rejected
+  // evidence; the transport must not silently erase that recovery history.
+  { schema_version: z.number().int().nonnegative().max(0xffff_ffff), payload: checkpointPayloadSchema },
   async (input) => {
     const denied = managedSeatControlDenied();
     if (denied) return denied;
