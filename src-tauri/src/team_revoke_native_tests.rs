@@ -281,3 +281,213 @@ fn unlaunched_floor_rejects_corruption_ambiguity_and_noncanonical_digests() {
     }
     std::fs::remove_dir_all(home).unwrap();
 }
+
+struct ReadyFixture(std::path::PathBuf);
+impl Drop for ReadyFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+impl ReadyFixture {
+    fn new() -> Self {
+        use crate::journal::{
+            ensure_private_dir, write_private_bytes_atomic, write_private_json_atomic,
+        };
+        let f = Self(
+            std::env::temp_dir().join(format!("aperture-ready-revoke-{}", uuid::Uuid::new_v4())),
+        );
+        let put = |p: &str, v: serde_json::Value| {
+            let p = f.0.join(p);
+            ensure_private_dir(p.parent().unwrap()).unwrap();
+            write_private_json_atomic(&p, &v, false).unwrap();
+        };
+        put(
+            ".aperture/teams/t1/team.json",
+            serde_json::json!({"schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture","preset":{"id":null,"sha256":null},"lead":"t1-worker","seats":[{"name":"t1-worker","role":"lead","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()}),
+        );
+        put(
+            ".aperture/teams/t1/state.json",
+            serde_json::json!({"schema_version":1,"state":"active","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-20T00:00:00Z"}),
+        );
+        put(
+            ".aperture/run/owner/t1-worker.json",
+            serde_json::json!({"schema_version":1,"seat":"t1-worker","generation":1,"state":"active","reservation_nonce_sha256":null,"provisional_token_id":null,"requested":{"harness":"codex","model":"gpt-6-astra","reasoning":"high"},"incarnation":{"pid":900001,"start_time":42,"thread_id":"fixture-thread","token_id":format!("{:x}",Sha256::digest("b".repeat(64).as_bytes())),"harness":"codex","model":"gpt-6-astra","reasoning":"high","observed":true,"processes":[]},"since":"2026-09-20T00:00:00Z","writer":"launcher"}),
+        );
+        put(
+            ".aperture/run/revocations/t1-worker.json",
+            serde_json::json!({"schema_version":1,"seat":"t1-worker","revoked_through_generation":1,"revoked_token_ids":[format!("{:x}",Sha256::digest("b".repeat(64).as_bytes()))]}),
+        );
+        for (path, bytes) in [
+            (".claude/aperture/t1-worker/TEAM", b"".as_slice()),
+            (".claude/aperture/t1-worker/.complete", b"".as_slice()),
+            (
+                ".aperture/run/hub-tokens/watchdog.token",
+                "a".repeat(64).as_bytes(),
+            ),
+        ] {
+            let p = f.0.join(path);
+            ensure_private_dir(p.parent().unwrap()).unwrap();
+            write_private_bytes_atomic(&p, bytes, false).unwrap();
+        }
+        f
+    }
+    fn prior(&self) -> crate::team_replacement::deadline::PriorReady {
+        // Obtain the historical proof through the real native socket exchange,
+        // not a test-created boolean. The server/bearers are synthetic only.
+        let (address, server) = fixture(ack(), Some(4003));
+        let proof = exchange(
+            address,
+            &Bearer("a".repeat(64)),
+            &Bearer("b".repeat(64)),
+            "t1-worker",
+            1,
+            &format!("{:x}", Sha256::digest("b".repeat(64).as_bytes())),
+        )
+        .unwrap();
+        assert_eq!(server.join().unwrap(), 2);
+        let mut attempt = crate::team_replacement::deadline::RuntimeAttempt::begin(
+            &self.0,
+            &crate::team_auth::AuthenticatedActor::launcher(),
+            "t1",
+            "t1-worker",
+            1,
+            crate::team_replacement::deadline::Deadline::new(),
+        )
+        .unwrap();
+        attempt.admit_effects().unwrap();
+        let ready = attempt.finish_ready(&proof).unwrap();
+        drop(ready);
+        crate::journal::read_private_json(&self.prepared()).unwrap()
+    }
+    fn prepared(&self) -> std::path::PathBuf {
+        self.0
+            .join(".aperture/teams/t1/runtime-attempts/t1-worker/g1/prepared.json")
+    }
+    fn guard(&self) -> PersistedProcessSnapshot {
+        let owner: OwnerRecord =
+            crate::journal::read_private_json(&self.0.join(".aperture/run/owner/t1-worker.json"))
+                .unwrap();
+        let i = owner.incarnation.unwrap();
+        let identity = crate::team_process::identity_from_owner(i.pid, i.start_time).unwrap();
+        assert_eq!(crate::team_process::state(&identity), ProcessState::Gone);
+        crate::team_process::persist_for_stop(
+            &self.0,
+            "t1",
+            &crate::team_auth::AuthenticatedActor::launcher(),
+            crate::team_replacement::OwnershipSnapshot {
+                seat: "t1-worker".into(),
+                generation: 1,
+                thread_id: i.thread_id,
+                complete: true,
+                unowned_matches: vec![],
+                processes: vec![crate::team_replacement::OwnedProcess {
+                    identity,
+                    parent_pid: 1,
+                    process_group: 900001,
+                    depth: 0,
+                    cmdline_sha256: "d".repeat(64),
+                    cwd: self.0.to_string_lossy().into_owned(),
+                }],
+            },
+        )
+        .unwrap()
+    }
+}
+#[test]
+fn ready_reaffirm_uses_native_bound_history_floor_and_one_fresh_ack_without_bearer() {
+    let f = ReadyFixture::new();
+    let prior = f.prior();
+    let before = std::fs::read(f.prepared()).unwrap();
+    let guard = f.guard();
+    let (address, server) = fixture(ack(), None);
+    let proof = reaffirm_stopped_at(
+        &f.0,
+        &guard,
+        &prior,
+        address,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_eq!(server.join().unwrap(), 1);
+    assert!(proof.reconnect_is_historical);
+    assert_eq!(proof.reconnect_code, 4003);
+    assert!(proof.durable && proof.sockets_closed && proof.token_deleted);
+    assert!(!f
+        .0
+        .join(".aperture/run/hub-tokens/t1-worker.token")
+        .exists());
+    assert_eq!(std::fs::read(f.prepared()).unwrap(), before);
+}
+#[test]
+fn ready_reaffirm_owner_proof_floor_drift_or_token_presence_prevents_connect() {
+    use crate::journal::{
+        read_private_json, write_private_bytes_atomic, write_private_json_atomic,
+    };
+    for variant in 0..4 {
+        let f = ReadyFixture::new();
+        let mut prior = f.prior();
+        match variant {
+            0 => {
+                let p = f.0.join(".aperture/run/owner/t1-worker.json");
+                let mut o: OwnerRecord = read_private_json(&p).unwrap();
+                o.incarnation.as_mut().unwrap().thread_id = "changed".into();
+                write_private_json_atomic(&p, &o, true).unwrap();
+            }
+            1 => {
+                let mut v: serde_json::Value = read_private_json(&f.prepared()).unwrap();
+                v["owner_identity_sha256"] = "0".repeat(64).into();
+                write_private_json_atomic(&f.prepared(), &v, true).unwrap();
+                prior = read_private_json(&f.prepared()).unwrap();
+            }
+            2 => write_private_bytes_atomic(
+                &f.0.join(".aperture/run/hub-tokens/t1-worker.token"),
+                b"unexpected",
+                false,
+            )
+            .unwrap(),
+            _ => write_private_bytes_atomic(
+                &f.0.join(".aperture/run/revocations/t1-worker.json"),
+                b"{}",
+                true,
+            )
+            .unwrap(),
+        }
+        let guard = f.guard();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(reaffirm_stopped_at(
+            &f.0,
+            &guard,
+            &prior,
+            listener.local_addr().unwrap(),
+            Instant::now() + Duration::from_millis(200)
+        )
+        .is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+#[test]
+fn ready_reaffirm_bad_fresh_ack_cannot_be_replaced_by_historical_success() {
+    let f = ReadyFixture::new();
+    let prior = f.prior();
+    let guard = f.guard();
+    let mut bad = ack();
+    bad["token_directory_synced"] = false.into();
+    let (address, server) = fixture(bad, None);
+    assert!(reaffirm_stopped_at(
+        &f.0,
+        &guard,
+        &prior,
+        address,
+        Instant::now() + Duration::from_secs(3)
+    )
+    .is_err());
+    assert_eq!(server.join().unwrap(), 1);
+    assert!(!f
+        .0
+        .join(".aperture/run/hub-tokens/t1-worker.token")
+        .exists());
+}

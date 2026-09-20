@@ -367,6 +367,15 @@ pub(crate) fn reaffirm_stopped(
     prior: &crate::team_replacement::deadline::PriorReady,
     until: Instant,
 ) -> Result<RevocationProof, ReplacementError> {
+    reaffirm_stopped_at(home, recorded, prior, HUB, until)
+}
+fn reaffirm_stopped_at(
+    home: &Path,
+    recorded: &PersistedProcessSnapshot,
+    prior: &crate::team_replacement::deadline::PriorReady,
+    address: SocketAddr,
+    until: Instant,
+) -> Result<RevocationProof, ReplacementError> {
     remaining(until)?;
     let snapshot = recorded.snapshot();
     if snapshot
@@ -402,7 +411,7 @@ pub(crate) fn reaffirm_stopped(
     verify_floor(home, &snapshot.seat, snapshot.generation, &i.token_id)?;
     let watchdog = read_bearer(home, "watchdog")?;
     let mut proof = exchange_optional_until(
-        HUB,
+        address,
         &watchdog,
         None,
         &snapshot.seat,
