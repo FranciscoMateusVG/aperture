@@ -27,7 +27,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -56,6 +56,7 @@ writeFileSync(BD_STUB, `#!/bin/sh\ncat "$FAKE_BD_UNREAD_FILE"\n`, { mode: 0o755 
 // Module-load-time env for dist/codex-bridge.js + dist/beads.js — MUST be set
 // before the dynamic import below.
 process.env.APERTURE_RUN_DIR = TMP; // thread-ready files land here
+process.env.HOME = TMP;
 process.env.APERTURE_AGENTS_DIR = AGENTS;
 process.env.APERTURE_TEAMS_DIR = TEAMS;
 process.env.BD_PATH = BD_STUB; // beads.ts shells this instead of real bd
@@ -123,7 +124,7 @@ function makeHooks() {
 }
 
 let sockCounter = 0;
-async function scenario(t, { threads = [], delays = {}, failures = {} } = {}) {
+async function scenario(t, { threads = [], delays = {}, failures = {}, threadStartModel, threadStartReasoning } = {}) {
   const agent = `cbx${++sockCounter}`;
   mkdirSync(join(AGENTS, agent));
   writeFileSync(
@@ -133,7 +134,7 @@ async function scenario(t, { threads = [], delays = {}, failures = {} } = {}) {
   writeFileSync(join(AGENTS, agent, "prompt.md"), "fixture");
   const sock = join(TMP, `${agent}.sock`);
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
-  const server = new FakeAppServer(sock, { threads, delays, failures });
+  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning });
   await server.start();
   const { hooks, logs, presence } = makeHooks();
   const bridge = new CodexBridgeClient(agent, sock, hooks);
@@ -143,6 +144,50 @@ async function scenario(t, { threads = [], delays = {}, failures = {} } = {}) {
     setUnread([]);
   });
   return { agent, server, bridge, logs, presence };
+}
+
+function writeManagedOwner(agent, state, receipt = null) {
+  const ownerDir = join(TMP, "owner");
+  mkdirSync(ownerDir, { recursive: true, mode: 0o700 });
+  chmodSync(ownerDir, 0o700);
+  const tokenId = "a".repeat(64);
+  writeFileSync(join(ownerDir, `${agent}.json`), JSON.stringify({
+    schema_version: 1,
+    seat: agent,
+    generation: 1,
+    state,
+    reservation_nonce_sha256: state === "starting" ? "b".repeat(64) : null,
+    provisional_token_id: state === "starting" ? tokenId : null,
+    requested: { harness: "codex", model: "gpt-6-astra", reasoning: "high" },
+    incarnation: {
+      pid: 321,
+      start_time: 1_790_000_000_000_001,
+      thread_id: receipt?.thread_id ?? "",
+      token_id: tokenId,
+      harness: "codex",
+      model: "gpt-6-astra",
+      reasoning: "high",
+      observed: state === "active",
+      processes: [{ pid: 321, start_time: 1_790_000_000_000_001, ppid: 1, pgid: 321, cmdline_sha256: "c".repeat(64), cwd: "/tmp/managed-worktree" }],
+    },
+    since: "2026-09-20T00:00:00Z",
+    writer: "launcher",
+  }), { mode: 0o600 });
+}
+
+function makeManagedSeat(agent) {
+  writeFileSync(join(AGENTS, agent, "TEAM"), "", { mode: 0o600 });
+  writeFileSync(join(AGENTS, agent, ".complete"), "", { mode: 0o600 });
+  const teamDir = join(TEAMS, `${agent}-team`);
+  mkdirSync(teamDir, { mode: 0o700 });
+  writeFileSync(join(teamDir, "state.json"), JSON.stringify({ state: "active", generation: 1 }), { mode: 0o600 });
+  writeFileSync(join(teamDir, "team.json"), JSON.stringify({
+    team: `${agent}-team`,
+    project: "project:aperture",
+    lead: agent,
+    seats: [{ name: agent, role: "backend" }],
+    grants: [],
+  }), { mode: 0o600 });
 }
 
 // ── pins ──
@@ -270,6 +315,84 @@ test("injection-before-bind (fresh session, thread/start bootstrap): pre-bind me
   const inj = server.turnCallsContaining("m-f1");
   assert.equal(inj.length, 1, "pre-bind unread injected exactly once on fresh bind");
   assert.equal(inj[0].method, "turn/steer", "kickoff turn active → steer delivery");
+});
+
+test("managed Starting generation owns one exact fresh thread and stays silent until Active", async (t) => {
+  const { agent, server, bridge, logs, presence } = await scenario(t, { threads: [{ id: "old-thread" }] });
+  makeManagedSeat(agent);
+  writeManagedOwner(agent, "starting");
+  bridge.start();
+
+  const receiptPath = join(TMP, `${agent}.g1.managed-observation.json`);
+  await waitFor(() => existsSync(receiptPath), "managed observation receipt");
+  const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+  assert.equal(server.callsOf("thread/list").length, 0, "managed generation never inherits newest thread");
+  assert.equal(server.callsOf("thread/start").length, 1, "one exact fresh thread/start");
+  assert.deepEqual(server.callsOf("thread/start")[0].params, {
+    model: "gpt-6-astra",
+    allowProviderModelFallback: false,
+    config: { model_reasoning_effort: "high" },
+  });
+  assert.equal(receipt.token_id, "a".repeat(64));
+  assert.equal(receipt.root_pid, 321);
+  assert.equal(receipt.root_start_time_us, 1_790_000_000_000_001);
+  assert.equal(receipt.actual_model, "gpt-6-astra");
+  assert.equal(receipt.actual_reasoning, "high");
+  assert.equal(bridge.isBound, false, "receipt is not an Active owner");
+  assert.deepEqual(presence, [], "no managed presence before Active");
+  assert.equal(server.callsOf("turn/start").length, 0, "no kickoff or work before Active");
+
+  dropClients(server);
+  await waitFor(() => server.callsOf("initialize").length >= 2, "managed bridge reconnect");
+  await delay(100);
+  assert.equal(server.callsOf("thread/start").length, 1, "reconnect reuses receipt without a second start");
+
+  writeManagedOwner(agent, "active", receipt);
+  await waitFor(() => bridge.isBound, "managed bridge binds after native Active commit");
+  assert.equal(bridge.boundThreadId, receipt.thread_id);
+  assert.equal(server.callsOf("thread/resume").length, 0, "fresh managed thread is never resumed by heuristic");
+  await waitFor(() => server.turnCallsContaining(CODEX_KICKOFF_TEXT.slice(0, 40)).length === 1, "managed kickoff after Active");
+  assert.ok(logs.some((entry) => entry.event === "codex_managed_observed"));
+  assert.ok(presence.includes("join"));
+});
+
+test("managed ambiguous or mismatched thread/start is never retried, bound, or delivered", async (t) => {
+  const failed = await scenario(t, { threads: [], failures: { "thread/start": 1 } });
+  makeManagedSeat(failed.agent);
+  writeManagedOwner(failed.agent, "starting");
+  failed.bridge.start();
+  await waitFor(() => failed.server.callsOf("thread/start").length === 1, "managed failed start attempt");
+  await delay(500);
+  assert.equal(failed.server.callsOf("thread/start").length, 1, "ambiguous start is not retried on reconnect");
+  assert.equal(failed.bridge.isBound, false);
+  assert.equal(existsSync(join(TMP, `${failed.agent}.g1.managed-observation.json`)), false);
+
+  const mismatched = await scenario(t, { threads: [], threadStartModel: "gpt-wrong" });
+  makeManagedSeat(mismatched.agent);
+  writeManagedOwner(mismatched.agent, "starting");
+  mismatched.bridge.start();
+  await waitFor(() => mismatched.server.callsOf("thread/start").length === 1, "managed mismatched start attempt");
+  await delay(500);
+  assert.equal(mismatched.server.callsOf("thread/start").length, 1, "model mismatch is terminal for the generation");
+  assert.equal(mismatched.bridge.isBound, false);
+  assert.equal(existsSync(join(TMP, `${mismatched.agent}.g1.managed-observation.json`)), false);
+  assert.equal(mismatched.server.callsOf("turn/start").length, 0);
+  assert.deepEqual(mismatched.presence, []);
+});
+
+test("managed Active reconnect resumes the owner thread, never the newest thread", async (t) => {
+  const { agent, server, bridge } = await scenario(t, {
+    threads: [{ id: "newest-unowned" }, { id: "owner-thread" }],
+  });
+  makeManagedSeat(agent);
+  writeManagedOwner(agent, "active", { thread_id: "owner-thread" });
+  bridge.start();
+  await waitFor(() => bridge.isBound, "managed Active bridge bound");
+  assert.equal(server.callsOf("thread/list").length, 0);
+  assert.equal(server.callsOf("thread/start").length, 0);
+  assert.equal(server.callsOf("thread/resume").length, 1);
+  assert.equal(server.callsOf("thread/resume")[0].params.threadId, "owner-thread");
+  assert.equal(bridge.boundThreadId, "owner-thread");
 });
 
 test("no-thread-at-connect: thread/start failure retried with backoff, no crash, bind completes + thread-ready file published", async (t) => {
@@ -414,6 +537,10 @@ test("aperture-oeb6q B — inject error: one re-pump with flipped turn-state aft
 
   bridge.start();
   await waitFor(() => bridge.isBound, "bridge bound");
+  // Let the bind-triggered empty unread replay finish before this test writes
+  // its row; otherwise that fetch and the explicit pump race and bypass the
+  // retry timer by legitimately scheduling two independent deliveries.
+  await delay(50);
 
   setUnread([msgRow("m-x1", "glados", agent, "message hitting a stale turn-state")]);
   bridge.deliver();

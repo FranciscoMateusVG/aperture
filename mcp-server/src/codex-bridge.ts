@@ -33,12 +33,15 @@
  *   APERTURE_AGENTS_DIR — manifest tree (default ~/.claude/aperture)
  *   APERTURE_RUN_DIR    — socket dir    (default ~/.aperture/run)
  */
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import WebSocket from "ws";
 import { getUnreadMessages } from "./beads.js";
 import { isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
+import { managedOwnerMatches, readManagedActiveRuntime, readManagedOwner, readManagedStartingRuntime, type ManagedStartingRuntime } from "./managed-owner.js";
+import { assertPrivateRuntimeDirectory } from "./private-runtime-path.js";
 
 const AGENTS_DIR = process.env.APERTURE_AGENTS_DIR ?? resolve(homedir(), ".claude", "aperture");
 const RUN_DIR = process.env.APERTURE_RUN_DIR ?? resolve(homedir(), ".aperture", "run");
@@ -53,11 +56,159 @@ const RPC_TIMEOUT_MS = 10_000; // control-plane calls (initialize, thread/*)
 const TURN_RPC_TIMEOUT_MS = 600_000; // turn/start may not respond until the turn ends
 const DISCOVERY_MS = 60_000; // manifest re-scan cadence
 const INJECT_RETRY_MS = envMs("APERTURE_CODEX_INJECT_RETRY_MS", 5_000); // failed inject RPC → single re-pump delay
+const MANAGED_ACTIVE_WAIT_MS = envMs("APERTURE_MANAGED_ACTIVE_WAIT_MS", 10_000);
+const MANAGED_RECEIPT_MAX_BYTES = 8 * 1024;
+
+interface ManagedObservationReceipt {
+  schema_version: 1;
+  seat: string;
+  generation: number;
+  token_id: string;
+  root_pid: number;
+  root_start_time_us: number;
+  thread_id: string;
+  actual_model: string;
+  actual_reasoning: string;
+  observed_at_ms: number;
+}
+
+interface ManagedStartAttempt {
+  schema_version: 1;
+  seat: string;
+  generation: number;
+  token_id: string;
+  root_pid: number;
+  root_start_time_us: number;
+  requested_model: string;
+  requested_reasoning: string;
+}
 
 /** Positive-integer millisecond override from env (test knob); fallback otherwise. */
 function envMs(name: string, fallback: number): number {
   const n = Number(process.env[name]);
   return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function managedArtifactPath(owner: ManagedStartingRuntime, kind: "start-attempt" | "observation"): string {
+  if (!isValidSeatName(owner.seat) || !Number.isSafeInteger(owner.generation) || owner.generation < 1) {
+    throw new Error("E_MANAGED_OBSERVATION_INVALID: invalid owner selector");
+  }
+  assertSecureRunDir();
+  assertPrivateRuntimeDirectory(RUN_DIR);
+  return join(RUN_DIR, `${owner.seat}.g${owner.generation}.managed-${kind}.json`);
+}
+
+function readPrivateJson(path: string): Record<string, unknown> | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      (stat.mode & 0o077) !== 0 ||
+      stat.size < 2 ||
+      stat.size > MANAGED_RECEIPT_MAX_BYTES ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) {
+      throw new Error("E_MANAGED_OBSERVATION_INVALID: unsafe receipt");
+    }
+    const parsed: unknown = JSON.parse(readFileSync(fd, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("E_MANAGED_OBSERVATION_INVALID: malformed receipt");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (error instanceof SyntaxError) throw new Error("E_MANAGED_OBSERVATION_INVALID: malformed receipt");
+    throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function persistPrivateJsonNoReplace(path: string, value: Record<string, unknown>): void {
+  if (readPrivateJson(path) !== null) {
+    throw new Error("E_MANAGED_OBSERVATION_CONFLICT: receipt already exists");
+  }
+  const temp = `${path}.${randomUUID()}.tmp`;
+  const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  if (bytes.length > MANAGED_RECEIPT_MAX_BYTES) {
+    throw new Error("E_MANAGED_OBSERVATION_INVALID: receipt exceeds limit");
+  }
+  let fd: number | null = null;
+  try {
+    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    writeFileSync(fd, bytes);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    linkSync(temp, path);
+    unlinkSync(temp);
+    const dirFd = openSync(RUN_DIR, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+    if (readPrivateJson(path) === null) {
+      throw new Error("E_MANAGED_OBSERVATION_INVALID: receipt readback failed");
+    }
+  } catch (error) {
+    if (fd !== null) closeSync(fd);
+    try {
+      unlinkSync(temp);
+    } catch {
+      // no temp residue
+    }
+    throw error;
+  }
+}
+
+function expectedStartAttempt(owner: ManagedStartingRuntime): ManagedStartAttempt {
+  if (owner.requested.harness !== "codex" || owner.requested.reasoning === null) {
+    throw new Error("E_MODEL_UNVERIFIED: managed Codex tuple is incomplete");
+  }
+  return {
+    schema_version: 1,
+    seat: owner.seat,
+    generation: owner.generation,
+    token_id: owner.tokenId,
+    root_pid: owner.pid,
+    root_start_time_us: owner.startTimeUs,
+    requested_model: owner.requested.model,
+    requested_reasoning: owner.requested.reasoning,
+  };
+}
+
+function exactRecord(value: Record<string, unknown>, expected: Record<string, unknown>): boolean {
+  return JSON.stringify(value) === JSON.stringify(expected);
+}
+
+function readManagedObservation(owner: ManagedStartingRuntime): ManagedObservationReceipt | null {
+  const raw = readPrivateJson(managedArtifactPath(owner, "observation"));
+  if (raw === null) return null;
+  const expected = expectedStartAttempt(owner);
+  const keys = Object.keys(raw).sort().join(",");
+  if (
+    keys !==
+      "actual_model,actual_reasoning,generation,observed_at_ms,root_pid,root_start_time_us,schema_version,seat,thread_id,token_id" ||
+    raw.schema_version !== 1 ||
+    raw.seat !== expected.seat ||
+    raw.generation !== expected.generation ||
+    raw.token_id !== expected.token_id ||
+    raw.root_pid !== expected.root_pid ||
+    raw.root_start_time_us !== expected.root_start_time_us ||
+    typeof raw.thread_id !== "string" ||
+    !/^[A-Za-z0-9-]{1,128}$/.test(raw.thread_id) ||
+    raw.actual_model !== expected.requested_model ||
+    raw.actual_reasoning !== expected.requested_reasoning ||
+    !Number.isSafeInteger(raw.observed_at_ms) ||
+    (raw.observed_at_ms as number) < 1
+  ) {
+    throw new Error("E_MANAGED_OBSERVATION_CONFLICT: receipt does not match owner");
+  }
+  return raw as unknown as ManagedObservationReceipt;
 }
 
 /**
@@ -356,6 +507,37 @@ export class CodexBridgeClient {
    * never re-kicks it.
    */
   private async bindThread(ws: WebSocket): Promise<void> {
+    let managed: ManagedStartingRuntime | null = null;
+    const principal = loadSeatRegistry().seats.get(this.agent);
+    if (principal?.group === "team") {
+      try {
+        const owner = readManagedOwner(this.agent);
+        if (owner.state === "starting") {
+          managed = readManagedStartingRuntime(this.agent);
+        } else if (owner.state === "active") {
+          const active = readManagedActiveRuntime(this.agent);
+          if (active === null || active.requested.harness !== "codex") {
+            throw new Error("E_MODEL_UNVERIFIED: active managed Codex identity is invalid");
+          }
+          await this.request("thread/resume", { threadId: active.threadId });
+          this.bindToThread(active.threadId, "thread_list");
+          if (!this.hooks.skipReplay) this.deliver();
+          return;
+        } else {
+          throw new Error("E_OWNER_CORRUPT: managed seat is not startable");
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error("E_OWNER_CORRUPT: managed seat owner is missing");
+        }
+        throw error;
+      }
+    }
+    if (managed !== null) {
+      await this.bindManagedStarting(ws, managed);
+      return;
+    }
+
     let kickoffRetryMs = KICKOFF_RETRY_INITIAL_MS;
     while (this.ws === ws && ws.readyState === WebSocket.OPEN && !this.stopped) {
       const result = (await this.request("thread/list", { limit: 5 })) as
@@ -410,6 +592,104 @@ export class CodexBridgeClient {
       this.hooks.log("codex_no_thread_yet", { agent: this.agent, retryMs: THREAD_POLL_MS });
       await delay(THREAD_POLL_MS);
     }
+  }
+
+  /**
+   * Bind a replacement Codex seat without inheriting a previous thread or
+   * delivering work before the native owner transition is Active. The durable
+   * attempt marker prevents an ambiguous thread/start from being retried.
+   */
+  private async bindManagedStarting(ws: WebSocket, owner: ManagedStartingRuntime): Promise<void> {
+    const attempt = expectedStartAttempt(owner);
+    const attemptPath = managedArtifactPath(owner, "start-attempt");
+    const existingAttempt = readPrivateJson(attemptPath);
+    let receipt = readManagedObservation(owner);
+
+    if (receipt === null) {
+      if (existingAttempt !== null) {
+        if (!exactRecord(existingAttempt, attempt as unknown as Record<string, unknown>)) {
+          throw new Error("E_FRESH_THREAD_UNVERIFIED: start attempt conflicts with owner");
+        }
+        throw new Error("E_FRESH_THREAD_UNVERIFIED: prior start outcome is ambiguous");
+      }
+      persistPrivateJsonNoReplace(attemptPath, attempt as unknown as Record<string, unknown>);
+
+      let result: Record<string, unknown> | null;
+      try {
+        result = (await this.request("thread/start", {
+          model: attempt.requested_model,
+          allowProviderModelFallback: false,
+          config: { model_reasoning_effort: attempt.requested_reasoning },
+        })) as Record<string, unknown> | null;
+      } catch {
+        throw new Error("E_FRESH_THREAD_UNVERIFIED: managed thread start failed");
+      }
+      const thread = result?.thread;
+      const threadId =
+        thread && typeof thread === "object" && !Array.isArray(thread)
+          ? (thread as Record<string, unknown>).id
+          : undefined;
+      if (
+        typeof threadId !== "string" ||
+        !/^[A-Za-z0-9-]{1,128}$/.test(threadId) ||
+        result?.model !== attempt.requested_model ||
+        result?.reasoningEffort !== attempt.requested_reasoning
+      ) {
+        throw new Error("E_MODEL_UNVERIFIED: thread/start did not prove the requested tuple");
+      }
+      receipt = {
+        schema_version: 1,
+        seat: owner.seat,
+        generation: owner.generation,
+        token_id: owner.tokenId,
+        root_pid: owner.pid,
+        root_start_time_us: owner.startTimeUs,
+        thread_id: threadId,
+        actual_model: result.model as string,
+        actual_reasoning: result.reasoningEffort as string,
+        observed_at_ms: Date.now(),
+      };
+      persistPrivateJsonNoReplace(
+        managedArtifactPath(owner, "observation"),
+        receipt as unknown as Record<string, unknown>,
+      );
+      this.hooks.log("codex_managed_observed", { agent: this.agent, generation: owner.generation });
+    }
+
+    const deadline = Date.now() + MANAGED_ACTIVE_WAIT_MS;
+    while (this.ws === ws && ws.readyState === WebSocket.OPEN && !this.stopped) {
+      const current = readManagedOwner(this.agent);
+      if (managedOwnerMatches(current, owner.generation, owner.tokenId, ["active"])) {
+        this.bindToThread(receipt.thread_id, "thread_start");
+        this.kickoffInjected = true;
+        this.setTurnActive(true);
+        this.request("turn/start", {
+          threadId: receipt.thread_id,
+          input: [{ type: "text", text: CODEX_KICKOFF_TEXT }],
+        }).catch((error: Error) => {
+          this.hooks.log("codex_kickoff_inject_error", {
+            agent: this.agent,
+            threadId: receipt?.thread_id,
+            error: error.message,
+          });
+        });
+        this.hooks.log("codex_kickoff_injected", { agent: this.agent, threadId: receipt.thread_id });
+        if (!this.hooks.skipReplay) this.deliver();
+        return;
+      }
+      if (
+        current.state !== "starting" ||
+        current.generation !== owner.generation ||
+        current.tokenId !== owner.tokenId
+      ) {
+        throw new Error("E_GENERATION_MISMATCH: managed owner changed before activation");
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("E_MODEL_UNVERIFIED: managed owner did not become active");
+      }
+      await delay(25);
+    }
+    throw new Error("E_FRESH_THREAD_UNVERIFIED: managed bridge disconnected before activation");
   }
 
   /** Make a known thread the bridge's sole delivery target and announce it once. */

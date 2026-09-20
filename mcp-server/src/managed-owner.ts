@@ -15,6 +15,29 @@ export interface ManagedOwnerIdentity {
   tokenId: string | null;
 }
 
+export interface ManagedExecutionTuple {
+  harness: "codex" | "claude";
+  model: string;
+  reasoning: string | null;
+}
+
+export interface ManagedStartingRuntime extends ManagedOwnerIdentity {
+  state: "starting";
+  tokenId: string;
+  requested: ManagedExecutionTuple;
+  pid: number;
+  startTimeUs: number;
+}
+
+export interface ManagedActiveRuntime extends ManagedOwnerIdentity {
+  state: "active";
+  tokenId: string;
+  requested: ManagedExecutionTuple;
+  pid: number;
+  startTimeUs: number;
+  threadId: string;
+}
+
 function ownerRoot(): string {
   return fixedExistingRuntimeChild(process.env.APERTURE_OWNER_DIR, "owner");
 }
@@ -84,4 +107,174 @@ export function managedOwnerMatches(
   allowedStates: readonly ManagedOwnerState[],
 ): boolean {
   return owner.generation === generation && owner.tokenId === tokenId && allowedStates.includes(owner.state);
+}
+
+/**
+ * Read the exact gated runtime identity used by the Codex bridge. A Starting
+ * record without a durable process candidate is not launchable yet; no
+ * caller/environment value can fill these fields.
+ */
+export function readManagedStartingRuntime(seat: string): ManagedStartingRuntime | null {
+  const identity = readManagedOwner(seat);
+  if (identity.state !== "starting") return null;
+
+  const path = join(ownerRoot(), `${seat}.json`);
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      (stat.mode & 0o077) !== 0 ||
+      stat.size > MAX_OWNER_BYTES ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) {
+      throw new Error("E_OWNER_CORRUPT: unsafe owner record");
+    }
+    const value = JSON.parse(readFileSync(fd, "utf8")) as Record<string, unknown>;
+    const requested = value.requested;
+    const incarnation = value.incarnation;
+    if (
+      !requested ||
+      typeof requested !== "object" ||
+      Array.isArray(requested) ||
+      !incarnation ||
+      typeof incarnation !== "object" ||
+      Array.isArray(incarnation)
+    ) {
+      throw new Error("E_OWNER_CORRUPT: gated runtime identity is incomplete");
+    }
+    const tuple = requested as Record<string, unknown>;
+    const candidate = incarnation as Record<string, unknown>;
+    if (
+      value.schema_version !== 1 ||
+      value.seat !== seat ||
+      value.state !== "starting" ||
+      value.generation !== identity.generation ||
+      value.provisional_token_id !== identity.tokenId ||
+      (tuple.harness !== "codex" && tuple.harness !== "claude") ||
+      typeof tuple.model !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tuple.model) ||
+      (tuple.reasoning !== null &&
+        tuple.reasoning !== "low" &&
+        tuple.reasoning !== "medium" &&
+        tuple.reasoning !== "high" &&
+        tuple.reasoning !== "xhigh" &&
+        tuple.reasoning !== "max" &&
+        tuple.reasoning !== "ultra") ||
+      !Number.isSafeInteger(candidate.pid) ||
+      (candidate.pid as number) < 1 ||
+      !Number.isSafeInteger(candidate.start_time) ||
+      (candidate.start_time as number) < 1 ||
+      candidate.token_id !== identity.tokenId ||
+      candidate.observed !== false ||
+      candidate.thread_id !== ""
+    ) {
+      throw new Error("E_OWNER_CORRUPT: invalid gated runtime identity");
+    }
+    return {
+      ...identity,
+      state: "starting",
+      tokenId: identity.tokenId as string,
+      requested: {
+        harness: tuple.harness,
+        model: tuple.model,
+        reasoning: tuple.reasoning as string | null,
+      },
+      pid: candidate.pid as number,
+      startTimeUs: candidate.start_time as number,
+    };
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error("E_OWNER_CORRUPT: malformed owner record");
+    throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/** Exact owner-bound thread for reconnect; managed seats never fall back to a
+ * newest-thread heuristic once a generation is Active. */
+export function readManagedActiveRuntime(seat: string): ManagedActiveRuntime | null {
+  const identity = readManagedOwner(seat);
+  if (identity.state !== "active") return null;
+
+  const path = join(ownerRoot(), `${seat}.json`);
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      (stat.mode & 0o077) !== 0 ||
+      stat.size > MAX_OWNER_BYTES ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    ) {
+      throw new Error("E_OWNER_CORRUPT: unsafe owner record");
+    }
+    const value = JSON.parse(readFileSync(fd, "utf8")) as Record<string, unknown>;
+    const requested = value.requested;
+    const incarnation = value.incarnation;
+    if (
+      !requested ||
+      typeof requested !== "object" ||
+      Array.isArray(requested) ||
+      !incarnation ||
+      typeof incarnation !== "object" ||
+      Array.isArray(incarnation)
+    ) {
+      throw new Error("E_OWNER_CORRUPT: active runtime identity is incomplete");
+    }
+    const tuple = requested as Record<string, unknown>;
+    const active = incarnation as Record<string, unknown>;
+    if (
+      value.schema_version !== 1 ||
+      value.seat !== seat ||
+      value.state !== "active" ||
+      value.generation !== identity.generation ||
+      value.provisional_token_id !== null ||
+      (tuple.harness !== "codex" && tuple.harness !== "claude") ||
+      typeof tuple.model !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(tuple.model) ||
+      (tuple.reasoning !== null &&
+        tuple.reasoning !== "low" &&
+        tuple.reasoning !== "medium" &&
+        tuple.reasoning !== "high" &&
+        tuple.reasoning !== "xhigh" &&
+        tuple.reasoning !== "max" &&
+        tuple.reasoning !== "ultra") ||
+      !Number.isSafeInteger(active.pid) ||
+      (active.pid as number) < 1 ||
+      !Number.isSafeInteger(active.start_time) ||
+      (active.start_time as number) < 1 ||
+      active.token_id !== identity.tokenId ||
+      active.observed !== true ||
+      typeof active.thread_id !== "string" ||
+      !/^[A-Za-z0-9-]{1,128}$/.test(active.thread_id) ||
+      active.harness !== tuple.harness ||
+      active.model !== tuple.model ||
+      active.reasoning !== tuple.reasoning
+    ) {
+      throw new Error("E_OWNER_CORRUPT: invalid active runtime identity");
+    }
+    return {
+      ...identity,
+      state: "active",
+      tokenId: identity.tokenId as string,
+      requested: {
+        harness: tuple.harness,
+        model: tuple.model,
+        reasoning: tuple.reasoning as string | null,
+      },
+      pid: active.pid as number,
+      startTimeUs: active.start_time as number,
+      threadId: active.thread_id,
+    };
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error("E_OWNER_CORRUPT: malformed owner record");
+    throw error;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
 }
