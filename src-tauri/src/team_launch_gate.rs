@@ -361,4 +361,25 @@ mod tests {
         assert!(wait_exit(&mut released.child).unwrap().success());
         assert!(f.marker().is_file());
     }
+    #[test]
+    fn gated_native_metadata_has_real_birth_group_and_digest_before_exec() {
+        let f = Fixture::new();
+        let child = spawn(f.spec()).unwrap();
+        let metadata = crate::team_process::native::capture_gated_child(&child).unwrap();
+        assert_eq!(metadata.pid, child.identity().pid);
+        assert_eq!(
+            metadata.start_time,
+            team_process::birth_micros(child.identity()).unwrap()
+        );
+        assert_eq!(metadata.pgid, metadata.pid);
+        assert_eq!(metadata.ppid, std::process::id());
+        assert_eq!(metadata.cmdline_sha256.len(), 64);
+        assert_eq!(
+            std::path::Path::new(&metadata.cwd).canonicalize().unwrap(),
+            f.root.canonicalize().unwrap()
+        );
+        assert!(!f.marker().exists());
+        child.cancel().unwrap();
+        assert!(!f.marker().exists());
+    }
 }

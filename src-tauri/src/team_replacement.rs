@@ -120,6 +120,7 @@ pub enum ReplacementError {
     NativeFailure,
     RepoBindingUnavailable,
     CheckpointUnavailable,
+    LaunchUnavailable,
 }
 impl ReplacementError {
     pub fn code(&self) -> &'static str {
@@ -136,6 +137,7 @@ impl ReplacementError {
             Self::NativeFailure => "E_RUNTIME_IO",
             Self::RepoBindingUnavailable => "E_REPO_BINDING_UNAVAILABLE",
             Self::CheckpointUnavailable => "E_CHECKPOINT_UNAVAILABLE",
+            Self::LaunchUnavailable => "E_LAUNCH_UNAVAILABLE",
         }
     }
 }
@@ -504,3 +506,6 @@ pub(crate) mod model_observation;
 
 #[path = "team_replacement_native.rs"]
 pub(crate) mod native;
+
+#[path = "team_repository_native.rs"]
+pub(crate) mod repository;

@@ -36,15 +36,22 @@ impl ReplacementAuthority<'_> {
     }
 }
 
-// Private, nonserializable capability. No existing authority supplies it yet.
-// A future binding implementation must freeze and revalidate authoritative
-// repository/worktree identity, not merely replace this error with Ok(()).
-struct RepositoryBinding;
+// The binding is derived from the immutable native snapshot and single catalog,
+// never a caller path. Launch composition remains a distinct fail-closed gate.
+struct RepositoryBinding(super::repository::BoundRepository);
 fn require_repository_binding(
-    _home: &Path,
-    _target: &remote::RemoteTarget,
+    home: &Path,
+    target: &remote::RemoteTarget,
 ) -> Result<RepositoryBinding, ReplacementError> {
-    Err(ReplacementError::RepoBindingUnavailable)
+    super::repository::resolve_native(home, &target.team, Instant::now() + Duration::from_secs(10))
+        .map(RepositoryBinding)
+        .map_err(|_| ReplacementError::RepoBindingUnavailable)
+}
+fn require_launch_composition() -> Result<(), ReplacementError> {
+    // Do not stop an old incarnation until start/observation/cleanup and the
+    // durable timeout boundary are all wired. This is not a capability flag
+    // supplied by a UI or caller; registration stays off as well.
+    Err(ReplacementError::LaunchUnavailable)
 }
 fn selectors(target: &remote::RemoteTarget) -> Result<(), ReplacementError> {
     if target.expected_generation == 0
@@ -59,8 +66,9 @@ fn selectors(target: &remote::RemoteTarget) -> Result<(), ReplacementError> {
 
 /// Agent one-shot seam. Target generation is CAS, not actor identity. No
 /// PreparedReplacement, inventory, filesystem path or native proof in the DTO.
-/// Currently returns the fixed missing-binding error BEFORE collection, locks,
-/// stop, revocation, stale CAS, token publication or reservation. Capabilities
+/// Missing binding returns its fixed error; valid binding reaches the separate
+/// uncomposed-launch error BEFORE locks, stop, revocation, stale CAS, token
+/// publication or reservation. Only bounded native Git reads precede it. Capabilities
 /// and command registration remain false; this is not functional P3 delivery.
 pub(crate) fn replace_authorized(
     home: &Path,
@@ -71,6 +79,7 @@ pub(crate) fn replace_authorized(
 ) -> Result<StartedReplacement, ReplacementError> {
     selectors(&target)?;
     let binding = require_repository_binding(home, &target)?;
+    require_launch_composition()?;
     let mut runtime = NativeRuntime::new(home, authority, target, sentinels, binding)?;
     let seat = runtime.target.seat.clone();
     let generation = runtime.target.expected_generation;

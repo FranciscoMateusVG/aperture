@@ -89,6 +89,40 @@ pub(crate) fn collect_native(
     }
     collect(&record, &mut NativeSource::new())
 }
+/// Metadata for the exact child held by the native pipe gate, before any
+/// harness exec. A caller PID/path cannot construct PendingChild. This observes
+/// no process table and grants no signal authority by itself.
+pub(crate) fn capture_gated_child(
+    child: &crate::team_replacement::launch_gate::PendingChild,
+) -> Result<crate::owner::ProcessIdentity, ReplacementError> {
+    let id = child.identity();
+    let before = observe(id.pid)?.ok_or(ReplacementError::StopUnverified)?;
+    if before.identity != *id
+        || before.uid != unsafe { libc::geteuid() }
+        || before.pgid != id.pid
+        || before.ppid != std::process::id()
+    {
+        return Err(ReplacementError::StopUnverified);
+    }
+    let (cmdline_sha256, cwd) = native_details(id)?;
+    let after = observe(id.pid)?.ok_or(ReplacementError::StopUnverified)?;
+    if after.identity != before.identity
+        || after.ppid != before.ppid
+        || after.pgid != before.pgid
+        || after.uid != before.uid
+    {
+        return Err(ReplacementError::StopUnverified);
+    }
+    Ok(crate::owner::ProcessIdentity {
+        pid: id.pid,
+        start_time: birth_micros(id)?,
+        ppid: before.ppid,
+        pgid: before.pgid,
+        cmdline_sha256,
+        cwd,
+    })
+}
+
 fn seeded(record: &OwnerRecord) -> Result<(ProcessIdentity, Vec<OwnedProcess>), ReplacementError> {
     let inc = record
         .incarnation
