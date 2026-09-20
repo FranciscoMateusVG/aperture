@@ -100,38 +100,7 @@ impl CheckpointStore for NativeStore<'_> {
             return Err(CheckpointError::Generation);
         }
         (self.revalidate)()?;
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&self.dir).map_err(|_| CheckpointError::Io)? {
-            let entry = entry.map_err(|_| CheckpointError::Io)?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| CheckpointError::Corrupt)?;
-            // A temp file is never a committed checkpoint. Shared IO publishes
-            // only by no-replace rename; crash residue cannot advance sequence.
-            if name.starts_with('.') && name.ends_with(".tmp") {
-                continue;
-            }
-            let stem = name.strip_suffix(".json").ok_or(CheckpointError::Corrupt)?;
-            let (g, seq) = stem.split_once('-').ok_or(CheckpointError::Corrupt)?;
-            let g: u64 = g.parse().map_err(|_| CheckpointError::Corrupt)?;
-            let seq: u64 = seq.parse().map_err(|_| CheckpointError::Corrupt)?;
-            if g == 0 || seq == 0 || name != format!("{g}-{seq}.json") {
-                return Err(CheckpointError::Corrupt);
-            }
-            if g != generation {
-                continue;
-            }
-            let path = validate_component_path(&self.dir, &name, false)
-                .map_err(|_| CheckpointError::Unsafe)?;
-            let value: CheckpointEntry =
-                read_private_json(&path).map_err(|_| CheckpointError::Corrupt)?;
-            if value.seq != seq || value.generation != g {
-                return Err(CheckpointError::Corrupt);
-            }
-            out.push(value);
-        }
-        Ok(out)
+        read_raw_entries(&self.dir, generation)
     }
     fn digest(&self, bytes: &[u8]) -> Result<String, CheckpointError> {
         Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -154,6 +123,61 @@ impl CheckpointStore for NativeStore<'_> {
         write_private_json_atomic(&path, value, false).map_err(|_| CheckpointError::Io)
     }
 }
+
+fn read_raw_entries(dir: &Path, generation: u64) -> Result<Vec<CheckpointEntry>, CheckpointError> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|_| CheckpointError::Io)? {
+        let entry = entry.map_err(|_| CheckpointError::Io)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| CheckpointError::Corrupt)?;
+        // A temp file is never a committed checkpoint. Shared IO publishes
+        // only by no-replace rename; crash residue cannot advance sequence.
+        if name.starts_with('.') && name.ends_with(".tmp") {
+            continue;
+        }
+        if name == ".validation" {
+            // Validation facts have their own bounded schema and readers.
+            validate_component_path(dir, &name, false).map_err(|_| CheckpointError::Unsafe)?;
+            let meta =
+                std::fs::symlink_metadata(dir.join(&name)).map_err(|_| CheckpointError::Unsafe)?;
+            if !meta.is_dir() {
+                return Err(CheckpointError::Unsafe);
+            }
+            continue;
+        }
+        let stem = name.strip_suffix(".json").ok_or(CheckpointError::Corrupt)?;
+        let (g, seq) = stem.split_once('-').ok_or(CheckpointError::Corrupt)?;
+        let g: u64 = g.parse().map_err(|_| CheckpointError::Corrupt)?;
+        let seq: u64 = seq.parse().map_err(|_| CheckpointError::Corrupt)?;
+        if g == 0 || seq == 0 || name != format!("{g}-{seq}.json") {
+            return Err(CheckpointError::Corrupt);
+        }
+        if g != generation {
+            continue;
+        }
+        let path =
+            validate_component_path(&dir, &name, false).map_err(|_| CheckpointError::Unsafe)?;
+        let value: CheckpointEntry =
+            read_private_json(&path).map_err(|_| CheckpointError::Corrupt)?;
+        let initial = if value.schema_version == 1 {
+            super::CheckpointValidation::Pending
+        } else {
+            super::CheckpointValidation::Rejected {
+                code: "E_CHECKPOINT_SCHEMA".into(),
+            }
+        };
+        if value.seq != seq || value.generation != g || value.validation != initial {
+            return Err(CheckpointError::Corrupt);
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
+#[path = "team_checkpoint_validation.rs"]
+pub(crate) mod validation;
 
 pub(crate) fn write_native<F>(
     home: &Path,
@@ -398,5 +422,267 @@ mod tests {
             Err(CheckpointError::Corrupt)
         );
         assert!(!f.dir().exists());
+    }
+    fn lead_context() -> validation::ValidationContext {
+        validation::ValidationContext {
+            team: "t1".into(),
+            seat: "t1-backend".into(),
+            generation: 1,
+            lead_seat: "t1-backend".into(),
+            lead_generation: 1,
+        }
+    }
+    fn actual(
+        e: &CheckpointEntry,
+    ) -> Result<crate::team_checkpoint::ArtifactObservation, CheckpointError> {
+        Ok(crate::team_checkpoint::ArtifactObservation {
+            head_sha: e.payload.head_sha.clone(),
+            dirty_files: e.payload.dirty_files.clone(),
+            open_pr: e.payload.open_pr.clone(),
+        })
+    }
+    #[test]
+    fn validation_facts_are_append_only_and_latest_valid_is_not_latest_file() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 1, &[], || Ok(())).unwrap();
+        let original = std::fs::read(f.dir().join("1-1.json")).unwrap();
+        validation::validate_native(&f.0, &lead_context(), 1, 2, &[], || Ok(()), actual).unwrap();
+        let fact = std::fs::read(f.dir().join(".validation/1-1-1.json")).unwrap();
+        // Worker dedupe remains immutable/pending, validation is a read view.
+        assert_eq!(
+            write_native(&f.0, &ctx(), 1, payload(), 3, &[], || Ok(()))
+                .unwrap()
+                .validation,
+            CheckpointValidation::Pending
+        );
+        write_native(&f.0, &ctx(), 1, payload(), 6000, &[], || Ok(())).unwrap();
+        let view =
+            validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(())).unwrap();
+        assert_eq!(crate::team_checkpoint::latest_valid(&view).unwrap().seq, 1);
+        validation::validate_native(&f.0, &lead_context(), 2, 6001, &[], || Ok(()), actual)
+            .unwrap();
+        let view =
+            validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(())).unwrap();
+        assert_eq!(crate::team_checkpoint::latest_valid(&view).unwrap().seq, 2);
+        // A later divergent observation invalidates this seq, not the earlier fact.
+        validation::validate_native(
+            &f.0,
+            &lead_context(),
+            2,
+            6002,
+            &[],
+            || Ok(()),
+            |e| {
+                let mut a = actual(e)?;
+                a.head_sha = "b".repeat(40);
+                Ok(a)
+            },
+        )
+        .unwrap();
+        let view =
+            validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(())).unwrap();
+        assert_eq!(crate::team_checkpoint::latest_valid(&view).unwrap().seq, 1);
+        assert_eq!(std::fs::read(f.dir().join("1-1.json")).unwrap(), original);
+        assert_eq!(
+            std::fs::read(f.dir().join(".validation/1-1-1.json")).unwrap(),
+            fact
+        );
+        let meta = std::fs::metadata(f.dir().join(".validation/1-2-3.json")).unwrap();
+        assert_eq!((meta.mode() & 0o777, meta.nlink()), (0o600, 1));
+    }
+    #[test]
+    fn nonlead_or_stale_lead_cannot_collect_or_validate() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();
+        for bad_name in [true, false] {
+            let mut c = lead_context();
+            if bad_name {
+                c.lead_seat = "different".into();
+            } else {
+                c.lead_generation = 2;
+            }
+            assert!(validation::validate_native(
+                &f.0,
+                &c,
+                1,
+                1,
+                &[],
+                || Ok(()),
+                |_| panic!("unauthorized collector")
+            )
+            .is_err());
+        }
+        assert!(!f.dir().join(".validation").exists());
+    }
+    #[test]
+    fn old_worker_generation_is_recoverable_by_current_lead() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();
+        let path = f.0.join(".aperture/run/owner/t1-backend.json");
+        let mut owner: OwnerRecord = read_private_json(&path).unwrap();
+        owner.generation = 2;
+        write_private_json_atomic(&path, &owner, true).unwrap();
+        let mut c = lead_context();
+        c.lead_generation = 2;
+        validation::validate_native(&f.0, &c, 1, 1, &[], || Ok(()), actual).unwrap();
+        assert_eq!(
+            validation::validated_entries_native(&f.0, &c, &[], || Ok(())).unwrap()[0].validation,
+            CheckpointValidation::Ok
+        );
+        assert!(write_native(&f.0, &ctx(), 1, payload(), 6000, &[], || Ok(())).is_err());
+    }
+    #[test]
+    fn revoked_lead_before_publish_never_gets_a_fact() {
+        for revoke_at in [1, 2, 3, 4] {
+            let f = Fixture::new();
+            write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();
+            let mut n = 0;
+            assert_eq!(
+                validation::validate_native(
+                    &f.0,
+                    &lead_context(),
+                    1,
+                    1,
+                    &[],
+                    || {
+                        n += 1;
+                        if n == revoke_at {
+                            Err(CheckpointError::Generation)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    actual
+                ),
+                Err(CheckpointError::Generation)
+            );
+            assert!(!f.dir().join(".validation/1-1-1.json").exists());
+        }
+    }
+    #[test]
+    fn unknown_schema_or_failed_collector_never_becomes_valid() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 44, payload(), 0, &[], || Ok(())).unwrap();
+        assert!(validation::validate_native(
+            &f.0,
+            &lead_context(),
+            1,
+            1,
+            &[],
+            || Ok(()),
+            |_| panic!("unknown schema collector")
+        )
+        .is_err());
+        write_native(&f.0, &ctx(), 1, payload(), 6000, &[], || Ok(())).unwrap();
+        assert!(validation::validate_native(
+            &f.0,
+            &lead_context(),
+            2,
+            6001,
+            &[],
+            || Ok(()),
+            |_| Err(CheckpointError::Io)
+        )
+        .is_err());
+        assert!(crate::team_checkpoint::latest_valid(
+            &validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(())).unwrap()
+        )
+        .is_none());
+        assert!(!f.dir().join(".validation").exists());
+    }
+    #[test]
+    fn validation_observation_sentinel_or_future_clock_is_not_retained() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 2, &[], || Ok(())).unwrap();
+        assert!(validation::validate_native(
+            &f.0,
+            &lead_context(),
+            1,
+            1,
+            &[],
+            || Ok(()),
+            |_| panic!("clock before write")
+        )
+        .is_err());
+        assert!(validation::validate_native(
+            &f.0,
+            &lead_context(),
+            1,
+            3,
+            &["PRIVATE_CANARY".into()],
+            || Ok(()),
+            |e| {
+                let mut a = actual(e)?;
+                a.dirty_files = vec!["PRIVATE_CANARY".into()];
+                Ok(a)
+            }
+        )
+        .is_err());
+        assert!(!f.dir().join(".validation").exists());
+    }
+    #[test]
+    fn validation_collision_is_noreplace_and_checkpoint_unchanged() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();
+        let before = std::fs::read(f.dir().join("1-1.json")).unwrap();
+        let mut n = 0;
+        assert!(validation::validate_native(
+            &f.0,
+            &lead_context(),
+            1,
+            1,
+            &[],
+            || {
+                n += 1;
+                if n == 4 {
+                    write_private_json_atomic(
+                        &f.dir().join(".validation/1-1-1.json"),
+                        &serde_json::json!({"collision":true}),
+                        false,
+                    )
+                    .unwrap();
+                }
+                Ok(())
+            },
+            actual
+        )
+        .is_err());
+        let collision: serde_json::Value =
+            read_private_json(&f.dir().join(".validation/1-1-1.json")).unwrap();
+        assert_eq!(collision, serde_json::json!({"collision":true}));
+        assert_eq!(std::fs::read(f.dir().join("1-1.json")).unwrap(), before);
+    }
+    #[test]
+    fn corrupt_hash_fact_status_or_hardlink_fails_closed() {
+        for mode in 0..4 {
+            let f = Fixture::new();
+            write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();
+            validation::validate_native(&f.0, &lead_context(), 1, 1, &[], || Ok(()), actual)
+                .unwrap();
+            let fact = f.dir().join(".validation/1-1-1.json");
+            if mode == 2 {
+                std::fs::hard_link(&fact, f.0.join("extra.json")).unwrap();
+            } else {
+                let path = if mode == 0 || mode == 3 {
+                    f.dir().join("1-1.json")
+                } else {
+                    fact
+                };
+                let mut value: serde_json::Value = read_private_json(&path).unwrap();
+                if mode == 0 {
+                    value["content_hash"] = "b".repeat(64).into();
+                } else if mode == 3 {
+                    value["validation"] = serde_json::json!({"status":"ok"});
+                } else {
+                    value["result"] =
+                        serde_json::json!({"status":"divergent","fields":["head_sha"]});
+                }
+                write_private_json_atomic(&path, &value, true).unwrap();
+            }
+            assert!(
+                validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(()))
+                    .is_err()
+            );
+        }
     }
 }

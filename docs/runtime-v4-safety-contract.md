@@ -12,9 +12,13 @@ Peppy owns checkpoint policy, exact-process observations, replacement and
 archive orchestration and the existing native launcher integration. No second
 journal, broker, tool-fencing service or universal effect instrumentation.
 
-The isolated integration test compiles the new modules without exposing them
-through Tauri. Passing it does not enable a button or prove native replacement.
+The modules are registered in the native library and exercised by unit tests
+against the actual compiled modules (not copied path-module implementations).
+Passing them does not expose a Tauri button or prove native replacement.
 Capabilities remain false until their authoritative adapter is integrated.
+The legacy GUI/headless lifecycle and watchdog re-kick paths deny managed or
+ambiguous seats before any nudge, teardown, model mutation or new process effect;
+only authoritative filesystem classification can admit a standing seat.
 
 ## Two distinct replacement actions
 
@@ -69,10 +73,31 @@ rejected and not recoverable. Latest usable checkpoint means highest validated
 sequence, not simply newest file. Git/PR observations are compared before marking
 valid; stale/divergent/pending remain distinguishable.
 
-Native storage must use shared secure IO under the existing seat lock: component
-checks, private UID/0700 parents, regular single-link 0600 append-only files,
-no-replace publication and fsync. Validation is an append-only fact, not rewriting
-an old checkpoint. BEADS mirror contains only the sanitized bounded receipt.
+Native persistence uses the shared secure IO and lock implementation: team lock
+then seat lock, component checks, private UID/0700 parents, regular single-link
+0600 append-only files, no-replace publication and fsync. The internal writer
+checks the exact active owner/model tuple and revalidates the transport capability
+before lock, under lock, and immediately before publication.
+
+Lead validation is stored separately at
+`checkpoints/<seat>/.validation/<g>-<checkpoint-seq>-<fact-seq>.json`. Facts bind the
+checkpoint ID and content hash, current authenticated lead generation, bounded
+artifact observation, native timestamp and derived result. Original checkpoint
+bytes remain unchanged. Facts are ordered under the team lock then all needed
+seat locks in lexical order. The current active lead may validate an older worker
+generation; an old worker cannot write into that generation. The latest fact for
+a checkpoint controls the read projection, including a later divergent result.
+Unknown schema remains rejected without invoking an artifact collector. Invalid,
+missing, duplicate, unsafe or hash-mismatched evidence fails closed rather than
+silently projecting a green checkpoint. Capability revocation before publication
+leaves no fact; a destination collision never overwrites existing evidence.
+
+These adapters remain internal: the authenticated worker/hook/lead control seam,
+bounded actual git/gh collector and sanitized BEADS mirror are not yet wired.
+Tests inject collector/authority callbacks in private temporary homes; no live
+bearer, process stop or provider call is exercised. No callback is exposed as a
+caller boolean or arbitrary observation in a public DTO. The eventual BEADS
+mirror contains only the sanitized bounded receipt.
 
 ## Archive
 
@@ -114,8 +139,9 @@ inconsistent evidence; never delete them or recycle archived identity/generation
 
 ## Remaining integration gates
 
-Shared owner/journal/secure-IO signatures, native checkpoint/control adapters,
-GUI/headless common start path, actual-model observation and cleanup, durable
+Shared owner/journal/secure-IO signatures and native checkpoint persistence are
+integrated. Authenticated checkpoint/control transport and artifact collection,
+GUI/headless managed start path, actual-model observation and cleanup, durable
 hub revoke acknowledgment, authoritative archive reconciliation, and the full
 crash/two-process composition suite remain required. Pure fixtures alone do not
 satisfy these gates or authorize installation.

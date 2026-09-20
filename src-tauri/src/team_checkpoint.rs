@@ -64,6 +64,7 @@ pub enum CheckpointValidation {
     Rejected { code: String },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointEntry {
     pub schema_version: u32,
     pub checkpoint_id: String,
@@ -331,7 +332,8 @@ pub fn write<S: CheckpointStore>(
     Ok(e)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactObservation {
     pub head_sha: String,
     pub dirty_files: Vec<String>,
