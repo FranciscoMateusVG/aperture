@@ -61,13 +61,13 @@ pub fn boot_agent_headless(name: &str) -> Result<String, String> {
 
 /// Authenticated, headless V4 team activation. The request carries selectors
 /// only; teams.rs derives authority from the fixed canonical GLaDOS bearer.
-pub fn activate_team_control_json(input: &str) -> Result<String, String> {
-    teams::activate_team_headless(input)
-        .and_then(|view| serde_json::to_string(&view).map_err(|_| teams::TeamError {
+pub fn team_control_json(input: &str) -> Result<String, String> {
+    teams::team_control_headless(input)
+        .and_then(|response| serde_json::to_string(&response).map_err(|_| teams::TeamError {
             code: "E_STAGING_IO".into(),
-            message: "activation result serialization failed".into(),
+            message: "team control result serialization failed".into(),
         }))
-        .map_err(|error| serde_json::to_string(&error).unwrap_or_else(|_| "{\"code\":\"E_STAGING_IO\",\"message\":\"activation failed\"}".into()))
+        .map_err(|error| serde_json::to_string(&error).unwrap_or_else(|_| "{\"code\":\"E_STAGING_IO\",\"message\":\"team control failed\"}".into()))
 }
 
 /// aperture-3x136: GUI-launched apps inherit launchd's minimal PATH

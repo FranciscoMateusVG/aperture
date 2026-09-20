@@ -23,7 +23,7 @@ fn main() -> std::process::ExitCode {
         eprintln!("aperture-team-control: request must be UTF-8 JSON");
         return std::process::ExitCode::from(2);
     };
-    match aperture_lib::activate_team_control_json(request) {
+    match aperture_lib::team_control_json(request) {
         Ok(response) => {
             let _ = std::io::stdout().write_all(response.as_bytes());
             let _ = std::io::stdout().write_all(b"\n");

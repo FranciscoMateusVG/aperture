@@ -336,6 +336,22 @@ pub struct ActivateTeamInput {
     pub epic_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", content = "input", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TeamControlRequest {
+    ListPending,
+    Approve(ActivateTeamInput),
+    Cancel(CancelPendingInput),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", content = "result", rename_all = "snake_case")]
+pub enum TeamControlResponse {
+    ListPending(Vec<TeamView>),
+    Approve(TeamView),
+    Cancel(CancelPendingResult),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ManagedSeatState {
     Active { team: String, generation: u64 },
@@ -778,7 +794,9 @@ impl TeamEngine {
     }
 
     pub fn cancel_pending(&self, actor: &AuthenticatedActor, input: CancelPendingInput) -> TeamResult<CancelPendingResult> {
-        if actor.principal() != "operator" { return Err(TeamError::state("operator context required")); }
+        if actor.principal() != "operator" && !actor.is_glados() {
+            return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "operator or exact glados context required"));
+        }
         self.paths.ensure_runtime_roots()?;
         validate_team_name(&input.team)?;
         let _team_lock = try_lock(&self.paths.team_locks, &input.team).map_err(TeamError::from_message)?;
@@ -1402,14 +1420,22 @@ pub fn team_cancel_pending(input: CancelPendingInput, state: tauri::State<'_, Ar
     engine_from_state(&state)?.cancel_pending(&AuthenticatedActor::operator_ui(), input)
 }
 
-/// Common headless engine entrypoint. The caller supplies request JSON only;
-/// actor/env fields are ignored and cannot construct `AuthenticatedActor`.
-pub fn activate_team_headless(input_json: &str) -> TeamResult<TeamView> {
-    let input: ActivateTeamInput = serde_json::from_str(input_json).map_err(|_| TeamError::state("invalid activation request"))?;
+/// Common headless control entrypoint. The caller supplies selectors only;
+/// actor/env fields are not part of the tagged schema and cannot construct
+/// `AuthenticatedActor`.
+pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse> {
+    let request: TeamControlRequest = serde_json::from_str(input_json).map_err(|_| TeamError::state("invalid team control request"))?;
     let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or_else(|| TeamError::io("project root unavailable"))?.to_path_buf();
-    TeamEngine::new(home, project).activate(&actor, input)
+    let engine = TeamEngine::new(home, project);
+    match request {
+        TeamControlRequest::ListPending => engine
+            .list_teams()
+            .map(|teams| TeamControlResponse::ListPending(teams.into_iter().filter(|team| team.state.state == TeamLifecycle::Pending).collect())),
+        TeamControlRequest::Approve(input) => engine.activate(&actor, input).map(TeamControlResponse::Approve),
+        TeamControlRequest::Cancel(input) => engine.cancel_pending(&actor, input).map(TeamControlResponse::Cancel),
+    }
 }
 
 #[cfg(test)]
@@ -1657,6 +1683,32 @@ mod tests {
         assert_eq!(recovered.state.state, TeamLifecycle::Active);
         assert!(marker.is_file());
         assert!(!team_dir.join("journal.json").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn headless_control_derives_glados_and_rejects_forged_actor_fields() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("headless-control");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t8")).unwrap();
+
+        assert!(team_control_headless(r#"{"action":"list_pending","actor":"glados"}"#)
+            .unwrap_err()
+            .message
+            .contains("invalid team control request"));
+        let listed = team_control_headless(r#"{"action":"list_pending"}"#).unwrap();
+        assert!(matches!(listed, TeamControlResponse::ListPending(ref teams) if teams.len() == 1 && teams[0].snapshot.team == "t8"));
+
+        let cancelled = team_control_headless(&serde_json::to_string(&TeamControlRequest::Cancel(CancelPendingInput {
+            team: "t8".into(),
+            expected_generation: 0,
+            creation_request_id: created.creation_request.request_id,
+        })).unwrap()).unwrap();
+        assert!(matches!(cancelled, TeamControlResponse::Cancel(CancelPendingResult { cancelled: true, .. })));
+        assert!(!home.join(".aperture/teams/t8").exists());
         fs::remove_dir_all(home).unwrap();
     }
 
