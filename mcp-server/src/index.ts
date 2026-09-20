@@ -10,6 +10,12 @@ import { notifyHub } from "./hub-notify.js";
 import { presenceReport, describePresence, type PresenceReport } from "./presence-snapshot.js";
 import { buildIndex, recall, recallFull, recallStats, RECALL_K_MAX, RECALL_FULL_MAX_BYTES } from "./memory-index.js";
 import { authorizeMessage, hasAuthenticatedMcpIdentity, loadSeatRegistry } from "./seat-registry.js";
+import {
+  assertActivationMatchesPending,
+  assertAuthorizedEpic,
+  invokeTeamControl,
+  parsePendingList,
+} from "./team-control.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
 if (!AGENT_NAME) {
@@ -430,6 +436,83 @@ server.tool(
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
   }
+);
+
+// ── V4 team activation control ──
+
+function gladosControlDenied(): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  if (AGENT_NAME === "glados" && hasAuthenticatedMcpIdentity("glados")) return null;
+  return {
+    content: [{ type: "text", text: "ERROR: E_CONTROL_UNAUTHORIZED exact authenticated GLaDOS context required" }],
+    isError: true,
+  };
+}
+
+const teamIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,15}$/);
+const requestIdSchema = z.string().uuid();
+const epicIdSchema = z.string().regex(/^aperture-[a-z0-9][a-z0-9-]{0,63}$/);
+
+server.tool(
+  "team_list_activation_requests",
+  "GLaDOS-only: list durable pending team activation requests. This reads the Rust transaction engine; it does not claim to wake or notify GLaDOS.",
+  {},
+  async () => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
+      return { content: [{ type: "text", text: JSON.stringify(pending.result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_approve_activation",
+  "GLaDOS-only: approve one exact pending team request after verifying its active authorized epic and project label. Uses the authenticated Rust transaction engine; no caller actor field is accepted.",
+  {
+    team: teamIdSchema,
+    expected_generation: z.number().int().nonnegative(),
+    creation_request_id: requestIdSchema,
+    epic_id: epicIdSchema,
+  },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
+      const matched = assertActivationMatchesPending(pending, input);
+      const epic = await queryTasks("show", input.epic_id, { fields: "full" });
+      assertAuthorizedEpic(epic, input.epic_id, matched.snapshot.project);
+      const result = await invokeTeamControl({ action: "approve", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_cancel_activation",
+  "GLaDOS-only: cancel one exact pending team request through the same locked Rust transaction engine. Operator UI cancel remains a separate human action.",
+  {
+    team: teamIdSchema,
+    expected_generation: z.number().int().nonnegative(),
+    creation_request_id: requestIdSchema,
+  },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
+      assertActivationMatchesPending(pending, { ...input, epic_id: "aperture-selector-only" });
+      const result = await invokeTeamControl({ action: "cancel", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
 );
 
 server.tool(
