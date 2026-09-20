@@ -4,6 +4,10 @@ mod codex_appserver;
 mod config;
 mod launcher;
 mod hub_auth;
+mod journal;
+mod owner;
+mod team_auth;
+mod teams;
 mod poller;
 mod state;
 mod tmux;
@@ -213,6 +217,15 @@ pub fn run() {
             tmux::tmux_select_window,
             // Build metadata for the launcher footer (semver + git SHA + build date)
             get_version,
+            // Aperture V4 P1 team lifecycle. Activation is intentionally not
+            // exposed to Tauri; authenticated GLaDOS control uses the common
+            // headless engine in teams.rs.
+            teams::team_get_catalog,
+            teams::team_list_presets,
+            teams::team_save_preset,
+            teams::team_create,
+            teams::team_list,
+            teams::team_cancel_pending,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

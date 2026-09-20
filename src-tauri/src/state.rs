@@ -88,3 +88,51 @@ pub struct AppState {
     pub db_path: String,
     pub project_dir: String,
 }
+
+// Aperture V4 shared execution/ownership DTOs. These are serialized to the UI,
+// but authoritative owner records (pid/token/thread/nonce) remain private to
+// owner.rs and are projected through OwnerSummary only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Harness {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionTuple {
+    pub harness: Harness,
+    pub model: String,
+    pub reasoning: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerState {
+    Starting,
+    Active,
+    Stale,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerSummary {
+    pub generation: u64,
+    pub state: OwnerState,
+    pub since: String,
+    pub configured: ExecutionTuple,
+    pub actual: Option<ExecutionTuple>,
+    pub process_count: u32,
+    pub thread_bound: bool,
+}
