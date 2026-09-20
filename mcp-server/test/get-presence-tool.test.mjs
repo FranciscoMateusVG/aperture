@@ -34,14 +34,25 @@ const TMP = mkdtempSync(join(tmpdir(), "presence-tool-"));
 const HOME = join(TMP, "home");
 const RUN = join(TMP, "run");
 const AGENTS = join(TMP, "agents");
+const TEAMS = join(TMP, "teams");
+const TOKENS = join(RUN, "hub-tokens");
 const PRESENCE = join(RUN, "presence.json");
 const BD_STUB = join(TMP, "bd");
 const BD_LOG = join(TMP, "bd-calls.log");
 
 const ROSTER = ["glados", "izzy", "peppy", "rex", "wheatley"];
-for (const d of [HOME, RUN, join(AGENTS, "shared"), ...ROSTER.map((n) => join(AGENTS, n))]) {
+for (const d of [HOME, RUN, TEAMS, TOKENS, join(AGENTS, "shared"), ...ROSTER.map((n) => join(AGENTS, n))]) {
   mkdirSync(d, { recursive: true });
 }
+for (const name of ROSTER) {
+  writeFileSync(
+    join(AGENTS, name, "manifest.json"),
+    JSON.stringify({ name, model: "claude/test", window: name, role: "test", enabled: true }),
+  );
+  writeFileSync(join(AGENTS, name, "prompt.md"), "fixture");
+}
+const WHEATLEY_TOKEN = join(TOKENS, "wheatley.token");
+writeFileSync(WHEATLEY_TOKEN, "11".repeat(32), { mode: 0o600 });
 writeFileSync(
   BD_STUB,
   `#!/bin/sh\nprintf '%s\\n' "$*" >> "${BD_LOG}"\necho '{"id":"aperture-stub1"}'\n`,
@@ -74,6 +85,9 @@ before(async () => {
       APERTURE_MAILBOX: join(TMP, "mailbox"),
       APERTURE_RUN_DIR: RUN,
       APERTURE_AGENTS_DIR: AGENTS,
+      APERTURE_TEAMS_DIR: TEAMS,
+      APERTURE_HUB_TOKEN_DIR: TOKENS,
+      APERTURE_HUB_TOKEN_FILE: WHEATLEY_TOKEN,
       BD_PATH: BD_STUB,
       APERTURE_WS_PORT: "1",
     },
@@ -164,15 +178,13 @@ test("retired recipients (sage/atlas/sterling) error with the routing hint; othe
   for (const to of ["sage", "atlas", "sterling"]) {
     const { text, isError } = await call("send_message", { to, message: "x" });
     assert.equal(isError, true, `${to} must be rejected`);
-    assert.match(text, /^ERROR: Unknown recipient/);
-    const validList = text.split("\n")[0].split("Valid recipients are:")[1];
-    assert.doesNotMatch(validList, /\b(sage|atlas|sterling)\b/, "retired names must not be listed as valid");
+    assert.match(text, /^ERROR: E_UNKNOWN_RECIPIENT unknown_recipient\./);
     assert.match(text, /\nsage\/atlas\/sterling were retired 2026-07-19 — route SEO\/content to vance, docs to the implementing agent, QA sign-off to izzy\.$/);
   }
   const typo = await call("send_message", { to: "nobody", message: "x" });
   assert.equal(typo.isError, true);
   assert.doesNotMatch(typo.text, /retired/);
-  assert.match(typo.text, /Valid recipients are: glados, wheatley, peppy, izzy, vance, rex, scout, cipher, operator\./);
+  assert.match(typo.text, /^ERROR: E_UNKNOWN_RECIPIENT unknown_recipient\.$/);
 });
 
 test("send_message tool description no longer lists retired agents", async () => {

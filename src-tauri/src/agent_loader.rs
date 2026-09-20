@@ -51,6 +51,14 @@ fn default_enabled() -> bool {
     true
 }
 
+fn is_reserved_seat_principal(name: &str) -> bool {
+    matches!(name, "operator" | "watchdog")
+}
+
+fn is_coordination_trio(name: &str) -> bool {
+    matches!(name, "glados" | "wheatley" | "peppy")
+}
+
 fn aperture_root() -> String {
     // APERTURE_AGENTS_DIR (aperture-syepg) overrides the registry root. The
     // boot-verification harness (aperture-xt16e) points this at a stub registry
@@ -65,19 +73,204 @@ fn aperture_root() -> String {
     format!("{}/.claude/aperture", home)
 }
 
+fn teams_root() -> String {
+    if let Ok(dir) = std::env::var("APERTURE_TEAMS_DIR") {
+        if !dir.is_empty() {
+            return dir;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    format!("{}/.aperture/teams", home)
+}
+
+/// Exact parity with the TS/hub/UI rule in §4.1. ASCII is intentional: these
+/// ids become filenames, tmux windows and unix-socket stems.
+pub fn is_valid_seat_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 31 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || (index > 0 && (*byte == b'_' || *byte == b'-'))
+    })
+}
+
+fn is_valid_project_label(project: &str) -> bool {
+    let Some(name) = project.strip_prefix("project:") else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && (*byte == b'_' || *byte == b'-'))
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamState {
+    state: String,
+    generation: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamSeat {
+    name: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamGrant {
+    from: String,
+    to: String,
+    scope: String,
+    by: String,
+    at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamSnapshot {
+    team: String,
+    project: String,
+    lead: String,
+    seats: Vec<TeamSeat>,
+    #[serde(default)]
+    grants: Vec<TeamGrant>,
+}
+
+fn is_real_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.is_file() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn path_entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn path_inside(root: &Path, path: &Path) -> bool {
+    match (fs::canonicalize(root), fs::canonicalize(path)) {
+        (Ok(root), Ok(path)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
+fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
+    if !is_valid_seat_name(name) {
+        return None;
+    }
+    let dir = root.join(name);
+    if !is_real_dir(&dir) || !path_inside(root, &dir) {
+        return None;
+    }
+    let state_path = dir.join("state.json");
+    let team_path = dir.join("team.json");
+    let journal_path = dir.join("journal.json");
+    if !is_real_file(&state_path) || !is_real_file(&team_path) || path_entry_exists(&journal_path) {
+        return None;
+    }
+    if !path_inside(&dir, &state_path) || !path_inside(&dir, &team_path) {
+        return None;
+    }
+    let state_before = fs::read_to_string(&state_path).ok()?;
+    let team_before = fs::read_to_string(&team_path).ok()?;
+    if path_entry_exists(&journal_path) {
+        return None;
+    }
+    let team_after = fs::read_to_string(&team_path).ok()?;
+    let state_after = fs::read_to_string(&state_path).ok()?;
+    if path_entry_exists(&journal_path) || state_before != state_after || team_before != team_after {
+        return None;
+    }
+    let state: TeamState = serde_json::from_str(&state_before).ok()?;
+    let snapshot: TeamSnapshot = serde_json::from_str(&team_before).ok()?;
+    let _generation = state.generation;
+    if state.state != "active"
+        || snapshot.team != name
+        || !is_valid_project_label(&snapshot.project)
+        || !is_valid_seat_name(&snapshot.lead)
+    {
+        return None;
+    }
+    let mut names = HashSet::new();
+    for seat in &snapshot.seats {
+        if !is_valid_seat_name(&seat.name)
+            || is_reserved_seat_principal(&seat.name)
+            || is_coordination_trio(&seat.name)
+            || seat.role.trim().is_empty()
+            || !names.insert(seat.name.clone())
+        {
+            return None;
+        }
+    }
+    if !names.contains(&snapshot.lead) {
+        return None;
+    }
+    for grant in &snapshot.grants {
+        if grant.scope != "message"
+            || grant.by != "glados"
+            || (grant.from != snapshot.team && !names.contains(&grant.from))
+            || !is_valid_seat_name(&grant.to)
+            || grant.at.trim().is_empty()
+        {
+            return None;
+        }
+    }
+    Some(snapshot)
+}
+
+fn active_team_memberships(root: &Path) -> HashMap<String, Vec<(String, String)>> {
+    let mut memberships: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    if !is_real_dir(root) {
+        return memberships;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return memberships;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('_') || name == "archive" || name == "presets" {
+            continue;
+        }
+        let Some(team) = read_active_team(root, &name) else {
+            continue;
+        };
+        for seat in team.seats {
+            memberships
+                .entry(seat.name)
+                .or_default()
+                .push((team.team.clone(), seat.role));
+        }
+    }
+    memberships
+}
+
 /// Scan `~/.claude/aperture/` for agent directories and parse each manifest.
 /// Skips `shared/` and any directory missing manifest.json or prompt.md, with
 /// a warning to stderr. Disabled agents (`"enabled": false`) are excluded.
 pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
-    let root = aperture_root();
-    let mut agents = HashMap::new();
+    load_agents_from_roots(Path::new(&aperture_root()), Path::new(&teams_root()))
+}
 
-    let entries = match fs::read_dir(&root) {
+fn load_agents_from_roots(root: &Path, team_root: &Path) -> HashMap<String, AgentDef> {
+    let mut agents = HashMap::new();
+    let memberships = active_team_memberships(team_root);
+
+    let entries = match fs::read_dir(root) {
         Ok(e) => e,
         Err(e) => {
             eprintln!(
                 "[aperture] could not read {}: {} — did you run `just setup`?",
-                root, e
+                root.display(), e
             );
             return agents;
         }
@@ -90,7 +283,25 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
         }
         let dir_name = entry.file_name().to_string_lossy().to_string();
         // Reserved names: shared/ holds skill symlinks, _* are scratch dirs.
-        if dir_name == "shared" || dir_name.starts_with('_') {
+        if dir_name == "shared" || dir_name.starts_with('_') || is_reserved_seat_principal(&dir_name) {
+            continue;
+        }
+        if !is_valid_seat_name(&dir_name) || !is_real_dir(&path) || !path_inside(root, &path) {
+            eprintln!("[aperture] skipping '{}': invalid or unsafe seat directory", dir_name);
+            continue;
+        }
+
+        let team_marker = path.join("TEAM");
+        let membership_count = memberships.get(&dir_name).map_or(0, Vec::len);
+        let is_team_seat = is_real_file(&team_marker);
+        if (path_entry_exists(&team_marker) && !is_team_seat)
+            || (!is_team_seat && membership_count > 0)
+        {
+            eprintln!("[aperture] skipping '{}': unsafe TEAM marker", dir_name);
+            continue;
+        }
+        if is_team_seat && is_coordination_trio(&dir_name) {
+            eprintln!("[aperture] skipping '{}': fixed coordination seat cannot be a team seat", dir_name);
             continue;
         }
 
@@ -106,6 +317,18 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
         }
         if !prompt_path.exists() {
             eprintln!("[aperture] skipping '{}': missing prompt.md", dir_name);
+            continue;
+        }
+        if is_team_seat
+            && (!is_real_file(&manifest_path)
+                || !is_real_file(&prompt_path)
+                || !is_real_file(&path.join(".complete")))
+        {
+            eprintln!("[aperture] skipping '{}': incomplete or unsafe team seat", dir_name);
+            continue;
+        }
+        if fs::read(&prompt_path).is_err() {
+            eprintln!("[aperture] skipping '{}': unreadable prompt.md", dir_name);
             continue;
         }
 
@@ -135,12 +358,34 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
         if !manifest.enabled {
             continue;
         }
+        if manifest.name.trim().is_empty()
+            || manifest.model.trim().is_empty()
+            || manifest.window.trim().is_empty()
+            || manifest.role.trim().is_empty()
+        {
+            eprintln!("[aperture] skipping '{}': blank required manifest field", dir_name);
+            continue;
+        }
+
+        let role = if is_team_seat {
+            let Some(entries) = memberships.get(&dir_name) else {
+                eprintln!("[aperture] skipping '{}': team seat has no active snapshot", dir_name);
+                continue;
+            };
+            if entries.len() != 1 {
+                eprintln!("[aperture] skipping '{}': ambiguous team membership", dir_name);
+                continue;
+            }
+            entries[0].1.clone()
+        } else {
+            manifest.role
+        };
 
         // The directory name is the canonical lowercase key used everywhere
         // (tmux window targeting, BEADS, message routing). The display name
         // in manifest.json is currently informational; the launcher renders
         // it via the frontend if/when it wants pretty labels.
-        let key = dir_name.to_lowercase();
+        let key = dir_name;
         // Empty string → None so the frontend's `agent.emoji || fallback`
         // and the serialized JSON both read "no emoji" the same way.
         let emoji = Some(manifest.emoji.trim().to_string()).filter(|e| !e.is_empty());
@@ -149,7 +394,7 @@ pub fn load_agents_from_disk() -> HashMap<String, AgentDef> {
             AgentDef {
                 name: key,
                 model: manifest.model,
-                role: manifest.role,
+                role,
                 prompt_file: prompt_path.to_string_lossy().to_string(),
                 tmux_window_id: None,
                 status: "stopped".into(),
@@ -490,9 +735,10 @@ fn link_codex_skills(
 
 #[cfg(test)]
 mod tests {
-    use super::{link_codex_skills, parse_skill_lines, read_resident_list};
+    use super::{is_valid_seat_name, link_codex_skills, load_agents_from_roots, parse_skill_lines, read_resident_list};
+    use serde::Deserialize;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -503,6 +749,215 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[derive(Deserialize)]
+    struct NameCases {
+        valid: Vec<String>,
+        invalid: Vec<String>,
+    }
+
+    #[test]
+    fn canonical_name_fixture_matches_rust_loader() {
+        let cases: NameCases = serde_json::from_str(include_str!(
+            "../../tests/fixtures/seat-name-cases.json"
+        ))
+        .unwrap();
+        for name in cases.valid {
+            assert!(is_valid_seat_name(&name), "expected valid: {name}");
+        }
+        for name in cases.invalid {
+            assert!(!is_valid_seat_name(&name), "expected invalid: {name}");
+        }
+    }
+
+    fn write_agent(root: &Path, name: &str, enabled: bool, team: bool) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "name": name,
+                "model": "codex/gpt-test",
+                "window": name,
+                "role": "manifest-role",
+                "kind": "codex",
+                "enabled": enabled
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(dir.join("prompt.md"), "fixture").unwrap();
+        if team {
+            fs::write(dir.join("TEAM"), "").unwrap();
+            fs::write(dir.join(".complete"), "").unwrap();
+        }
+    }
+
+    fn write_team(root: &Path, team: &str, state: &str, seats: &[(&str, &str)]) {
+        let dir = root.join(team);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json"),
+            serde_json::json!({"state": state, "generation": 1}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("team.json"),
+            serde_json::json!({
+                "team": team,
+                "project": "project:aperture",
+                "lead": seats[0].0,
+                "seats": seats.iter().map(|(name, role)| serde_json::json!({"name": name, "role": role})).collect::<Vec<_>>(),
+                "grants": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn loader_keeps_legacy_and_only_complete_active_unambiguous_team_seats() {
+        let root = temp_dir("v4-registry");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+        write_agent(&agents, "rex", true, false);
+        write_agent(&agents, "disabled", false, false);
+        write_agent(&agents, "p1-backend", true, true);
+        write_agent(&agents, "pending-backend", true, true);
+        write_agent(&agents, "missing-marker", true, false);
+        write_agent(&agents, "journal-link", true, true);
+        write_agent(&agents, "a1234567890123456789012345678901", true, false);
+        write_team(&teams, "p1", "active", &[("p1-backend", "backend")]);
+        write_team(&teams, "pending", "pending", &[("pending-backend", "backend")]);
+        write_team(&teams, "markerless", "active", &[("missing-marker", "backend")]);
+        write_team(&teams, "journal-link-team", "active", &[("journal-link", "backend")]);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("does-not-exist"),
+            teams.join("journal-link-team/journal.json"),
+        )
+        .unwrap();
+
+        let loaded = load_agents_from_roots(&agents, &teams);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("rex").unwrap().role, "manifest-role");
+        assert_eq!(loaded.get("p1-backend").unwrap().role, "backend");
+        assert!(!loaded.contains_key("disabled"));
+        assert!(!loaded.contains_key("pending-backend"));
+        assert!(!loaded.contains_key("missing-marker"));
+        assert!(!loaded.contains_key("journal-link"));
+
+        fs::write(teams.join("p1/journal.json"), "{}").unwrap();
+        let during_transition = load_agents_from_roots(&agents, &teams);
+        assert!(!during_transition.contains_key("p1-backend"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_rejects_missing_or_malformed_boot_fields_and_prompt() {
+        let root = temp_dir("v4-required-fields");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+
+        write_agent(&agents, "missing-prompt", true, false);
+        fs::remove_file(agents.join("missing-prompt/prompt.md")).unwrap();
+        for field in ["name", "model", "window", "role"] {
+            let name = format!("bad-{field}");
+            write_agent(&agents, &name, true, false);
+            let path = agents.join(&name).join("manifest.json");
+            let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            fs::write(path, value.to_string()).unwrap();
+        }
+        write_agent(&agents, "bad-malformed", true, false);
+        let malformed_path = agents.join("bad-malformed/manifest.json");
+        let mut malformed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&malformed_path).unwrap()).unwrap();
+        malformed["window"] = serde_json::json!(42);
+        fs::write(malformed_path, malformed.to_string()).unwrap();
+        for (name, field, value) in [
+            ("bad-enabled", "enabled", serde_json::json!("yes")),
+            ("bad-emoji", "emoji", serde_json::json!(42)),
+            ("bad-kind", "kind", serde_json::json!(42)),
+        ] {
+            write_agent(&agents, name, true, false);
+            let path = agents.join(name).join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            manifest[field] = value;
+            fs::write(path, manifest.to_string()).unwrap();
+        }
+
+        assert!(load_agents_from_roots(&agents, &teams).is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loader_preserves_readable_repo_owned_legacy_symlinks() {
+        let root = temp_dir("v4-legacy-links");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        let source = root.join("source");
+        let linked = agents.join("legacy-link");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            source.join("manifest.json"),
+            serde_json::json!({
+                "name": "legacy-link",
+                "model": "claude/test",
+                "window": "legacy-link",
+                "role": "legacy",
+                "enabled": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(source.join("prompt.md"), "legacy prompt").unwrap();
+        std::os::unix::fs::symlink(source.join("manifest.json"), linked.join("manifest.json"))
+            .unwrap();
+        std::os::unix::fs::symlink(source.join("prompt.md"), linked.join("prompt.md")).unwrap();
+
+        let loaded = load_agents_from_roots(&agents, &teams);
+        assert!(loaded.contains_key("legacy-link"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_rejects_reserved_team_collisions_but_preserves_fixed_legacy_trio() {
+        let root = temp_dir("v4-reserved");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+        for name in ["operator", "watchdog", "glados", "wheatley", "peppy", "rex"] {
+            write_agent(&agents, name, true, name != "rex");
+        }
+        for name in ["operator", "watchdog", "glados", "wheatley", "peppy"] {
+            write_team(&teams, &format!("team-{name}"), "active", &[(name, "lead")]);
+        }
+        let loaded = load_agents_from_roots(&agents, &teams);
+        assert_eq!(loaded.keys().cloned().collect::<Vec<_>>(), vec!["rex".to_string()]);
+
+        for name in ["glados", "wheatley", "peppy"] {
+            fs::remove_file(agents.join(name).join("TEAM")).unwrap();
+            fs::remove_file(agents.join(name).join(".complete")).unwrap();
+        }
+        let legacy = load_agents_from_roots(&agents, &teams);
+        for name in ["glados", "wheatley", "peppy"] {
+            assert!(legacy.contains_key(name), "{name} should remain a fixed legacy principal");
+        }
+        assert!(!legacy.contains_key("operator"));
+        assert!(!legacy.contains_key("watchdog"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

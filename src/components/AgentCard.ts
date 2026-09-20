@@ -23,13 +23,9 @@ const AGENT_THEME: Record<string, { icon: string; color: string }> = {
 
 const DEFAULT_THEME = { icon: "⚙️", color: "#f39c12" };
 
-// Bead titles (current-work summary, aperture-nr65b) originate from BEADS —
-// including, transitively, user-submitted report titles via the AI-intake
-// pipeline (aperture:incluir-intake-to-bead). Unlike agent.name/agent.model
-// (constrained to a fixed manifest list), a bead title is free text, so it
-// gets escaped (utils/html.ts) before landing in innerHTML. Everything else
-// already interpolated in this file's template comes from a closed, trusted
-// set.
+// Registry data is validated by the loader, but every value interpolated into
+// innerHTML is escaped as defense in depth. The below-loader test seam
+// deliberately injects an invalid `<` name to prove this boundary.
 
 /** Lifecycle ops are owned by AgentList (aperture-ull4y): it holds the
  *  per-agent in-flight lock, merges it into `op_pending`, routes failures
@@ -86,7 +82,7 @@ export function createAgentCard(
     if (isRunning) {
       const dotState = deriveDotState(agent);
       const tooltip = dotTooltip(dotState, agent);
-      presenceDot = `<span class="agent-mini__presence agent-mini__presence--${dotState}" title="${tooltip}"></span>`;
+      presenceDot = `<span class="agent-mini__presence agent-mini__presence--${dotState}" title="${escapeHtml(tooltip)}"></span>`;
 
       // Current-work summary line (aperture-nr65b). null = no data available
       // (agent stopped — can't happen here since isRunning, or the backend's
@@ -118,18 +114,18 @@ export function createAgentCard(
     } else {
       const chip = deriveStateChip(agent, Date.now());
       if (chip) {
-        stateSlot = `<span class="agent-mini__state agent-mini__state--${chip.kind}" title="${chip.tooltip}">${chip.label}</span>`;
+        stateSlot = `<span class="agent-mini__state agent-mini__state--${chip.kind}" title="${escapeHtml(chip.tooltip)}">${escapeHtml(chip.label)}</span>`;
       }
     }
 
     const disabled = pending ? " disabled" : "";
     card.innerHTML = `
       <div class="agent-mini__row">
-        <span class="agent-mini__icon">${icon}${presenceDot}</span>
-        <span class="agent-mini__name">${agent.name}</span>
+        <span class="agent-mini__icon">${escapeHtml(icon)}${presenceDot}</span>
+        <span class="agent-mini__name">${escapeHtml(agent.name)}</span>
         ${badge}
         ${stateSlot}
-        <span class="agent-mini__model">${agent.model}</span>
+        <span class="agent-mini__model">${escapeHtml(agent.model)}</span>
         <button class="agent-mini__config" title="Configure">⚙</button>
         <button class="agent-mini__restart" title="Restart (stop if running, then boot)"${disabled}>↻</button>
         <button class="agent-mini__toggle" title="${isRunning ? "Stop" : "Start"}"${disabled}>

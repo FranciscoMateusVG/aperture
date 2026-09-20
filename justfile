@@ -29,6 +29,10 @@ setup:
             [ -d "$d" ] || continue
             name=$(basename "$d")
             [ "$name" = "shared" ] && continue
+            [[ "$name" = _* ]] && continue
+            # V4 team seats are launcher-owned runtime state. Source setup must
+            # never delete or rewrite them.
+            { [ -e "$d/TEAM" ] || [ -L "$d/TEAM" ]; } && continue
             rm -rf "$d"
         done
     fi
@@ -55,6 +59,8 @@ setup:
     for agent_dir in "$REPO"/agents/*/; do
         [ -d "$agent_dir" ] || continue
         name=$(basename "$agent_dir")
+        [[ "$name" = _* ]] && continue
+        { [ -e "$agent_dir/TEAM" ] || [ -L "$agent_dir/TEAM" ]; } && continue
         manifest="$agent_dir/manifest.json"
         skills_txt="$agent_dir/skills.txt"
         prompt_src="$REPO/prompts/$name.md"
@@ -235,7 +241,15 @@ status:
     docker info > /dev/null 2>&1 && echo "  ✅ Docker is running" || echo "  ⚠️  Docker is not running (needed for deploys)"
     echo ""
     echo "── Agents ──"
-    for agent in glados wheatley peppy izzy vance rex; do
+    for agent_dir in "$(pwd)"/agents/*/; do
+        [ -d "$agent_dir" ] || continue
+        agent=$(basename "$agent_dir")
+        [[ "$agent" = _* ]] && continue
+        { [ -e "$agent_dir/TEAM" ] || [ -L "$agent_dir/TEAM" ]; } && continue
+        manifest="$agent_dir/manifest.json"
+        [ -f "$manifest" ] || continue
+        enabled=$(node -e 'const m=require(process.argv[1]); process.stdout.write(m.enabled === false ? "false" : "true")' "$manifest")
+        [ "$enabled" = "true" ] || continue
         if pgrep -f "name $agent" > /dev/null 2>&1; then
             echo "  ✅ $agent is running"
         else

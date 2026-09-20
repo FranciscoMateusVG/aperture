@@ -42,14 +42,14 @@ import { basename } from "node:path";
  * Identity: the launcher exports APERTURE_HUB_TOKEN_FILE=…/hub-tokens/<name>.token
  * into the agent's shell but NOT AGENT_NAME, so `agent` is derived from the
  * token file's basename minus `.token`, validated against the same
- * /^[a-z0-9_-]{1,32}$/ the hub enforces. The token is sent as the raw file
+ * /^[a-z0-9][a-z0-9_-]{0,30}$/ the hub enforces. The token is sent as the raw file
  * contents (no trim) — the hub compares bytes, exactly as hub-notify.ts does.
  *
  * Hub URL: APERTURE_HUB_URL (default ws://127.0.0.1:4517), like hub-client.ts.
  * perMessageDeflate is OFF (hub requirement — banked gotcha).
  */
 
-const AGENT_NAME = /^[a-z0-9_-]{1,32}$/;
+const AGENT_NAME = /^[a-z0-9][a-z0-9_-]{0,30}$/;
 const DEFAULT_TIMEOUT_MS = 800;
 const TOKEN_SUFFIX = ".token";
 

@@ -610,9 +610,49 @@ fn find_running_window<'a>(windows: &'a [tmux::WindowInfo], agent_name: &str) ->
     })
 }
 
+/// Replace the cached registry membership with a fresh authoritative load,
+/// while retaining only launcher-owned runtime state for principals that are
+/// still enabled.  Keeping this merge pure makes the activate/archive
+/// boundary testable without a running Tauri process or tmux session.
+fn merge_fresh_registry(
+    mut fresh: HashMap<String, AgentDef>,
+    previous: &HashMap<String, AgentDef>,
+    overrides: &HashMap<String, String>,
+) -> HashMap<String, AgentDef> {
+    for (name, agent) in fresh.iter_mut() {
+        if let Some(model) = overrides.get(name) {
+            agent.model = model.clone();
+        }
+        if let Some(previous) = previous.get(name) {
+            agent.tmux_window_id = previous.tmux_window_id.clone();
+            agent.status = previous.status.clone();
+            agent.attention = previous.attention;
+            agent.attention_reason = previous.attention_reason.clone();
+            agent.turn_state = previous.turn_state.clone();
+            agent.current_task_id = previous.current_task_id.clone();
+            agent.current_task_title = previous.current_task_title.clone();
+            agent.current_task_extra_count = previous.current_task_extra_count;
+            agent.dot_state = previous.dot_state.clone();
+            agent.dot_state_since = previous.dot_state_since.clone();
+            agent.kickoff_fired_at = previous.kickoff_fired_at.clone();
+        }
+    }
+    fresh
+}
+
 #[tauri::command]
 pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<AgentDef>, String> {
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
+
+    // V4 P0: the filesystem registry is authoritative and activation/archive
+    // must become visible without restarting the Tauri process. Reload on the
+    // existing 3s list poll, while retaining launcher-owned ephemeral state
+    // for principals that remain enabled. An invalid/incoherent snapshot is
+    // absent (fail closed), never merged with stale AppState membership.
+    let fresh = crate::agent_loader::load_agents_from_disk();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let overrides = crate::config::load_agent_overrides(&home);
+    app_state.agents = merge_fresh_registry(fresh, &app_state.agents, &overrides);
 
     // Cross-reference with actual tmux windows to detect agents started outside the UI
     if let Ok(windows) = tmux::tmux_list_windows(app_state.tmux_session.clone()) {
@@ -993,6 +1033,53 @@ mod tests {
             dot_state_since: None,
             kickoff_fired_at: None,
         }
+    }
+
+    #[test]
+    fn fresh_registry_drops_archived_adds_activated_and_preserves_runtime_only() {
+        let mut retained = agent();
+        retained.name = "retained".into();
+        retained.role = "old-role".into();
+        retained.prompt_file = "old-prompt".into();
+        retained.tmux_window_id = Some("@7".into());
+        retained.attention = true;
+        retained.turn_state = Some("busy".into());
+        retained.current_task_id = Some("aperture-test".into());
+
+        let mut archived = agent();
+        archived.name = "archived".into();
+
+        let previous = HashMap::from([
+            (retained.name.clone(), retained.clone()),
+            (archived.name.clone(), archived),
+        ]);
+
+        let mut fresh_retained = agent();
+        fresh_retained.name = "retained".into();
+        fresh_retained.role = "new-role".into();
+        fresh_retained.prompt_file = "new-prompt".into();
+        fresh_retained.status = "stopped".into();
+        let mut activated = agent();
+        activated.name = "activated".into();
+        activated.status = "stopped".into();
+
+        let fresh = HashMap::from([
+            (fresh_retained.name.clone(), fresh_retained),
+            (activated.name.clone(), activated),
+        ]);
+        let overrides = HashMap::from([("retained".into(), "codex/test".into())]);
+        let merged = merge_fresh_registry(fresh, &previous, &overrides);
+
+        assert!(!merged.contains_key("archived"), "archived seats must disappear on refresh");
+        assert!(merged.contains_key("activated"), "newly activated seats must appear on refresh");
+        let retained = merged.get("retained").unwrap();
+        assert_eq!(retained.role, "new-role", "registry-owned fields come from the fresh snapshot");
+        assert_eq!(retained.prompt_file, "new-prompt");
+        assert_eq!(retained.model, "codex/test", "model override applies to the fresh definition");
+        assert_eq!(retained.tmux_window_id.as_deref(), Some("@7"));
+        assert!(retained.attention);
+        assert_eq!(retained.turn_state.as_deref(), Some("busy"));
+        assert_eq!(retained.current_task_id.as_deref(), Some("aperture-test"));
     }
 
     // ---- aperture-84bby: picker <-> validator alignment ----

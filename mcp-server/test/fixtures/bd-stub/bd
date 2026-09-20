@@ -3,9 +3,11 @@
 # test/hub-replay.test.mjs to pin the WS hub's replay-on-reconnect behavior
 # (aperture-xt16e) without touching hub code or a real BEADS store.
 #
-# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages; -n 200 = UNREAD_LIMIT,
-#           aperture-84bby — bounded replay, was -n 0):
-#   bd query 'type=message AND status=open AND title="->RECIPIENT]"' --json -n 200
+# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages and bd 1.0.2
+#           list semantics: complete message-wisp selection, then sort, stdout bounded
+#           by the caller rather than a pre-sort row limit):
+#   bd list --type message --status open --title-contains '->RECIPIENT]' --include-infra \
+#     --sort id --reverse --json -n 0
 #     → prints the JSON array in $BD_STUB_DIR/unread-RECIPIENT.json, or [] if
 #       that file is absent.
 #
@@ -40,15 +42,31 @@ if [[ "${BD_STUB_FAIL:-}" == "1" ]]; then
   exit 1
 fi
 
-# The one recognized shape: query <getUnreadMessages-query> --json -n 200
-if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" == "200" ]]; then
-  query="$2"
-  re='^type=message AND status=open AND title="->(.+)\]"$'
-  if [[ "$query" =~ $re ]]; then
+# Read-time authorization loss annotates the original open row instead of
+# closing/replacing it. Accept that one mutation shape so replay tests can pin
+# the durable-withheld contract without a real BEADS store.
+if [[ $# -eq 5 && "$1" == "update" && "$3" == "--add-label" && "$5" == "--json" && "$4" == withheld:* ]]; then
+  printf '{"id":"%s","status":"open","labels":["%s"]}\n' "$2" "$4"
+  exit 0
+fi
+
+# The primary recognized shape: complete getUnreadMessages list scan.
+if [[ $# -eq 14 && "$1" == "list" && "$2" == "--type" && "$3" == "message" && "$4" == "--status" && "$5" == "open" && "$6" == "--title-contains" && "$8" == "--include-infra" && "$9" == "--sort" && "${10}" == "id" && "${11}" == "--reverse" && "${12}" == "--json" && "${13}" == "-n" && "${14}" == "0" ]]; then
+  title_filter="$7"
+  re='^->([^]]+)\]$'
+  if [[ "$title_filter" =~ $re ]]; then
     recipient="${BASH_REMATCH[1]}"
     seed="$BD_STUB_DIR/unread-${recipient}.json"
     if [[ -f "$seed" ]]; then
-      cat "$seed"
+      node - "$seed" "$title_filter" <<'NODE'
+const fs = require("node:fs");
+const rows = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const titleFilter = process.argv[3].toLowerCase();
+const page = rows
+  .filter((row) => row.issue_type === "message" && row.status === "open" && String(row.title ?? "").toLowerCase().includes(titleFilter))
+  .sort((a, b) => b.id.localeCompare(a.id));
+process.stdout.write(JSON.stringify(page));
+NODE
     else
       echo "[]"
     fi
@@ -56,5 +74,5 @@ if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" ==
   fi
 fi
 
-echo "bd-stub: unrecognized argv shape (contract drift from beads.ts getUnreadMessages?): $*" >&2
+echo "bd-stub: unrecognized argv shape (contract drift from beads.ts unread/withheld contract?): $*" >&2
 exit 2

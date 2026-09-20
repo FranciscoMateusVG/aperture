@@ -12,7 +12,8 @@
 // long-lived server child serves every test.
 //
 // Pins:
-//   (a) get_messages passes `-n 200`, renders oldest-first, and appends the
+//   (a) get_messages uses bd 1.0.2 list's complete message-wisp scan with a
+//       dedicated stdout bound, renders at most 200 oldest-first, and appends the
 //       cap notice ONLY when exactly 200 rows came back; the aperture-q6gov
 //       non-array → ERROR path is intact.
 //   (b) include_done:true → `--all`; omitted/false → no `--all`, and no
@@ -25,7 +26,7 @@
 //       the raw dump; show keeps fields:"full" as the raw opt-in.
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,13 +42,47 @@ const TMP = mkdtempSync(join(tmpdir(), "beads-projection-"));
 const HOME = join(TMP, "home");
 const RUN = join(TMP, "run");
 const AGENTS = join(TMP, "agents");
+const TEAMS = join(TMP, "teams");
+const TOKENS = join(TMP, "tokens");
+const AGENT_TOKEN = join(TOKENS, `${AGENT}.token`);
 const BD_STUB = join(TMP, "bd");
+const BD_STUB_JS = join(TMP, "bd-unread.mjs");
 const BD_LOG = join(TMP, "bd-calls.log");
 const SCENARIO = join(TMP, "scenario.out");
 
-for (const d of [HOME, RUN, join(AGENTS, "shared"), join(AGENTS, AGENT), join(AGENTS, "glados")]) {
+for (const d of [HOME, RUN, TEAMS, TOKENS, join(AGENTS, "shared"), join(AGENTS, AGENT), join(AGENTS, "glados"), join(AGENTS, "p1-offline"), join(AGENTS, "disabled")]) {
   mkdirSync(d, { recursive: true });
 }
+for (const name of [AGENT, "glados", "p1-offline", "disabled"]) {
+  writeFileSync(
+    join(AGENTS, name, "manifest.json"),
+    JSON.stringify({ name, model: "codex/test", window: name, role: "test", enabled: name !== "disabled" }),
+  );
+  writeFileSync(join(AGENTS, name, "prompt.md"), "fixture");
+}
+writeFileSync(AGENT_TOKEN, "a".repeat(64), { mode: 0o600 });
+writeFileSync(
+  BD_STUB_JS,
+  [
+    'import { readFileSync } from "node:fs";',
+    'const value = JSON.parse(readFileSync(process.argv[2], "utf8"));',
+    'const args = process.argv.slice(3);',
+    'if (value?.oversized === true) { await new Promise((resolve) => process.stdout.write("x".repeat(9 * 1024 * 1024), resolve)); process.exit(0); }',
+    'if (value?.invalidJson === true) { process.stdout.write("{not-json"); process.exit(0); }',
+    'if (!Array.isArray(value)) { process.stdout.write(JSON.stringify(value)); process.exit(0); }',
+    'const flag = (name) => { const i=args.indexOf(name); return i < 0 ? null : args[i+1]; };',
+    '// Faithful bd 1.0.2 list boundary: infra is hidden unless explicitly included;',
+    '// exact infra type selects message wisps; --sort runs on the full set before -n.',
+    'let page = args.includes("--include-infra") ? value : value.filter((row) => row.issue_type !== "message");',
+    'const type = flag("--type"); if (type) page = page.filter((row) => row.issue_type === type);',
+    'const status = flag("--status"); if (status) page = page.filter((row) => row.status === status);',
+    'const title = flag("--title-contains"); if (title) page = page.filter((row) => String(row.title ?? "").toLowerCase().includes(title.toLowerCase()));',
+    'if (flag("--sort") === "id") page = page.toSorted((a, b) => args.includes("--reverse") ? b.id.localeCompare(a.id) : a.id.localeCompare(b.id));',
+    'const limit = Number(flag("-n")); if (Number.isFinite(limit) && limit > 0) page = page.slice(0, limit);',
+    'process.stdout.write(JSON.stringify(page));',
+    "",
+  ].join("\n"),
+);
 // Stub bd: log argv (tab-joined, one line per call), print the scenario file
 // verbatim. The `\t` below are real tab characters once JS writes the file.
 writeFileSync(
@@ -57,6 +92,9 @@ writeFileSync(
     'line=""',
     'for a in "$@"; do line="${line}${a}\t"; done',
     `printf '%s\\n' "\${line%\t}" >> "${BD_LOG}"`,
+    `if [ "$1" = list ] && [ "$2" = --type ] && [ "$4" = --status ] && [ "$6" = --title-contains ]; then exec "${process.execPath}" "${BD_STUB_JS}" "${SCENARIO}" "$@"; fi`,
+    `if [ "$1" = show ]; then if [ "$(head -c 1 "${SCENARIO}")" != "[" ]; then cat "${SCENARIO}"; exit 0; fi; exec "${process.execPath}" -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const r=v.find(x=>x&&x.id===process.argv[2]);process.stdout.write(JSON.stringify(r??[]))' "${SCENARIO}" "$2"; fi`,
+    `if [ "$1" = close ]; then printf '{"id":"%s","status":"closed"}\\n' "$2"; exit 0; fi`,
     `cat "${SCENARIO}"`,
     "",
   ].join("\n"),
@@ -96,9 +134,11 @@ const message = (i, createdAt) => ({
   description: `body ${i}`,
   status: "open",
   issue_type: "message",
+  ephemeral: true,
   created_at: createdAt,
 });
-// bd query emits NEWEST-first; build n messages that way so the sort is observable.
+// Build n messages newest-first; the faithful list stub re-sorts the complete
+// issues+wisp merge before applying any nonzero output limit.
 const newestFirstMessages = (n) =>
   Array.from({ length: n }, (_, k) => {
     const i = n - k; // n, n-1, …, 1
@@ -120,6 +160,9 @@ before(async () => {
       APERTURE_MAILBOX: join(TMP, "mailbox"),
       APERTURE_RUN_DIR: RUN,
       APERTURE_AGENTS_DIR: AGENTS,
+      APERTURE_TEAMS_DIR: TEAMS,
+      APERTURE_HUB_TOKEN_DIR: TOKENS,
+      APERTURE_HUB_TOKEN_FILE: AGENT_TOKEN,
       BD_PATH: BD_STUB,
       APERTURE_WS_PORT: "1",
     },
@@ -143,17 +186,26 @@ const call = async (name, args = {}) => {
 
 // ── (a) get_messages ──────────────────────────────────────────────────────
 
-test("get_messages: bd argv is the query with -n 200 (bounded, not -n 0)", async () => {
+test("get_messages: bd argv uses the complete message-wisp list boundary with explicit infra visibility", async () => {
   setScenario([]);
   const { text, isError } = await call("get_messages");
   assert.equal(isError, false);
   assert.equal(text, "No unread messages.");
   assert.deepEqual(lastCall(), [
-    "query",
-    `type=message AND status=open AND title="->${AGENT}]"`,
+    "list",
+    "--type",
+    "message",
+    "--status",
+    "open",
+    "--title-contains",
+    `->${AGENT}]`,
+    "--include-infra",
+    "--sort",
+    "id",
+    "--reverse",
     "--json",
     "-n",
-    "200",
+    "0",
   ]);
 });
 
@@ -177,7 +229,7 @@ test("get_messages: exactly 200 rows → oldest-first + cap notice appended once
   assert.match(blocks[199], /^\[aperture-wisp-0200\] From glados: body 200$/);
   assert.equal(
     blocks[200],
-    "Showing the 200 most recent unread messages (oldest first); older messages are still queued. Call get_messages again after marking these read.",
+    "Showing the 200 most recent currently authorized unread messages (oldest first). Additional authorized messages may remain queued; call get_messages again after marking these read.",
   );
   assert.equal((text.match(/Showing the 200 most recent/g) ?? []).length, 1);
 });
@@ -195,6 +247,213 @@ test("get_messages: non-array bd body is still an ERROR, never an empty inbox (a
   assert.equal(isError, true);
   assert.match(text, /^ERROR: unexpected bd response shape for get_messages — expected a JSON array, got object/);
   assert.match(text, /NOT an empty inbox/);
+});
+
+test("get_messages: malformed complete scan is a fixed hard error before mutation", async () => {
+  setScenario({ invalidJson: true });
+  const { text, isError } = await call("get_messages");
+  assert.equal(isError, true);
+  assert.equal(
+    text,
+    "ERROR: unread scan returned invalid JSON; no messages were delivered or acknowledged — retry get_messages",
+  );
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+});
+
+test("message tools fail before BEADS when the MCP principal token binding is no longer valid", async () => {
+  chmodSync(AGENT_TOKEN, 0o644);
+  try {
+    rmSync(BD_LOG, { force: true });
+    const get = await call("get_messages");
+    assert.equal(get.isError, true);
+    assert.equal(get.text, "ERROR: E_CROSS_TEAM_DENIED unknown_sender");
+    const ack = await call("mark_as_read", { message_id: "aperture-wisp-never" });
+    assert.equal(ack.isError, true);
+    assert.equal(ack.text, "ERROR: E_CROSS_TEAM_DENIED unknown_sender");
+    assert.deepEqual(calls(), [], "neither read nor ack reaches bd for an unauthenticated principal");
+  } finally {
+    chmodSync(AGENT_TOKEN, 0o600);
+  }
+});
+
+test("mark_as_read closes only an open message addressed and currently authorized to the caller", async () => {
+  const own = message(88, "2026-09-01T00:00:00.000Z");
+  const foreign = { ...message(89, "2026-09-01T00:00:01.000Z"), title: "[glados->p1-offline] foreign" };
+  const withheld = { ...message(90, "2026-09-01T00:00:02.000Z"), title: `[disabled->${AGENT}] denied` };
+
+  setScenario([own, foreign, withheld]);
+  let result = await call("mark_as_read", { message_id: own.id });
+  assert.equal(result.isError, false);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show", "close"]);
+
+  rmSync(BD_LOG, { force: true });
+  result = await call("mark_as_read", { message_id: foreign.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /not addressed to this principal/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"], "foreign recipient remains open");
+
+  rmSync(BD_LOG, { force: true });
+  result = await call("mark_as_read", { message_id: withheld.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /not currently authorized/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show", "update"], "withheld row is labelled but never closed");
+
+  rmSync(BD_LOG, { force: true });
+  const gladosManifest = join(AGENTS, "glados", "manifest.json");
+  writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", window: "glados", role: "test", enabled: false }));
+  try {
+    setScenario([{ ...own, status: "closed", close_reason: "delivered" }]);
+    result = await call("mark_as_read", { message_id: own.id });
+    assert.equal(result.isError, false, result.text);
+    assert.deepEqual(calls().map((argv) => argv[0]), ["show"], "duplicate delivered ack is a no-op without policy recheck");
+  } finally {
+    writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", window: "glados", role: "test", enabled: true }));
+  }
+
+  rmSync(BD_LOG, { force: true });
+  setScenario([{ ...foreign, status: "closed", close_reason: "delivered" }]);
+  result = await call("mark_as_read", { message_id: foreign.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /not addressed to this principal/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"]);
+
+  rmSync(BD_LOG, { force: true });
+  setScenario([{ ...own, status: "closed", close_reason: "cancelled" }]);
+  result = await call("mark_as_read", { message_id: own.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /message record unavailable/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"]);
+
+  rmSync(BD_LOG, { force: true });
+  setScenario([{ ...own, issue_type: "task" }]);
+  result = await call("mark_as_read", { message_id: own.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /message record unavailable/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"]);
+});
+
+test("send_message accepts an enabled never-booted registry recipient and rejects disabled/unknown before write", async () => {
+  rmSync(BD_LOG, { force: true });
+  setScenario({ id: "aperture-wisp-offline" });
+  const queued = await call("send_message", { to: "p1-offline", message: "queued while offline" });
+  assert.equal(queued.isError, false);
+  assert.match(queued.text, /^Queued for p1-offline\./);
+
+  const deadline = Date.now() + 2_000;
+  while (!calls().some((argv) => argv[0] === "create") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls().filter((argv) => argv[0] === "create").length, 1, "offline delivery is durably enqueued once");
+
+  rmSync(BD_LOG, { force: true });
+  const disabled = await call("send_message", { to: "disabled", message: "must not persist" });
+  assert.equal(disabled.isError, true);
+  assert.equal(disabled.text, "ERROR: E_UNKNOWN_RECIPIENT unknown_recipient.");
+  const malformed = await call("send_message", { to: "P1-OFFLINE", message: "must not normalize" });
+  assert.equal(malformed.isError, true);
+  assert.equal(malformed.text, "ERROR: E_UNKNOWN_RECIPIENT unknown_recipient.");
+  assert.deepEqual(calls(), [], "invalid recipients never reach bd");
+});
+
+test("authorization loss withholds the original unread id without delivering or acknowledging its body", async () => {
+  const gladosManifest = join(AGENTS, "glados", "manifest.json");
+  writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", window: "glados", role: "test", enabled: false }));
+  try {
+    rmSync(BD_LOG, { force: true });
+    setScenario([{ ...message(77, "2026-09-01T00:00:00.000Z"), description: "reassign/cancel the target bead" }]);
+    const result = await call("get_messages");
+    assert.equal(result.isError, false);
+    assert.equal(result.text, "No unread messages.");
+    const invoked = calls();
+    assert.equal(invoked[0][0], "list");
+    assert.deepEqual(invoked[1], [
+      "update",
+      "aperture-wisp-0077",
+      "--add-label",
+      "withheld:unknown_sender",
+      "--json",
+    ]);
+    assert.equal(invoked.some((argv) => argv[0] === "close"), false, "withholding is not a synthetic read ack");
+  } finally {
+    writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", window: "glados", role: "test", enabled: true }));
+  }
+  rmSync(BD_LOG, { force: true });
+  const reauthorized = await call("get_messages");
+  assert.equal(reauthorized.isError, false);
+  assert.match(reauthorized.text, /reassign\/cancel the target bead/, "a current grant/identity change re-evaluates the original open row");
+});
+
+test("authorization filtering cannot starve an allowed row behind 201 withheld rows", async () => {
+  const denied = Array.from({ length: 201 }, (_, index) => ({
+    ...message(1000 + index, new Date(Date.UTC(2026, 8, 2, 0, 0, index)).toISOString()),
+    title: `[retired-sender->${AGENT}] denied ${index}`,
+  }));
+  const allowed = {
+    ...message(1, "2026-09-01T00:00:00.000Z"),
+    title: `[glados->${AGENT}] allowed after denied prefix`,
+    description: "authorized payload",
+  };
+  setScenario([...denied, allowed]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, false, result.text);
+  assert.match(result.text, /^\[aperture-wisp-0001\] From glados: authorized payload$/m);
+  assert.doesNotMatch(result.text, /denied \d+/);
+  const scans = calls().filter((argv) => argv[0] === "list");
+  assert.equal(scans.length, 1, "one complete native list scan sees the authorized row beyond the denied prefix");
+  assert.equal(hasFlag(scans[0], "-n", 0), true, "bd receives no pre-sort row limit");
+  assert.equal(hasFlag(scans[0], "--include-infra"), true, "real message wisps are not hidden by list defaults");
+  assert.equal(calls().filter((argv) => argv[0] === "close").length, 0, "withholding never acknowledges");
+});
+
+test("authorized delivery applies the exact 200 cap after filtering without duplicates", async () => {
+  setScenario(newestFirstMessages(201));
+  const result = await call("get_messages");
+  assert.equal(result.isError, false);
+  const ids = [...result.text.matchAll(/^\[(aperture-wisp-\d+)\]/gm)].map((match) => match[1]);
+  assert.equal(ids.length, 200);
+  assert.equal(new Set(ids).size, 200, "no duplicate survives the complete scan boundary");
+  assert.equal(ids[0], "aperture-wisp-0002", "the oldest retained authorized row is 2");
+  assert.equal(ids.at(-1), "aperture-wisp-0201", "the newest authorized row is retained");
+  assert.match(result.text, /200 most recent currently authorized unread messages/);
+});
+
+test("unread complete scan fails explicitly on stdout overflow before any policy mutation", async () => {
+  setScenario({ oversized: true });
+  const result = await call("get_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.text, /^ERROR: unread message backlog exceeds the bounded scan capacity/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+  assert.equal(calls().some((argv) => argv[0] === "update" || argv[0] === "close"), false);
+});
+
+test("unread complete scan rejects ambiguous rows before labels or acknowledgements", async () => {
+  const duplicated = message(33, "2026-09-01T00:00:00.000Z");
+  setScenario([duplicated, duplicated]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.text, /^ERROR: unread scan returned an invalid or ambiguous message row$/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+});
+
+test("unread message selection excludes a legitimate non-message title match and still delivers the message", async () => {
+  const realMessage = message(34, "2026-09-01T00:00:01.000Z");
+  setScenario([{
+    ...task("aperture-task-shaped", 2),
+    title: `[glados->${AGENT}] not actually a message`,
+  }, realMessage]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, false, result.text);
+  assert.match(result.text, new RegExp(`^\\[${realMessage.id}\\] From glados: body 34$`, "m"));
+  assert.doesNotMatch(result.text, /not actually a message/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+});
+
+test("unread post-parse defense rejects a malformed row returned by the message boundary", async () => {
+  setScenario([{ ...message(35, "2026-09-01T00:00:02.000Z"), id: "../invalid" }]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.text, /^ERROR: unread scan returned an invalid or ambiguous message row$/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
 });
 
 // ── (b) include_done push-down ───────────────────────────────────────────

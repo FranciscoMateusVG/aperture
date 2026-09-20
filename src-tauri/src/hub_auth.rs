@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::agent_loader::is_valid_seat_name;
+
 fn token_dir() -> PathBuf {
     std::env::var("APERTURE_HUB_TOKEN_DIR")
         .map(PathBuf::from)
@@ -13,12 +15,7 @@ fn token_dir() -> PathBuf {
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name.bytes().enumerate().all(|(i, b)| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || (i > 0 && (b == b'_' || b == b'-'))
-        })
-    {
+    if !is_valid_seat_name(name) {
         return Err("invalid hub token principal".into());
     }
     Ok(())
@@ -140,7 +137,21 @@ mod tests {
     #[test]
     fn rejects_invalid_principals() {
         let parent = private_parent();
-        assert!(provision_token_in(&parent.join("tokens"), "../cipher").is_err());
+        for invalid in [
+            "../cipher",
+            "-lead",
+            "_lead",
+            "Upper",
+            "with.dot",
+            "a1234567890123456789012345678901",
+        ] {
+            assert!(provision_token_in(&parent.join("tokens"), invalid).is_err(), "{invalid}");
+        }
+        assert!(provision_token_in(
+            &parent.join("tokens"),
+            "a123456789012345678901234567890"
+        )
+        .is_ok());
         fs::remove_dir_all(parent).unwrap();
     }
 }
