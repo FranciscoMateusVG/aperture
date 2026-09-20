@@ -272,6 +272,12 @@ pub fn write<S: CheckpointStore>(
     let entries = store.entries(&ctx.team, &ctx.seat, ctx.generation)?;
     let mut seqs = HashSet::new();
     for e in &entries {
+        validate_payload(&e.payload, sentinels).map_err(|_| CheckpointError::Corrupt)?;
+        let stored_canonical = serde_json::to_vec(&(e.schema_version, &e.payload))
+            .map_err(|_| CheckpointError::Corrupt)?;
+        if store.digest(&stored_canonical)? != e.content_hash {
+            return Err(CheckpointError::Corrupt);
+        }
         if e.team != ctx.team
             || e.seat != ctx.seat
             || e.generation != ctx.generation

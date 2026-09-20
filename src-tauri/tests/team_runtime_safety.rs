@@ -703,6 +703,23 @@ mod checkpoint_tests {
         assert_eq!(s.0.len(), 2);
     }
     #[test]
+    fn corrupted_checkpoint_hash_or_payload_never_advances_sequence() {
+        for mutation in [0, 1, 2] {
+            let mut s = Store::default();
+            write(&mut s, &context(), 1, payload(), 0, &[]).unwrap();
+            match mutation {
+                0 => s.0[0].content_hash = "wrong".into(),
+                1 => s.0[0].payload.next_step = "changed".into(),
+                _ => s.0[0].payload.worktree = "../outside".into(),
+            };
+            assert_eq!(
+                write(&mut s, &context(), 1, payload(), 6000, &[]),
+                Err(CheckpointError::Corrupt)
+            );
+            assert_eq!(s.0.len(), 1);
+        }
+    }
+    #[test]
     fn codex_has_no_stop_hook() {
         let mut s = Store::default();
         let mut c = context();
