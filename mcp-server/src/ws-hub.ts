@@ -52,21 +52,28 @@
  */
 import { WebSocketServer, WebSocket } from "ws";
 import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { getUnreadMessages, persistDeniedNotification } from "./beads.js";
 import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
 import { writePresenceSnapshot, PRESENCE_FILE, type PresenceEntry, type PresenceState } from "./presence-snapshot.js";
 import { authorizeMessage, isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
-import { identityIsRevoked, readRevocation, revokeGeneration } from "./revocation-store.js";
+import { identityIsRevoked, revokeGeneration } from "./revocation-store.js";
+import { managedOwnerMatches, readManagedOwner } from "./managed-owner.js";
+import { fixedRuntimeChild } from "./private-runtime-path.js";
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.APERTURE_WS_PORT ?? 4517);
 const SKIP_REPLAY = process.env.APERTURE_HUB_SKIP_REPLAY === "1";
 const HEARTBEAT_MS = 30_000;
 const MAX_FRAME_BYTES = 16 * 1024;
-const TOKEN_DIR = process.env.APERTURE_HUB_TOKEN_DIR ?? join(homedir(), ".aperture", "run", "hub-tokens");
+const TOKEN_DIR = fixedRuntimeChild(process.env.APERTURE_HUB_TOKEN_DIR, "hub-tokens");
+
+function secureTokenDirectory(): string {
+  const current = fixedRuntimeChild(process.env.APERTURE_HUB_TOKEN_DIR, "hub-tokens");
+  if (current !== TOKEN_DIR) throw new Error("E_RUNTIME_PATH_UNSAFE: token root changed");
+  return current;
+}
 
 type Role = "agent" | "subscriber" | "producer";
 
@@ -76,6 +83,7 @@ interface Conn {
   isAlive: boolean;
   generation: number | null;
   tokenId: string | null;
+  revoked: boolean;
 }
 
 const conns = new Map<WebSocket, Conn>();
@@ -174,7 +182,7 @@ function readAgentToken(agent: string): Buffer | null {
   if (!isValidSeatName(agent)) return null;
   let fd: number | null = null;
   try {
-    fd = openSync(join(TOKEN_DIR, `${agent}.token`), constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(join(secureTokenDirectory(), `${agent}.token`), constants.O_RDONLY | constants.O_NOFOLLOW);
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) return null;
     if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return null;
@@ -207,7 +215,7 @@ function tokenBelongsToAnotherAgent(agent: string, presented: unknown): boolean 
   if (typeof presented !== "string" || presented.length > 256) return false;
   let names: string[];
   try {
-    names = readdirSync(TOKEN_DIR);
+    names = readdirSync(secureTokenDirectory());
   } catch {
     return false;
   }
@@ -277,16 +285,7 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
     log("bad_hello", { reason: "operator_is_doorbell_only", role, agent });
     return { ok: false, closeCode: 4002 };
   }
-  if (!validAgentToken(agent, msg.token)) {
-    const principalMismatch = tokenBelongsToAnotherAgent(agent, msg.token);
-    log("bad_hello", { reason: principalMismatch ? "principal_mismatch" : "invalid_token", role, agent });
-    return { ok: false, closeCode: principalMismatch ? 4002 : 4001 };
-  }
   const registry = loadSeatRegistry();
-  if (role !== "subscriber" && !registry.seats.has(agent)) {
-    log("bad_hello", { reason: "principal_not_enabled", role, agent });
-    return { ok: false, closeCode: 4002 };
-  }
   const principal = registry.seats.get(agent);
   if (principal?.group === "team") {
     const generation = msg.generation;
@@ -303,6 +302,15 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
       return { ok: false, closeCode: 4003 };
     }
     try {
+      const owner = readManagedOwner(agent);
+      if (!managedOwnerMatches(owner, generation as number, presentedTokenId, ["active"])) {
+        log("bad_hello", { reason: "managed_owner_mismatch", role, agent, generation });
+        return { ok: false, closeCode: 4003 };
+      }
+      // Durable revocation precedes token-file validation.  This preserves the
+      // protocol's 4003 result after the exact bearer file has been deleted,
+      // without granting authority to an arbitrary bearer: it must first bind
+      // to the current private OwnerRecord tuple.
       if (identityIsRevoked(agent, generation as number, presentedTokenId)) {
         log("bad_hello", { reason: "managed_identity_revoked", role, agent, generation });
         return { ok: false, closeCode: 4003 };
@@ -311,9 +319,22 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
       log("bad_hello", { reason: "revocation_state_unreadable", role, agent });
       return { ok: false, closeCode: 4003 };
     }
+    if (!validAgentToken(agent, msg.token)) {
+      log("bad_hello", { reason: "managed_token_invalid", role, agent });
+      return { ok: false, closeCode: 4003 };
+    }
     conn.generation = generation as number;
     conn.tokenId = presentedTokenId;
   } else {
+    if (!validAgentToken(agent, msg.token)) {
+      const principalMismatch = tokenBelongsToAnotherAgent(agent, msg.token);
+      log("bad_hello", { reason: principalMismatch ? "principal_mismatch" : "invalid_token", role, agent });
+      return { ok: false, closeCode: principalMismatch ? 4002 : 4001 };
+    }
+    if (role !== "subscriber" && !registry.seats.has(agent)) {
+      log("bad_hello", { reason: "principal_not_enabled", role, agent });
+      return { ok: false, closeCode: 4002 };
+    }
     conn.generation = null;
     conn.tokenId = null;
   }
@@ -347,7 +368,7 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
 }
 
 function validateExactToken(seat: string, expectedTokenId: string): void {
-  const path = join(TOKEN_DIR, `${seat}.token`);
+  const path = join(secureTokenDirectory(), `${seat}.token`);
   let fd: number | null = null;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -372,7 +393,8 @@ interface TokenDeletionProof {
 }
 
 function deleteExactToken(seat: string, expectedTokenId: string): TokenDeletionProof {
-  const path = join(TOKEN_DIR, `${seat}.token`);
+  const tokenDirectory = secureTokenDirectory();
+  const path = join(tokenDirectory, `${seat}.token`);
   let tokenDeleted = false;
   try {
     validateExactToken(seat, expectedTokenId);
@@ -385,7 +407,7 @@ function deleteExactToken(seat: string, expectedTokenId: string): TokenDeletionP
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const dirFd = openSync(TOKEN_DIR, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const dirFd = openSync(tokenDirectory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try {
     const stat = fstatSync(dirFd);
     if (!stat.isDirectory() || (stat.mode & 0o077) !== 0) throw new Error("unsafe token directory");
@@ -442,27 +464,44 @@ async function handleRevokeGeneration(ws: WebSocket, conn: Conn, msg: Record<str
     return;
   }
   try {
-    const current = readRevocation(seat);
-    const alreadyRevoked = generation as number <= current.revoked_through_generation
-      && current.revoked_token_ids.includes(requestedTokenId);
-    if (!alreadyRevoked) validateExactToken(seat, requestedTokenId);
+    const owner = readManagedOwner(seat);
+    if (!managedOwnerMatches(owner, generation as number, requestedTokenId, ["starting", "active"])) {
+      throw new Error("owner identity mismatch");
+    }
+    // OwnerRecord is the authority.  The token file is intentionally not a
+    // precondition here: idempotent replay happens after durable deletion.
     revokeGeneration(seat, generation as number, requestedTokenId);
-    const tokenProof = deleteExactToken(seat, requestedTokenId);
-    const matchingSockets: WebSocket[] = [];
+    const matchingSockets: Array<{ socket: WebSocket; identity: Conn }> = [];
     for (const [candidate, identity] of conns) {
       if (
         identity.agent === seat &&
         identity.generation === generation &&
         identity.tokenId === requestedTokenId
       ) {
-        matchingSockets.push(candidate);
+        // Fence authority synchronously at the durable revocation point,
+        // before token cleanup or the asynchronous close handshake.
+        identity.revoked = true;
+        matchingSockets.push({ socket: candidate, identity });
       }
     }
-    const closeResults = await Promise.all(matchingSockets.map(closeManagedSocket));
+    log("generation_revocation_fenced", { seat, generation, sockets_fenced: matchingSockets.length });
+    let tokenProof: TokenDeletionProof | null = null;
+    let cleanupFailed = false;
+    try {
+      tokenProof = deleteExactToken(seat, requestedTokenId);
+    } catch {
+      cleanupFailed = true;
+    }
+    const closeResults = await Promise.all(matchingSockets.map(({ socket }) => closeManagedSocket(socket)));
     const socketsClosed = closeResults.filter(Boolean).length;
     if (socketsClosed !== matchingSockets.length) {
       log("revocation_failed", { seat, generation, reason: "socket_close_unverified" });
       send(ws, { type: "error", code: "E_REVOCATION_INCOMPLETE" });
+      return;
+    }
+    if (cleanupFailed || tokenProof === null) {
+      log("revocation_failed", { seat, generation, reason: "token_cleanup_unverified", sockets_closed_verified: socketsClosed });
+      send(ws, { type: "error", code: "E_REVOCATION_FAILED" });
       return;
     }
     log("generation_revoked", {
@@ -622,7 +661,7 @@ wss.on("error", (err) => {
 });
 
 wss.on("connection", (ws) => {
-  const conn: Conn = { role: null, agent: null, isAlive: true, generation: null, tokenId: null };
+  const conn: Conn = { role: null, agent: null, isAlive: true, generation: null, tokenId: null, revoked: false };
   conns.set(ws, conn);
   const helloDeadline = setTimeout(() => {
     if (conn.role === null) ws.close(4001, "expected hello");
@@ -667,6 +706,11 @@ wss.on("connection", (ws) => {
         ws.close(result.closeCode, reason);
       }
       else clearTimeout(helloDeadline);
+      return;
+    }
+
+    if (conn.revoked) {
+      log("revoked_frame_rejected", { role: conn.role, agent: conn.agent, type: String(msg.type) });
       return;
     }
 

@@ -117,7 +117,7 @@ try {
 ws!.on("open", () => {
   let managed: Record<string, unknown>;
   try {
-    managed = managedHelloFields(token);
+    managed = managedHelloFields(agent, token);
   } catch {
     finish("managed seat identity is invalid");
     return;

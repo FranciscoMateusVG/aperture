@@ -289,8 +289,19 @@ impl OwnerStore {
         if incarnation.pid != expected_root_pid || incarnation.start_time != expected_root_start_time {
             return Err("E_PROCESS_IDENTITY: root process identity changed".into());
         }
+        // A refreshed descendant walk can omit a previously recorded child
+        // after it is reparented.  Absence from that walk is not proof that
+        // the exact pid+birth identity disappeared, so retain the union.
+        // Reused PIDs remain distinct when their birth time differs.
+        let mut merged = incarnation.processes.clone();
+        for process in processes {
+            if !merged.iter().any(|known| known.pid == process.pid && known.start_time == process.start_time) {
+                merged.push(process);
+            }
+        }
+        merged.sort_by_key(|process| (process.pid, process.start_time));
         let mut candidate = incarnation.clone();
-        candidate.processes = processes;
+        candidate.processes = merged;
         validate_incarnation(&candidate)?;
         incarnation.processes = candidate.processes;
         record.writer = actor.principal().into();
@@ -445,6 +456,36 @@ mod tests {
         assert_eq!(after.incarnation.as_ref().unwrap().thread_id, before.incarnation.as_ref().unwrap().thread_id);
         assert_eq!(after.requested, before.requested);
         assert_eq!(after.state, OwnerState::Active);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_snapshot_refresh_preserves_reparented_and_pid_reuse_evidence() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let launcher = AuthenticatedActor::launcher();
+        store.initialize_owner(&launcher, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&launcher, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+        let mut first = incarnation("gpt-6-astra");
+        first.processes.push(ProcessIdentity { pid:124,start_time:457,ppid:123,pgid:123,cmdline_sha256:"b".repeat(64),cwd:"/tmp/work".into() });
+        store.record_start_candidate(&launcher, &reservation, first).unwrap();
+
+        let reused = ProcessIdentity { pid:124,start_time:999,ppid:1,pgid:124,cmdline_sha256:"c".repeat(64),cwd:"/tmp/reused".into() };
+        let refreshed = store.record_process_snapshot(
+            &launcher,
+            "t1-backend",
+            1,
+            123,
+            456,
+            vec![
+                ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/work".into() },
+                reused.clone(),
+            ],
+        ).unwrap();
+        let identities = &refreshed.incarnation.unwrap().processes;
+        assert!(identities.iter().any(|p| p.pid == 124 && p.start_time == 457), "omitted reparented child remains recorded");
+        assert!(identities.iter().any(|p| p == &reused), "reused pid with a new birth remains separate");
+        assert_eq!(identities.iter().filter(|p| p.pid == 124).count(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

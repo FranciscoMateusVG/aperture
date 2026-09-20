@@ -88,7 +88,7 @@ export function notifyHub(
       }
       let managed: Record<string, unknown>;
       try {
-        managed = managedHelloFields(token);
+        managed = managedHelloFields(AGENT_NAME, token);
       } catch {
         finish("unacked", "managed seat identity is invalid");
         return;

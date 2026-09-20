@@ -4,17 +4,16 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isValidSeatName } from "./seat-registry.js";
+import { fixedRuntimeChild } from "./private-runtime-path.js";
 
 const MAX_STORE_BYTES = 256 * 1024;
 const MAX_REVOKED_TOKENS = 4096;
@@ -27,7 +26,7 @@ export interface RevocationRecord {
 }
 
 function defaultRoot(): string {
-  return process.env.APERTURE_REVOCATION_DIR ?? join(homedir(), ".aperture", "run", "revocations");
+  return fixedRuntimeChild(process.env.APERTURE_REVOCATION_DIR, "revocations");
 }
 
 function privateDirectory(path: string): void {
@@ -40,19 +39,8 @@ function privateDirectory(path: string): void {
   }
 }
 
-function ensureRoot(root = defaultRoot()): string {
-  let rootExists = true;
-  try {
-    lstatSync(root);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    rootExists = false;
-  }
-  if (!rootExists) {
-    const parent = dirname(root);
-    privateDirectory(parent);
-    mkdirSync(root, { mode: 0o700 });
-  }
+function ensureRoot(): string {
+  const root = defaultRoot();
   privateDirectory(root);
   return root;
 }
@@ -105,7 +93,7 @@ function parseRecord(raw: Buffer, seat: string): RevocationRecord {
   };
 }
 
-export function readRevocation(seat: string, root = ensureRoot()): RevocationRecord {
+function readRevocationAtRoot(seat: string, root: string): RevocationRecord {
   privateDirectory(root);
   const path = recordPath(root, seat);
   let before;
@@ -133,12 +121,16 @@ export function readRevocation(seat: string, root = ensureRoot()): RevocationRec
   }
 }
 
+export function readRevocation(seat: string): RevocationRecord {
+  return readRevocationAtRoot(seat, ensureRoot());
+}
+
 function persist(record: RevocationRecord, root: string): void {
   privateDirectory(root);
   const path = recordPath(root, record.seat);
   try {
     lstatSync(path);
-    readRevocation(record.seat, root);
+    readRevocationAtRoot(record.seat, root);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -155,7 +147,7 @@ function persist(record: RevocationRecord, root: string): void {
     renameSync(temp, path);
     const dirFd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-    readRevocation(record.seat, root);
+    readRevocationAtRoot(record.seat, root);
   } catch (error) {
     if (fd !== undefined) closeSync(fd);
     try { unlinkSync(temp); } catch { /* best effort temp cleanup */ }
@@ -163,16 +155,12 @@ function persist(record: RevocationRecord, root: string): void {
   }
 }
 
-export function revokeGeneration(
-  seat: string,
-  generation: number,
-  tokenId: string,
-  root = ensureRoot(),
-): RevocationRecord {
+export function revokeGeneration(seat: string, generation: number, tokenId: string): RevocationRecord {
+  const root = ensureRoot();
   if (!Number.isSafeInteger(generation) || generation < 1 || !validTokenId(tokenId)) {
     throw new Error("E_REVOCATION_INVALID: invalid generation or token id");
   }
-  const current = readRevocation(seat, root);
+  const current = readRevocationAtRoot(seat, root);
   if (generation <= current.revoked_through_generation) {
     if (!current.revoked_token_ids.includes(tokenId)) {
       throw new Error("E_REVOCATION_CONFLICT: generation was revoked with another token id");
@@ -192,12 +180,7 @@ export function revokeGeneration(
   return next;
 }
 
-export function identityIsRevoked(
-  seat: string,
-  generation: number,
-  tokenId: string,
-  root = ensureRoot(),
-): boolean {
-  const current = readRevocation(seat, root);
+export function identityIsRevoked(seat: string, generation: number, tokenId: string): boolean {
+  const current = readRevocation(seat);
   return generation <= current.revoked_through_generation || current.revoked_token_ids.includes(tokenId);
 }

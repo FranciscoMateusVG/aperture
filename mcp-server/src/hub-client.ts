@@ -178,7 +178,7 @@ function connect(): void {
   ws.on("open", () => {
     let managed: Record<string, unknown>;
     try {
-      managed = managedHelloFields(agentToken);
+      managed = managedHelloFields(agent, agentToken);
     } catch {
       exitWithLine("HUB_IDENTITY_INVALID managed seat identity is invalid; fix launcher state before reconnecting", 1);
       return;

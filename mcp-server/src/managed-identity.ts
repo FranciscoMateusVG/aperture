@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readManagedOwner } from "./managed-owner.js";
 
 export interface ManagedHelloFields {
   generation: number;
@@ -6,20 +7,24 @@ export interface ManagedHelloFields {
 }
 
 /**
- * Team launchers set a generation; standing seats omit it. The token id is a
- * digest derived in-process from the bearer, never another caller-supplied
- * authority field.
+ * Managed seats derive their generation from the current private OwnerRecord;
+ * standing seats without an owner record omit managed fields. The token id is
+ * a digest derived in-process from the bearer and must match that owner tuple.
  */
-export function managedHelloFields(token: string): Record<string, unknown> {
-  const raw = process.env.APERTURE_TEAM_GENERATION;
-  if (raw === undefined || raw === "") return {};
-  if (!/^[1-9][0-9]{0,15}$/.test(raw)) {
-    throw new Error("managed seat generation is invalid");
+export function managedHelloFields(agent: string, token: string): Record<string, unknown> {
+  let owner;
+  try {
+    owner = readManagedOwner(agent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
   }
-  const generation = Number(raw);
-  if (!Number.isSafeInteger(generation)) throw new Error("managed seat generation is invalid");
+  const tokenId = createHash("sha256").update(token).digest("hex");
+  if (owner.state !== "active" || owner.generation < 1 || owner.tokenId !== tokenId) {
+    throw new Error("managed seat owner identity is invalid");
+  }
   return {
-    generation,
-    token_id: createHash("sha256").update(token).digest("hex"),
+    generation: owner.generation,
+    token_id: tokenId,
   };
 }
