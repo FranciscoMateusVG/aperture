@@ -80,7 +80,8 @@ pub struct RemoteInventory {
     /// effect states or complete_observation and is not caller-deserializable.
     pub(crate) explicit_resolution: Option<remote::RemoteProjection>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevocationProof {
     pub generation: u64,
     pub durable: bool,
@@ -88,6 +89,8 @@ pub struct RevocationProof {
     pub close_code: u16,
     pub close_elapsed_ms: u64,
     pub reconnect_code: u16,
+    /// True only for a Ready-bound historical negative reconnect, not a fresh request.
+    pub reconnect_is_historical: bool,
     pub token_deleted: bool,
 }
 

@@ -370,7 +370,7 @@ fn human_ready_is_terminal_clock_free_and_start_gets_new_nonrenewable_budget() {
     let mut a = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
     a.admit_effects().unwrap();
     let old_start = a.budget.started;
-    let ready = a.finish_ready().unwrap();
+    let ready = a.finish_ready(&proof()).unwrap();
     let old_dir = ready.dir.clone();
     let terminal: Fact = read_private_json(&old_dir.join("terminal.json")).unwrap();
     assert_eq!(terminal.kind, FactKind::Ready);
@@ -394,7 +394,7 @@ fn human_permit_corruption_owner_drift_or_consumed_path_is_expired_not_unknown()
         let mut a =
             RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
         a.admit_effects().unwrap();
-        let ready = a.finish_ready().unwrap();
+        let ready = a.finish_ready(&proof()).unwrap();
         match variant {
             0 => std::fs::write(ready.dir.join("terminal.json"), b"{}").unwrap(),
             1 => {
@@ -418,4 +418,96 @@ fn human_permit_corruption_owner_drift_or_consumed_path_is_expired_not_unknown()
             Err(ReplacementError::PreparationExpired)
         ));
     }
+}
+
+fn proof() -> crate::team_replacement::RevocationProof {
+    crate::team_replacement::RevocationProof {
+        generation: 1,
+        durable: true,
+        sockets_closed: true,
+        close_code: 4001,
+        close_elapsed_ms: 2,
+        reconnect_code: 4003,
+        reconnect_is_historical: false,
+        token_deleted: true,
+    }
+}
+#[test]
+fn lost_human_permit_allows_fresh_ready_successor_not_reconstruction() {
+    let f = Fixture::new();
+    f.managed();
+    let actor = AuthenticatedActor::launcher();
+    let mut a = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+    a.admit_effects().unwrap();
+    let ready = a.finish_ready(&proof()).unwrap();
+    let old = std::fs::read(ready.dir.join("prepared.json")).unwrap();
+    let next = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+    assert!(next.dir.ends_with("g1/reprepare"));
+    assert!(next.prior_ready().is_some());
+    assert!(!next.effects_admitted());
+    assert_eq!(old, std::fs::read(ready.dir.join("prepared.json")).unwrap());
+    assert!(matches!(
+        ready.start(Deadline::new()),
+        Err(ReplacementError::PreparationExpired)
+    ));
+    drop(next); // An incomplete successor is UNKNOWN, never retry admission.
+    assert!(matches!(
+        RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()),
+        Err(ReplacementError::OutcomeUnknown)
+    ));
+}
+#[test]
+fn ready_reprepare_denies_corrupt_proof_changed_identity_and_started_effects() {
+    for mode in 0..3 {
+        let f = Fixture::new();
+        f.managed();
+        let actor = AuthenticatedActor::launcher();
+        let mut a =
+            RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+        a.admit_effects().unwrap();
+        let ready = a.finish_ready(&proof()).unwrap();
+        match mode {
+            0 => std::fs::write(ready.dir.join("prepared.json"), b"{}").unwrap(),
+            1 => {
+                let p = f.0.join(".aperture/run/owner/t1-worker.json");
+                let mut o: OwnerRecord = read_private_json(&p).unwrap();
+                o.incarnation.as_mut().unwrap().token_id = "b".repeat(64);
+                write_private_json_atomic(&p, &o, true).unwrap();
+            }
+            _ => {
+                let mut start = ready.start(Deadline::new()).unwrap();
+                start.admit_effects().unwrap();
+                let _ = start.finish_unknown();
+            }
+        }
+        assert!(
+            RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).is_err()
+        );
+    }
+}
+
+#[test]
+fn failed_start_without_effects_can_reprepare_and_preserves_all_old_facts() {
+    let f = Fixture::new();
+    f.managed();
+    let actor = AuthenticatedActor::launcher();
+    let mut a = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+    a.admit_effects().unwrap();
+    let ready = a.finish_ready(&proof()).unwrap();
+    let dir = ready.dir.clone();
+    let prior = std::fs::read(dir.join("terminal.json")).unwrap();
+    let mut start = ready.start(Deadline::new()).unwrap();
+    start.finish_failed().unwrap();
+    let mut next =
+        RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+    assert!(next.prior_ready().is_some());
+    next.admit_effects().unwrap();
+    let mut historical = proof();
+    historical.reconnect_is_historical = true;
+    let ready2 = next.finish_ready(&historical).unwrap();
+    assert_eq!(std::fs::read(dir.join("terminal.json")).unwrap(), prior);
+    let evidence: PriorReady = read_private_json(&ready2.dir.join("prepared.json")).unwrap();
+    assert!(evidence.revocation.reconnect_is_historical);
+    let third = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+    assert!(third.dir.ends_with("g1/reprepare/reprepare"));
 }

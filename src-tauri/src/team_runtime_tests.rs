@@ -158,6 +158,7 @@ impl ReplacementRuntime for Fake {
             close_code: 4001,
             close_elapsed_ms: 10,
             reconnect_code: 4003,
+            reconnect_is_historical: false,
             token_deleted: true,
         })
     }

@@ -437,3 +437,24 @@ BEADS epic/children inventory, typed authenticated per-item reconciliation and
 review/metric references, joined with exact-seat stop/revoke/remote evidence
 before using Rex's one journal. Notes/free text/caller booleans cannot fill that
 gap. No archive completion or installation is claimed by this checkpoint.
+
+### Lost human permit: fresh preparation, not reconstruction
+
+A terminal Ready now retains a private native `prepared.json` with its attempt
+identity, exact owner-incarnation binding and factual revocation receipt. This
+is **not** a serialized preparation permit. If the launcher loses its in-memory
+map, a new Prepare may create a no-replace `reprepare` successor under the same
+old generation, under team/seat locks (maximum 32 retained attempts). It performs
+fresh process/inventory/policy checks; the prior Ready remains byte-identical.
+The old in-memory permit, if still present, is invalid once a successor exists.
+Pending/UNKNOWN/active attempts cannot be superseded. A failed Start is eligible
+only if terminal Failed and no effects-admission fact exists. No history is
+removed or reused as a reconstructed permit.
+
+The old bearer has already been deleted, so reprepare cannot honestly perform
+another original-bearer reconnect. It instead binds the previous Ready's 4003
+proof to the same exact owner identity, verifies the durable floor and token
+absence, and obtains a **fresh** native exact-socket/absence/fsync ACK. The
+returned receipt marks `reconnect_is_historical:true`; this is not a new 4003
+provider request. Corrupt evidence, drift, any unverified successor or a failed
+new control check blocks. No new token, restart or implicit retry is used.

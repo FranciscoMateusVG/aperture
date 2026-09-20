@@ -83,6 +83,68 @@ struct Fact {
     kind: FactKind,
 }
 
+/// Durable Ready facts are evidence, never a reconstructed preparation permit.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PriorReady {
+    schema_version: u32,
+    attempt_id: String,
+    seat: String,
+    generation: u64,
+    owner_identity_sha256: String,
+    revocation: super::RevocationProof,
+}
+impl PriorReady {
+    fn owner_hash(owner: &OwnerRecord) -> Result<String, ReplacementError> {
+        use sha2::{Digest, Sha256};
+        let i = owner
+            .incarnation
+            .as_ref()
+            .ok_or(ReplacementError::PreparationExpired)?;
+        if owner.state != OwnerState::Active
+            || !i.observed
+            || i.model != owner.requested.model
+            || i.harness != owner.requested.harness
+            || i.reasoning != owner.requested.reasoning
+        {
+            return Err(ReplacementError::PreparationExpired);
+        }
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &owner.seat,
+                    owner.generation,
+                    &owner.requested,
+                    i.pid,
+                    i.start_time,
+                    &i.thread_id,
+                    &i.token_id
+                ))
+                .map_err(|_| ReplacementError::PreparationExpired)?
+            )
+        ))
+    }
+    pub(crate) fn verify_owner(&self, owner: &OwnerRecord) -> Result<(), ReplacementError> {
+        let p = &self.revocation;
+        if self.schema_version != 1
+            || self.seat != owner.seat
+            || self.generation != owner.generation
+            || self.owner_identity_sha256 != Self::owner_hash(owner)?
+            || p.generation != owner.generation
+            || !p.durable
+            || !p.sockets_closed
+            || !p.token_deleted
+            || p.close_code != 4001
+            || p.reconnect_code != 4003
+            || p.close_elapsed_ms > 1000
+        {
+            return Err(ReplacementError::PreparationExpired);
+        }
+        Ok(())
+    }
+}
+
 /// Unforgeable in callers: no Deserialize/Clone, native constructor only.
 /// Drop does not write success, remove evidence or retry cleanup.
 pub(crate) struct RuntimeAttempt {
@@ -92,6 +154,7 @@ pub(crate) struct RuntimeAttempt {
     budget: Deadline,
     effects_admitted: bool,
     terminal: bool,
+    prior_ready: Option<PriorReady>,
 }
 /// Clock-free, opaque, one-use human preparation authority. No caller fields.
 pub(crate) struct ReadyAttempt {
@@ -141,6 +204,10 @@ impl ReadyAttempt {
                     && i.harness == owner.requested.harness
                     && i.reasoning == owner.requested.reasoning
             })
+        {
+            return Err(expired());
+        }
+        if !matches!(std::fs::symlink_metadata(self.dir.join("reprepare")),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
         {
             return Err(expired());
         }
@@ -252,16 +319,69 @@ impl RuntimeAttempt {
         let seat_dir = validate_component_path(&attempts, seat, true)
             .map_err(|_| ReplacementError::NativeFailure)?;
         ensure_private_dir(&seat_dir).map_err(|_| ReplacementError::NativeFailure)?;
-        let dir = validate_component_path(&seat_dir, &format!("g{generation}"), true)
+        let mut dir = validate_component_path(&seat_dir, &format!("g{generation}"), true)
             .map_err(|_| ReplacementError::NativeFailure)?;
-        // Even an incomplete directory left before admission is retained and
-        // blocked. No blind resume/retry, no deletion of crash evidence.
-        match std::fs::symlink_metadata(&dir) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(ReplacementError::OutcomeUnknown),
+        let mut prior_ready = None;
+        // Only a completed Ready can be superseded by a fresh preparation.
+        // Unknown/active/pending/failed attempts never grant blind retry.
+        for ordinal in 0..32 {
+            match std::fs::symlink_metadata(&dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Ok(_) if !bootstrap && ordinal < 31 => {
+                    validate_component_path(
+                        &seat_dir,
+                        dir.strip_prefix(&seat_dir)
+                            .ok()
+                            .and_then(|p| p.to_str())
+                            .ok_or(ReplacementError::OutcomeUnknown)?,
+                        false,
+                    )
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                    let a: Admission = read_private_json(&dir.join("admitted.json"))
+                        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                    let fact: Fact = read_private_json(&dir.join("terminal.json"))
+                        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                    let evidence: PriorReady = read_private_json(&dir.join("prepared.json"))
+                        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                    if a.schema_version != 1
+                        || a.team != team
+                        || a.seat != seat
+                        || a.old_generation != generation
+                        || fact.attempt_id != a.attempt_id
+                        || fact.kind != FactKind::Ready
+                        || fact.schema_version != 1
+                        || evidence.attempt_id != a.attempt_id
+                    {
+                        return Err(ReplacementError::OutcomeUnknown);
+                    }
+                    evidence.verify_owner(&owner)?;
+                    let start = dir.join("start");
+                    if !matches!(std::fs::symlink_metadata(&start),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+                    {
+                        let terminal: Fact = read_private_json(&start.join("terminal.json"))
+                            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                        let started: Admission = read_private_json(&start.join("admitted.json"))
+                            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                        if terminal.schema_version != 1
+                            || terminal.kind != FactKind::Failed
+                            || terminal.attempt_id != started.attempt_id
+                            || started.team != team
+                            || started.seat != seat
+                            || started.old_generation != generation
+                            || !matches!(std::fs::symlink_metadata(start.join("effects.json")),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+                        {
+                            return Err(ReplacementError::OutcomeUnknown);
+                        }
+                    }
+                    prior_ready = Some(evidence);
+                    dir = validate_component_path(&dir, "reprepare", true)
+                        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                }
+                _ => return Err(ReplacementError::OutcomeUnknown),
+            }
         }
         ensure_private_dir(&dir).map_err(|_| ReplacementError::OutcomeUnknown)?;
-        Self::publish(
+        let mut attempt = Self::publish(
             home,
             dir,
             Admission {
@@ -275,7 +395,9 @@ impl RuntimeAttempt {
                 cleanup_reserve_ms: CLEANUP.as_millis() as u64,
             },
             budget,
-        )
+        )?;
+        attempt.prior_ready = prior_ready;
+        Ok(attempt)
     }
     fn publish(
         home: &Path,
@@ -297,14 +419,42 @@ impl RuntimeAttempt {
             budget,
             effects_admitted: false,
             terminal: false,
+            prior_ready: None,
         })
     }
     /// Human prepare is terminal and factual; no clock runs while a person
     /// reads the dialog. The retained native permit is consumed by Start.
-    pub(crate) fn finish_ready(mut self) -> Result<ReadyAttempt, ReplacementError> {
+    pub(crate) fn finish_ready(
+        mut self,
+        revocation: &super::RevocationProof,
+    ) -> Result<ReadyAttempt, ReplacementError> {
         self.budget.forward(Duration::ZERO)?;
         if self.terminal {
             return Err(ReplacementError::OutcomeUnknown);
+        }
+        {
+            let _team = try_lock(
+                &self.home.join(".aperture/run/team-locks"),
+                &self.admitted.team,
+            )
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+            let store = OwnerStore::new(self.home.join(".aperture/run/owner"));
+            let _seat = store
+                .lock(&self.admitted.seat)
+                .map_err(|_| ReplacementError::OutcomeUnknown)?;
+            let owner: OwnerRecord = read_private_json(&store.record_path(&self.admitted.seat))
+                .map_err(|_| ReplacementError::OutcomeUnknown)?;
+            let evidence = PriorReady {
+                schema_version: 1,
+                attempt_id: self.id().into(),
+                seat: self.admitted.seat.clone(),
+                generation: self.admitted.old_generation,
+                owner_identity_sha256: PriorReady::owner_hash(&owner)?,
+                revocation: revocation.clone(),
+            };
+            evidence.verify_owner(&owner)?;
+            write_private_json_atomic(&self.dir.join("prepared.json"), &evidence, false)
+                .map_err(|_| ReplacementError::OutcomeUnknown)?;
         }
         self.fact("terminal.json", FactKind::Ready)?;
         self.terminal = true;
@@ -313,6 +463,9 @@ impl RuntimeAttempt {
             dir: self.dir,
             admitted: self.admitted,
         })
+    }
+    pub(crate) fn prior_ready(&self) -> Option<&PriorReady> {
+        self.prior_ready.as_ref()
     }
     pub(crate) fn effects_admitted(&self) -> bool {
         self.effects_admitted

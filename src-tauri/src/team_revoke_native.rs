@@ -299,6 +299,7 @@ fn exchange_optional_until(
         close_code: 4001,
         close_elapsed_ms: elapsed,
         reconnect_code: if old.is_some() { 4003 } else { 0 },
+        reconnect_is_historical: false,
         token_deleted: ack.token_absent_verified,
     })
 }
@@ -356,6 +357,65 @@ pub(crate) fn revoke_stopped_before(
         &digest,
         until,
     )
+}
+
+/// Fresh no-token ACK plus exact historical Ready negative-reconnect evidence.
+/// This does NOT claim to repeat a 4003 request with an erased bearer.
+pub(crate) fn reaffirm_stopped(
+    home: &Path,
+    recorded: &PersistedProcessSnapshot,
+    prior: &crate::team_replacement::deadline::PriorReady,
+    until: Instant,
+) -> Result<RevocationProof, ReplacementError> {
+    remaining(until)?;
+    let snapshot = recorded.snapshot();
+    if snapshot
+        .processes
+        .iter()
+        .any(|p| crate::team_process::state(&p.identity) != ProcessState::Gone)
+        || !snapshot.complete
+        || !snapshot.unowned_matches.is_empty()
+    {
+        return Err(failure());
+    }
+    let owner: OwnerRecord = crate::journal::read_private_json(
+        &home
+            .join(".aperture/run/owner")
+            .join(format!("{}.json", snapshot.seat)),
+    )
+    .map_err(|_| failure())?;
+    prior.verify_owner(&owner)?;
+    let i = owner.incarnation.as_ref().ok_or_else(failure)?;
+    if owner.seat != snapshot.seat
+        || owner.generation != snapshot.generation
+        || i.thread_id != snapshot.thread_id
+    {
+        return Err(failure());
+    }
+    let token = home
+        .join(".aperture/run/hub-tokens")
+        .join(format!("{}.token", snapshot.seat));
+    if !matches!(std::fs::symlink_metadata(&token),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Err(failure());
+    }
+    verify_floor(home, &snapshot.seat, snapshot.generation, &i.token_id)?;
+    let watchdog = read_bearer(home, "watchdog")?;
+    let mut proof = exchange_optional_until(
+        HUB,
+        &watchdog,
+        None,
+        &snapshot.seat,
+        snapshot.generation,
+        &i.token_id,
+        until,
+    )?;
+    verify_floor(home, &snapshot.seat, snapshot.generation, &i.token_id)?;
+    // Historical 4003 belongs to this exact immutable owner identity. Current
+    // durable floor and exact socket-close/absent-token ACK were freshly checked.
+    proof.reconnect_code = 4003;
+    proof.reconnect_is_historical = true;
+    Ok(proof)
 }
 
 #[cfg(test)]

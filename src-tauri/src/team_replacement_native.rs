@@ -758,7 +758,7 @@ pub(crate) fn prepare_operator(
         .revoked
         .take()
         .ok_or(ReplacementError::RevocationUnverified)?;
-    let ready = runtime.attempt.finish_ready()?;
+    let ready = runtime.attempt.finish_ready(&revoked)?;
     Ok(NativePreparedReplacement {
         home: home.into(),
         target: runtime.target,
@@ -1072,7 +1072,18 @@ impl ReplacementRuntime for NativeRuntime<'_> {
     ) -> Result<RevocationProof, ReplacementError> {
         self.attempt.admit_effects()?;
         let proof = self.with_stop_guard(snapshot, |guard| {
-            crate::ws_hub::managed_control::revoke_stopped(self.home, guard)
+            if let Some(prior) = self.attempt.prior_ready() {
+                crate::ws_hub::managed_control::reaffirm_stopped(
+                    self.home,
+                    guard,
+                    prior,
+                    self.attempt
+                        .budget()
+                        .forward_until(Duration::from_secs(3))?,
+                )
+            } else {
+                crate::ws_hub::managed_control::revoke_stopped(self.home, guard)
+            }
         })?;
         self.revoked = Some(proof.clone());
         Ok(proof)
