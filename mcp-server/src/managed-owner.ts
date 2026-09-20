@@ -41,6 +41,7 @@ export function readManagedOwner(seat: string): ManagedOwnerIdentity {
     }
     const record = value as Record<string, unknown>;
     const incarnation = record.incarnation;
+    const provisional = record.provisional_token_id ?? null;
     const state = record.state;
     const generation = record.generation;
     if (
@@ -49,14 +50,24 @@ export function readManagedOwner(seat: string): ManagedOwnerIdentity {
       !Number.isSafeInteger(generation) ||
       (generation as number) < 0 ||
       (state !== "starting" && state !== "active" && state !== "stale" && state !== "quarantined") ||
-      (incarnation !== null && (!incarnation || typeof incarnation !== "object" || Array.isArray(incarnation)))
+      (incarnation !== null && (!incarnation || typeof incarnation !== "object" || Array.isArray(incarnation))) ||
+      (provisional !== null && (typeof provisional !== "string" || !TOKEN_ID.test(provisional)))
     ) {
       throw new Error("E_OWNER_CORRUPT: invalid owner identity");
     }
-    const token = incarnation === null ? null : (incarnation as Record<string, unknown>).token_id;
-    if (token !== null && (typeof token !== "string" || !TOKEN_ID.test(token))) {
+    const incarnationToken = incarnation === null ? null : (incarnation as Record<string, unknown>).token_id;
+    if (incarnationToken !== null && (typeof incarnationToken !== "string" || !TOKEN_ID.test(incarnationToken))) {
       throw new Error("E_OWNER_CORRUPT: invalid owner token identity");
     }
+    if (state === "starting") {
+      if (provisional === null || (incarnationToken !== null && incarnationToken !== provisional)) {
+        throw new Error("E_OWNER_CORRUPT: invalid provisional owner identity");
+      }
+    }
+    if (state === "active" && (incarnationToken === null || provisional !== null)) {
+      throw new Error("E_OWNER_CORRUPT: invalid active owner identity");
+    }
+    const token = state === "starting" ? provisional : incarnationToken;
     return { seat, generation: generation as number, state, tokenId: token };
   } catch (error) {
     if (error instanceof SyntaxError) throw new Error("E_OWNER_CORRUPT: malformed owner record");

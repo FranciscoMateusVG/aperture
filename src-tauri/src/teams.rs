@@ -16,6 +16,10 @@ use crate::owner::{try_lock, AdvisoryLock, OwnerStore};
 use crate::state::{AppState, ExecutionTuple, Harness, OwnerSummary, ReasoningEffort};
 use crate::team_auth::{authenticate_glados_control, authenticate_seat_control, AuthenticatedActor};
 use crate::team_checkpoint::{CheckpointContext, CheckpointError, CheckpointPayload, CheckpointWriter};
+use crate::team_replacement::remote::{
+    inspect_authorized, resolve_native, RemoteError, RemoteInventoryView, RemoteTarget,
+    ResolutionAuthority, ResolutionReceipt, ResolutionRequest,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -359,6 +363,23 @@ pub struct AgentReplaceInput {
     pub selection: ExecutionTuple,
 }
 
+/// Target selectors only. The authenticated lead's team, seat and generation
+/// are derived from the current canonical capability and never accepted here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InspectRemoteInput {
+    pub target_seat: String,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRemoteInput {
+    pub target_seat: String,
+    pub expected_generation: u64,
+    pub resolution: ResolutionRequest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", content = "input", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TeamControlRequest {
@@ -366,16 +387,20 @@ pub enum TeamControlRequest {
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
     Checkpoint(WriteCheckpointInput),
+    InspectRemote(InspectRemoteInput),
+    ResolveRemote(ResolveRemoteInput),
     Replace(AgentReplaceInput),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "action", content = "result", rename_all = "snake_case")]
 pub enum TeamControlResponse {
     ListPending(Vec<TeamView>),
     Approve(TeamView),
     Cancel(CancelPendingResult),
     Checkpoint(CheckpointReceipt),
+    InspectRemote(RemoteInventoryView),
+    ResolveRemote(ResolutionReceipt),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1498,8 +1523,53 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             ).map_err(checkpoint_error)?;
             Ok(TeamControlResponse::Checkpoint(CheckpointReceipt { checkpoint_id: entry.checkpoint_id, status: "pending".into() }))
         }
+        TeamControlRequest::InspectRemote(input) => {
+            let actor = authenticate_seat_control().map_err(TeamError::from_message)?;
+            let target = RemoteTarget {
+                team: actor.team().to_string(),
+                seat: input.target_seat,
+                expected_generation: input.expected_generation,
+            };
+            inspect_authorized(
+                &engine.paths.home,
+                ResolutionAuthority::Lead(&actor),
+                &target,
+                &[],
+            )
+            .map(TeamControlResponse::InspectRemote)
+            .map_err(remote_error)
+        }
+        TeamControlRequest::ResolveRemote(input) => {
+            let actor = authenticate_seat_control().map_err(TeamError::from_message)?;
+            let target = RemoteTarget {
+                team: actor.team().to_string(),
+                seat: input.target_seat,
+                expected_generation: input.expected_generation,
+            };
+            resolve_native(
+                &engine.paths.home,
+                ResolutionAuthority::Lead(&actor),
+                &target,
+                &input.resolution,
+                &[],
+            )
+            .map(TeamControlResponse::ResolveRemote)
+            .map_err(remote_error)
+        }
         TeamControlRequest::Replace(_input) => Err(TeamError::new("E_CONTROL_UNAVAILABLE", "native replacement adapter is not integrated")),
     }
+}
+
+fn remote_error(error: RemoteError) -> TeamError {
+    let code = error.code();
+    let message = match code {
+        "E_CONTROL_UNAUTHORIZED" => "remote-effect authority is unavailable",
+        "E_GENERATION_MISMATCH" => "remote-effect target generation changed",
+        "E_REMOTE_RESOLUTION_INVALID" => "remote-effect resolution is invalid",
+        "E_REMOTE_RESOLUTION_CONFLICT" => "remote-effect resolution conflicts with durable history",
+        _ => "remote-effect inventory is uncertain",
+    };
+    TeamError::new(code, message)
 }
 
 fn checkpoint_error(error: CheckpointError) -> TeamError {
@@ -1575,9 +1645,8 @@ mod tests {
         }
     }
 
-    fn bind_active_worker(home: &Path, seat: &TeamSeat) -> PathBuf {
+    fn bind_active_worker_with_token(home: &Path, seat: &TeamSeat, token: &[u8]) -> PathBuf {
         let token_path = home.join(".aperture/run/hub-tokens").join(format!("{}.token", seat.name));
-        let token = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         fs::write(&token_path, token).unwrap();
         fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
         let owner_path = home.join(".aperture/run/owner").join(format!("{}.json", seat.name));
@@ -1591,6 +1660,14 @@ mod tests {
         });
         write_private_json_atomic(&owner_path, &owner, true).unwrap();
         token_path
+    }
+
+    fn bind_active_worker(home: &Path, seat: &TeamSeat) -> PathBuf {
+        bind_active_worker_with_token(
+            home,
+            seat,
+            b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
     }
     impl Drop for EnvRestore {
         fn drop(&mut self) {
@@ -1873,6 +1950,129 @@ mod tests {
         }), false).unwrap();
         assert_eq!(team_control_headless(&request_json).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
         assert_eq!(fs::read_dir(&checkpoint_dir).unwrap().count(), 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn lead_remote_control_derives_team_and_resolves_only_bound_target_inventory() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("lead-remote-control");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine
+            .create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t10"))
+            .unwrap();
+        engine
+            .activate(
+                &authenticate_glados_control().unwrap(),
+                ActivateTeamInput {
+                    team: "t10".into(),
+                    expected_generation: 0,
+                    creation_request_id: created.creation_request.request_id,
+                    epic_id: "aperture-4rsnc".into(),
+                },
+            )
+            .unwrap();
+        let lead = created
+            .team
+            .snapshot
+            .seats
+            .iter()
+            .find(|seat| seat.name == created.team.snapshot.lead)
+            .unwrap();
+        let target = created
+            .team
+            .snapshot
+            .seats
+            .iter()
+            .find(|seat| seat.name != lead.name)
+            .unwrap();
+        let lead_token = bind_active_worker_with_token(
+            &home,
+            lead,
+            b"llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll",
+        );
+        bind_active_worker_with_token(
+            &home,
+            target,
+            b"tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+        );
+        let harness = serde_json::to_value(&target.harness)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        crate::team_checkpoint::native::write_native(
+            &home,
+            &CheckpointContext {
+                team: "t10".into(),
+                seat: target.name.clone(),
+                generation: 1,
+                authenticated_generation: 1,
+                harness,
+                writer: CheckpointWriter::Explicit,
+            },
+            1,
+            CheckpointPayload {
+                task_id: "aperture-fixture".into(),
+                worktree: "aperture-worktrees/aperture-fixture".into(),
+                branch: "aperture-fixture".into(),
+                head_sha: "a".repeat(40),
+                dirty_files: vec![],
+                open_pr: None,
+                running_procs: vec![],
+                decisions: vec![],
+                next_step: "Wait for the approved remote effect decision.".into(),
+                remote_effects: vec![crate::team_checkpoint::RemoteEffectRef {
+                    kind: "ci".into(),
+                    reference: "ci:fixture-1".into(),
+                    state: "unknown".into(),
+                }],
+            },
+            1,
+            &[],
+            || Ok(()),
+        )
+        .unwrap();
+        std::env::set_var("APERTURE_HUB_TOKEN_FILE", &lead_token);
+
+        let inspect = TeamControlRequest::InspectRemote(InspectRemoteInput {
+            target_seat: target.name.clone(),
+            expected_generation: 1,
+        });
+        let inventory = match team_control_headless(&serde_json::to_string(&inspect).unwrap()).unwrap() {
+            TeamControlResponse::InspectRemote(value) => value,
+            _ => panic!("unexpected control response"),
+        };
+        assert!(!inventory.complete_observation);
+        assert_eq!(inventory.effects.len(), 1);
+        assert_eq!(inventory.effects[0].reference, "ci:fixture-1");
+
+        let resolve = TeamControlRequest::ResolveRemote(ResolveRemoteInput {
+            target_seat: target.name.clone(),
+            expected_generation: 1,
+            resolution: ResolutionRequest {
+                expected_inventory_hash: inventory.inventory_hash,
+                scope: crate::team_replacement::remote::ResolutionScope::EffectResolution,
+                reference: Some("ci:fixture-1".into()),
+                decision: crate::team_replacement::remote::ResolutionDecision::Finished,
+                evidence_ref: "beads:fixture-review".into(),
+            },
+        });
+        let receipt = match team_control_headless(&serde_json::to_string(&resolve).unwrap()).unwrap() {
+            TeamControlResponse::ResolveRemote(value) => value,
+            _ => panic!("unexpected control response"),
+        };
+        assert_eq!(receipt.source, "authorized_decision");
+        assert!(!receipt.complete_observation);
+        assert!(!receipt.replay);
+
+        let forged = serde_json::json!({
+            "action": "inspect_remote",
+            "input": {"target_seat": target.name, "expected_generation": 1, "team": "t10"}
+        });
+        assert_eq!(team_control_headless(&forged.to_string()).unwrap_err().code, "E_STATE_CONFLICT");
         fs::remove_dir_all(home).unwrap();
     }
 

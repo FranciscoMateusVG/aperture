@@ -47,7 +47,11 @@ impl Fixture {
         owners
             .initialize_owner(&actor, SEAT, tuple.clone())
             .unwrap();
-        let reservation = owners.reserve_start(&actor, SEAT, 0, tuple).unwrap();
+        let reservation = owners.reserve_start(&actor, SEAT, 0, tuple.clone()).unwrap();
+        let token_id = "a".repeat(64);
+        owners
+            .bind_and_publish_token(&actor, &reservation, token_id.clone(), || Ok(()))
+            .unwrap();
         owners
             .record_start_candidate(
                 &actor,
@@ -55,16 +59,29 @@ impl Fixture {
                 Incarnation {
                     pid: 900001,
                     start_time: 1_000_001,
-                    thread_id: "fixture-thread".into(),
-                    token_id: "fixture-token-id".into(),
+                    thread_id: String::new(),
+                    token_id: token_id.clone(),
                     harness: Harness::Codex,
                     model: "gpt-6-astra".into(),
                     reasoning: Some(ReasoningEffort::High),
-                    observed: true,
+                    observed: false,
                     processes: vec![
                         owner_process(900001, 1_000_001, 1),
                         owner_process(900002, 1_000_002, 900001),
                     ],
+                },
+            )
+            .unwrap();
+        owners
+            .record_runtime_observation(
+                &actor,
+                &reservation,
+                crate::owner::RuntimeObservation {
+                    pid: 900001,
+                    start_time: 1_000_001,
+                    token_id,
+                    thread_id: "fixture-thread".into(),
+                    actual: tuple,
                 },
             )
             .unwrap();

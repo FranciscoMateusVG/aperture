@@ -38,6 +38,10 @@ impl Fixture {
             };
             store.initialize_owner(&actor, seat, tuple.clone()).unwrap();
             let reservation = store.reserve_start(&actor, seat, 0, tuple.clone()).unwrap();
+            let token_id = if seat == TARGET { "a".repeat(64) } else { "b".repeat(64) };
+            store
+                .bind_and_publish_token(&actor, &reservation, token_id.clone(), || Ok(()))
+                .unwrap();
             store
                 .record_start_candidate(
                     &actor,
@@ -45,12 +49,12 @@ impl Fixture {
                     Incarnation {
                         pid: 900001,
                         start_time: 42,
-                        thread_id: "synthetic-thread".into(),
-                        token_id: "synthetic-token-id".into(),
-                        harness: tuple.harness,
-                        model: tuple.model,
-                        reasoning: tuple.reasoning,
-                        observed: true,
+                        thread_id: String::new(),
+                        token_id: token_id.clone(),
+                        harness: tuple.harness.clone(),
+                        model: tuple.model.clone(),
+                        reasoning: tuple.reasoning.clone(),
+                        observed: false,
                         processes: vec![crate::owner::ProcessIdentity {
                             pid: 900001,
                             start_time: 42,
@@ -59,6 +63,19 @@ impl Fixture {
                             cmdline_sha256: "a".repeat(64),
                             cwd: "/fixture".into(),
                         }],
+                    },
+                )
+                .unwrap();
+            store
+                .record_runtime_observation(
+                    &actor,
+                    &reservation,
+                    crate::owner::RuntimeObservation {
+                        pid: 900001,
+                        start_time: 42,
+                        token_id,
+                        thread_id: "synthetic-thread".into(),
+                        actual: tuple,
                     },
                 )
                 .unwrap();

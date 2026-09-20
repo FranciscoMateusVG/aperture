@@ -17,6 +17,7 @@ process.env.APERTURE_RUN_DIR = run;
 process.env.APERTURE_OWNER_DIR = owner;
 process.env.APERTURE_TEAM_GENERATION = "999";
 const { managedHelloFields } = await import("../dist/managed-identity.js");
+const { managedOwnerMatches, readManagedOwner } = await import("../dist/managed-owner.js");
 
 const seat = "alpha-worker";
 const token = "ab".repeat(32);
@@ -27,6 +28,7 @@ const record = (state = "active", tokenId = digest) => ({
   generation: 7,
   state,
   reservation_nonce_sha256: null,
+  provisional_token_id: state === "starting" ? tokenId : null,
   requested: { harness: "claude", model: "claude/test", reasoning: null },
   incarnation: {
     pid: 123,
@@ -40,6 +42,24 @@ const record = (state = "active", tokenId = digest) => ({
   },
   since: "2026-09-20T00:00:00Z",
   writer: "launcher",
+});
+
+test("starting owner exposes only its durably bound provisional token identity", () => {
+  const starting = record("starting");
+  starting.incarnation = null;
+  writeFileSync(join(owner, `${seat}.json`), JSON.stringify(starting), { mode: 0o600 });
+  const parsed = readManagedOwner(seat);
+  assert.deepEqual(parsed, { seat, generation: 7, state: "starting", tokenId: digest });
+  assert.equal(managedOwnerMatches(parsed, 7, digest, ["starting", "active"]), true);
+
+  delete starting.provisional_token_id;
+  writeFileSync(join(owner, `${seat}.json`), JSON.stringify(starting), { mode: 0o600 });
+  assert.throws(() => readManagedOwner(seat), /invalid provisional owner identity/);
+
+  starting.provisional_token_id = "c".repeat(64);
+  starting.incarnation = record("starting").incarnation;
+  writeFileSync(join(owner, `${seat}.json`), JSON.stringify(starting), { mode: 0o600 });
+  assert.throws(() => readManagedOwner(seat), /invalid provisional owner identity/);
 });
 
 test("managed hello derives generation and token identity from the active OwnerRecord", () => {

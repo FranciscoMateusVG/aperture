@@ -99,6 +99,10 @@ pub struct OwnerRecord {
     pub generation: u64,
     pub state: OwnerState,
     pub reservation_nonce_sha256: Option<String>,
+    /// Digest reserved durably before the canonical token file is published.
+    /// It exists only for a Starting generation and is never a bearer value.
+    #[serde(default)]
+    pub provisional_token_id: Option<String>,
     pub requested: ExecutionTuple,
     pub incarnation: Option<Incarnation>,
     pub since: String,
@@ -111,6 +115,17 @@ pub struct StartReservation {
     pub seat: String,
     pub generation: u64,
     nonce: String,
+}
+
+/// Native runtime evidence bound to the exact gated candidate. This is not a
+/// command DTO and cannot be supplied by a managed seat or UI caller.
+#[derive(Debug)]
+pub(crate) struct RuntimeObservation {
+    pub pid: u32,
+    pub start_time: u64,
+    pub token_id: String,
+    pub thread_id: String,
+    pub actual: ExecutionTuple,
 }
 
 impl StartReservation {
@@ -159,6 +174,7 @@ impl OwnerStore {
             generation: 0,
             state: OwnerState::Stale,
             reservation_nonce_sha256: None,
+            provisional_token_id: None,
             requested: configured,
             incarnation: None,
             since: now(),
@@ -204,12 +220,47 @@ impl OwnerStore {
         record.generation = expected_generation.checked_add(1).ok_or_else(|| "E_GENERATION_MISMATCH: generation overflow".to_string())?;
         record.state = OwnerState::Starting;
         record.reservation_nonce_sha256 = Some(hash_text(&nonce));
+        record.provisional_token_id = None;
         record.requested = requested;
         record.incarnation = None;
         record.since = now();
         record.writer = actor.principal().into();
         self.write_unlocked(&record, true)?;
         Ok(StartReservation { seat: seat.into(), generation: record.generation, nonce })
+    }
+
+    /// Persist the new token digest before publishing its canonical file. The
+    /// callback runs while the reservation/seat lock is held and may publish
+    /// only the already-generated token. A callback failure leaves the digest
+    /// durably bound so cleanup can revoke that exact identity; it is never
+    /// retried or replaced in this generation.
+    pub(crate) fn bind_and_publish_token<F>(
+        &self,
+        actor: &AuthenticatedActor,
+        reservation: &StartReservation,
+        token_id: String,
+        publish: F,
+    ) -> Result<OwnerRecord, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if !actor.is_launcher() {
+            return Err("E_CONTROL_UNAUTHORIZED: launcher actor required".into());
+        }
+        if !is_token_id(&token_id) {
+            return Err("E_TOKEN_INVALID: provisional token identity is invalid".into());
+        }
+        let _lock = self.lock(&reservation.seat)?;
+        let mut record = self.read_unlocked(&reservation.seat)?;
+        require_reservation(&record, reservation)?;
+        if record.provisional_token_id.is_some() || record.incarnation.is_some() {
+            return Err("E_STATE_CONFLICT: provisional token is already bound".into());
+        }
+        record.provisional_token_id = Some(token_id);
+        record.writer = actor.principal().into();
+        self.write_unlocked(&record, true)?;
+        publish()?;
+        Ok(record)
     }
 
     /// Persist exact process identity while the child is still blocked on its
@@ -223,30 +274,69 @@ impl OwnerStore {
         let _lock = self.lock(&reservation.seat)?;
         let mut record = self.read_unlocked(&reservation.seat)?;
         require_reservation(&record, reservation)?;
+        if incarnation.observed || !incarnation.thread_id.is_empty() {
+            return Err("E_STATE_CONFLICT: gated candidate cannot claim runtime observation".into());
+        }
         validate_incarnation(&incarnation)?;
+        if record.provisional_token_id.as_deref() != Some(&incarnation.token_id) {
+            return Err("E_PROCESS_IDENTITY: candidate token is not the reserved identity".into());
+        }
         record.incarnation = Some(incarnation);
         record.writer = actor.principal().into();
         self.write_unlocked(&record, true)?;
         Ok(record)
     }
 
-    /// Persist the native harness observation while the exact candidate is
-    /// still Starting. Caller payloads cannot reach this seam.
-    pub(crate) fn record_observed_tuple(
+    /// Atomically bind the exact native thread and harness observation while
+    /// the same pid/birth/token candidate is still Starting. Existing process
+    /// identities are preserved byte-for-byte; caller payloads cannot reach
+    /// this seam.
+    pub(crate) fn record_runtime_observation(
         &self,
         actor: &AuthenticatedActor,
         reservation: &StartReservation,
-        actual: ExecutionTuple,
+        observation: RuntimeObservation,
     ) -> Result<OwnerRecord, String> {
         if !actor.is_launcher() { return Err("E_CONTROL_UNAUTHORIZED: launcher actor required".into()); }
         let _lock = self.lock(&reservation.seat)?;
         let mut record = self.read_unlocked(&reservation.seat)?;
         require_reservation(&record, reservation)?;
         let incarnation = record.incarnation.as_mut().ok_or_else(|| "E_STATE_CONFLICT: process identity not recorded".to_string())?;
-        incarnation.harness = actual.harness;
-        incarnation.model = actual.model;
-        incarnation.reasoning = actual.reasoning;
+        if incarnation.pid != observation.pid
+            || incarnation.start_time != observation.start_time
+            || incarnation.token_id != observation.token_id
+        {
+            return Err("E_PROCESS_IDENTITY: runtime observation does not match candidate".into());
+        }
+        if record.provisional_token_id.as_deref() != Some(&observation.token_id) {
+            return Err("E_PROCESS_IDENTITY: runtime token is not the reserved identity".into());
+        }
+        if observation.thread_id.is_empty()
+            || observation.thread_id.len() > 128
+            || !observation
+                .thread_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("E_FRESH_THREAD_UNVERIFIED: runtime thread identity is invalid".into());
+        }
+        if incarnation.observed {
+            if incarnation.thread_id == observation.thread_id
+                && incarnation.execution_tuple().as_ref() == Some(&observation.actual)
+            {
+                return Ok(record);
+            }
+            return Err("E_MODEL_UNVERIFIED: runtime observation conflicts with owner".into());
+        }
+        if !incarnation.thread_id.is_empty() && incarnation.thread_id != observation.thread_id {
+            return Err("E_FRESH_THREAD_UNVERIFIED: runtime thread identity changed".into());
+        }
+        incarnation.thread_id = observation.thread_id;
+        incarnation.harness = observation.actual.harness;
+        incarnation.model = observation.actual.model;
+        incarnation.reasoning = observation.actual.reasoning;
         incarnation.observed = true;
+        validate_incarnation(incarnation)?;
         record.writer = actor.principal().into();
         self.write_unlocked(&record, true)?;
         Ok(record)
@@ -269,6 +359,7 @@ impl OwnerStore {
         }
         record.state = OwnerState::Active;
         record.reservation_nonce_sha256 = None;
+        record.provisional_token_id = None;
         record.since = now();
         record.writer = actor.principal().into();
         self.write_unlocked(&record, true)?;
@@ -377,6 +468,13 @@ fn hash_text(value: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn is_token_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn require_reservation(record: &OwnerRecord, reservation: &StartReservation) -> Result<(), String> {
     if record.generation != reservation.generation || record.state != OwnerState::Starting {
         return Err("E_GENERATION_MISMATCH: start reservation changed".into());
@@ -388,7 +486,12 @@ fn require_reservation(record: &OwnerRecord, reservation: &StartReservation) -> 
 }
 
 fn validate_incarnation(value: &Incarnation) -> Result<(), String> {
-    if value.pid == 0 || value.start_time == 0 || value.thread_id.is_empty() || value.token_id.is_empty() || value.processes.is_empty() {
+    if value.pid == 0
+        || value.start_time == 0
+        || (value.observed && value.thread_id.is_empty())
+        || value.token_id.is_empty()
+        || value.processes.is_empty()
+    {
         return Err("E_STATE_CONFLICT: incomplete incarnation identity".into());
     }
     if !value.processes.iter().any(|p| p.pid == value.pid && p.start_time == value.start_time) {
@@ -416,7 +519,16 @@ mod tests {
         path
     }
     fn tuple(model: &str) -> ExecutionTuple { ExecutionTuple { harness: Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High) } }
-    fn incarnation(model: &str) -> Incarnation { Incarnation { pid:123, start_time:456, thread_id:"thread".into(), token_id:"token-id".into(), harness:Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High), observed:true, processes:vec![ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/work".into() }] } }
+    fn token_id() -> String { "a".repeat(64) }
+    fn candidate(model: &str) -> Incarnation { Incarnation { pid:123, start_time:456, thread_id:String::new(), token_id:token_id(), harness:Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High), observed:false, processes:vec![ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/work".into() }] } }
+    fn bind_token(store: &OwnerStore, actor: &AuthenticatedActor, reservation: &StartReservation) {
+        store.bind_and_publish_token(actor, reservation, token_id(), || Ok(())).unwrap();
+    }
+    fn observe(store: &OwnerStore, actor: &AuthenticatedActor, reservation: &StartReservation, model: &str) -> OwnerRecord {
+        store.record_runtime_observation(actor, reservation, RuntimeObservation {
+            pid:123, start_time:456, token_id:token_id(), thread_id:"thread".into(), actual:tuple(model),
+        }).unwrap()
+    }
 
     #[test]
     fn generation_cas_and_model_observation_gate() {
@@ -426,7 +538,9 @@ mod tests {
         store.initialize_owner(&actor, "t1-backend", tuple("gpt-6-astra")).unwrap();
         let reservation = store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
         assert!(store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).is_err());
-        store.record_start_candidate(&actor, &reservation, incarnation("gpt-5.6-sol")).unwrap();
+        bind_token(&store, &actor, &reservation);
+        store.record_start_candidate(&actor, &reservation, candidate("gpt-5.6-sol")).unwrap();
+        observe(&store, &actor, &reservation, "gpt-5.6-sol");
         assert!(store.commit_start(&actor, &reservation).unwrap_err().contains("E_MODEL_MISMATCH"));
         let quarantined = store.abort_start(&actor, &reservation).unwrap();
         assert_eq!(quarantined.state, OwnerState::Quarantined);
@@ -441,15 +555,90 @@ mod tests {
         let actor = AuthenticatedActor::launcher();
         store.initialize_owner(&actor, "t1-backend", tuple("gpt-6-astra")).unwrap();
         let reservation = store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
-        let mut candidate = incarnation("gpt-6-astra");
-        candidate.observed = false;
-        store.record_start_candidate(&actor, &reservation, candidate).unwrap();
+        bind_token(&store, &actor, &reservation);
+        store.record_start_candidate(&actor, &reservation, candidate("gpt-6-astra")).unwrap();
         assert!(store.summary("t1-backend").unwrap().actual.is_none());
+        assert!(!store.summary("t1-backend").unwrap().thread_bound);
         assert!(store.commit_start(&actor, &reservation).unwrap_err().contains("E_MODEL_UNVERIFIED"));
-        store.record_observed_tuple(&actor, &reservation, tuple("gpt-6-astra")).unwrap();
+        observe(&store, &actor, &reservation, "gpt-6-astra");
         let committed = store.commit_start(&actor, &reservation).unwrap();
         assert_eq!(committed.state, OwnerState::Active);
         assert_eq!(store.summary("t1-backend").unwrap().actual, Some(tuple("gpt-6-astra")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisional_token_precedes_publication_and_runtime_observation_is_exact() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let actor = AuthenticatedActor::launcher();
+        store.initialize_owner(&actor, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+
+        assert!(store
+            .record_start_candidate(&actor, &reservation, candidate("gpt-6-astra"))
+            .unwrap_err()
+            .contains("candidate token is not the reserved identity"));
+        let observed_during_publish = std::cell::Cell::new(false);
+        let publish_error = store
+            .bind_and_publish_token(&actor, &reservation, token_id(), || {
+                let record: OwnerRecord = read_private_json(&store.record_path("t1-backend"))?;
+                observed_during_publish.set(record.provisional_token_id.as_deref() == Some(token_id().as_str()));
+                Err("E_TOKEN_PUBLICATION: fixture failure".into())
+            })
+            .unwrap_err();
+        assert!(publish_error.contains("E_TOKEN_PUBLICATION"));
+        assert!(observed_during_publish.get(), "digest must be durable before publication callback");
+        let after_failure = store.read_owner("t1-backend").unwrap();
+        assert_eq!(after_failure.provisional_token_id, Some(token_id()));
+        assert!(after_failure.incarnation.is_none());
+        let callback_reached = std::cell::Cell::new(false);
+        assert!(store
+            .bind_and_publish_token(&actor, &reservation, token_id(), || {
+                callback_reached.set(true);
+                Ok(())
+            })
+            .unwrap_err()
+            .contains("already bound"));
+        assert!(!callback_reached.get(), "failed publication is not retried in the same generation");
+
+        // A fresh fixture exercises the successful path and exact receipt CAS.
+        let store = OwnerStore::new(root.join("owner-success"));
+        store.initialize_owner(&actor, "t2-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&actor, "t2-backend", 0, tuple("gpt-6-astra")).unwrap();
+        bind_token(&store, &actor, &reservation);
+        store.record_start_candidate(&actor, &reservation, candidate("gpt-6-astra")).unwrap();
+        let before = store.read_owner("t2-backend").unwrap();
+        let mut wrong = RuntimeObservation {
+            pid: 999,
+            start_time: 456,
+            token_id: token_id(),
+            thread_id: "thread".into(),
+            actual: tuple("gpt-6-astra"),
+        };
+        assert!(store.record_runtime_observation(&actor, &reservation, wrong).unwrap_err().contains("E_PROCESS_IDENTITY"));
+        assert_eq!(store.read_owner("t2-backend").unwrap(), before);
+        wrong = RuntimeObservation {
+            pid: 123,
+            start_time: 456,
+            token_id: token_id(),
+            thread_id: "thread".into(),
+            actual: tuple("gpt-6-astra"),
+        };
+        let observed = store.record_runtime_observation(&actor, &reservation, wrong).unwrap();
+        assert_eq!(observed.incarnation.as_ref().unwrap().thread_id, "thread");
+        assert_eq!(observed.incarnation.as_ref().unwrap().processes, before.incarnation.as_ref().unwrap().processes);
+        let replay = store.record_runtime_observation(&actor, &reservation, RuntimeObservation {
+            pid: 123,
+            start_time: 456,
+            token_id: token_id(),
+            thread_id: "thread".into(),
+            actual: tuple("gpt-6-astra"),
+        }).unwrap();
+        assert_eq!(replay, observed);
+        let active = store.commit_start(&actor, &reservation).unwrap();
+        assert_eq!(active.state, OwnerState::Active);
+        assert_eq!(active.provisional_token_id, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -472,7 +661,9 @@ mod tests {
         let actor = AuthenticatedActor::launcher();
         store.initialize_owner(&actor, "t1-backend", tuple("gpt-6-astra")).unwrap();
         let reservation = store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
-        store.record_start_candidate(&actor, &reservation, incarnation("gpt-6-astra")).unwrap();
+        bind_token(&store, &actor, &reservation);
+        store.record_start_candidate(&actor, &reservation, candidate("gpt-6-astra")).unwrap();
+        observe(&store, &actor, &reservation, "gpt-6-astra");
         store.commit_start(&actor, &reservation).unwrap();
         let mut record: OwnerRecord = read_private_json(&store.record_path("t1-backend")).unwrap();
         record.incarnation.as_mut().unwrap().model = "gpt-5.6-sol".into();
@@ -488,7 +679,9 @@ mod tests {
         let launcher = AuthenticatedActor::launcher();
         store.initialize_owner(&launcher, "t1-backend", tuple("gpt-6-astra")).unwrap();
         let reservation = store.reserve_start(&launcher, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
-        store.record_start_candidate(&launcher, &reservation, incarnation("gpt-6-astra")).unwrap();
+        bind_token(&store, &launcher, &reservation);
+        store.record_start_candidate(&launcher, &reservation, candidate("gpt-6-astra")).unwrap();
+        observe(&store, &launcher, &reservation, "gpt-6-astra");
         store.commit_start(&launcher, &reservation).unwrap();
         let before = store.read_owner("t1-backend").unwrap();
         let mut refreshed = before.incarnation.as_ref().unwrap().processes.clone();
@@ -512,7 +705,8 @@ mod tests {
         let launcher = AuthenticatedActor::launcher();
         store.initialize_owner(&launcher, "t1-backend", tuple("gpt-6-astra")).unwrap();
         let reservation = store.reserve_start(&launcher, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
-        let mut first = incarnation("gpt-6-astra");
+        bind_token(&store, &launcher, &reservation);
+        let mut first = candidate("gpt-6-astra");
         first.processes.push(ProcessIdentity { pid:124,start_time:457,ppid:123,pgid:123,cmdline_sha256:"b".repeat(64),cwd:"/tmp/work".into() });
         store.record_start_candidate(&launcher, &reservation, first).unwrap();
 

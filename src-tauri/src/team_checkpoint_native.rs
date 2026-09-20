@@ -245,6 +245,10 @@ mod tests {
                     },
                 )
                 .unwrap();
+            let token_id = "a".repeat(64);
+            owners
+                .bind_and_publish_token(&actor, &reservation, token_id.clone(), || Ok(()))
+                .unwrap();
             owners
                 .record_start_candidate(
                     &actor,
@@ -252,12 +256,12 @@ mod tests {
                     crate::owner::Incarnation {
                         pid: 999999,
                         start_time: 1,
-                        thread_id: "fixture-thread".into(),
-                        token_id: "fixture-token-id".into(),
+                        thread_id: String::new(),
+                        token_id: token_id.clone(),
                         harness: crate::state::Harness::Codex,
                         model: "gpt-6-astra".into(),
                         reasoning: Some(crate::state::ReasoningEffort::High),
-                        observed: true,
+                        observed: false,
                         processes: vec![crate::owner::ProcessIdentity {
                             pid: 999999,
                             start_time: 1,
@@ -266,6 +270,23 @@ mod tests {
                             cmdline_sha256: "a".repeat(64),
                             cwd: "/fixture".into(),
                         }],
+                    },
+                )
+                .unwrap();
+            owners
+                .record_runtime_observation(
+                    &actor,
+                    &reservation,
+                    crate::owner::RuntimeObservation {
+                        pid: 999999,
+                        start_time: 1,
+                        token_id,
+                        thread_id: "fixture-thread".into(),
+                        actual: crate::state::ExecutionTuple {
+                            harness: crate::state::Harness::Codex,
+                            model: "gpt-6-astra".into(),
+                            reasoning: Some(crate::state::ReasoningEffort::High),
+                        },
                     },
                 )
                 .unwrap();
