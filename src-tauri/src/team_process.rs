@@ -457,3 +457,6 @@ where
 #[cfg(test)]
 #[path = "team_process_tests.rs"]
 mod persisted_tests;
+
+#[path = "team_process_native.rs"]
+pub(crate) mod native;

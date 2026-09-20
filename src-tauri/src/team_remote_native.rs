@@ -571,6 +571,30 @@ fn projection(
         may_proceed,
     }
 }
+/// Authenticated inventory read for the existing control action. Lead may
+/// inspect only another seat of its current immutable team, under the same
+/// target/lead locks used for resolution. No inventory leaks before validation.
+pub(crate) fn inspect_authorized(
+    home: &Path,
+    auth: ResolutionAuthority<'_>,
+    t: &RemoteTarget,
+    sentinels: &[String],
+) -> Result<RemoteInventoryView, RemoteError> {
+    let who = principal(&auth, t)?;
+    let locked = open(home, t, Some(&who))?;
+    if principal(&auth, t)? != who {
+        return Err(RemoteError::Authority);
+    }
+    let view = inventory(&locked, t, sentinels)?;
+    if principal(&auth, t)? != who {
+        return Err(RemoteError::Authority);
+    }
+    owner(home, &t.seat, t.expected_generation)?;
+    if let Principal::Lead { seat, generation } = &who {
+        owner(home, seat, *generation)?;
+    }
+    Ok(view)
+}
 pub(crate) fn inspect_native(
     home: &Path,
     t: &RemoteTarget,

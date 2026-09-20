@@ -610,3 +610,49 @@ fn excessive_refs_or_files_stop_instead_of_truncating_inventory() {
         Err(RemoteError::Limit)
     ));
 }
+
+#[test]
+fn operator_inventory_read_uses_authority_and_generation_guards() {
+    let f = Fixture::new();
+    f.checkpoint(1, &[("job-a", "unknown")]);
+    let view = inspect_authorized(
+        &f.0,
+        ResolutionAuthority::Operator(&AuthenticatedActor::operator_ui()),
+        &f.target(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(view, f.view());
+    assert!(matches!(
+        inspect_authorized(
+            &f.0,
+            ResolutionAuthority::Operator(&AuthenticatedActor::launcher()),
+            &f.target(),
+            &[]
+        ),
+        Err(RemoteError::Authority)
+    ));
+    assert!(matches!(
+        open(
+            &f.0,
+            &f.target(),
+            Some(&Principal::Lead {
+                seat: TARGET.into(),
+                generation: 1
+            })
+        ),
+        Err(RemoteError::Authority)
+    ));
+    assert!(matches!(
+        open(
+            &f.0,
+            &f.target(),
+            Some(&Principal::Lead {
+                seat: LEAD.into(),
+                generation: 2
+            })
+        ),
+        Err(RemoteError::Generation)
+    ));
+    assert!(!f.facts().exists());
+}

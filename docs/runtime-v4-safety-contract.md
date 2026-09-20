@@ -241,3 +241,34 @@ an authenticated boolean from a replacement request. Auth/control registration,
 human resolution UI and the complete native replacement journey still require
 composition and consolidated review. No live resolution, process effect, new
 capability or installation is authorized by this source checkpoint.
+
+### Authorized inventory inspection and native process collection
+
+Control must call `remote::inspect_authorized`, not the internal collector-only
+`inspect_native`: inventory reads use the same authenticated principal, current
+lead/other-seat policy, team then lexical owner locks, and capability revalidation
+as resolution. OperatorUi can inspect its selected target. No lead inventory is
+returned for a self-target, other team, stale owner or missing authority.
+
+`team_process::native::collect_native(home,team,seat,generation)` reads the current
+managed OwnerRecord and derives an OS observation; it is not signal authority.
+The separate `persist_for_stop` lock/CAS guard is still required before effects.
+The macOS adapter uses the SDK's PID table and exact birth records, privately
+hydrates cwd/argument digests, keeps persisted orphan identities, and refreshes
+child depth before children-first stop ordering. It checks a second topology
+observation and all exact identities before return. Recycled/unreadable/missing
+live rows, newly unobserved descendants or same-user outsiders invalidate the
+snapshot. Same cwd/command matches outside ownership are blockers only; shared
+working directories may therefore block conservatively, never widen kill scope.
+A control process included in the owned stop set is rejected before argument
+reads. There is no claim of atomic kernel process fencing or observation of a
+child that detached before it could ever be recorded.
+
+PID/metadata/argument/time bounds fail closed. `KERN_PROCARGS2` necessarily returns
+a native buffer containing environment as well as argv; only its argc-delimited
+argv is hashed and the entire private allocation is best-effort wiped. No raw
+arguments or environment are returned/logged/serialized. This is not a universal
+memory-erasure guarantee. Current collector tests supply synthetic native tables
+and byte buffers: the real OS collector, live process-stop and complete launcher
+journey remain NOT_RUN. No public capability or live action follows from these
+source fixtures.
