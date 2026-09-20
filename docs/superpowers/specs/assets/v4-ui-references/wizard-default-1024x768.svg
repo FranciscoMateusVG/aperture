@@ -41,7 +41,7 @@
 <text x="890.88" y="566" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">—</text>
 <rect x="32" y="596" width="136" height="44" rx="6" fill="#141428" stroke="#666684"/>
 <text x="46" y="624" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">+ Add seat</text>
-<text x="188" y="623" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Fallback: gpt-5.6-sol · gpt-5.6-terra (approved list)</text>
+<text x="188" y="623" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Configured fallbacks: gpt-5.6-sol · gpt-5.6-terra</text>
 <rect x="720" y="680" width="120" height="44" rx="6" fill="#141428" stroke="#666684"/>
 <text x="734" y="708" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Cancel</text>
 <rect x="856" y="680" width="136" height="44" rx="6" fill="#f39c12" stroke="#666684"/>

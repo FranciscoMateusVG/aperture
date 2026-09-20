@@ -1,6 +1,6 @@
 {
-  "status": "layout-awaiting-root-visual-approval",
-  "approver": null,
+  "status": "layout-approved",
+  "approver": "GLaDOS aperture-wisp-ivi8hg, 2026-09-20; layout only, not runtime",
   "sourceBase": "2703dc47d0f41f2c0e0dc417ed7c14d8df4a393a",
   "sources": [
     "src/style.css",
@@ -23,7 +23,7 @@
     },
     {
       "file": "wizard-default-1280x800.svg",
-      "sha256": "41a21c455703f0da8a794690683a8e2d8b23d4894ee74ee0650e734fb14668f9",
+      "sha256": "fc4ee21ebf1b1f0ff8b0e9f3721d5acbc609e825e235e190dee48c06b3ce9216",
       "viewport": [
         1280,
         800
@@ -113,7 +113,7 @@
     },
     {
       "file": "wizard-default-1024x768.svg",
-      "sha256": "49d6be8ca6dd0109a5dd9ce0b56dbdf0d6c01c2a5c6316c4f6e3c324ff1e5c7d",
+      "sha256": "767241cc5e961d766635fe449e02ae42e8f401c754df1e3a315c1f406f209303",
       "viewport": [
         1024,
         768
@@ -202,5 +202,8 @@
       "file": "components.css",
       "sha256": "2d7b940c9641d5df383115da1a6917aa8e70211760b4dc268aacfc0153da0fa6"
     }
+  ],
+  "corrections": [
+    "Wizard says configured fallbacks, not approved list; catalog membership never implies team authorization."
   ]
 }

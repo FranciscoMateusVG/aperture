@@ -41,7 +41,7 @@ for W,H in [(1280,800),(1024,768)]:
     y=438+j*50;rect(32,y,W-64,44,PANEL)
     t(46,y+28,('● ' if j==0 else '○ ')+f'fitt-relaunch-{role}',14)
     t(W*.43,y+28,role);t(W*.57,y+28,harness);t(W*.68,y+28,model);t(W*.87,y+28,reason)
-   btn(32,596,136,'+ Add seat');t(188,623,'Fallback: gpt-5.6-sol · gpt-5.6-terra (approved list)',14,MUT)
+   btn(32,596,136,'+ Add seat');t(188,623,'Configured fallbacks: gpt-5.6-sol · gpt-5.6-terra',14,MUT)
    btn(W-304,H-88,120,'Cancel');btn(W-168,H-88,136,'Create team',True)
   elif screen=='grouped':
    t(32,108,'Sessions',28,TXT,600);btn(W-179,80,147,'Browse presets')
