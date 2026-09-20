@@ -1555,6 +1555,15 @@ pub(crate) fn classify_managed_seat(home: &Path, seat: &str) -> TeamResult<Optio
     if !is_valid_seat_name(seat) { return Err(TeamError::name("invalid seat id")); }
     let teams_root = home.join(".aperture/teams");
     let journal_root = home.join(".aperture/run/team-journals");
+    match fs::symlink_metadata(&journal_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0 => {}
+        _ => return Err(TeamError::new("E_PATH_UNSAFE", "team archive journal root is unsafe")),
+    }
     let agents_root = home.join(".claude/aperture");
     let marker = agents_root.join(seat).join("TEAM");
     let marker_exists = fs::symlink_metadata(&marker).is_ok();
@@ -2285,6 +2294,14 @@ mod tests {
         fs::remove_file(home.join(".aperture/teams")).unwrap();
         ensure_private_dir(&home.join(".aperture/teams")).unwrap();
         std::os::unix::fs::symlink(home.join("missing-archive"), home.join(".aperture/teams/archive")).unwrap();
+        assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_PATH_UNSAFE");
+        fs::remove_file(home.join(".aperture/teams/archive")).unwrap();
+        ensure_private_dir(&home.join(".aperture/run")).unwrap();
+        std::os::unix::fs::symlink(
+            home.join("missing-journals"),
+            home.join(".aperture/run/team-journals"),
+        )
+        .unwrap();
         assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_PATH_UNSAFE");
         fs::remove_dir_all(home).unwrap();
     }
