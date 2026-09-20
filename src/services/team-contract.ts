@@ -1,4 +1,4 @@
-import type { TeamCatalog, TeamPreset, TeamView, TeamCreateResult, CancelPendingResult, ExecutionTuple } from "../types";
+import type { TeamCatalog, TeamPreset, TeamView, TeamCreateResult, CancelPendingResult, ExecutionTuple, PresetSeat, TeamPresetInput } from "../types";
 
 const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const str = (v: unknown): v is string => typeof v === "string";
@@ -10,6 +10,20 @@ const invalid = (): never => { throw { code: "E_RESPONSE_INVALID", message: "Inv
 export function isExecutionTuple(v: unknown): v is ExecutionTuple {
   return record(v) && str(v.model) && v.model.length > 0 &&
     ((v.harness === "claude" && v.reasoning === null) || (v.harness === "codex" && str(v.reasoning) && v.reasoning.length > 0));
+}
+export function sameExecutionTuple(a: ExecutionTuple, b: ExecutionTuple): boolean {
+  return a.harness === b.harness && a.model === b.model && a.reasoning === b.reasoning;
+}
+export function sameSeats(a: readonly PresetSeat[], b: readonly PresetSeat[]): boolean {
+  return a.length === b.length && a.every((seat, i) => seat.role === b[i].role && sameExecutionTuple(seat, b[i]));
+}
+export function sameFallbacks(a: readonly ExecutionTuple[], b: readonly ExecutionTuple[]): boolean {
+  return a.length === b.length && a.every((tuple, i) => sameExecutionTuple(tuple, b[i]));
+}
+export function samePresetContent(a: TeamPresetInput, b: TeamPresetInput): boolean {
+  return a.schema_version === b.schema_version && a.id === b.id && a.display_name === b.display_name &&
+    a.mission_placeholder === b.mission_placeholder && a.acceptance_placeholder === b.acceptance_placeholder &&
+    a.lead_index === b.lead_index && sameSeats(a.seats, b.seats) && sameFallbacks(a.fallbacks, b.fallbacks);
 }
 const seat = (v: unknown) => record(v) && str(v.role) && isExecutionTuple(v);
 const teamSeat = (v: unknown) => record(v) && str(v.name) && seat(v);
@@ -51,6 +65,15 @@ export function parseTeamView(v: unknown): TeamView {
       const snap = result.snapshot.seats.find(p => p.name === s.configured.name);
       return !snap || ["role", "harness", "model", "reasoning"].some(k => snap[k as keyof typeof snap] !== s.configured[k as keyof typeof s.configured]);
     })) return invalid();
+  for (const { configured, observed_owner: observed } of result.seats) {
+    if (!observed) continue;
+    // Team lifecycle and seat incarnation generations are independent CAS counters.
+    // owner.configured is the incarnation request, not the immutable seat snapshot.
+    const allowed = observed.generation === 0
+      ? sameExecutionTuple(observed.configured, configured)
+      : [configured, ...result.snapshot.fallbacks].some(tuple => sameExecutionTuple(observed.configured, tuple));
+    if (!allowed || (observed.state === "active" && (!observed.actual || !sameExecutionTuple(observed.actual, observed.configured)))) return invalid();
+  }
   return result;
 }
 export function parseTeams(v: unknown): TeamView[] {
@@ -62,6 +85,7 @@ export function parseTeams(v: unknown): TeamView[] {
 export function parseTeamCreateResult(v: unknown): TeamCreateResult {
   if (!record(v) || !record(v.creation_request)) return invalid();
   const team = parseTeamView(v.team), r = v.creation_request;
+  if (team.state.state !== "pending" || team.state.generation !== 0 || team.state.epic_id !== null || team.state.failure !== null) return invalid();
   if (r.schema_version !== 1 || ![r.request_id, r.team, r.project, r.created_at].every(str) || !hash(r.snapshot_sha256) || !int(r.expected_generation) ||
     r.team !== team.snapshot.team || r.project !== team.snapshot.project || r.request_id !== team.snapshot.creation_request_id || r.expected_generation !== team.state.generation) return invalid();
   return v as unknown as TeamCreateResult;
