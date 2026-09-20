@@ -48,6 +48,10 @@ impl AuthenticatedActor {
         self.kind == ActorKind::GladosControl
     }
 
+    pub(crate) fn is_launcher(&self) -> bool {
+        self.kind == ActorKind::Launcher
+    }
+
     /// Revalidate the already-open canonical GLaDOS capability immediately
     /// before the first team mutation. Both the descriptor and the canonical
     /// path must still name the same inode; an atomically replaced path must

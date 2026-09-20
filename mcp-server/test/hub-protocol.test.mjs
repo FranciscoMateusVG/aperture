@@ -43,6 +43,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -89,7 +90,7 @@ const TOKENS = {
  * Returns { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, stop }.
  * stderrEvents is the live array of parsed JSON log lines from hub stderr.
  */
-async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry = false } = {}) {
+async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry = false, revocationRoot = null } = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-test-agents-"));
   const teamsDir = mkdtempSync(join(tmpdir(), "hub-test-teams-"));
@@ -97,6 +98,7 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
   // Short prefix: the codex app-server unix socket lives here and sun_path is
   // ~104 bytes on macOS.
   const runDir = mkdtempSync(join(tmpdir(), "hr-"));
+  const revocationDir = revocationRoot ?? join(runDir, "revocations");
   const presenceFile = join(runDir, "presence.json");
   const bdMessageFile = join(runDir, "bd-message.json");
   const bdCallsFile = join(runDir, "bd-calls.log");
@@ -172,6 +174,7 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
       APERTURE_TEAMS_DIR: teamsDir,
       APERTURE_HUB_TOKEN_DIR: tokenDir,
       APERTURE_RUN_DIR: runDir,
+      APERTURE_REVOCATION_DIR: revocationDir,
       // Never let the developer's real ~/.aperture/agent-config.json model
       // overrides leak into discovery.
       APERTURE_AGENT_CONFIG_PATH: join(runDir, "no-such-agent-config.json"),
@@ -247,7 +250,7 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
   const bdCalls = () => existsSync(bdCallsFile)
     ? readFileSync(bdCallsFile, "utf8").split("\n").filter(Boolean)
     : [];
-  return { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, setBdMessage, bdCalls, stop };
+  return { port, proc, runDir, tokenDir, revocationDir, presenceFile, readPresence, stderrEvents, waitForEvent, setBdMessage, bdCalls, stop };
 }
 
 function connect(port) {
@@ -258,9 +261,13 @@ function connect(port) {
   });
 }
 
-const hello = (ws, role, agent) => {
+const hello = (ws, role, agent, options = {}) => {
   const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
-  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token: TOKENS[principal] }));
+  const token = options.token ?? TOKENS[principal];
+  const managed = principal.startsWith("p1-")
+    ? { generation: options.generation ?? 1, token_id: createHash("sha256").update(token).digest("hex") }
+    : {};
+  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token, ...managed }));
 };
 
 async function authenticate(hub, ws, role, agent) {
@@ -632,6 +639,146 @@ test("team registry is enforced at the hub: dynamic hello, lead route, and non-l
     closeAll(leadProducer, workerProducer);
   } finally {
     hub.stop();
+  }
+});
+
+test("managed identity revocation is durable, exact-generation, and fail-closed", async () => {
+  const revocationParent = mkdtempSync(join(tmpdir(), "hub-revocation-restart-"));
+  const revocationRoot = join(revocationParent, "store");
+  const hub = await spawnHub({ teamRegistry: true, revocationRoot });
+  let restarted = null;
+  try {
+    const missingIdentity = await connect(hub.port);
+    const missingClose = waitForClose(missingIdentity, "managed hello without generation");
+    missingIdentity.send(JSON.stringify({
+      type: "hello",
+      role: "agent",
+      agent: "p1-a-worker",
+      token: TOKENS["p1-a-worker"],
+    }));
+    assert.equal((await missingClose).code, 4003);
+
+    const launcher = await connect(hub.port);
+    await authenticate(hub, launcher, "subscriber", "watchdog");
+    const generationOne = await connect(hub.port);
+    await authenticate(hub, generationOne, "agent", "p1-a-worker");
+    const generationOneClose = waitForClose(generationOne, "revoked generation one socket");
+    const generationOneTokenId = createHash("sha256").update(TOKENS["p1-a-worker"]).digest("hex");
+    const ordinaryProducer = await connect(hub.port);
+    await authenticate(hub, ordinaryProducer, "producer", "glados");
+    const unauthorized = waitFor(
+      ordinaryProducer,
+      (m) => m.type === "error" && m.code === "E_CONTROL_UNAUTHORIZED",
+      "non-launcher control rejection",
+    );
+    ordinaryProducer.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_id: generationOneTokenId,
+    }));
+    await unauthorized;
+    assert.equal(generationOne.readyState, WebSocket.OPEN, "ordinary producer cannot revoke a managed identity");
+    const generationOneAck = waitFor(
+      launcher,
+      (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 1,
+      "generation one revocation ack",
+    );
+    launcher.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_id: generationOneTokenId,
+    }));
+    assert.deepEqual(await generationOneAck, {
+      type: "ok",
+      control: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_deleted: true,
+      sockets_closed: 1,
+    });
+    assert.equal((await generationOneClose).code, 4001);
+    assert.equal(existsSync(join(hub.tokenDir, "p1-a-worker.token")), false, "exact token file deleted durably");
+    const repeatedGenerationOneAck = waitFor(
+      launcher,
+      (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 1,
+      "idempotent generation one revocation ack",
+    );
+    launcher.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_id: generationOneTokenId,
+    }));
+    assert.deepEqual(await repeatedGenerationOneAck, {
+      type: "ok",
+      control: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_deleted: false,
+      sockets_closed: 0,
+    });
+
+    writeFileSync(join(hub.tokenDir, "p1-a-worker.token"), TOKENS["p1-a-worker"], { mode: 0o600 });
+    const replayedGenerationOne = await connect(hub.port);
+    const replayedClose = waitForClose(replayedGenerationOne, "revoked generation rejected after token reprovision");
+    hello(replayedGenerationOne, "agent", "p1-a-worker");
+    assert.equal((await replayedClose).code, 4003, "revocation state, not token absence, rejects generation one");
+
+    const generationTwoToken = "0b".repeat(32);
+    const generationTwoTokenId = createHash("sha256").update(generationTwoToken).digest("hex");
+    writeFileSync(join(hub.tokenDir, "p1-a-worker.token"), generationTwoToken, { mode: 0o600 });
+    const generationTwo = await connect(hub.port);
+    hello(generationTwo, "agent", "p1-a-worker", { token: generationTwoToken, generation: 2 });
+    await hub.waitForEvent(
+      (e) => e.event === "hello" && e.agent === "p1-a-worker" && e.generation === 2,
+      "generation two managed hello",
+    );
+    await sleep(50);
+    assert.equal(generationTwo.readyState, WebSocket.OPEN, "next fresh generation is accepted");
+    const generationTwoClose = waitForClose(generationTwo, "revoked generation two socket");
+    const generationTwoAck = waitFor(
+      launcher,
+      (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 2,
+      "generation two revocation ack",
+    );
+    launcher.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 2,
+      token_id: generationTwoTokenId,
+    }));
+    await generationTwoAck;
+    assert.equal((await generationTwoClose).code, 4001);
+    const persisted = JSON.parse(readFileSync(join(hub.revocationDir, "p1-a-worker.json"), "utf8"));
+    assert.equal(persisted.revoked_through_generation, 2);
+    assert.deepEqual(persisted.revoked_token_ids, [generationOneTokenId, generationTwoTokenId].sort());
+
+    closeAll(launcher, ordinaryProducer);
+    hub.stop();
+
+    restarted = await spawnHub({ teamRegistry: true, revocationRoot });
+    const oldAfterRestart = await connect(restarted.port);
+    const oldAfterRestartClose = waitForClose(oldAfterRestart, "old identity rejected after hub restart");
+    hello(oldAfterRestart, "agent", "p1-a-worker");
+    assert.equal((await oldAfterRestartClose).code, 4003, "hub reloads the durable generation floor");
+
+    const generationThreeToken = "0c".repeat(32);
+    writeFileSync(join(restarted.tokenDir, "p1-a-worker.token"), generationThreeToken, { mode: 0o600 });
+    const generationThree = await connect(restarted.port);
+    hello(generationThree, "agent", "p1-a-worker", { token: generationThreeToken, generation: 3 });
+    await restarted.waitForEvent(
+      (e) => e.event === "hello" && e.agent === "p1-a-worker" && e.generation === 3,
+      "generation three after hub restart",
+    );
+    await sleep(100);
+    assert.equal(generationThree.readyState, WebSocket.OPEN, "generation three is the only accepted fresh identity");
+    closeAll(generationThree);
+  } finally {
+    restarted?.stop();
+    hub.stop();
+    rmSync(revocationParent, { recursive: true, force: true });
   }
 });
 

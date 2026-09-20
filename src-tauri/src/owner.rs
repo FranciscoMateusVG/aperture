@@ -266,6 +266,38 @@ impl OwnerStore {
         Ok(record)
     }
 
+    /// Refresh the exact root+descendant identity set immediately before a
+    /// launcher stop. No caller-supplied provenance is persisted, and no
+    /// process may be signalled unless this CAS succeeds first.
+    pub(crate) fn record_process_snapshot(
+        &self,
+        actor: &AuthenticatedActor,
+        seat: &str,
+        expected_generation: u64,
+        expected_root_pid: u32,
+        expected_root_start_time: u64,
+        processes: Vec<ProcessIdentity>,
+    ) -> Result<OwnerRecord, String> {
+        if !actor.is_launcher() { return Err("E_CONTROL_UNAUTHORIZED: launcher actor required".into()); }
+        let _lock = self.lock(seat)?;
+        let mut record = self.read_unlocked(seat)?;
+        if record.generation != expected_generation { return Err("E_GENERATION_MISMATCH: owner generation changed".into()); }
+        if !matches!(record.state, OwnerState::Starting | OwnerState::Active) {
+            return Err("E_STATE_CONFLICT: owner process snapshot is not refreshable".into());
+        }
+        let incarnation = record.incarnation.as_mut().ok_or_else(|| "E_OWNER_CORRUPT: owner incarnation is missing".to_string())?;
+        if incarnation.pid != expected_root_pid || incarnation.start_time != expected_root_start_time {
+            return Err("E_PROCESS_IDENTITY: root process identity changed".into());
+        }
+        let mut candidate = incarnation.clone();
+        candidate.processes = processes;
+        validate_incarnation(&candidate)?;
+        incarnation.processes = candidate.processes;
+        record.writer = actor.principal().into();
+        self.write_unlocked(&record, true)?;
+        Ok(record)
+    }
+
     pub(crate) fn mark_stale(&self, actor: &AuthenticatedActor, seat: &str, expected_generation: u64) -> Result<OwnerRecord, String> {
         let _lock = self.lock(seat)?;
         let mut record = self.read_unlocked(seat)?;
@@ -389,6 +421,30 @@ mod tests {
         record.incarnation.as_mut().unwrap().model = "gpt-5.6-sol".into();
         write_private_json_atomic(&store.record_path("t1-backend"), &record, true).unwrap();
         assert!(store.summary("t1-backend").unwrap_err().contains("E_OWNER_CORRUPT"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_snapshot_refresh_is_launcher_only_and_root_bound() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let launcher = AuthenticatedActor::launcher();
+        store.initialize_owner(&launcher, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&launcher, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+        store.record_start_candidate(&launcher, &reservation, incarnation("gpt-6-astra")).unwrap();
+        store.commit_start(&launcher, &reservation).unwrap();
+        let before = store.read_owner("t1-backend").unwrap();
+        let mut refreshed = before.incarnation.as_ref().unwrap().processes.clone();
+        refreshed.push(ProcessIdentity { pid:124,start_time:457,ppid:123,pgid:123,cmdline_sha256:"b".repeat(64),cwd:"/tmp/work".into() });
+        assert!(store.record_process_snapshot(&AuthenticatedActor::operator_ui(), "t1-backend", 1, 123, 456, refreshed.clone()).unwrap_err().contains("E_CONTROL_UNAUTHORIZED"));
+        assert!(store.record_process_snapshot(&launcher, "t1-backend", 1, 123, 999, refreshed.clone()).unwrap_err().contains("E_PROCESS_IDENTITY"));
+        assert_eq!(store.read_owner("t1-backend").unwrap(), before, "failed refreshes are byte-semantic no-ops");
+        let after = store.record_process_snapshot(&launcher, "t1-backend", 1, 123, 456, refreshed).unwrap();
+        assert_eq!(after.incarnation.as_ref().unwrap().processes.len(), 2);
+        assert_eq!(after.incarnation.as_ref().unwrap().token_id, before.incarnation.as_ref().unwrap().token_id);
+        assert_eq!(after.incarnation.as_ref().unwrap().thread_id, before.incarnation.as_ref().unwrap().thread_id);
+        assert_eq!(after.requested, before.requested);
+        assert_eq!(after.state, OwnerState::Active);
         fs::remove_dir_all(root).unwrap();
     }
 

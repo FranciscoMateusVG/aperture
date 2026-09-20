@@ -1322,10 +1322,18 @@ pub(crate) fn classify_managed_seat(home: &Path, seat: &str) -> TeamResult<Optio
     let marker = agents_root.join(seat).join("TEAM");
     let marker_exists = fs::symlink_metadata(&marker).is_ok();
     let mut found: Option<ManagedSeatState> = None;
-    if teams_root.exists() {
-        scan_team_memberships(&teams_root, seat, false, &mut found)?;
-        let archive = teams_root.join("archive");
-        if archive.exists() { scan_team_memberships(&archive, seat, true, &mut found)?; }
+    match fs::symlink_metadata(&teams_root) {
+        Ok(_) => {
+            scan_team_memberships(&teams_root, seat, false, &mut found)?;
+            let archive = teams_root.join("archive");
+            match fs::symlink_metadata(&archive) {
+                Ok(_) => scan_team_memberships(&archive, seat, true, &mut found)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(TeamError::io("team archive registry unreadable")),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(TeamError::io("team registry unreadable")),
     }
     match (&found, marker_exists) {
         (Some(ManagedSeatState::Active { team, generation }), true) => {
@@ -1602,6 +1610,20 @@ mod tests {
         assert_eq!(classify_managed_seat(&home, "standing").unwrap(), None);
         write_private_bytes_atomic(&home.join(".claude/aperture/standing/TEAM"), b"{}\n", false).unwrap();
         assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_STATE_CONFLICT");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn classifier_rejects_dangling_registry_symlinks_instead_of_falling_back_to_legacy() {
+        let home = temp_root("classify-dangling");
+        ensure_private_dir(&home.join(".claude/aperture/standing")).unwrap();
+        ensure_private_dir(&home.join(".aperture")).unwrap();
+        std::os::unix::fs::symlink(home.join("missing-teams"), home.join(".aperture/teams")).unwrap();
+        assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_PATH_UNSAFE");
+        fs::remove_file(home.join(".aperture/teams")).unwrap();
+        ensure_private_dir(&home.join(".aperture/teams")).unwrap();
+        std::os::unix::fs::symlink(home.join("missing-archive"), home.join(".aperture/teams/archive")).unwrap();
+        assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_PATH_UNSAFE");
         fs::remove_dir_all(home).unwrap();
     }
 
