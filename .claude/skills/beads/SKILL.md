@@ -15,11 +15,11 @@ Bead creation is a direction-layer decision ("does this deserve to exist as trac
 
 - **Only GLaDOS calls `create_task` / `bd create`.** No other agent files a new bead, ever — not a follow-up, not a `discovered-from` child, not "just noting this for later."
 - **GLaDOS does not create a bead without the operator's explicit acknowledgment first.** No exceptions — including live security P0s (operator-confirmed 2026-07-29).
-- Hard rule, not a judgment call. Specialist about to reach for `create_task`? Stop; message GLaDOS instead.
+- Hard rule, not a judgment call. Specialist about to reach for `create_task`? Stop; propose via your team lead (directly to GLaDOS for standing work) instead. Lead is not a creation privilege.
 
-**Not restricted:** everything else in the lifecycle (§4) — `query_tasks` / `search_tasks`, `update_task(claim/notes)` on an *existing* bead, `store_artifact`, `close_task`. The gate is only on bringing a new bead into existence.
+**Outside this creation gate (still subject to assigned-scope discipline):** everything else in the lifecycle (§4) — `query_tasks` / `search_tasks`, `update_task(claim/notes)` on an *existing* bead, `store_artifact`, `close_task`. The gate is only on bringing a new bead into existence.
 
-**How a specialist gets something tracked:** `send_message(to: "glados", ...)` with a proposed title, why it matters, and what "done" looks like. GLaDOS runs it against the filing bar below; if it clears, she brings it to the operator for ack (batched, not one doorbell per candidate); only after ack does she file it, with the project label per §2. If the operator says no or it doesn't clear the bar, it isn't filed — not everything worth noticing is worth tracking.
+**How a specialist gets something tracked:** team workers message their lead, who proposes the batch to GLaDOS; standing specialists use `send_message(to: "glados", ...)` with a proposed title, why it matters, and what "done" looks like. GLaDOS runs it against the filing bar below; if it clears, she brings it to the operator for ack (batched, not one doorbell per candidate); only after ack does she file it, with the project label per §2. If the operator says no or it doesn't clear the bar, it isn't filed — not everything worth noticing is worth tracking.
 
 **Live security P0:** ring the operator's doorbell immediately per `aperture:communicate`. Urgency of *response* and gating of *bead creation* are separate concerns — escalate in real time; the bead still waits for ack.
 
@@ -188,12 +188,12 @@ update_task(claim)   → claim it before you start
 store_artifact()     → attach deliverables
 update_task(status)  → mark complete or note blockers
 close_task()         → close with a summary
-send_message(glados) → report completion
+send_message(lead)   → report completion (GLaDOS for standing work)
 ```
 
 **Finding:** `query_tasks(mode: "ready")` unblocked; `mode: "list"` your active tasks (defaults to your assignee; `assignee: "*"` for any); `mode: "show", id` one task (`fields: "full"` for the untruncated record); `search_tasks(label: ...)`. Always check for existing tasks before proposing new ones.
 
-> Specialist scope (operator directive 2026-09-06): ready/list/search sweeps are GLaDOS's job; specialists fetch only their assigned bead. See the constitution skill.
+> Specialist scope (operator directive 2026-09-06): ready/list/search sweeps are GLaDOS's job; workers fetch only their assigned bead. V4 supersedes the blanket one-bead restriction **for the appointed lead only**: inspect the assigned mission and named seat/review beads for delegation/reconciliation, not global queue discovery. See constitution C-5/C-17.
 
 **Claiming:** `update_task(id, claim: true)` then `status: "in_progress"` — before you start, so two agents don't pick up the same task.
 
@@ -248,7 +248,7 @@ close_reason: "Closed because </reason> field was wrong, recovered by..."
 
 ### Reporting
 
-After closing, send a short completion report (format in `aperture:communicate`). GLaDOS or the originator needs to know it's done — don't close silently.
+After closing, send a short completion report (format in `aperture:communicate`) to your team lead, or GLaDOS/originator for standing work. The accountable lead needs to know it's done — don't close silently.
 
 ---
 
@@ -286,3 +286,14 @@ bd create "Imperative, specific title" \
 ```
 
 Full end-to-end walkthroughs: `references/precedents.md` → §6 Full Example Sequence, §7 Filing Example.
+
+
+## 7. V4 mission ownership and archive reconciliation
+
+This supersedes fixed-persona assignees and direct routine worker→GLaDOS reports for team work. It does not grant bead creation or a server-side task ACL. Source: V4 spec v2.7 §§4.9–4.12; constitution C-17/C-18.
+
+- GLaDOS files each approved task with the actual seat as assignee; the lead proposes the decomposition but never files. Each bead keeps exactly one canonical project label; team identity does not replace it.
+- Workers claim only scoped assignments received from their lead, preserve task evidence and send a reference to the lead. A cross-team message cannot reassign, cancel or expand another team's task.
+- The lead's epic reconciliation lists every mission/seat/review item: completed with acceptance evidence; cancelled with explicit operator acknowledgement and GLaDOS-recorded reason; or transferred with approval, named new owner/task and written acceptance. A transfer also removes the old parent edge, re-parents to the receiver (or explicitly keeps only a related link), preserves history/transferred-from provenance and re-evaluates success metrics. Merely changing assignee does not unblock archive.
+- Unresolved items, required reviews missing, completed-without-evidence, unauthorized cancellation, unaccepted transfer, unfinished team-assigned work, open children or unmet success metrics block archive. Closed historical beads retain their seat assignee. Only GLaDOS requests the final archive transition after the lead's record is reconciled.
+- Use communicate §11 for same-turn batch/delta reporting and checkpoint/recovery; neither the checkpoint tool nor the Claude Stop hook creates a bead. Codex has no Stop hook. Missing runtime support must be reported, never simulated as an accepted checkpoint.
