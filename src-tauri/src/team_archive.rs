@@ -246,3 +246,6 @@ pub fn archive<R: ArchiveRuntime>(
 pub(crate) mod beads;
 #[path = "team_archive_record.rs"]
 pub(crate) mod record;
+
+#[path = "team_archive_native.rs"]
+pub(crate) mod native;
