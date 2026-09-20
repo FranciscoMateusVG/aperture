@@ -1067,3 +1067,23 @@ mod legacy_guard_tests {
         assert!(ensure_legacy(&f.0, "missing", Membership::Standing).is_err())
     }
 }
+
+#[path = "../src/tmux.rs"]
+mod native_tmux;
+#[test]
+fn exact_tmux_pane_metadata_never_selects_by_name_or_ambiguity() {
+    let p = native_tmux::parse_pane_process("@12", b"@12\t%13\t777\n").unwrap();
+    assert_eq!((p.pane_id.as_str(), p.pid), ("%13", 777));
+    for output in [
+        b"@12\t%13\t777\n@12\t%14\t778\n".as_slice(),
+        b"@13\t%13\t777",
+        b"@12\tname\t777",
+        b"@12\t%13\t1",
+        b"@12\t%13\t00777",
+        b"",
+        b"@12\t%13\t777\textra",
+    ] {
+        assert!(native_tmux::parse_pane_process("@12", output).is_err());
+    }
+    assert!(native_tmux::parse_pane_process("seat", b"seat\t%1\t777").is_err());
+}

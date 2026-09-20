@@ -183,3 +183,64 @@ pub fn tmux_send_keys(target: String, keys: String) -> Result<(), String> {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
 }
+
+/// Exact native pane locator for V4 ownership capture. A window containing
+/// multiple panes is not silently reduced to whichever pane happens to be
+/// active. Process birth identity is obtained separately from the OS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneProcess {
+    pub window_id: String,
+    pub pane_id: String,
+    pub pid: u32,
+}
+fn exact_tmux_id(value: &str, prefix: char) -> bool {
+    value.starts_with(prefix)
+        && value.len() > 1
+        && value.len() <= 21
+        && value[1..].bytes().all(|b| b.is_ascii_digit())
+}
+pub(crate) fn parse_pane_process(window_id: &str, output: &[u8]) -> Result<PaneProcess, String> {
+    let deny = || "E_STOP_UNVERIFIED".to_string();
+    if !exact_tmux_id(window_id, '@') || output.len() > 1024 {
+        return Err(deny());
+    }
+    let text = std::str::from_utf8(output).map_err(|_| deny())?;
+    let rows: Vec<_> = text.lines().collect();
+    if rows.len() != 1 {
+        return Err(deny());
+    }
+    let fields: Vec<_> = rows[0].split('\t').collect();
+    if fields.len() != 3 || fields[0] != window_id || !exact_tmux_id(fields[1], '%') {
+        return Err(deny());
+    }
+    let pid: u32 = fields[2].parse().map_err(|_| deny())?;
+    if pid <= 1 || pid > i32::MAX as u32 || fields[2] != pid.to_string() {
+        return Err(deny());
+    }
+    Ok(PaneProcess {
+        window_id: window_id.into(),
+        pane_id: fields[1].into(),
+        pid,
+    })
+}
+/// Read-only native command. Never falls back to a name, active pane, command,
+/// cwd, cached AgentDef or another window after an unavailable/ambiguous result.
+pub fn tmux_pane_process(window_id: &str) -> Result<PaneProcess, String> {
+    if !exact_tmux_id(window_id, '@') {
+        return Err("E_STOP_UNVERIFIED".into());
+    }
+    let out = cmd("tmux")
+        .args([
+            "list-panes",
+            "-t",
+            window_id,
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_pid}",
+        ])
+        .output()
+        .map_err(|_| "E_STOP_UNVERIFIED".to_string())?;
+    if !out.status.success() {
+        return Err("E_STOP_UNVERIFIED".into());
+    }
+    parse_pane_process(window_id, &out.stdout)
+}
