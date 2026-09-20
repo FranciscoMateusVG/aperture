@@ -1,0 +1,14 @@
+# Bounded role catalog (P1: <=256 KiB seat tree); only two residents.
+# Curated from the persona catalog; standing agents and their skills are unchanged.
+constitution
+backend-core
+communicate
+team
+beads
+worktree-discipline
+specialist-delegation
+walk-the-route
+zod-recursive-validation-gotchas
+spec-deviation-discipline
+wire-the-adapter
+stacked-pr-verification
