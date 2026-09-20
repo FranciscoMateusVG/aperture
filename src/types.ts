@@ -157,3 +157,26 @@ export interface CreationRequestDTO {
 export interface TeamCreateResult { team: TeamView; creation_request: CreationRequestDTO }
 export interface CancelPendingInput { team: string; expected_generation: number; creation_request_id: string }
 export interface CancelPendingResult { team: string; cancelled: true; rejected_snapshot_id: string }
+
+// P3 source-only contract: reserved commands remain unavailable until native wiring.
+export type RuntimeCheckState = "pending" | "verified" | "blocked" | "unknown";
+export type CheckpointRecovery = "valid" | "stale" | "none";
+export type ReplacementPhase = "snapshot" | "checkpoint_pending" | "stopping" | "revoking" | "reconciling" | "ready" | "starting" | "started" | "model_unverified" | "blocked";
+export interface RuntimeBlocker { code: string; reference: string }
+export interface ReplacementChecks {
+  process_stop: RuntimeCheckState; revocation: RuntimeCheckState; remote_effects: RuntimeCheckState;
+}
+export interface ReplacementView {
+  team: string; seat: string; generation: number; phase: ReplacementPhase;
+  checkpoint_recovery: CheckpointRecovery; checks: ReplacementChecks;
+  owner: OwnerSummary | null; blockers: RuntimeBlocker[];
+}
+export interface PreparedReplacementView extends ReplacementView { preparation_id: string | null }
+export interface ArchiveChecks {
+  reconciliation: RuntimeCheckState; reviews: RuntimeCheckState; metrics: RuntimeCheckState;
+  process_stop: RuntimeCheckState; revocation: RuntimeCheckState; remote_effects: RuntimeCheckState; worktrees: RuntimeCheckState;
+}
+export interface ArchiveView {
+  team: string; generation: number; state: "pending" | "blocked" | "archived" | "unknown";
+  checks: ArchiveChecks; blockers: RuntimeBlocker[];
+}

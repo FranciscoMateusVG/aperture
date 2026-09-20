@@ -3,6 +3,7 @@ import { teamCommands, type TeamCommands } from "../services/team-commands";
 import { teamErrorCopy } from "../services/team-draft";
 import { escapeHtml as e } from "../utils/html";
 import { openTeamEditor, tupleLabel } from "./TeamEditor";
+import { openTeamLifecycle } from "./TeamLifecycle";
 
 export function renderPresetCard(preset: TeamPreset): string {
   return `<article class="v4-card"><h2>${e(preset.display_name)}</h2><p class="v4-meta">${e(preset.mission_placeholder)}</p><ul>${preset.seats.map((s, i) => `<li>${e(s.role)}${i === preset.lead_index ? " · lead" : ""}<br><span class="v4-meta">${e(tupleLabel(s))}</span></li>`).join("")}</ul><p class="v4-meta">${e(preset.source)} preset · snapshot on creation</p><div class="v4-actions"><button class="v4-button v4-button--primary" data-action="create" data-preset="${e(preset.id)}">New team from preset</button><button class="v4-button" data-action="edit" data-preset="${e(preset.id)}">Edit preset</button><button class="v4-button" data-action="duplicate" data-preset="${e(preset.id)}">Duplicate</button></div></article>`;
@@ -21,16 +22,6 @@ export function renderTeamGroup(team: TeamView, agents: readonly AgentDef[] = []
       <dl class="v4-seat-facts"><div><dt>Snapshot · immutable configuration</dt><dd>${e(tupleLabel(configured))}</dd></div><div><dt>Requested · current incarnation</dt><dd>${owner ? e(tupleLabel(owner.configured)) : "Unknown — no owner observation"}</dd></div><div><dt>Observed model</dt><dd>${owner?.actual ? e(tupleLabel(owner.actual)) : "Unknown — not observed"}</dd></div><div><dt>Owner / generation</dt><dd>${owner ? `${e(owner.state)} · g${owner.generation}` : "Unknown — no owner observation"}</dd></div><div><dt>Checkpoint / context</dt><dd>Not available from this backend</dd></div><div><dt>Current turn</dt><dd>${e(turn(configured.name))}</dd></div><div><dt>Thread binding</dt><dd>${owner ? owner.thread_bound ? "Bound (reported)" : "Not bound" : "Unknown"}</dd></div></dl>
       <div class="v4-actions"><button class="v4-button" data-action="open-seat" data-seat="${e(configured.name)}">Open</button><button class="v4-button" disabled title="Checkpoint command is not integrated">Checkpoint unavailable</button><button class="v4-button" data-action="replace" data-team="${e(s.team)}" data-seat="${e(configured.name)}">Replace worker…</button><button class="v4-button" disabled title="Team stop requires the verified lifecycle protocol">Stop unavailable</button></div></article>`).join("")}</div>` : ""}
     <div class="v4-actions">${state.state === "pending" ? `<button class="v4-button" data-action="cancel-pending" data-team="${e(s.team)}" ${team.capabilities.cancel ? "" : "disabled"}>Cancel pending team</button>` : ""}<button class="v4-button" data-action="archive" data-team="${e(s.team)}">Archive checklist…</button></div></section>`;
-}
-
-/** Unavailable is deliberate until P3's commands/evidence are integrated; never a success fixture. */
-export function openUnavailableLifecycle(team: TeamView, kind: "replace" | "archive", seat?: string) {
-  const origin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  const dialog = document.createElement("dialog"); dialog.className = "v4-dialog"; dialog.setAttribute("aria-labelledby", "v4-lifecycle-title");
-  dialog.innerHTML = `<div class="v4-dialog__body"><h2 id="v4-lifecycle-title">${kind === "replace" ? "Replace worker" : "Archive team"}</h2><p>${e(seat ?? team.snapshot.team)} · g${team.state.generation}</p><p class="v4-notice" role="status">Not available: the lifecycle evidence/command contract is not integrated. No operation has been requested.</p><ul class="v4-checklist">${(kind === "replace" ? ["Checkpoint: unknown", "Owned-process stop: unverified", "Hub authority revocation: unverified", "Remote effects: unknown", "Worktree inventory: unavailable"] : ["Mission reconciliation: unavailable", "Required reviews: unknown", "Evidence and transfers: unverified", "Live process and remote-effect checks: unknown"]).map(t => `<li>${t}</li>`).join("")}</ul><p class="v4-meta">Backend evidence is required; these are not manually checkable permissions.</p></div><div class="v4-dialog__actions"><button class="v4-button" disabled>${kind === "replace" ? "Prepare / stop / verify" : "Check readiness"}</button><button class="v4-button" data-close>Close</button><button class="v4-button" disabled>${kind === "replace" ? "Start replacement" : "Archive"}</button></div>`;
-  dialog.querySelector("[data-close]")!.addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => { dialog.remove(); if (origin?.isConnected) origin.focus(); });
-  document.body.appendChild(dialog); dialog.showModal();
 }
 
 export interface TeamsAreaOptions {
@@ -106,8 +97,13 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
       }); return;
     }
     const team = teams.find(t => t.snapshot.team === button.dataset.team);
-    if (action === "replace" && team) { openUnavailableLifecycle(team, "replace", button.dataset.seat); return; }
-    if (action === "archive" && team) { openUnavailableLifecycle(team, "archive"); return; }
+    if ((action === "replace" || action === "archive") && team) {
+      const teamName = team.snapshot.team;
+      openTeamLifecycle({ kind: action, team, seat: button.dataset.seat,
+        current: () => loaded ? teams.find(t => t.snapshot.team === teamName) : undefined,
+        refresh: async () => { await refresh(); return loaded ? teams.find(t => t.snapshot.team === teamName) : undefined; },
+      }); return;
+    }
     if (action === "open-seat" && button.dataset.seat) {
       try { await options.openAgent(button.dataset.seat); } catch { status.textContent = "No current terminal window could be opened. Refresh the observed state."; }
       return;
