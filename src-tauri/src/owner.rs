@@ -55,6 +55,8 @@ pub(crate) fn try_lock(root: &Path, key: &str) -> Result<AdvisoryLock, String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
+    /// Process birth time as checked Unix-epoch microseconds. On macOS this is
+    /// proc_bsdinfo.pbi_start_tvsec * 1_000_000 + pbi_start_tvusec.
     pub start_time: u64,
     pub ppid: u32,
     pub pgid: u32,
@@ -65,6 +67,8 @@ pub struct ProcessIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Incarnation {
     pub pid: u32,
+    /// Root process birth time in the same Unix-epoch microsecond unit used by
+    /// every entry in `processes`.
     pub start_time: u64,
     pub thread_id: String,
     pub token_id: String,
