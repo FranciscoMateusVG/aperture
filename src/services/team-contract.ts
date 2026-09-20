@@ -47,7 +47,10 @@ export function parseTeamView(v: unknown): TeamView {
   const names = result.snapshot.seats.map(s => s.name);
   if (!names.length || new Set(names).size !== names.length || !names.includes(result.snapshot.lead) ||
     result.seats.length !== names.length || new Set(result.seats.map(s => s.configured.name)).size !== names.length ||
-    result.seats.some(s => !names.includes(s.configured.name))) return invalid();
+    result.seats.some(s => {
+      const snap = result.snapshot.seats.find(p => p.name === s.configured.name);
+      return !snap || ["role", "harness", "model", "reasoning"].some(k => snap[k as keyof typeof snap] !== s.configured[k as keyof typeof s.configured]);
+    })) return invalid();
   return result;
 }
 export function parseTeams(v: unknown): TeamView[] {
