@@ -109,7 +109,7 @@ function dropClients(server) {
   for (const ws of server.sockets) ws.terminate();
 }
 
-function makeHooks() {
+function makeHooks(beforeManagedOwnerReadback) {
   const logs = [];
   const presence = [];
   return {
@@ -118,13 +118,21 @@ function makeHooks() {
     hooks: {
       broadcastPresence: (_agent, event) => presence.push(event),
       log: (event, fields = {}) => logs.push({ event, ...fields }),
+      beforeManagedOwnerReadback,
       // NB: no skipReplay — delivery is the subject under test.
     },
   };
 }
 
 let sockCounter = 0;
-async function scenario(t, { threads = [], delays = {}, failures = {}, threadStartModel, threadStartReasoning } = {}) {
+async function scenario(t, {
+  threads = [],
+  delays = {},
+  failures = {},
+  threadStartModel,
+  threadStartReasoning,
+  beforeManagedOwnerReadback,
+} = {}) {
   const agent = `cbx${++sockCounter}`;
   mkdirSync(join(AGENTS, agent));
   writeFileSync(
@@ -136,7 +144,7 @@ async function scenario(t, { threads = [], delays = {}, failures = {}, threadSta
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
   const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning });
   await server.start();
-  const { hooks, logs, presence } = makeHooks();
+  const { hooks, logs, presence } = makeHooks(beforeManagedOwnerReadback);
   const bridge = new CodexBridgeClient(agent, sock, hooks);
   t.after(async () => {
     bridge.stop();
@@ -173,6 +181,22 @@ function writeManagedOwner(agent, state, receipt = null) {
     since: "2026-09-20T00:00:00Z",
     writer: "launcher",
   }), { mode: 0o600 });
+}
+
+function mutateManagedOwner(agent, mutate) {
+  const path = join(TMP, "owner", `${agent}.json`);
+  const owner = JSON.parse(readFileSync(path, "utf8"));
+  mutate(owner);
+  writeFileSync(path, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+}
+
+function markManagedOwnerObserved(agent, receipt) {
+  mutateManagedOwner(agent, (owner) => {
+    owner.incarnation.thread_id = receipt.thread_id;
+    owner.incarnation.model = receipt.actual_model;
+    owner.incarnation.reasoning = receipt.actual_reasoning;
+    owner.incarnation.observed = true;
+  });
 }
 
 function makeManagedSeat(agent) {
@@ -347,6 +371,9 @@ test("managed Starting generation owns one exact fresh thread and stays silent u
   await delay(100);
   assert.equal(server.callsOf("thread/start").length, 1, "reconnect reuses receipt without a second start");
 
+  markManagedOwnerObserved(agent, receipt);
+  await delay(50);
+  assert.equal(bridge.isBound, false, "observed Starting transition is not delivery authority");
   writeManagedOwner(agent, "active", receipt);
   await waitFor(() => bridge.isBound, "managed bridge binds after native Active commit");
   assert.equal(bridge.boundThreadId, receipt.thread_id);
@@ -393,6 +420,87 @@ test("managed Active reconnect resumes the owner thread, never the newest thread
   assert.equal(server.callsOf("thread/resume").length, 1);
   assert.equal(server.callsOf("thread/resume")[0].params.threadId, "owner-thread");
   assert.equal(bridge.boundThreadId, "owner-thread");
+});
+
+test("managed Starting state change between owner reads fails closed without legacy discovery", async (t) => {
+  let changed = false;
+  const { agent, server, bridge, logs, presence } = await scenario(t, {
+    threads: [{ id: "legacy-thread-must-not-bind" }],
+    beforeManagedOwnerReadback: (seat, phase) => {
+      if (seat !== agent || phase !== "starting-bind" || changed) return;
+      changed = true;
+      mutateManagedOwner(agent, (owner) => {
+        owner.state = "quarantined";
+        owner.provisional_token_id = null;
+      });
+    },
+  });
+  makeManagedSeat(agent);
+  writeManagedOwner(agent, "starting");
+  bridge.start();
+
+  await waitFor(
+    () => logs.some((entry) => entry.event === "codex_handshake_error"),
+    "managed nullable read fails handshake",
+  );
+  bridge.stop();
+  assert.equal(server.callsOf("thread/list").length, 0);
+  assert.equal(server.callsOf("thread/start").length, 0);
+  assert.equal(server.callsOf("thread/resume").length, 0);
+  assert.equal(bridge.isBound, false);
+  assert.deepEqual(presence, []);
+});
+
+test("managed thread/start owner change rejects observation before publication", async (t) => {
+  const { agent, server, bridge, logs, presence } = await scenario(t, {
+    delays: { "thread/start": 200 },
+  });
+  makeManagedSeat(agent);
+  writeManagedOwner(agent, "starting");
+  bridge.start();
+  await waitFor(() => server.callsOf("thread/start").length === 1, "managed delayed thread/start");
+  mutateManagedOwner(agent, (owner) => {
+    owner.incarnation.pid = 322;
+    owner.incarnation.processes[0].pid = 322;
+  });
+  await waitFor(
+    () => logs.some((entry) => entry.event === "codex_handshake_error"),
+    "changed Starting owner rejected",
+  );
+  bridge.stop();
+
+  assert.equal(existsSync(join(TMP, `${agent}.g1.managed-observation.json`)), false);
+  assert.equal(server.callsOf("thread/start").length, 1);
+  assert.equal(server.callsOf("thread/list").length, 0);
+  assert.equal(server.callsOf("turn/start").length, 0);
+  assert.equal(bridge.isBound, false);
+  assert.deepEqual(presence, []);
+});
+
+test("managed Active owner change during resume rejects bind and delivery", async (t) => {
+  const { agent, server, bridge, logs, presence } = await scenario(t, {
+    threads: [{ id: "owner-thread" }],
+    delays: { "thread/resume": 200 },
+  });
+  makeManagedSeat(agent);
+  writeManagedOwner(agent, "active", { thread_id: "owner-thread" });
+  bridge.start();
+  await waitFor(() => server.callsOf("thread/resume").length === 1, "managed delayed resume");
+  mutateManagedOwner(agent, (owner) => {
+    owner.incarnation.pid = 322;
+    owner.incarnation.processes[0].pid = 322;
+  });
+  await waitFor(
+    () => logs.some((entry) => entry.event === "codex_handshake_error"),
+    "changed Active owner rejected",
+  );
+  bridge.stop();
+
+  assert.equal(server.callsOf("thread/list").length, 0);
+  assert.equal(server.callsOf("thread/start").length, 0);
+  assert.equal(server.callsOf("turn/start").length, 0);
+  assert.equal(bridge.isBound, false);
+  assert.deepEqual(presence, []);
 });
 
 test("no-thread-at-connect: thread/start failure retried with backoff, no crash, bind completes + thread-ready file published", async (t) => {

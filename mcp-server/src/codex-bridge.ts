@@ -40,7 +40,14 @@ import { join, resolve } from "node:path";
 import WebSocket from "ws";
 import { getUnreadMessages } from "./beads.js";
 import { isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
-import { managedOwnerMatches, readManagedActiveRuntime, readManagedOwner, readManagedStartingRuntime, type ManagedStartingRuntime } from "./managed-owner.js";
+import {
+  readManagedActiveRuntime,
+  readManagedObservedStartingRuntime,
+  readManagedOwner,
+  readManagedStartingRuntime,
+  type ManagedActiveRuntime,
+  type ManagedStartingRuntime,
+} from "./managed-owner.js";
 import { assertPrivateRuntimeDirectory } from "./private-runtime-path.js";
 
 const AGENTS_DIR = process.env.APERTURE_AGENTS_DIR ?? resolve(homedir(), ".claude", "aperture");
@@ -181,6 +188,53 @@ function expectedStartAttempt(owner: ManagedStartingRuntime): ManagedStartAttemp
   };
 }
 
+function sameStartingRuntime(left: ManagedStartingRuntime, right: ManagedStartingRuntime): boolean {
+  return (
+    left.seat === right.seat &&
+    left.state === right.state &&
+    left.generation === right.generation &&
+    left.tokenId === right.tokenId &&
+    left.pid === right.pid &&
+    left.startTimeUs === right.startTimeUs &&
+    left.requested.harness === right.requested.harness &&
+    left.requested.model === right.requested.model &&
+    left.requested.reasoning === right.requested.reasoning
+  );
+}
+
+function sameActiveRuntime(left: ManagedActiveRuntime, right: ManagedActiveRuntime): boolean {
+  return (
+    left.seat === right.seat &&
+    left.state === right.state &&
+    left.generation === right.generation &&
+    left.tokenId === right.tokenId &&
+    left.pid === right.pid &&
+    left.startTimeUs === right.startTimeUs &&
+    left.requested.harness === right.requested.harness &&
+    left.requested.model === right.requested.model &&
+    left.requested.reasoning === right.requested.reasoning &&
+    left.threadId === right.threadId
+  );
+}
+
+function activeMatchesObservation(
+  active: ManagedActiveRuntime,
+  owner: ManagedStartingRuntime,
+  receipt: ManagedObservationReceipt,
+): boolean {
+  return (
+    active.requested.harness === "codex" &&
+    active.requested.model === receipt.actual_model &&
+    active.requested.reasoning === receipt.actual_reasoning &&
+    active.seat === owner.seat &&
+    active.generation === owner.generation &&
+    active.tokenId === owner.tokenId &&
+    active.pid === owner.pid &&
+    active.startTimeUs === owner.startTimeUs &&
+    active.threadId === receipt.thread_id
+  );
+}
+
 function exactRecord(value: Record<string, unknown>, expected: Record<string, unknown>): boolean {
   return JSON.stringify(value) === JSON.stringify(expected);
 }
@@ -235,6 +289,11 @@ export interface BridgeHooks {
   skipReplay?: boolean;
   /** Testing hook: observe raw JSON-RPC notifications from the app-server. */
   onNotification?: (agent: string, method: string, params: unknown) => void;
+  /** Testing hook: model an owner CAS at exact asynchronous readback seams. */
+  beforeManagedOwnerReadback?: (
+    agent: string,
+    phase: "starting-bind" | "starting-observation" | "active-resume",
+  ) => void;
 }
 
 export interface BridgeOptions {
@@ -513,13 +572,22 @@ export class CodexBridgeClient {
       try {
         const owner = readManagedOwner(this.agent);
         if (owner.state === "starting") {
+          this.hooks.beforeManagedOwnerReadback?.(this.agent, "starting-bind");
           managed = readManagedStartingRuntime(this.agent);
+          if (managed === null) {
+            throw new Error("E_GENERATION_MISMATCH: managed owner changed before thread start");
+          }
         } else if (owner.state === "active") {
           const active = readManagedActiveRuntime(this.agent);
           if (active === null || active.requested.harness !== "codex") {
             throw new Error("E_MODEL_UNVERIFIED: active managed Codex identity is invalid");
           }
           await this.request("thread/resume", { threadId: active.threadId });
+          this.hooks.beforeManagedOwnerReadback?.(this.agent, "active-resume");
+          const confirmed = readManagedActiveRuntime(this.agent);
+          if (confirmed === null || !sameActiveRuntime(active, confirmed)) {
+            throw new Error("E_GENERATION_MISMATCH: managed owner changed during thread resume");
+          }
           this.bindToThread(active.threadId, "thread_list");
           if (!this.hooks.skipReplay) this.deliver();
           return;
@@ -637,6 +705,11 @@ export class CodexBridgeClient {
       ) {
         throw new Error("E_MODEL_UNVERIFIED: thread/start did not prove the requested tuple");
       }
+      this.hooks.beforeManagedOwnerReadback?.(this.agent, "starting-observation");
+      const confirmed = readManagedStartingRuntime(this.agent);
+      if (confirmed === null || !sameStartingRuntime(owner, confirmed)) {
+        throw new Error("E_GENERATION_MISMATCH: managed owner changed during thread start");
+      }
       receipt = {
         schema_version: 1,
         seat: owner.seat,
@@ -659,7 +732,11 @@ export class CodexBridgeClient {
     const deadline = Date.now() + MANAGED_ACTIVE_WAIT_MS;
     while (this.ws === ws && ws.readyState === WebSocket.OPEN && !this.stopped) {
       const current = readManagedOwner(this.agent);
-      if (managedOwnerMatches(current, owner.generation, owner.tokenId, ["active"])) {
+      if (current.state === "active") {
+        const active = readManagedActiveRuntime(this.agent);
+        if (active === null || !activeMatchesObservation(active, owner, receipt)) {
+          throw new Error("E_GENERATION_MISMATCH: active owner does not match observation");
+        }
         this.bindToThread(receipt.thread_id, "thread_start");
         this.kickoffInjected = true;
         this.setTurnActive(true);
@@ -677,12 +754,25 @@ export class CodexBridgeClient {
         if (!this.hooks.skipReplay) this.deliver();
         return;
       }
-      if (
-        current.state !== "starting" ||
-        current.generation !== owner.generation ||
-        current.tokenId !== owner.tokenId
-      ) {
+      if (current.state !== "starting") {
         throw new Error("E_GENERATION_MISMATCH: managed owner changed before activation");
+      }
+      const unobserved = readManagedStartingRuntime(this.agent);
+      if (unobserved !== null) {
+        if (!sameStartingRuntime(owner, unobserved)) {
+          throw new Error("E_GENERATION_MISMATCH: managed owner changed before activation");
+        }
+      } else {
+        const observed = readManagedObservedStartingRuntime(this.agent);
+        if (
+          observed === null ||
+          !sameStartingRuntime(owner, observed) ||
+          observed.threadId !== receipt.thread_id ||
+          observed.requested.model !== receipt.actual_model ||
+          observed.requested.reasoning !== receipt.actual_reasoning
+        ) {
+          throw new Error("E_GENERATION_MISMATCH: observed owner does not match receipt");
+        }
       }
       if (Date.now() >= deadline) {
         throw new Error("E_MODEL_UNVERIFIED: managed owner did not become active");
