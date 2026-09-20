@@ -121,6 +121,7 @@ export const runtimeCommands = createRuntimeCommands(invoke);
 export type RuntimeCommands = ReturnType<typeof createRuntimeCommands>;
 
 const errorMessages: Record<string, string> = {
+ E_PREPARATION_EXPIRED: "Start blocked: the preparation permit expired or is no longer valid. The previous worker remains stopped and revoked. Refresh state and prepare again; no rollback or automatic retry.",
  E_LAUNCH_UNAVAILABLE: "The native launch capability is unavailable. No start is confirmed.",
  E_RUNTIME_DEADLINE: "The runtime deadline elapsed. Outcome is unknown; refresh state, do not assume rollback.",
  E_CONTROL_UNKNOWN: "Native control outcome is unknown. Refresh authoritative state before another operation.",

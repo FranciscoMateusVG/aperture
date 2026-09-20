@@ -85,3 +85,37 @@ test("archive CTA is explicitly effectful, unknown review blocks completion, no 
   assert.match(f.evidence.innerHTML, /Backend archive state: blocked/); assert.doesNotMatch(f.evidence.innerHTML, /Backend archive state: archived/); assert.equal(f.buttons.archive.disabled, true); assert.equal(f.calls.length, 1);
  });
 });
+
+test("expired Start permit is blocked with completed Prepare evidence, not unknown or rollback", async () => {
+ await run({ call: (name, _args, t) => {
+  if (name === "team_prepare_replacement") return ready(t);
+  throw { code: "E_PREPARATION_EXPIRED", message: "SENTINEL_PRIVATE_PERMIT" };
+ } }, async f => {
+  await f.click("prepare"); await f.click("start");
+  assert.equal(f.calls.length, 2); assert.match(f.evidence.innerHTML, /Start blocked.*completed preparation evidence retained/);
+  assert.match(f.evidence.innerHTML, /process stop.*verified/); assert.match(f.evidence.innerHTML, /revocation.*verified/);
+  assert.doesNotMatch(f.evidence.innerHTML, /outcome: unknown|Backend phase: ready|fixture-only-selector/);
+  assert.match(f.error.textContent, /previous worker remains stopped and revoked/);
+  assert.match(f.status.textContent, /Refresh authoritative state and prepare again/);
+  assert.doesNotMatch(f.error.textContent, /SENTINEL_PRIVATE_PERMIT/);
+  assert.equal(f.buttons.start.disabled, true); assert.equal(f.buttons.prepare.disabled, true);
+  assert.equal(f.selection.disabled, true); f.change(1); assert.match(f.evidence.innerHTML, /Start blocked/);
+  await f.click("start"); await f.click("prepare"); assert.equal(f.calls.length, 2); assert.equal(f.t.seats[0].observed_owner.generation, 4);
+  await f.click("refresh"); assert.equal(f.reads(), 1); assert.equal(f.calls.length, 2);
+  assert.equal(f.buttons.prepare.disabled, false); assert.equal(f.buttons.start.disabled, true);
+  await f.click("prepare"); assert.equal(f.calls.length, 3); assert.equal(f.buttons.start.disabled, false);
+  assert.doesNotMatch(f.evidence.innerHTML, /Start blocked/);
+ });
+});
+test("transport loss after completed Prepare still yields unknown, not expiry's stopped assertion", async () => {
+ await run({ call: (name, _args, t) => {
+  if (name === "team_prepare_replacement") return ready(t);
+  throw { code: "E_RUNTIME_IO", message: "SENTINEL_PRIVATE" };
+ } }, async f => {
+  await f.click("prepare"); await f.click("start");
+  assert.match(f.evidence.innerHTML, /outcome: unknown/);
+  assert.doesNotMatch(f.evidence.innerHTML, /completed preparation evidence retained/);
+  assert.doesNotMatch(f.error.textContent, /remains stopped and revoked|SENTINEL_PRIVATE/);
+  assert.equal(f.calls.length, 2); assert.equal(f.buttons.start.disabled, true);
+ });
+});

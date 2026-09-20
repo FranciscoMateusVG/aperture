@@ -28,3 +28,23 @@ Existing node:test + Vite SSR/FakeElement handler-contract layer, no new depende
 → **114/114 PASS**, including 31 P3 wrapper/render/handler tests. `npm run build` and `git diff --check` PASS. Positive fixtures are explicitly synthetic test-only responses, never fallback production data.
 
 These checks do not prove native dialog focus, geometry, pixel parity, Tauri adapters, durable permits, provider model observation or actual team lifecycle effects. All are **NOT_RUN**. No runtime command was called; no app install/setup/restart occurred. This slice requires independent source review and later exact backend composition before any live capability is enabled.
+
+## Bounded preparation-expiry correction (parent c6eb8e3)
+
+Frozen follow-up: Rex BEADS ecqk3j, root dikw3t. The fixed
+`E_PREPARATION_EXPIRED` category means completed Prepare facts still hold:
+the previous worker remains stopped/revoked, but its opaque Start permit is
+invalid. Start is **blocked**, not an unknown transport outcome.
+
+The UI keeps the completed preparation evidence, discards the expired selector,
+and requires explicit refresh/reprepare. It does not mutate the native DTO to
+fabricate a blocked response, restore a worker, retry, or reset a generation.
+Selection cannot erase this evidence while refresh is required. Transport loss
+after Prepare remains unknown and does not inherit the expiry-specific claim.
+
+Existing handler regression: completed Prepare -> Start expiry -> blocked evidence
+-> disabled Start/Prepare -> explicit refresh -> fresh Prepare. Separate transport
+negative control. Pre-fix expiry regression **RED**, transport control **PASS**;
+current full source suite **159/159 PASS**, Vite build and diff-check PASS.
+No DTO/layout/backend change. Native expiry/stop/revocation, WKWebView and installed
+runtime behavior remain NOT_RUN; this is source evidence only.

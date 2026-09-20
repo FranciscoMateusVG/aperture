@@ -6,11 +6,11 @@ import { escapeHtml as e } from "../utils/html";
 
 const checks = (items: Record<string, RuntimeCheckState>) => `<ul class="v4-checklist">${Object.entries(items).map(([name, state]) => `<li><span>${e(name.replaceAll("_", " "))}</span> — <strong>${e(state)}</strong></li>`).join("")}</ul>`;
 const runtimeBlockers = (view: ReplacementView | ArchiveView) => view.blockers.length ? `<ul class="v4-checklist">${view.blockers.map(b => `<li>${e(runtimeErrorCopy(b))}<br><span class="v4-meta">${e(b.code)} · ${e(b.reference)}</span></li>`).join("")}</ul>` : "";
-export function renderReplacementEvidence(view: ReplacementView | null, pending = false): string {
+export function renderReplacementEvidence(view: ReplacementView | null, pending = false, preparationExpired = false): string {
   const states = view?.checks ?? { process_stop: "unknown", revocation: "unknown", remote_effects: "unknown" };
   const shown = pending ? { process_stop: "pending", revocation: "pending", remote_effects: "pending" } : states;
   const checkpoint = view?.checkpoint_recovery;
-  return `<p class="v4-status">${pending ? "Operation pending — awaiting backend evidence" : view ? `Backend phase: ${e(view.phase)}` : "Replacement outcome: unknown — no backend evidence"}</p>
+  return `<p class="v4-status">${preparationExpired ? "Start blocked — preparation permit expired; completed preparation evidence retained" : pending ? "Operation pending — awaiting backend evidence" : view ? `Backend phase: ${e(view.phase)}` : "Replacement outcome: unknown — no backend evidence"}</p>
     <p>${checkpoint ? `Checkpoint recovery: ${e(checkpoint)}${checkpoint === "valid" ? "" : " — warning: native inventory decides safe recovery"}` : "Checkpoint recovery: unknown"}</p>
     ${checks(shown as Record<string, RuntimeCheckState>)}
     ${view?.owner ? `<dl class="v4-seat-facts"><div><dt>Requested incarnation</dt><dd>${e(tupleLabel(view.owner.configured))}</dd></div><div><dt>Observed</dt><dd>${view.owner.actual ? e(tupleLabel(view.owner.actual)) : "Unknown — actual model not observed"}</dd></div><div><dt>Returned owner generation / state</dt><dd>g${view.owner.generation} · ${e(view.owner.state)}</dd></div></dl>` : '<p class="v4-meta">Owner observation unavailable. Missing data does not prove a stopped worker.</p>'}
@@ -42,7 +42,7 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
   const initialOwner = team.seats.find(s => s.configured.name === seat)?.observed_owner;
   let selected: ExecutionTuple | undefined = choices.find(t => initialOwner && sameExecutionTuple(t, initialOwner.configured)) ?? choices[0];
   let prepared: PreparedReplacementView | null = null, latest: ReplacementView | null = null, archived: ArchiveView | null = null;
-  let inflight = false, refreshing = false, needsRefresh = false, closed = false;
+  let inflight = false, refreshing = false, needsRefresh = false, closed = false, preparationExpired = false;
   const dialog = document.createElement("dialog"); dialog.className = "v4-dialog"; dialog.setAttribute("aria-labelledby", "v4-runtime-title");
   dialog.innerHTML = `<div class="v4-dialog__body"><h2 id="v4-runtime-title">${options.kind === "replace" ? "Replace worker" : "Archive team"}</h2><p>${e(seat || team.snapshot.team)}</p>
     ${options.kind === "replace" ? `<div class="v4-field"><label for="v4-runtime-selection">Replacement · exact immutable policy tuple</label><select id="v4-runtime-selection"></select></div><label class="v4-radio-label"><input type="checkbox" data-confirm> I confirm this configuration change, including harness, reasoning and budget intent. Backend authorization still applies.</label><p class="v4-meta">Snapshot and configured fallbacks determine choices; the catalog alone does not grant replacement authority.</p>` : '<p>The backend will verify reconciliation, reviews, metrics, processes, revocation, remote effects and worktree preservation. This action may archive the team if every native gate passes; it is not a read-only check.</p>'}
@@ -75,10 +75,10 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
   }
   function paint() {
     if (closed) return;
-    evidence.innerHTML = options.kind === "replace" ? renderReplacementEvidence(latest, inflight && !refreshing) : renderArchiveEvidence(archived, inflight && !refreshing);
+    evidence.innerHTML = options.kind === "replace" ? renderReplacementEvidence(latest, inflight && !refreshing, preparationExpired) : renderArchiveEvidence(archived, inflight && !refreshing);
     const available = allowed();
     button("refresh")!.disabled = inflight;
-    if (selection) selection.disabled = inflight || !available;
+    if (selection) selection.disabled = inflight || needsRefresh || !available;
     if (confirm) { confirm.disabled = inflight || !available; confirm.parentElement!.hidden = !confirmationRequired(); }
     const prepare = button("prepare"), start = button("start"), archive = button("archive");
     if (prepare) prepare.disabled = inflight || needsRefresh || !available;
@@ -89,15 +89,16 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
     if (!available) status.textContent = "Not available: the backend has not enabled this capability, or its authoritative generation is missing/changed. No operation was requested by opening this dialog.";
     else if (refreshing) status.textContent = "Refreshing authoritative state. Refresh does not initiate a lifecycle operation.";
     else if (inflight) status.textContent = "Waiting for native evidence. No successful outcome is confirmed yet.";
+    else if (preparationExpired) status.textContent = "Start blocked. Refresh authoritative state and prepare again; the completed stop and revocation are not undone.";
     else if (needsRefresh) status.textContent = "Refresh authoritative state before another operation. Prior effects are not undone.";
     else status.textContent = "Only returned native evidence can enable a start or confirm archival.";
   }
   selection?.addEventListener("change", () => {
-    if (inflight) return;
+    if (inflight || needsRefresh) return;
     const index = selection.value === "" ? -1 : Number(selection.value);
     selected = Number.isInteger(index) ? choices[index] : undefined;
     if (prepared || latest) needsRefresh = true;
-    prepared = null; latest = null; if (confirm) confirm.checked = false; paint();
+    prepared = null; latest = null; preparationExpired = false; if (confirm) confirm.checked = false; paint();
   });
   confirm?.addEventListener("change", paint);
   dialog.addEventListener("click", async event => {
@@ -108,7 +109,7 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
     if (inflight) return;
     error.textContent = "";
     if (action === "refresh") {
-      prepared = null; latest = null; archived = null;
+      prepared = null; latest = null; archived = null; preparationExpired = false;
       inflight = true; refreshing = true; paint();
       try {
         const refreshed = await options.refresh();
@@ -133,7 +134,16 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
         needsRefresh = true; archived = await api.archive(team);
       }
     } catch (failure) {
-      prepared = null; latest = null; archived = null; needsRefresh = true; error.textContent = runtimeErrorCopy(failure);
+      // A fixed native expiry rejection does not erase the completed Prepare facts.
+      // Keep its evidence, but never retain or reuse its opaque start selector.
+      preparationExpired = action === "start" && !!activePreparation && !!failure &&
+        typeof failure === "object" && "code" in failure && failure.code === "E_PREPARATION_EXPIRED";
+      latest = null;
+      if (preparationExpired && activePreparation) {
+        const { preparation_id: _expiredSelector, ...completedEvidence } = activePreparation;
+        latest = completedEvidence;
+      }
+      prepared = null; archived = null; needsRefresh = true; error.textContent = runtimeErrorCopy(failure);
     } finally { inflight = false; paint(); if (closed) void options.refresh().catch(() => {}); }
   });
   dialog.addEventListener("close", () => { closed = true; dialog.remove(); if (origin?.isConnected) origin.focus(); });
