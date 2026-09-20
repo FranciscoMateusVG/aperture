@@ -16,6 +16,12 @@ use crate::owner::{try_lock, AdvisoryLock, OwnerStore};
 use crate::state::{AppState, ExecutionTuple, Harness, OwnerSummary, ReasoningEffort};
 use crate::team_auth::{authenticate_glados_control, authenticate_seat_control, AuthenticatedActor};
 use crate::team_checkpoint::{CheckpointContext, CheckpointError, CheckpointPayload, CheckpointWriter};
+use crate::team_replacement::{
+    CheckpointRecovery, ReplacementError, ReplacementPhase, StartSelection,
+};
+use crate::team_replacement::native::{
+    bootstrap_authorized, prepare_operator, start_operator,
+};
 use crate::team_replacement::remote::{
     inspect_authorized, resolve_native, RemoteError, RemoteInventoryView, RemoteTarget,
     ResolutionAuthority, ResolutionReceipt, ResolutionRequest,
@@ -383,6 +389,91 @@ pub struct AgentReplaceInput {
     /// Target owner-generation CAS selector, never caller authority.
     pub expected_generation: u64,
     pub selection: ExecutionTuple,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapSeatInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareReplacementInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StartReplacementInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+    pub preparation_id: String,
+    pub selection: ExecutionTuple,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCheckState {
+    Pending,
+    Verified,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RuntimeBlocker {
+    pub code: String,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReplacementChecks {
+    pub process_stop: RuntimeCheckState,
+    pub revocation: RuntimeCheckState,
+    pub remote_effects: RuntimeCheckState,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReplacementView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub phase: ReplacementPhase,
+    pub checkpoint_recovery: CheckpointRecovery,
+    pub checks: ReplacementChecks,
+    pub owner: Option<OwnerSummary>,
+    pub blockers: Vec<RuntimeBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PreparedReplacementView {
+    #[serde(flatten)]
+    pub replacement: ReplacementView,
+    pub preparation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BootstrapPhase {
+    Starting,
+    Started,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BootstrapView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub phase: BootstrapPhase,
+    pub owner: Option<OwnerSummary>,
+    pub blockers: Vec<RuntimeBlocker>,
 }
 
 /// Target selectors only. The authenticated lead's team, seat and generation
@@ -1571,6 +1662,205 @@ pub fn team_cancel_pending(input: CancelPendingInput, state: tauri::State<'_, Ar
     engine_from_state(&state)?.cancel_pending(&AuthenticatedActor::operator_ui(), input)
 }
 
+fn replacement_error(error: ReplacementError) -> TeamError {
+    let message = match error {
+        ReplacementError::GenerationMismatch => "runtime generation changed",
+        ReplacementError::InvalidSnapshot | ReplacementError::StopUnverified => "owned process stop could not be verified",
+        ReplacementError::UnownedProcess => "an unowned process blocks this operation",
+        ReplacementError::RevocationUnverified => "message authority revocation could not be verified",
+        ReplacementError::RemoteUncertain => "remote effects remain uncertain",
+        ReplacementError::AuthorizationRequired => "this replacement is not authorized",
+        ReplacementError::FreshThreadUnverified => "a fresh thread could not be verified",
+        ReplacementError::ModelUnverified => "the requested runtime tuple was not verified",
+        ReplacementError::StartCleanupUnverified => "failed-start cleanup could not be verified",
+        ReplacementError::NativeFailure => "native runtime operation failed",
+        ReplacementError::RepoBindingUnavailable => "repository binding is unavailable",
+        ReplacementError::CheckpointUnavailable => "checkpoint validation is unavailable",
+        ReplacementError::LaunchUnavailable => "native launch is unavailable",
+        ReplacementError::Deadline => "runtime deadline elapsed",
+        ReplacementError::OutcomeUnknown => "native control outcome is unknown",
+        ReplacementError::PreparationExpired => "replacement preparation expired",
+        ReplacementError::WorktreeUnbound => "replacement worktree is not authoritatively bound",
+    };
+    TeamError::new(error.code(), message)
+}
+
+fn selection_from_tuple(tuple: &ExecutionTuple) -> TeamResult<StartSelection> {
+    let harness = serde_json::to_value(&tuple.harness)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| TeamError::state("execution harness is invalid"))?;
+    let reasoning = tuple
+        .reasoning
+        .as_ref()
+        .map(|value| {
+            serde_json::to_value(value)
+                .ok()
+                .and_then(|encoded| encoded.as_str().map(str::to_owned))
+                .ok_or_else(|| TeamError::state("execution reasoning is invalid"))
+        })
+        .transpose()?;
+    Ok(StartSelection { harness, model: tuple.model.clone(), reasoning })
+}
+
+fn verified_replacement_checks() -> ReplacementChecks {
+    ReplacementChecks {
+        process_stop: RuntimeCheckState::Verified,
+        revocation: RuntimeCheckState::Verified,
+        remote_effects: RuntimeCheckState::Verified,
+    }
+}
+
+fn owner_summary(home: &Path, seat: &str) -> TeamResult<OwnerSummary> {
+    OwnerStore::new(home.join(".aperture/run/owner"))
+        .summary(seat)
+        .map_err(TeamError::from_message)
+}
+
+fn permit_store(
+    state: &tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> TeamResult<Arc<Mutex<crate::state::RuntimePermitStore>>> {
+    state
+        .lock()
+        .map(|state| Arc::clone(&state.team_preparations))
+        .map_err(|_| TeamError::io("application state unavailable"))
+}
+
+#[tauri::command]
+pub fn team_bootstrap_seat(
+    input: BootstrapSeatInput,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> TeamResult<BootstrapView> {
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation != 0 {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "bootstrap selectors are invalid"));
+    }
+    let engine = engine_from_state(&state)?;
+    let started = bootstrap_authorized(
+        &engine.paths.home,
+        &AuthenticatedActor::operator_ui(),
+        &input.team,
+        &input.seat,
+        input.expected_generation,
+    )
+    .map_err(replacement_error)?;
+    let owner = owner_summary(&engine.paths.home, &input.seat)?;
+    if owner.generation != started.generation || owner.state != crate::state::OwnerState::Active {
+        return Err(TeamError::new("E_CONTROL_UNKNOWN", "bootstrap owner readback is inconsistent"));
+    }
+    Ok(BootstrapView {
+        team: input.team,
+        seat: input.seat,
+        generation: started.generation,
+        phase: BootstrapPhase::Started,
+        owner: Some(owner),
+        blockers: vec![],
+    })
+}
+
+#[tauri::command]
+pub fn team_prepare_replacement(
+    input: PrepareReplacementInput,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> TeamResult<PreparedReplacementView> {
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation == 0 {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "replacement selectors are invalid"));
+    }
+    let engine = engine_from_state(&state)?;
+    let permits = permit_store(&state)?;
+    {
+        let mut permits = permits.lock().map_err(|_| TeamError::io("replacement permit store unavailable"))?;
+        permits
+            .reserve(&input.team, &input.seat, input.expected_generation)
+            .map_err(TeamError::from_message)?;
+    }
+    let prepared = prepare_operator(
+        &engine.paths.home,
+        &AuthenticatedActor::operator_ui(),
+        &input.team,
+        &input.seat,
+        input.expected_generation,
+        &[],
+    );
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Ok(mut permits) = permits.lock() {
+                permits.cancel_reservation(&input.team, &input.seat, input.expected_generation);
+            }
+            return Err(replacement_error(error));
+        }
+    };
+    let recovery = prepared.recovery();
+    let preparation_id = Uuid::new_v4().to_string();
+    {
+        let mut permits = permits.lock().map_err(|_| TeamError::io("replacement permit store unavailable"))?;
+        permits.publish(preparation_id.clone(), prepared).map_err(TeamError::from_message)?;
+    }
+    let owner = owner_summary(&engine.paths.home, &input.seat)?;
+    if owner.generation != input.expected_generation {
+        return Err(TeamError::new("E_CONTROL_UNKNOWN", "prepared owner readback is inconsistent"));
+    }
+    Ok(PreparedReplacementView {
+        replacement: ReplacementView {
+            team: input.team,
+            seat: input.seat,
+            generation: input.expected_generation,
+            phase: ReplacementPhase::Ready,
+            checkpoint_recovery: recovery,
+            checks: verified_replacement_checks(),
+            owner: Some(owner),
+            blockers: vec![],
+        },
+        preparation_id: Some(preparation_id),
+    })
+}
+
+#[tauri::command]
+pub fn team_start_replacement(
+    input: StartReplacementInput,
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> TeamResult<ReplacementView> {
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat)
+        || input.expected_generation == 0
+        || Uuid::parse_str(&input.preparation_id).is_err()
+    {
+        return Err(TeamError::new("E_PREPARATION_EXPIRED", "replacement preparation selectors are invalid"));
+    }
+    let engine = engine_from_state(&state)?;
+    let permits = permit_store(&state)?;
+    let permit = permits
+        .lock()
+        .map_err(|_| TeamError::io("replacement permit store unavailable"))?
+        .take(
+            &input.preparation_id,
+            &input.team,
+            &input.seat,
+            input.expected_generation,
+        )
+        .map_err(TeamError::from_message)?;
+    let recovery = permit.recovery();
+    let selection = selection_from_tuple(&input.selection)?;
+    let started = start_operator(&AuthenticatedActor::operator_ui(), permit, &selection)
+        .map_err(replacement_error)?;
+    let owner = owner_summary(&engine.paths.home, &input.seat)?;
+    if owner.generation != started.generation || owner.state != crate::state::OwnerState::Active {
+        return Err(TeamError::new("E_CONTROL_UNKNOWN", "replacement owner readback is inconsistent"));
+    }
+    Ok(ReplacementView {
+        team: input.team,
+        seat: input.seat,
+        generation: started.generation,
+        phase: ReplacementPhase::Started,
+        checkpoint_recovery: recovery,
+        checks: verified_replacement_checks(),
+        owner: Some(owner),
+        blockers: vec![],
+    })
+}
+
 /// Common headless control entrypoint. The caller supplies selectors only;
 /// actor/env fields are not part of the tagged schema and cannot construct
 /// `AuthenticatedActor`.
@@ -2258,5 +2548,56 @@ mod tests {
             assert!(!home.join(".aperture/teams/t5").exists());
         }
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn runtime_command_contract_is_strict_and_does_not_expose_thread_identity() {
+        let input = serde_json::from_value::<StartReplacementInput>(serde_json::json!({
+            "team":"t1", "seat":"t1-backend", "expected_generation":1,
+            "preparation_id":"00000000-0000-4000-8000-000000000001",
+            "selection":{"harness":"codex","model":"gpt-6-astra","reasoning":"high"}
+        })).unwrap();
+        let selection = selection_from_tuple(&input.selection).unwrap();
+        assert_eq!(selection.harness, "codex");
+        assert_eq!(selection.reasoning.as_deref(), Some("high"));
+
+        let forged = serde_json::json!({
+            "team":"t1", "seat":"t1-backend", "expected_generation":1,
+            "preparation_id":"00000000-0000-4000-8000-000000000001",
+            "selection":{"harness":"codex","model":"gpt-6-astra","reasoning":"high"},
+            "thread_id":"forged"
+        });
+        assert!(serde_json::from_value::<StartReplacementInput>(forged).is_err());
+
+        let configured = input.selection.clone();
+        let owner = OwnerSummary {
+            generation: 1,
+            state: crate::state::OwnerState::Active,
+            since: "2026-09-20T00:00:00Z".into(),
+            configured: configured.clone(),
+            actual: Some(configured),
+            process_count: 1,
+            thread_bound: true,
+        };
+        let response = PreparedReplacementView {
+            replacement: ReplacementView {
+                team: "t1".into(),
+                seat: "t1-backend".into(),
+                generation: 1,
+                phase: ReplacementPhase::Ready,
+                checkpoint_recovery: CheckpointRecovery::Valid,
+                checks: verified_replacement_checks(),
+                owner: Some(owner),
+                blockers: vec![],
+            },
+            preparation_id: Some("00000000-0000-4000-8000-000000000001".into()),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 9);
+        for key in ["team", "seat", "generation", "phase", "checkpoint_recovery", "checks", "owner", "blockers", "preparation_id"] {
+            assert!(object.contains_key(key), "missing {key}");
+        }
+        assert!(value.to_string().find("thread_id").is_none());
     }
 }
