@@ -118,6 +118,8 @@ pub enum ReplacementError {
     ModelUnverified,
     StartCleanupUnverified,
     NativeFailure,
+    RepoBindingUnavailable,
+    CheckpointUnavailable,
 }
 impl ReplacementError {
     pub fn code(&self) -> &'static str {
@@ -132,6 +134,8 @@ impl ReplacementError {
             Self::ModelUnverified => "E_MODEL_UNVERIFIED",
             Self::StartCleanupUnverified => "E_START_CLEANUP_UNVERIFIED",
             Self::NativeFailure => "E_RUNTIME_IO",
+            Self::RepoBindingUnavailable => "E_REPO_BINDING_UNAVAILABLE",
+            Self::CheckpointUnavailable => "E_CHECKPOINT_UNAVAILABLE",
         }
     }
 }
@@ -497,3 +501,6 @@ pub(crate) mod launch_gate;
 
 #[path = "team_model_observation.rs"]
 pub(crate) mod model_observation;
+
+#[path = "team_replacement_native.rs"]
+pub(crate) mod native;
