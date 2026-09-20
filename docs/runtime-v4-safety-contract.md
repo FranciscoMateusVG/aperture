@@ -272,3 +272,34 @@ memory-erasure guarantee. Current collector tests supply synthetic native tables
 and byte buffers: the real OS collector, live process-stop and complete launcher
 journey remain NOT_RUN. No public capability or live action follows from these
 source fixtures.
+
+### Managed launch primitives (unwired source checkpoint)
+
+`hub_auth::managed` is a separate no-overwrite token publisher; the standing
+provisioner remains byte-identical. It validates the native Starting reservation,
+team membership, canonical private roots and prior revocation floor, generates
+fresh entropy privately, and publishes with shared no-replace/file+directory
+fsync. Existing token files are never reused or removed. This publisher alone
+is **not crash-safe orchestration**: composition must durably bind its provisional
+token digest to the shared owner reservation before canonical publication, so
+failure before PID attachment can use the same owner-bound revoke path. That
+shared owner/TS extension is being supplied by the integrator; no launch path
+calls this isolated helper yet.
+
+`team_replacement::launch_gate` starts an internal pipe-gated child in its own
+session/process group. The shell program is fixed and all executable arguments
+are positional data. Parent pipe loss exits before the harness exec; no signal
+or restart fallback occurs. Release rechecks the private Starting owner under
+its OS lock, reservation nonce, exact root PID/OS birth and recorded root, and
+requires unobserved state. Only then does one pipe write release exec. An
+ambiguous release must use exact native stop/revoke cleanup, never retry start.
+The returned child is not an Active owner: actual tuple/thread observation and
+owner CAS are later requirements. Managed Codex must not use the legacy
+app-server supervisor, thread-resume selection or automatic restart.
+
+Four focused fixtures actually run disposable local gate shells that can only
+create a private temporary marker with `touch`: pre-owner blocking, exact-owner
+release, wrong/absent birth rejection, parent EOF and argument-as-data handling.
+These are not live harness, gateway, team replacement or provider tests. The
+full one-shot adapter, provisional-token crash composition and actual-model
+observation remain unproven; public capabilities and installation remain off.
