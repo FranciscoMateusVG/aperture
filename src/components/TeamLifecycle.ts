@@ -67,7 +67,7 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
     const current = live();
     return !!current && current.snapshot.team === team.snapshot.team && current.state.state === "active" &&
       current.capabilities?.[options.kind] === true &&
-      (options.kind === "archive" ? current.state.generation === team.state.generation : ownerGeneration(current, seat) !== null && ownerGeneration(current, seat) === ownerGeneration(team, seat));
+      (options.kind === "archive" ? current.state.generation === team.state.generation : (ownerGeneration(current, seat) ?? 0) > 0 && ownerGeneration(current, seat) === ownerGeneration(team, seat));
   }
   function confirmationRequired(): boolean {
     const requested = team.seats.find(s => s.configured.name === seat)?.observed_owner?.configured;

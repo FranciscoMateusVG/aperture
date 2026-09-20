@@ -180,3 +180,12 @@ export interface ArchiveView {
   team: string; generation: number; state: "pending" | "blocked" | "archived" | "unknown";
   checks: ArchiveChecks; blockers: RuntimeBlocker[];
 }
+
+
+// First start is distinct from replacement: no preparation or selected fallback.
+export interface BootstrapView {
+  team: string; seat: string; generation: number;
+  phase: "starting" | "started" | "blocked";
+  owner: OwnerSummary | null;
+  blockers: RuntimeBlocker[];
+}

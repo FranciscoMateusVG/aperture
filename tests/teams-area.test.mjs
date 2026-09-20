@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createServer } from "vite";
 import { preset, catalog, team, clone } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
-const { createTeamsArea } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); await vite.close();
+const { createTeamsArea } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); const { createRuntimeCommands } = await vite.ssrLoadModule("/src/services/team-runtime.ts"); await vite.close();
 const tick = () => new Promise(r => setImmediate(r));
 async function setup(options, fn) {
  class El {
@@ -59,5 +59,79 @@ test("tab handler follows arrow/home/end semantics and preserves roster visibili
   key("ArrowRight"); assert.equal(f.legacy.hidden, true); assert.equal(f.library.hidden, false); assert.equal(f.doc.activeElement.dataset.tab, "presets");
   key("Home"); assert.equal(f.legacy.hidden, false); assert.equal(f.sessions.hidden, false); assert.equal(f.doc.activeElement.dataset.tab, "sessions");
   key("End"); assert.equal(f.legacy.hidden, true); assert.equal(prevented, 3);
+ });
+});
+
+function bootstrapTeam() {
+ const t = team("active"); t.capabilities.start = true;
+ const { harness, model, reasoning } = t.snapshot.seats[0];
+ t.seats[0].observed_owner = { generation: 0, state: "stale", since: "fixture", configured: { harness, model, reasoning }, actual: null, process_count: 0, thread_bound: false };
+ return t;
+}
+test("bootstrap CTA exists only for active/stale g0 enabled seat, not other seats", async () => {
+ for (const [enabled, mutate] of [[true, () => {}], [false, t => t.capabilities.start = false], [false, t => t.seats[0].observed_owner.generation = 1], [false, t => t.state.state = "pending"]]) {
+  const t = bootstrapTeam(); mutate(t);
+  await setup({ api: { list: async () => [t] } }, async f => {
+   assert.equal(f.teams.innerHTML.includes('data-action="bootstrap"'), enabled);
+   if (enabled) assert.equal((f.teams.innerHTML.match(/data-action="bootstrap"/g) ?? []).length, 1);
+  });
+ }
+});
+test("bootstrap click handler-contract locks duplicate start, avoids legacy and refreshes authoritative state", async () => {
+ const t = bootstrapTeam(); let resolve, calls = 0, reads = 0, legacy = 0;
+ await setup({ api: { list: async () => { reads++; return [t]; } }, openAgent: async () => { legacy++; },
+  runtime: { bootstrap: (input, seat) => { calls++; assert.equal(input, t); assert.equal(seat, "t1-backend"); return new Promise(r => { resolve = r; }); } } }, async f => {
+  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
+  const pending = f.root.handlers.click({ target: button }); await f.root.handlers.click({ target: button });
+  assert.equal(calls, 1); assert.equal(reads, 1); assert.equal(legacy, 0); assert.equal(f.refresh.disabled, true);
+  assert.match(f.status.textContent, /pending.*awaiting native evidence/);
+  const next = clone(t); next.seats[0].observed_owner.generation = 3; next.seats[0].observed_owner.state = "active"; next.seats[0].observed_owner.actual = next.seats[0].observed_owner.configured;
+  f.api.list = async () => { reads++; return [next]; };
+  resolve({ phase: "started", blockers: [] }); await pending;
+  assert.equal(reads, 2); assert.match(f.teams.innerHTML, /active · g3/); assert.equal(t.seats[0].observed_owner.generation, 0);
+  assert.doesNotMatch(f.teams.innerHTML, /data-action="bootstrap"/); assert.match(f.status.textContent, /reported started/);
+ });
+});
+test("bootstrap unknown outcome requires explicit read refresh, no retry or local generation reset", async () => {
+ let calls = 0, reads = 0; const t = bootstrapTeam();
+ await setup({ api: { list: async () => { reads++; return [t]; } }, runtime: { bootstrap: async () => { calls++; throw { code: "E_RUNTIME_DEADLINE", message: "SECRET_SENTINEL" }; } } }, async f => {
+  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
+  await f.root.handlers.click({ target: button });
+  assert.equal(calls, 1); assert.equal(reads, 1); assert.match(f.status.textContent, /unknown.*[Rr]efresh/); assert.doesNotMatch(f.status.textContent, /SECRET_SENTINEL/);
+  const syntheticSecond = new f.El(); syntheticSecond.dataset = button.dataset;
+  await f.root.handlers.click({ target: syntheticSecond }); assert.equal(calls, 1);
+  assert.equal(f.refresh.disabled, false); assert.equal(t.seats[0].observed_owner.generation, 0);
+  await f.instance.refresh(); assert.equal(reads, 2); assert.equal(calls, 1);
+ });
+});
+test("bootstrap starting and blocked responses refresh but do not claim success", async () => {
+ for (const phase of ["starting", "blocked"]) {
+  let reads = 0;
+  await setup({ api: { list: async () => { reads++; return [bootstrapTeam()]; } }, runtime: { bootstrap: async () => ({ phase, blockers: phase === "blocked" ? [{ code: "E_LAUNCH_UNAVAILABLE", reference: "fixture" }] : [] }) } }, async f => {
+   const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
+   await f.root.handlers.click({ target: button });
+   assert.equal(reads, 2); assert.match(f.status.textContent, /successful launch is not confirmed/); assert.doesNotMatch(f.status.textContent, /reported started/);
+  });
+ }
+});
+
+
+test("malformed bootstrap response keeps unknown state and cannot trigger success refresh", async () => {
+ let calls = 0, reads = 0;
+ const runtime = createRuntimeCommands(async () => { calls++; return { phase: "started", owner: null }; });
+ await setup({ api: { list: async () => { reads++; return [bootstrapTeam()]; } }, runtime }, async f => {
+  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
+  await f.root.handlers.click({ target: button }); assert.equal(calls, 1); assert.equal(reads, 1);
+  assert.match(f.status.textContent, /could not be confirmed/); assert.doesNotMatch(f.status.textContent, /reported started/);
+ });
+});
+test("stale rendered bootstrap actions cannot bypass current capability or failed refresh", async () => {
+ let calls = 0;
+ const t = bootstrapTeam(); t.capabilities.start = false;
+ await setup({ api: { list: async () => [t] }, runtime: { bootstrap: async () => { calls++; } } }, async f => {
+  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
+  await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
+  f.api.list = async () => { throw new Error("unavailable"); }; await f.instance.refresh();
+  t.capabilities.start = true; await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
  });
 });

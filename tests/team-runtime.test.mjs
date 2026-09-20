@@ -116,3 +116,65 @@ test("archive generation is canonical readback, never computed or equated to req
  const t = current(); const result = await r.createRuntimeCommands(async () => a).archive(t);
  assert.equal(result.generation, 9); assert.equal(t.state.generation, 1);
 });
+
+function bootable() {
+ const t = current(); t.capabilities.start = true;
+ t.seats[0].observed_owner = { ...t.seats[0].observed_owner, generation: 0, state: "stale", actual: null, process_count: 0, thread_bound: false };
+ return t;
+}
+function booted(t = bootable()) {
+ return { team: "t1", seat: "t1-backend", generation: 1, phase: "started",
+  owner: { ...clone(t.seats[0].observed_owner), generation: 1, state: "active", actual: tuple(), process_count: 1, thread_bound: true }, blockers: [] };
+}
+test("bootstrap input is exact selectors/g0 only; snapshot implicit, no picker/prepare/actor", async () => {
+ const t = bootable(); t.state.generation = 27; let sent;
+ const api = r.createRuntimeCommands(async (...args) => { sent = args; return booted(t); });
+ const result = await api.bootstrap(t, "t1-backend");
+ assert.deepEqual(sent, ["team_bootstrap_seat", { input: { team: "t1", seat: "t1-backend", expected_generation: 0 } }]);
+ assert.equal(result.generation, 1); assert.equal(t.seats[0].observed_owner.generation, 0); assert.equal(t.state.generation, 27);
+});
+for (const [label, mutate] of [
+ ["false capability", t => t.capabilities.start = false], ["missing capability", t => delete t.capabilities.start],
+ ["pending team", t => t.state.state = "pending"], ["missing owner", t => t.seats[0].observed_owner = null],
+ ["starting owner", t => t.seats[0].observed_owner.state = "starting"], ["nonzero owner", t => t.seats[0].observed_owner.generation = 1],
+ ["wrong configured tuple", t => t.seats[0].observed_owner.configured = preset.fallbacks[0]],
+]) test(`bootstrap zero-invoke gate: ${label}`, async () => {
+ const t = bootable(); mutate(t); let calls = 0;
+ assert.equal(r.canBootstrapSeat(t, "t1-backend"), false);
+ await assert.rejects(r.createRuntimeCommands(async () => { calls++; }).bootstrap(t, "t1-backend"), e => e.code === "E_RUNTIME_UNAVAILABLE");
+ assert.equal(calls, 0);
+});
+test("bootstrap unknown seat and g0 replacement preparation never invoke", async () => {
+ const t = bootable(); let calls = 0; const api = r.createRuntimeCommands(async () => { calls++; });
+ await assert.rejects(api.prepare(t, "t1-backend"));
+ assert.equal(calls, 0);
+ await assert.rejects(api.bootstrap(t, "other"));
+ assert.equal(r.canStartReplacement(t, "t1-backend", { ...prepared(t), generation: 0 }, tuple()), false);
+ assert.equal(calls, 0);
+});
+for (const [label, mutate] of [
+ ["wrong team", v => v.team = "other"], ["wrong seat", v => v.seat = "other"],
+ ["zero started generation", v => { v.generation = 0; v.owner.generation = 0; }],
+ ["generation mismatch", v => v.owner.generation = 2], ["missing active owner", v => v.owner = null],
+ ["missing actual", v => v.owner.actual = null], ["different actual", v => v.owner.actual = preset.fallbacks[0]],
+ ["fallback used for first start", v => { v.owner.configured = preset.fallbacks[0]; v.owner.actual = preset.fallbacks[0]; }],
+ ["started with blocker", v => v.blockers = [{ code: "E_MODEL_UNVERIFIED", reference: "fixture" }]],
+ ["raw PID", v => v.owner.pid = 123], ["raw thread", v => v.owner.thread_id = "fixture"],
+ ["invented verified checks", v => v.checks = { process_stop: "verified" }],
+]) test(`bootstrap rejects false success/private reply: ${label}`, () => {
+ const v = booted(); mutate(v); rejected(() => r.parseBootstrap(v, bootable(), "t1-backend"));
+});
+test("bootstrap pending/blocked are evidence, not fabricated completed checks", () => {
+ for (const phase of ["starting", "blocked"]) {
+  const v = { ...booted(), phase, owner: null };
+  assert.equal(r.parseBootstrap(v, bootable(), "t1-backend").phase, phase);
+ }
+});
+test("bootstrap transport/deadline errors never retry or change generation", async () => {
+ for (const code of ["E_LAUNCH_UNAVAILABLE", "E_MODEL_UNVERIFIED", "E_START_CLEANUP_UNVERIFIED", "E_RUNTIME_DEADLINE", "E_CONTROL_UNKNOWN"]) {
+  const t = bootable(); let calls = 0;
+  const api = r.createRuntimeCommands(async () => { calls++; throw { code, message: "SECRET_SENTINEL" }; });
+  await assert.rejects(api.bootstrap(t, "t1-backend")); assert.equal(calls, 1); assert.equal(t.seats[0].observed_owner.generation, 0);
+  assert.doesNotMatch(r.runtimeErrorCopy({ code, message: "SECRET_SENTINEL" }), /SECRET_SENTINEL/);
+ }
+});

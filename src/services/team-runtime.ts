@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ArchiveView, ExecutionTuple, OwnerSummary, PreparedReplacementView, ReplacementView, RuntimeBlocker, TeamView } from "../types";
+import type { BootstrapView, ArchiveView, ExecutionTuple, OwnerSummary, PreparedReplacementView, ReplacementView, RuntimeBlocker, TeamView } from "../types";
 import { isExecutionTuple, sameExecutionTuple } from "./team-contract";
 
 const invalid = (): never => { throw { code: "E_RESPONSE_INVALID", message: "Runtime response could not be confirmed" }; };
@@ -40,6 +40,22 @@ function safeOwner(v: unknown, team: TeamView, seat: string): v is OwnerSummary 
   return allowed.length > 0 && (v.generation === 0 ? sameExecutionTuple(v.configured, allowed[0]) : allowed.some(t => sameExecutionTuple(t, v.configured as ExecutionTuple))) &&
     (v.state !== "active" || (!!v.actual && sameExecutionTuple(v.configured, v.actual as ExecutionTuple)));
 }
+export function canBootstrapSeat(team: TeamView, seat: string): boolean {
+  const snapshot = team.snapshot.seats.find(s => s.name === seat);
+  const owner = team.seats.find(s => s.configured.name === seat)?.observed_owner;
+  return team.state.state === "active" && team.capabilities?.start === true && !!snapshot && !!owner &&
+    owner.state === "stale" && owner.generation === 0 && sameExecutionTuple(owner.configured, snapshot);
+}
+export function parseBootstrap(v: unknown, team: TeamView, seat: string): BootstrapView {
+  const snapshot = team.snapshot.seats.find(s => s.name === seat);
+  if (!snapshot || !obj(v) || !exact(v, ["team", "seat", "generation", "phase", "owner", "blockers"]) ||
+    v.team !== team.snapshot.team || v.seat !== seat || !number(v.generation) ||
+    !includes(v.phase, ["starting", "started", "blocked"]) || !blockers(v.blockers) || !safeOwner(v.owner, team, seat)) return invalid();
+  if (v.owner && (v.owner.generation !== v.generation || !sameExecutionTuple(v.owner.configured, snapshot))) return invalid();
+  if (v.phase === "started" && (!v.owner || v.owner.state !== "active" || v.generation === 0 ||
+    !v.owner.actual || !sameExecutionTuple(v.owner.actual, snapshot) || v.blockers.length)) return invalid();
+  return v as unknown as BootstrapView;
+}
 export function ownerGeneration(team: TeamView, seat: string): number | null {
   return team.seats.find(s => s.configured.name === seat)?.observed_owner?.generation ?? null;
 }
@@ -57,7 +73,7 @@ export function parseReplacement(v: unknown, team: TeamView, seat: string, prepa
   return v as unknown as ReplacementView | PreparedReplacementView;
 }
 export function canStartReplacement(team: TeamView, seat: string, prepared: PreparedReplacementView | null, selection: ExecutionTuple): boolean {
-  return canInvoke(team, "replace") && !!prepared && prepared.team === team.snapshot.team && prepared.seat === seat &&
+  return canInvoke(team, "replace") && (ownerGeneration(team, seat) ?? 0) > 0 && !!prepared && prepared.team === team.snapshot.team && prepared.seat === seat &&
     prepared.generation === ownerGeneration(team, seat) && prepared.phase === "ready" && !!prepared.preparation_id &&
     prepared.blockers.length === 0 && Object.values(prepared.checks).every(v => v === "verified") &&
     authorizedSelections(team, seat).some(t => sameExecutionTuple(t, selection));
@@ -73,9 +89,15 @@ type Invoke = (command: string, args: Record<string, unknown>) => Promise<unknow
 /** Reserved calls. Capability false/missing fails before invoking, including in fixtures. */
 export function createRuntimeCommands(call: Invoke) {
   return {
+    bootstrap: async (team: TeamView, seat: string): Promise<BootstrapView> => {
+      if (!canBootstrapSeat(team, seat)) return unavailable();
+      return parseBootstrap(await call("team_bootstrap_seat", {
+        input: { team: team.snapshot.team, seat, expected_generation: 0 },
+      }), team, seat);
+    },
     prepare: async (team: TeamView, seat: string): Promise<PreparedReplacementView> => {
       const generation = ownerGeneration(team, seat);
-      if (!canInvoke(team, "replace") || generation === null) return unavailable();
+      if (!canInvoke(team, "replace") || (generation === null || generation === 0)) return unavailable();
       const result = parseReplacement(await call("team_prepare_replacement", { input: { team: team.snapshot.team, seat, expected_generation: generation } }), team, seat, true) as PreparedReplacementView;
       if (result.generation !== generation) return invalid();
       return result;
@@ -99,15 +121,18 @@ export const runtimeCommands = createRuntimeCommands(invoke);
 export type RuntimeCommands = ReturnType<typeof createRuntimeCommands>;
 
 const errorMessages: Record<string, string> = {
+ E_LAUNCH_UNAVAILABLE: "The native launch capability is unavailable. No start is confirmed.",
+ E_RUNTIME_DEADLINE: "The runtime deadline elapsed. Outcome is unknown; refresh state, do not assume rollback.",
+ E_CONTROL_UNKNOWN: "Native control outcome is unknown. Refresh authoritative state before another operation.",
  E_RUNTIME_UNAVAILABLE: "Not available: this backend has not enabled the runtime capability.",
- E_GENERATION_MISMATCH: "Generation changed. Refresh authoritative state before preparing again.",
+ E_GENERATION_MISMATCH: "Generation changed. Refresh authoritative state before another lifecycle operation.",
  E_STOP_UNVERIFIED: "Owned-process stop could not be verified.",
  E_UNOWNED_PROCESS: "An unowned process blocks this operation; it was not authorized for termination.",
  E_REVOCATION_UNVERIFIED: "Hub/message authority revocation could not be verified.",
  E_REMOTE_UNCERTAIN: "Remote effects remain uncertain; no safe completion is confirmed.",
  E_REPLACEMENT_AUTHORIZATION: "This exact replacement tuple is not authorized by the backend.",
  E_FRESH_THREAD_UNVERIFIED: "A fresh thread could not be verified.",
- E_MODEL_UNVERIFIED: "The requested model was not verified. No successful replacement is confirmed.",
+ E_MODEL_UNVERIFIED: "The requested model was not verified. No successful start is confirmed.",
  E_START_CLEANUP_UNVERIFIED: "Failed-start cleanup could not be verified. Do not assume rollback.",
  E_RUNTIME_IO: "Runtime outcome is unknown. Refresh before another operation.",
  E_REVIEW_MISSING: "A required review is missing.",

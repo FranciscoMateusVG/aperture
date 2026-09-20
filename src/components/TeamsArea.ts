@@ -1,3 +1,4 @@
+import { canBootstrapSeat, runtimeCommands, runtimeErrorCopy, type RuntimeCommands } from "../services/team-runtime";
 import type { AgentDef, TeamCatalog, TeamPreset, TeamView, TeamCreateResult } from "../types";
 import { teamCommands, type TeamCommands } from "../services/team-commands";
 import { teamErrorCopy } from "../services/team-draft";
@@ -20,18 +21,20 @@ export function renderTeamGroup(team: TeamView, agents: readonly AgentDef[] = []
     ${state.state === "failed" ? `<p class="v4-notice" role="status">Recovery needs attention. ${e(teamErrorCopy(state.failure))}</p>` : ""}
     ${active ? `<div class="v4-stack">${team.seats.map(({ configured, observed_owner: owner }) => `<article class="v4-card"><h3>${e(configured.name)}${configured.name === s.lead ? " · LEAD" : ""}</h3>
       <dl class="v4-seat-facts"><div><dt>Snapshot · immutable configuration</dt><dd>${e(tupleLabel(configured))}</dd></div><div><dt>Requested · current incarnation</dt><dd>${owner ? e(tupleLabel(owner.configured)) : "Unknown — no owner observation"}</dd></div><div><dt>Observed model</dt><dd>${owner?.actual ? e(tupleLabel(owner.actual)) : "Unknown — not observed"}</dd></div><div><dt>Owner / generation</dt><dd>${owner ? `${e(owner.state)} · g${owner.generation}` : "Unknown — no owner observation"}</dd></div><div><dt>Checkpoint / context</dt><dd>Not available from this backend</dd></div><div><dt>Current turn</dt><dd>${e(turn(configured.name))}</dd></div><div><dt>Thread binding</dt><dd>${owner ? owner.thread_bound ? "Bound (reported)" : "Not bound" : "Unknown"}</dd></div></dl>
-      <div class="v4-actions"><button class="v4-button" data-action="open-seat" data-seat="${e(configured.name)}">Open</button><button class="v4-button" disabled title="Checkpoint command is not integrated">Checkpoint unavailable</button><button class="v4-button" data-action="replace" data-team="${e(s.team)}" data-seat="${e(configured.name)}">Replace worker…</button><button class="v4-button" disabled title="Team stop requires the verified lifecycle protocol">Stop unavailable</button></div></article>`).join("")}</div>` : ""}
+      <div class="v4-actions">${canBootstrapSeat(team, configured.name) ? `<button class="v4-button v4-button--primary" data-action="bootstrap" data-team="${e(s.team)}" data-seat="${e(configured.name)}">Bootstrap worker</button>` : ""}<button class="v4-button" data-action="open-seat" data-seat="${e(configured.name)}">Open</button><button class="v4-button" disabled title="Checkpoint command is not integrated">Checkpoint unavailable</button><button class="v4-button" data-action="replace" data-team="${e(s.team)}" data-seat="${e(configured.name)}">Replace worker…</button><button class="v4-button" disabled title="Team stop requires the verified lifecycle protocol">Stop unavailable</button></div></article>`).join("")}</div>` : ""}
     <div class="v4-actions">${state.state === "pending" ? `<button class="v4-button" data-action="cancel-pending" data-team="${e(s.team)}" ${team.capabilities.cancel ? "" : "disabled"}>Cancel pending team</button>` : ""}<button class="v4-button" data-action="archive" data-team="${e(s.team)}">Archive checklist…</button></div></section>`;
 }
 
 export interface TeamsAreaOptions {
   api?: TeamCommands;
+  runtime?: Pick<RuntimeCommands, "bootstrap">;
   listAgents: () => Promise<AgentDef[]>;
   openAgent: (name: string) => Promise<void>;
   onTeamSeats: (names: string[]) => void;
 }
 export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElement, options: TeamsAreaOptions) {
   const api = options.api ?? teamCommands;
+  const runtime = options.runtime ?? runtimeCommands;
   const root = document.createElement("section"); root.className = "v4";
   root.innerHTML = `<div class="v4-tabs" role="tablist" aria-label="Launcher area"><button class="v4-tab" id="v4-sessions-tab" role="tab" aria-selected="true" aria-controls="v4-sessions" tabindex="0" data-tab="sessions">Sessions</button><button class="v4-tab" id="v4-presets-tab" role="tab" aria-selected="false" aria-controls="v4-presets" tabindex="-1" data-tab="presets">Presets</button></div><p class="v4-notice" role="status" aria-live="polite" data-global-status>Loading team state…</p><div class="v4-actions"><button class="v4-button" data-refresh>Refresh teams</button></div><section id="v4-sessions" role="tabpanel" aria-labelledby="v4-sessions-tab"><div class="v4-toolbar"><div><h1>Sessions</h1><p class="v4-meta">Coordination and standing specialists remain available below.</p></div></div><div class="v4-stack" data-teams></div></section><section id="v4-presets" role="tabpanel" aria-labelledby="v4-presets-tab" hidden><div class="v4-toolbar"><div><h1>A team starts with a clear mission.</h1><p class="v4-meta">Reusable presets. Independent snapshots. Existing teams stay unchanged.</p></div><button class="v4-button" data-action="blank" disabled>New blank preset</button></div><div class="v4-grid" data-presets></div></section>`;
   container.appendChild(root);
@@ -97,6 +100,28 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
       }); return;
     }
     const team = teams.find(t => t.snapshot.team === button.dataset.team);
+    if (action === "bootstrap" && team && button.dataset.seat && canBootstrapSeat(team, button.dataset.seat)) {
+      mutation = true; button.disabled = true; refreshButton.disabled = true;
+      status.textContent = "First start pending — awaiting native evidence for the exact snapshot configuration. No successful launch is confirmed.";
+      try {
+        const result = await runtime.bootstrap(team, button.dataset.seat);
+        mutation = false;
+        await refresh();
+        const outcome = result.phase === "started" ? "Native bootstrap reported started."
+          : result.phase === "starting" ? "Native bootstrap is still starting; successful launch is not confirmed."
+          : "Native bootstrap is blocked; successful launch is not confirmed.";
+        const blockers = result.blockers.map(runtimeErrorCopy).join(" ");
+        status.textContent = outcome + (blockers ? " " + blockers : "") + " " + status.textContent;
+      } catch (error) {
+        // Do not retry an ambiguous first start or reset its owner generation.
+        mutation = false; loaded = false;
+        teamsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
+        presetsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
+        blank.disabled = true;
+        status.textContent = runtimeErrorCopy(error) + " Refresh authoritative state before another action; no automatic retry was made.";
+      } finally { refreshButton.disabled = false; }
+      return;
+    }
     if ((action === "replace" || action === "archive") && team) {
       const teamName = team.snapshot.team;
       openTeamLifecycle({ kind: action, team, seat: button.dataset.seat,
