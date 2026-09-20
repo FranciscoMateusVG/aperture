@@ -43,6 +43,11 @@ struct LockedHistory {
     _team: Option<AdvisoryLock>,
     dir: PathBuf,
 }
+pub(crate) struct CheckpointEvidence {
+    pub validated_entries: Vec<CheckpointEntry>,
+    pub historical_bindings: Vec<CheckpointEntry>,
+    pub sha256: String,
+}
 fn open(home: &Path, ctx: &ValidationContext) -> Result<LockedHistory, CheckpointError> {
     use crate::team_checkpoint::identifier;
     if !identifier(&ctx.team, 16)
@@ -161,7 +166,7 @@ fn checked_entries(
     ctx: &ValidationContext,
     sentinels: &[String],
 ) -> Result<Vec<CheckpointEntry>, CheckpointError> {
-    let entries = super::read_raw_entries(&history.dir, ctx.generation)?;
+    let mut entries = super::read_raw_entries(&history.dir, ctx.generation)?;
     let mut seqs = HashSet::new();
     for entry in &entries {
         crate::team_checkpoint::validate_payload(&entry.payload, sentinels)
@@ -187,6 +192,7 @@ fn checked_entries(
             return Err(CheckpointError::Corrupt);
         }
     }
+    entries.sort_by_key(|entry| entry.seq);
     Ok(entries)
 }
 fn observation_is_safe(
@@ -275,6 +281,79 @@ fn read_facts(
         }
     }
     Ok(facts)
+}
+
+fn project_evidence(
+    history: &LockedHistory,
+    ctx: &ValidationContext,
+    sentinels: &[String],
+) -> Result<CheckpointEvidence, CheckpointError> {
+    let entries = checked_entries(history, ctx, sentinels)?;
+    let facts = read_facts(history, ctx, &entries, sentinels)?;
+    // Bind the immutable checkpoint entries and every validated fact field,
+    // not only the latest projected result. A later Ok fact with different
+    // observation/provenance is archive evidence even when the projection is
+    // still Ok.
+    let canonical = serde_json::to_vec(&(
+        "aperture.checkpoint-evidence.v1",
+        ctx.generation,
+        &entries,
+        &facts,
+    ))
+    .map_err(|_| CheckpointError::Corrupt)?;
+    let sha256 = format!("{:x}", Sha256::digest(canonical));
+    let historical_bindings = entries
+        .iter()
+        .filter(|entry| {
+            facts.iter().any(|fact| {
+                fact.checkpoint_id == entry.checkpoint_id
+                    && fact.content_hash == entry.content_hash
+                    && fact.result == CheckpointValidation::Ok
+            })
+        })
+        .cloned()
+        .collect();
+    let mut validated_entries = entries;
+    for fact in facts {
+        let entry = validated_entries
+            .iter_mut()
+            .find(|entry| entry.checkpoint_id == fact.checkpoint_id)
+            .ok_or(CheckpointError::Corrupt)?;
+        entry.validation = fact.result;
+    }
+    Ok(CheckpointEvidence {
+        validated_entries,
+        historical_bindings,
+        sha256,
+    })
+}
+
+pub(crate) fn checkpoint_evidence_native<F>(
+    home: &Path,
+    ctx: &ValidationContext,
+    sentinels: &[String],
+    mut revalidate: F,
+) -> Result<CheckpointEvidence, CheckpointError>
+where
+    F: FnMut() -> Result<(), CheckpointError>,
+{
+    revalidate()?;
+    let history = open(home, ctx)?;
+    revalidate()?;
+    let evidence = project_evidence(&history, ctx, sentinels)?;
+    revalidate()?;
+    Ok(evidence)
+}
+
+pub(crate) fn checkpoint_evidence_native_locked(
+    home: &Path,
+    ctx: &ValidationContext,
+    sentinels: &[String],
+    team_lock: &AdvisoryLock,
+    seat_locks: &[AdvisoryLock],
+) -> Result<CheckpointEvidence, CheckpointError> {
+    let history = open_prelocked(home, ctx, team_lock, seat_locks)?;
+    project_evidence(&history, ctx, sentinels)
 }
 
 /// The native control adapter supplies a lead capability revalidator AND a
@@ -394,45 +473,4 @@ where
         .collect();
     revalidate()?;
     Ok(bound)
-}
-
-pub(crate) fn validated_entries_native_locked(
-    home: &Path,
-    ctx: &ValidationContext,
-    sentinels: &[String],
-    team_lock: &AdvisoryLock,
-    seat_locks: &[AdvisoryLock],
-) -> Result<Vec<CheckpointEntry>, CheckpointError> {
-    let history = open_prelocked(home, ctx, team_lock, seat_locks)?;
-    let mut entries = checked_entries(&history, ctx, sentinels)?;
-    for fact in read_facts(&history, ctx, &entries, sentinels)? {
-        let entry = entries
-            .iter_mut()
-            .find(|e| e.checkpoint_id == fact.checkpoint_id)
-            .ok_or(CheckpointError::Corrupt)?;
-        entry.validation = fact.result;
-    }
-    Ok(entries)
-}
-
-pub(crate) fn historical_bindings_native_locked(
-    home: &Path,
-    ctx: &ValidationContext,
-    sentinels: &[String],
-    team_lock: &AdvisoryLock,
-    seat_locks: &[AdvisoryLock],
-) -> Result<Vec<CheckpointEntry>, CheckpointError> {
-    let history = open_prelocked(home, ctx, team_lock, seat_locks)?;
-    let entries = checked_entries(&history, ctx, sentinels)?;
-    let facts = read_facts(&history, ctx, &entries, sentinels)?;
-    Ok(entries
-        .into_iter()
-        .filter(|e| {
-            facts.iter().any(|f| {
-                f.checkpoint_id == e.checkpoint_id
-                    && f.content_hash == e.content_hash
-                    && f.result == CheckpointValidation::Ok
-            })
-        })
-        .collect())
 }

@@ -514,6 +514,34 @@ mod tests {
         assert_eq!((meta.mode() & 0o777, meta.nlink()), (0o600, 1));
     }
     #[test]
+    fn archive_evidence_hash_binds_every_validation_fact() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 1, &[], || Ok(())).unwrap();
+        validation::validate_native(&f.0, &lead_context(), 1, 2, &[], || Ok(()), actual).unwrap();
+        let first = validation::checkpoint_evidence_native(
+            &f.0,
+            &lead_context(),
+            &[],
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(first.validated_entries[0].validation, CheckpointValidation::Ok);
+
+        // The read projection is unchanged, but fact_seq and validated_at are
+        // new archive evidence and therefore must change the evidence hash.
+        validation::validate_native(&f.0, &lead_context(), 1, 3, &[], || Ok(()), actual).unwrap();
+        let second = validation::checkpoint_evidence_native(
+            &f.0,
+            &lead_context(),
+            &[],
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(second.validated_entries[0].validation, CheckpointValidation::Ok);
+        assert_eq!(first.validated_entries, second.validated_entries);
+        assert_ne!(first.sha256, second.sha256);
+    }
+    #[test]
     fn nonlead_or_stale_lead_cannot_collect_or_validate() {
         let f = Fixture::new();
         write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();

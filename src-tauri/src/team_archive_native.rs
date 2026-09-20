@@ -7,7 +7,6 @@ use crate::state::OwnerState;
 use crate::team_replacement::{remote, repository, ProcessState};
 use crate::teams::{TeamLifecycle, TeamSnapshot, TeamStateFile};
 use serde::Serialize;
-use sha2::Digest;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -482,49 +481,21 @@ fn inspect_native_inner(
                     lead_seat: snapshot.lead.clone(),
                     lead_generation: lead.generation,
                 };
-                let entries_result = match held {
-                    Some((team_lock, seat_locks)) => {
-                        crate::team_checkpoint::native::validation::validated_entries_native_locked(
-                            home, &ctx, sentinels, team_lock, seat_locks,
-                        )
-                    }
-                    None => crate::team_checkpoint::native::validation::validated_entries_native(
-                        home,
-                        &ctx,
-                        sentinels,
-                        || Ok(()),
-                    ),
-                };
-                match entries_result {
-                    Ok(entries) => {
-                        checkpoint_evidence.extend(
-                            serde_json::to_vec(&entries)
-                                .map_err(|_| blocker("E_ARCHIVE_NATIVE_INVALID", &owner.seat))?,
-                        );
-                        for entry in entries {
-                            referenced.insert(entry.payload.worktree);
-                        }
-                    }
-                    Err(_) => {
-                        valid = false;
-                        break;
-                    }
-                }
-                let bindings_result = match held {
-                    Some((team_lock, seat_locks)) => crate::team_checkpoint::native::validation::historical_bindings_native_locked(
+                let evidence_result = match held {
+                    Some((team_lock, seat_locks)) => crate::team_checkpoint::native::validation::checkpoint_evidence_native_locked(
                         home, &ctx, sentinels, team_lock, seat_locks,
                     ),
-                    None => crate::team_checkpoint::native::validation::historical_bindings_native(
+                    None => crate::team_checkpoint::native::validation::checkpoint_evidence_native(
                         home, &ctx, sentinels, || Ok(()),
                     ),
                 };
-                match bindings_result {
-                    Ok(entries) => {
-                        checkpoint_evidence.extend(
-                            serde_json::to_vec(&entries)
-                                .map_err(|_| blocker("E_ARCHIVE_NATIVE_INVALID", &owner.seat))?,
-                        );
-                        for e in entries {
+                match evidence_result {
+                    Ok(evidence) => {
+                        checkpoint_evidence.push((g, evidence.sha256));
+                        for entry in evidence.validated_entries {
+                            referenced.insert(entry.payload.worktree);
+                        }
+                        for e in evidence.historical_bindings {
                             bound.insert(e.payload.worktree.clone(), e);
                         }
                     }
@@ -541,8 +512,10 @@ fn inspect_native_inner(
         }
         view.bound_worktree_count = bound.len();
         if valid {
-            view.checkpoint_evidence_sha256 =
-                Some(format!("{:x}", sha2::Sha256::digest(&checkpoint_evidence)));
+            view.checkpoint_evidence_sha256 = Some(hash(&(
+                "aperture.archive.checkpoint-evidence.v1",
+                &checkpoint_evidence,
+            ))?);
         }
         view.worktrees_clean =
             valid && bound_coverage(&referenced, &bound.keys().cloned().collect());
