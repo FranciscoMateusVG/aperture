@@ -613,13 +613,26 @@ fn selectors(target: &remote::RemoteTarget) -> Result<(), ReplacementError> {
 /// Native repo/checkpoint/launch preflight precedes effects. It then consumes
 /// exactly one continuous attempt through prepare/start/cleanup. Registration
 /// remains a separate integrated gate; no caller-observed facts are accepted.
+/// Internal result only. Transport projects the safe owner summary, never the
+/// started thread identity. Recovery is the actual prepare result, not inferred.
+pub(crate) struct NativeReplacementResult {
+    pub(crate) started: StartedReplacement,
+    pub(crate) checkpoint_recovery: CheckpointRecovery,
+}
+impl std::fmt::Debug for NativeReplacementResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReplacementResult")
+            .field("checkpoint_recovery", &self.checkpoint_recovery)
+            .finish_non_exhaustive()
+    }
+}
 pub(crate) fn replace_authorized(
     home: &Path,
     authority: ReplacementAuthority<'_>,
     target: remote::RemoteTarget,
     selection: &StartSelection,
     sentinels: &[String],
-) -> Result<StartedReplacement, ReplacementError> {
+) -> Result<NativeReplacementResult, ReplacementError> {
     let budget = deadline::Deadline::new();
     selectors(&target)?;
     let binding = require_repository_binding(home, &target, &budget)?;
@@ -653,7 +666,12 @@ pub(crate) fn replace_authorized(
         // Binding must survive reconciliation too; never reset total budget.
         runtime.attempt.budget().forward(Duration::from_secs(10))?;
         require_repository_binding(home, &runtime.target, runtime.attempt.budget())?;
-        start(&mut runtime, prepared, selection)
+        let checkpoint_recovery = prepared.checkpoint_recovery();
+        let started = start(&mut runtime, prepared, selection)?;
+        Ok(NativeReplacementResult {
+            started,
+            checkpoint_recovery,
+        })
     })();
     match result {
         Ok(value) => {

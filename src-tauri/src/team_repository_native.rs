@@ -349,7 +349,10 @@ impl ReadCommands for NativeCommands {
         bounded_command(command, self.deadline)
     }
 }
-fn bounded_command(mut command: Command, deadline: Instant) -> Result<Vec<u8>, RepositoryError> {
+pub(crate) fn bounded_command(
+    mut command: Command,
+    deadline: Instant,
+) -> Result<Vec<u8>, RepositoryError> {
     if Instant::now() >= deadline {
         return Err(RepositoryError::Timeout);
     }

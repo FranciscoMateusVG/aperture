@@ -241,3 +241,8 @@ pub fn archive<R: ArchiveRuntime>(
     r.shared_journal_archive(&e).map_err(|e| vec![e])?;
     r.verify_canonical_archive(team).map_err(|e| vec![e])
 }
+
+#[path = "team_archive_beads.rs"]
+pub(crate) mod beads;
+#[path = "team_archive_record.rs"]
+pub(crate) mod record;
