@@ -245,3 +245,46 @@ where
     snapshot.complete = true;
     Ok(snapshot)
 }
+
+/// Lossless adapter to the shared OwnerRecord convention: checked Unix epoch
+/// microseconds, identical for root and descendants. Never elapsed-time text.
+pub(crate) fn birth_micros(identity: &ProcessIdentity) -> Result<u64, ReplacementError> {
+    let (seconds, fraction) = identity
+        .start_time
+        .split_once('.')
+        .ok_or(ReplacementError::InvalidSnapshot)?;
+    if seconds.is_empty()
+        || !seconds.bytes().all(|b| b.is_ascii_digit())
+        || fraction.len() != 6
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(ReplacementError::InvalidSnapshot);
+    }
+    let seconds: u64 = seconds
+        .parse()
+        .map_err(|_| ReplacementError::InvalidSnapshot)?;
+    let fraction: u64 = fraction
+        .parse()
+        .map_err(|_| ReplacementError::InvalidSnapshot)?;
+    let micros = seconds
+        .checked_mul(1_000_000)
+        .and_then(|s| s.checked_add(fraction))
+        .filter(|m| *m > 0)
+        .ok_or(ReplacementError::InvalidSnapshot)?;
+    if identity.start_time != format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000) {
+        return Err(ReplacementError::InvalidSnapshot);
+    }
+    Ok(micros)
+}
+pub(crate) fn identity_from_owner(
+    pid: u32,
+    micros: u64,
+) -> Result<ProcessIdentity, ReplacementError> {
+    if pid <= 1 || pid > i32::MAX as u32 || micros == 0 {
+        return Err(ReplacementError::InvalidSnapshot);
+    }
+    Ok(ProcessIdentity {
+        pid,
+        start_time: format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000),
+    })
+}

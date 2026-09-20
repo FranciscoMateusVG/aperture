@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use crate::state::AgentDef;
 
 #[path = "team_legacy_guard.rs"]
-mod legacy_lifecycle_guard;
+pub(crate) mod legacy_lifecycle_guard;
 
 fn require_legacy_lifecycle_at(
     home: &std::path::Path,

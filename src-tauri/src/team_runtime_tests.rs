@@ -1,5 +1,6 @@
-#[path = "../src/team_replacement.rs"]
-mod team_replacement;
+use crate::agents::legacy_lifecycle_guard as team_legacy_guard;
+use crate::tmux as native_tmux;
+use crate::{team_archive, team_checkpoint, team_process, team_replacement};
 use std::collections::HashMap;
 use team_replacement::*;
 
@@ -421,8 +422,6 @@ fn failed_owner_commit_cleans_exact_spawn_once() {
     assert_eq!(r.new_owner, 0);
     assert_eq!(r.threads, 1);
 }
-#[path = "../src/team_archive.rs"]
-mod team_archive;
 mod archive_tests {
     use super::team_archive::*;
     fn evidence() -> ArchiveEvidence {
@@ -635,8 +634,6 @@ mod archive_tests {
             .any(|x| x.code == "E_RECONCILIATION_COVERAGE"));
     }
 }
-#[path = "../src/team_checkpoint.rs"]
-mod team_checkpoint;
 mod checkpoint_tests {
     use super::team_checkpoint::*;
     #[derive(Default)]
@@ -813,8 +810,6 @@ mod checkpoint_tests {
         assert!(serde_json::from_value::<CheckpointPayload>(raw).is_err());
     }
 }
-#[path = "../src/team_process.rs"]
-mod team_process;
 mod process_tests {
     use super::{team_process::*, team_replacement::*};
     fn p(pid: u32, ppid: u32, pgid: u32) -> ProcessMetadata {
@@ -1007,8 +1002,6 @@ fn observed_execution_tuple_must_match_not_only_model_string() {
     }
 }
 
-#[path = "../src/team_legacy_guard.rs"]
-mod team_legacy_guard;
 mod legacy_guard_tests {
     use super::team_legacy_guard::*;
     struct Fixture(std::path::PathBuf);
@@ -1068,8 +1061,6 @@ mod legacy_guard_tests {
     }
 }
 
-#[path = "../src/tmux.rs"]
-mod native_tmux;
 #[test]
 fn exact_tmux_pane_metadata_never_selects_by_name_or_ambiguity() {
     let p = native_tmux::parse_pane_process("@12", b"@12\t%13\t777\n").unwrap();
@@ -1086,4 +1077,26 @@ fn exact_tmux_pane_metadata_never_selects_by_name_or_ambiguity() {
         assert!(native_tmux::parse_pane_process("@12", output).is_err());
     }
     assert!(native_tmux::parse_pane_process("seat", b"seat\t%1\t777").is_err());
+}
+
+#[test]
+fn native_owner_birth_unit_roundtrips_without_rounding_or_elapsed_guess() {
+    for micros in [1u64, 1234567890123456, u64::MAX] {
+        let p = team_process::identity_from_owner(777, micros).unwrap();
+        assert_eq!(team_process::birth_micros(&p).unwrap(), micros);
+    }
+    for bad in [
+        "birth",
+        "12.5",
+        "012.500000",
+        "0.000000",
+        "18446744073709551615.999999",
+        "1.0000000",
+    ] {
+        assert!(team_process::birth_micros(&ProcessIdentity {
+            pid: 777,
+            start_time: bad.into()
+        })
+        .is_err());
+    }
 }

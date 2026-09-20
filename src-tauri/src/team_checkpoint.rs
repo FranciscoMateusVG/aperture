@@ -379,3 +379,6 @@ pub fn stale(e: &CheckpointEntry, now: u64, max_age_ms: u64) -> bool {
         || now < e.written_at
         || now - e.written_at > max_age_ms
 }
+
+#[path = "team_checkpoint_native.rs"]
+pub(crate) mod native;

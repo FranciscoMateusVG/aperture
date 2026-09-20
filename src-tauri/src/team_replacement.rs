@@ -500,3 +500,7 @@ pub fn start<R: ReplacementRuntime>(
     }
     result
 }
+
+#[cfg(test)]
+#[path = "team_runtime_tests.rs"]
+mod runtime_tests;
