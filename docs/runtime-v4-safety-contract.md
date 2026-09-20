@@ -124,11 +124,35 @@ inconsistent evidence; never delete them or recycle archived identity/generation
    MCP output and affected configuration, plus exact runtime binding and versions.
    Existing standing seats must remain byte-for-byte and generation-stable.
    First install must not infer ownership of already-running legacy processes.
+   Include the existing headless control binary explicitly: MCP team-control
+   expects `~/.aperture/bin/aperture-team-control` by default. Building the GUI or
+   `aperture-boot` alone does not install it; an absent binary yields
+   `E_CONTROL_UNAVAILABLE`. Build from the same frozen cumulative head with
+   `cargo build --manifest-path src-tauri/Cargo.toml --release --bin aperture-boot
+   --bin aperture-team-control` (one command). Record the actual Cargo output
+   directory, both executable hashes and compiler versions. Do not point the
+   consumer at an unrelated stale debug build or change its configured override.
+   Publication belongs in the existing native recipe/lifecycle, not a new
+   transport or auto-install-on-tool-call path. Before publication, validate the
+   destination parents without following caller-controlled symlinks, current UID
+   and private directory modes. Retain the previous control binary privately, or
+   record that it was absent. Stage the reviewed control executable as a regular
+   single-link current-UID file mode0700, fsync, and replace only the exact guarded
+   destination; fsync its directory and verify the installed hash/owner/mode/link
+   count. Never `cp` blindly onto a symlink. The consumer permits executable
+   current-UID single-link files without group/other write; installation uses the
+   stricter private0700 mode. Recipe integration and operational execution remain
+   gated; these instructions are not evidence that either has happened.
 4. Obtain the separately approved shared-app/hub interruption window. Use the
    existing native install/lifecycle path only; no automatic setup/restart here.
    Verify installed artifact, process readiness, registry coexistence, then an
    explicitly authorized synthetic-team user path. Report source, installation,
    control, model observation and functional results separately.
+   Control verification must include the real consumer resolving that installed
+   hash and a bounded authorized read-only control response; binary presence or
+   a GUI-ready signal alone does not prove the MCP activation path. Keep all
+   capability/bearer values out of receipts. No activation or managed start is
+   implied by this install check.
 5. Rollback is not journal deletion or generation reset. Stop only the exact
    newly owned test incarnation and revoke it durably using the same seam.
    Reconcile active journal moves before reverting software. If new state cannot
@@ -136,6 +160,11 @@ inconsistent evidence; never delete them or recycle archived identity/generation
    code to incompatible state. Restore approved binary/config preimages only
    after explicit operational authorization; preserve all owner/revocation/
    checkpoint/archive evidence and record unresolved effects as UNKNOWN.
+   Restore the control binary and matching MCP artifacts as one compatible
+   software set using their preimages and hash readback. If it was previously
+   absent, do not leave the new command usable under the old consumer by accident;
+   any removal/disable action is part of the separately approved rollback, not
+   automatic cleanup. Never restore old mutable owner or revocation state.
 
 ## Remaining integration gates
 

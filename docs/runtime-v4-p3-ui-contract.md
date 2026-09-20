@@ -52,6 +52,11 @@ process_count/thread_bound. No raw PID, start time, command/cwd, thread ID, toke
 ID, nonce, bearer, transcript or checkpoint text enters this view. The internal
 `StartedReplacement.thread_id` must NOT be serialized directly to the UI.
 
+`ReplacementView.generation` equals `owner.generation` whenever owner is present.
+A `started` result requires a strictly newer owner generation than the requested
+old generation, active owner and the exact observed requested tuple. The core
+currently requires g+1; UI must never manufacture that increment.
+
 The native backend can report `verified` only from its completed evidence gate.
 No observation means `unknown` (or `pending` for an action actually in progress),
 not a zero count or a green checkbox. Empty lists/transcripts cannot verify
@@ -142,6 +147,11 @@ interface ArchiveView {
   blockers: RuntimeBlocker[];
 }
 ```
+
+`ArchiveView.generation` is the generation observed in the canonical team state
+that supports the response; `archived` uses the final journal readback. It is
+not a client-computed post-operation increment. Do not impose request/response
+arithmetic. Missing final evidence remains unknown, not inferred success.
 
 Opening the dialog supplies no authoritative checklist; start unknown. Archive
 capability false keeps it unavailable. A native command always collects fresh
