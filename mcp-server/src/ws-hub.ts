@@ -710,7 +710,7 @@ wss.on("connection", (ws) => {
     }
 
     if (conn.revoked) {
-      log("revoked_frame_rejected", { role: conn.role, agent: conn.agent, type: String(msg.type) });
+      log("revoked_frame_rejected", { role: conn.role, agent: conn.agent, frame_type_kind: typeof msg.type });
       return;
     }
 
@@ -730,7 +730,7 @@ wss.on("connection", (ws) => {
     }
 
     // Anything else post-hello is ignored (logged for forensics).
-    log("ignored_message", { role: conn.role, agent: conn.agent, type: String(msg.type) });
+    log("ignored_message", { role: conn.role, agent: conn.agent, frame_type_kind: typeof msg.type });
   });
 
   ws.on("close", () => {

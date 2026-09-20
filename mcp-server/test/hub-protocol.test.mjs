@@ -740,14 +740,14 @@ test("managed identity revocation is durable, exact-generation, and fail-closed"
       "generation one authority fence",
     );
     generationOne.send(JSON.stringify({
-      type: "notify",
+      type: { toString: null },
       to: "p1-a-lead",
       id: "revoked-hostile-frame",
       from: "p1-a-worker",
       preview: "must be rejected",
     }));
     await hub.waitForEvent(
-      (e) => e.event === "revoked_frame_rejected" && e.agent === "p1-a-worker" && e.type === "notify",
+      (e) => e.event === "revoked_frame_rejected" && e.agent === "p1-a-worker" && e.frame_type_kind === "object",
       "hostile post-revocation frame rejection",
     );
     assert.equal(
@@ -1044,10 +1044,10 @@ test("post-hello junk from an agent is ignored; connection stays open and still 
     // Give the hello a beat so the junk below is unambiguously post-hello.
     await sleep(100);
 
-    // Valid JSON, unknown type → ignored_message (logged, socket kept).
-    agent.send(JSON.stringify({ type: "weird-frame", payload: 42 }));
+    // Hostile-but-valid object type cannot trigger attacker-controlled coercion.
+    agent.send(JSON.stringify({ type: { toString: null }, payload: 42 }));
     await hub.waitForEvent(
-      (e) => e.event === "ignored_message" && e.agent === "izzy-test" && e.type === "weird-frame",
+      (e) => e.event === "ignored_message" && e.agent === "izzy-test" && e.frame_type_kind === "object",
       "ignored_message log",
     );
 
