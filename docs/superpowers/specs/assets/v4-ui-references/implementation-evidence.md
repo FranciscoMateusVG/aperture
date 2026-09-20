@@ -6,14 +6,14 @@ Source base `origin/master` 2703dc4. Task aperture-zfmd5. Layout approved by GLa
 
 - TypeScript DOM components, no React or new package/framework. Existing AgentList and controls retained, coordination/standing grouped before project teams.
 - Preset library and native-dialog editor: create from preset, edit with backend SHA CAS, duplicate/blank with new ID, detached submission snapshots, derived repeated-seat names, one explicit lead, current backend catalog execution tuples/roles.
-- Fixed error copy; pending registration never claims notification/worker boot. Backend errors and malformed success remain errors. No auto-retry.
+- Exact mutation-response identity and configured-snapshot consistency are checked. Fixed error copy; pending registration never claims notification/worker boot. Backend errors and malformed success remain errors. No auto-retry.
 - Model configuration and observations rendered separately; missing owner, turn, context and checkpoint remain unknown/unavailable.
 - P1 wrappers invoke only frozen catalog/preset/list/create/cancel commands; no activation endpoint, actor/grants/source claims or caller paths.
 - Replacement/archive dialogs deliberately show unavailable evidence and disabled actions until P3 integration. These are not completed capabilities.
 
 ## Source tests
 
-`node --test tests/seat-name-ui.test.mjs tests/team-draft.test.mjs tests/team-contract.test.mjs tests/team-editor.test.mjs` → 48/48 PASS.
+`node --test tests/seat-name-ui.test.mjs tests/team-draft.test.mjs tests/team-contract.test.mjs tests/team-editor.test.mjs tests/teams-area.test.mjs` → 56/56 PASS.
 
 `npm run build` → TypeScript and Vite PASS. No install/setup/restart or live team operation executed.
 

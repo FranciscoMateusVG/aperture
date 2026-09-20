@@ -21,6 +21,7 @@ for (const [name, mutate] of [
  ["unknown lifecycle", t => t.state.state = "ready"],
  ["negative generation", t => t.state.generation = -1],
  ["duplicate configured seat", t => t.seats[1] = t.seats[0]],
+ ["configured snapshot mismatch", t => t.seats[0] = { ...t.seats[0], configured: { ...t.seats[0].configured, model: "different" } }],
  ["lead outside team", t => t.snapshot.lead = "glados"],
  ["bad preset digest", t => t.snapshot.preset.sha256 = "not-a-hash"],
  ["malformed observed model", t => t.seats[0].observed_owner = { actual: "gpt-6-astra" }],
@@ -70,4 +71,15 @@ test("write failures do not auto-retry and malformed success is rejected", async
  await assert.rejects(api.create({ ...createInitialTeamDraft(preset), team: "t1" }), e => e.code === "E_RESPONSE_INVALID"); assert.equal(calls, 1);
  const rejected = createTeamCommands(async () => { throw { code: "E_PRESET_CONFLICT", message: "fixed" }; });
  await assert.rejects(rejected.savePreset(preset, preset.sha256), e => e.code === "E_PRESET_CONFLICT");
+});
+
+test("successful response for another team or preset is not accepted", async () => {
+ const api = createTeamCommands(async cmd => cmd === "team_create" ? created() : { ...preset, id: "other" });
+ await assert.rejects(api.create({ ...createInitialTeamDraft(preset), team: "another" }), e => e.code === "E_RESPONSE_INVALID");
+ await assert.rejects(api.savePreset(preset, preset.sha256), e => e.code === "E_RESPONSE_INVALID");
+});
+
+test("turn state uses observed hub facts only, not requested model or owner state", () => {
+ assert.match(renderTeamGroup(team("active"), [{ name: "t1-backend", turn_state: "busy" }]), /Current turn<\/dt><dd>busy/);
+ assert.match(renderTeamGroup(team("active"), [{ name: "t1-backend", status: "running", model: "gpt-6-astra" }]), /Current turn<\/dt><dd>Unknown/);
 });
