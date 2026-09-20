@@ -6,7 +6,7 @@ Open `index.html` or an individual SVG. `manifest.json` hashes every vector and 
 
 ## Direction
 
-Root approved preserving the actual navy/amber design system (message aperture-wisp-cvx2gl, 2026-09-20). Layout approval is still pending. Source: current `src/style.css` and spec §3 ASCII mockups; no external image assets were supplied or invented. Typography is system sans with monospaced identity metadata; six-pixel controls, restrained panel borders, amber only for primary intent. New text/control tokens improve contrast without restyling the existing roster.
+Root approved preserving the actual navy/amber design system (message aperture-wisp-cvx2gl, 2026-09-20). Layout approved by GLaDOS (aperture-wisp-ivi8hg), with wizard fallback copy corrected to configured fallbacks. This does not approve runtime or actual model usage. Source: current `src/style.css` and spec §3 ASCII mockups; no external image assets were supplied or invented. Typography is system sans with monospaced identity metadata; six-pixel controls, restrained panel borders, amber only for primary intent. New text/control tokens improve contrast without restyling the existing roster.
 
 - Library: reusable cards, edit/duplicate/blank, explicit snapshot semantics.
 - Wizard: mission and acceptance before seats; derived names, one lead, configured harness/model/reasoning and fallback. Create means pending approval, not worker start.
