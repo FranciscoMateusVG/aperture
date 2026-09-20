@@ -72,6 +72,58 @@ export function runBd(args: string[]): Promise<string> {
   });
 }
 
+// bd 1.0.2 `query` applies its row limit before its CLI sort, so it cannot be
+// cursor-paged without skipping rows. `list --sort ... -n 0` reads the complete
+// filtered issues+wisp set before sorting. Bound that command's stdout here:
+// an oversized backlog is a hard, recoverable error rather than a partial or
+// falsely empty inbox. This bounds IPC consumption, not bd's internal scan.
+export const UNREAD_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+
+function runBdUnreadScan(args: string[]): Promise<string> {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    execFile(
+      BD_PATH,
+      args,
+      { env: bdEnv(), timeout: 30000, maxBuffer: UNREAD_SCAN_MAX_BYTES },
+      (err, stdout, stderr) => {
+        if (err) {
+          const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+          if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+            reject(
+              new Error(
+                "unread message backlog exceeds the bounded scan capacity; no messages were delivered or acknowledged — reduce the open backlog and retry",
+              ),
+            );
+            return;
+          }
+          const detail = [
+            `bd unread scan failed after ${Date.now() - startedAt}ms`,
+            `argv: ${redactArgv([BD_PATH, ...args])}`,
+            `exit: ${e.code ?? "n/a"}`,
+            e.signal ? `signal: ${e.signal}` : undefined,
+            e.killed ? "killed: true (execFile timeout is 30000ms)" : undefined,
+            stderr?.trim() ? `stderr: ${stderr.trim()}` : "stderr: (empty)",
+          ]
+            .filter(Boolean)
+            .join(" | ");
+          reject(new Error(detail));
+          return;
+        }
+        if (Buffer.byteLength(stdout, "utf8") > UNREAD_SCAN_MAX_BYTES) {
+          reject(
+            new Error(
+              "unread message backlog exceeds the bounded scan capacity; no messages were delivered or acknowledged — reduce the open backlog and retry",
+            ),
+          );
+          return;
+        }
+        resolve(stdout.trim());
+      },
+    );
+  });
+}
+
 export type TaskType = "task" | "bug" | "feature" | "chore" | "epic";
 
 export interface CreateTaskOptions {
@@ -575,12 +627,13 @@ export async function createMessage(
  * row count. 200 keeps a worst-case reply bounded; the agent drains the rest by
  * marking these read and calling again — formatUnreadMessages says so.
  *
- * Authorization is evaluated before this output cap. The implementation pages
- * the full finite open set through bd's supported `--sort id --reverse` plus
- * `id<cursor`, keeping each SELECT and retained result bounded at 200. It then
- * keeps the 200 newest authorized rows and formatUnreadMessages renders that
- * batch oldest-first. This prevents durable open `withheld:*` rows from
- * starving later authorized messages without losing re-authorization.
+ * Authorization is evaluated before this output cap. bd 1.0.2 query limits
+ * before sorting and list has no ordered cursor. We instead use list's
+ * complete issues+wisp merge with `--sort` (which forces its SQL Limit=0),
+ * protected by UNREAD_SCAN_MAX_BYTES. It then keeps the 200 newest authorized
+ * rows and renders that batch oldest-first. This prevents durable open
+ * `withheld:*` rows from starving later authorized messages without losing
+ * re-authorization.
  */
 export const UNREAD_LIMIT = 200;
 
@@ -592,9 +645,11 @@ interface StoredMessageEnvelope {
   from: string;
   to: string;
   labels: string[];
+  status: "open" | "closed";
+  closeReason: string;
 }
 
-async function readOpenMessageEnvelope(messageId: string): Promise<StoredMessageEnvelope> {
+async function readMessageEnvelope(messageId: string): Promise<StoredMessageEnvelope> {
   if (!MESSAGE_ID_RE.test(messageId)) throw new Error("invalid message id");
   const raw = await runBd(["show", messageId, "--json"]);
   let parsed: unknown;
@@ -614,7 +669,7 @@ async function readOpenMessageEnvelope(messageId: string): Promise<StoredMessage
   if (
     row.id !== messageId ||
     type !== "message" ||
-    row.status !== "open" ||
+    (row.status !== "open" && row.status !== "closed") ||
     !match
   ) {
     throw new Error("message record unavailable");
@@ -626,7 +681,15 @@ async function readOpenMessageEnvelope(messageId: string): Promise<StoredMessage
     labels: Array.isArray(row.labels)
       ? row.labels.filter((value): value is string => typeof value === "string")
       : [],
+    status: row.status,
+    closeReason: typeof row.close_reason === "string" ? row.close_reason : "",
   };
+}
+
+async function readOpenMessageEnvelope(messageId: string): Promise<StoredMessageEnvelope> {
+  const envelope = await readMessageEnvelope(messageId);
+  if (envelope.status !== "open") throw new Error("message record unavailable");
+  return envelope;
 }
 
 async function addWithheldLabel(
@@ -664,69 +727,86 @@ export async function getUnreadMessages(recipient: string): Promise<string> {
   // `withheld:*` rows deliberately stay open so a later grant/lead change can
   // authorize the same stable message id. Therefore the row cap must be
   // applied AFTER policy, not to bd's first page: 200 denied rows must never
-  // starve an authorized row at position 201. Scan by a strict id cursor with
-  // every individual SELECT capped, retain only the newest 200 authorized
-  // rows in memory, and re-evaluate the whole finite open set each call.
+  // starve an authorized row at position 201. `--include-infra` keeps message
+  // wisps visible; leaving Ephemeral unset makes SearchIssues merge ordinary
+  // rows and wisps, matching the old query boundary. Exact message type,
+  // status and recipient are validated below before any policy mutation.
   const registry = loadSeatRegistry();
   const allowed: Record<string, unknown>[] = [];
   const seenIds = new Set<string>();
-  const baseQuery = `type=message AND status=open AND title="->${recipient}]"`;
-  let cursor: string | null = null;
-  for (;;) {
-    const query = cursor === null ? baseQuery : `${baseQuery} AND id<"${cursor}"`;
-    const raw = await runBd([
-      "query",
-      query,
-      "--sort",
-      "id",
-      "--reverse",
-      "--json",
-      "-n",
-      String(UNREAD_LIMIT),
-    ]);
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return raw;
-    if (parsed.length > UNREAD_LIMIT) throw new Error("bd unread page exceeded limit");
+  const raw = await runBdUnreadScan([
+    "list",
+    "--status",
+    "open",
+    "--title-contains",
+    `->${recipient}]`,
+    "--include-infra",
+    "--sort",
+    "id",
+    "--reverse",
+    "--json",
+    "-n",
+    "0",
+  ]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error(
+      "unread scan returned invalid JSON; no messages were delivered or acknowledged — retry get_messages",
+    );
+  }
+  if (!Array.isArray(parsed)) return raw;
 
-    const pageIds: string[] = [];
-    for (const value of parsed) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      const row = value as Record<string, unknown>;
-      const id = typeof row.id === "string" ? row.id : "";
-      if (!MESSAGE_ID_RE.test(id)) throw new Error("invalid message id in unread page");
-      if (seenIds.has(id)) throw new Error("unread pagination returned a duplicate message id");
-      seenIds.add(id);
-      pageIds.push(id);
-
-      const title = typeof row.title === "string" ? row.title : "";
-      const match = title.match(MESSAGE_TITLE_RE);
-      const sender = match?.[1] ?? "";
-      const addressedTo = match?.[2] ?? "";
-      const decision = addressedTo === recipient
-        ? authorizeMessage(registry, sender, recipient)
-        : { allowed: false as const, reason: "unknown_recipient" as const };
-      if (decision.allowed) {
-        allowed.push(row);
-        allowed.sort(newestMessageFirst);
-        if (allowed.length > UNREAD_LIMIT) allowed.length = UNREAD_LIMIT;
-        continue;
-      }
-      await addWithheldLabel({
-        id,
-        from: sender,
-        to: addressedTo,
-        labels: Array.isArray(row.labels)
-          ? row.labels.filter((value): value is string => typeof value === "string")
-          : [],
-      }, decision.reason);
+  // Validate the complete scan before adding any withheld metadata. A malformed
+  // or ambiguous row is a hard error, not a skipped row or an empty inbox.
+  const rows: Array<{
+    row: Record<string, unknown>;
+    id: string;
+    sender: string;
+    addressedTo: string;
+  }> = [];
+  for (const value of parsed) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("unread scan returned an invalid message row");
     }
-
-    if (parsed.length < UNREAD_LIMIT) break;
-    const next = pageIds.sort((a, b) => a.localeCompare(b))[0];
-    if (!next || (cursor !== null && next.localeCompare(cursor) >= 0)) {
-      throw new Error("unread pagination did not advance");
+    const row = value as Record<string, unknown>;
+    const id = typeof row.id === "string" ? row.id : "";
+    const type = row.issue_type ?? row.type;
+    const title = typeof row.title === "string" ? row.title : "";
+    const match = title.match(MESSAGE_TITLE_RE);
+    if (
+      !MESSAGE_ID_RE.test(id) ||
+      seenIds.has(id) ||
+      type !== "message" ||
+      row.status !== "open" ||
+      !match ||
+      match[2] !== recipient
+    ) {
+      throw new Error("unread scan returned an invalid or ambiguous message row");
     }
-    cursor = next;
+    seenIds.add(id);
+    rows.push({ row, id, sender: match[1]!, addressedTo: match[2]! });
+  }
+
+  for (const { row, id, sender, addressedTo } of rows) {
+    const decision = authorizeMessage(registry, sender, recipient);
+    if (decision.allowed) {
+      allowed.push(row);
+      allowed.sort(newestMessageFirst);
+      if (allowed.length > UNREAD_LIMIT) allowed.length = UNREAD_LIMIT;
+      continue;
+    }
+    await addWithheldLabel({
+      id,
+      from: sender,
+      to: addressedTo,
+      labels: Array.isArray(row.labels)
+        ? row.labels.filter((value): value is string => typeof value === "string")
+        : [],
+      status: "open",
+      closeReason: "",
+    }, decision.reason);
   }
   return JSON.stringify(allowed);
 }
@@ -767,8 +847,15 @@ export function formatUnreadMessages(messages: Record<string, unknown>[]): strin
  */
 export async function markMessageRead(messageId: string, recipient: string): Promise<string> {
   if (!isValidSeatName(recipient)) throw new Error("invalid message recipient");
-  const envelope = await readOpenMessageEnvelope(messageId);
+  const envelope = await readMessageEnvelope(messageId);
   if (envelope.to !== recipient) throw new Error("message is not addressed to this principal");
+  // A replayed acknowledgement of the same authoritative delivered message is
+  // idempotent. Do not re-run policy (the sender may since have been archived)
+  // and do not issue a second close/event. Other closed reasons remain opaque.
+  if (envelope.status === "closed") {
+    if (envelope.closeReason !== "delivered") throw new Error("message record unavailable");
+    return JSON.stringify({ id: messageId, status: "closed", close_reason: "delivered" });
+  }
   const decision = authorizeMessage(loadSeatRegistry(), envelope.from, recipient);
   if (!decision.allowed) {
     await addWithheldLabel(envelope, decision.reason);

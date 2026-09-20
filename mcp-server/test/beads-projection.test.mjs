@@ -12,7 +12,8 @@
 // long-lived server child serves every test.
 //
 // Pins:
-//   (a) get_messages passes `-n 200`, renders oldest-first, and appends the
+//   (a) get_messages uses bd 1.0.2 list's complete issues+wisp merge with a
+//       dedicated stdout bound, renders at most 200 oldest-first, and appends the
 //       cap notice ONLY when exactly 200 rows came back; the aperture-q6gov
 //       non-array → ERROR path is intact.
 //   (b) include_done:true → `--all`; omitted/false → no `--all`, and no
@@ -48,7 +49,6 @@ const BD_STUB = join(TMP, "bd");
 const BD_STUB_JS = join(TMP, "bd-unread.mjs");
 const BD_LOG = join(TMP, "bd-calls.log");
 const SCENARIO = join(TMP, "scenario.out");
-const STUCK_CURSOR = join(TMP, "stuck-cursor");
 
 for (const d of [HOME, RUN, TEAMS, TOKENS, join(AGENTS, "shared"), join(AGENTS, AGENT), join(AGENTS, "glados"), join(AGENTS, "p1-offline"), join(AGENTS, "disabled")]) {
   mkdirSync(d, { recursive: true });
@@ -66,11 +66,18 @@ writeFileSync(
   [
     'import { readFileSync } from "node:fs";',
     'const value = JSON.parse(readFileSync(process.argv[2], "utf8"));',
+    'const args = process.argv.slice(3);',
+    'if (value?.oversized === true) { await new Promise((resolve) => process.stdout.write("x".repeat(9 * 1024 * 1024), resolve)); process.exit(0); }',
+    'if (value?.invalidJson === true) { process.stdout.write("{not-json"); process.exit(0); }',
     'if (!Array.isArray(value)) { process.stdout.write(JSON.stringify(value)); process.exit(0); }',
-    'const match = process.argv[3].match(/ AND id<"([a-z0-9._-]+)"$/);',
-    'const cursor = match?.[1] ?? null;',
-    'const stuck = process.argv[4] && (() => { try { readFileSync(process.argv[4]); return true; } catch { return false; } })();',
-    'const page = value.filter((row) => stuck || !cursor || row.id < cursor).sort((a, b) => b.id.localeCompare(a.id)).slice(0, 200);',
+    'const flag = (name) => { const i=args.indexOf(name); return i < 0 ? null : args[i+1]; };',
+    '// Faithful bd 1.0.2 list boundary: infra is hidden unless explicitly included;',
+    '// Ephemeral unset merges ordinary issues+wisp rows; --sort runs on the full set before -n.',
+    'let page = args.includes("--include-infra") ? value : value.filter((row) => row.issue_type !== "message");',
+    'const status = flag("--status"); if (status) page = page.filter((row) => row.status === status);',
+    'const title = flag("--title-contains"); if (title) page = page.filter((row) => String(row.title ?? "").toLowerCase().includes(title.toLowerCase()));',
+    'if (flag("--sort") === "id") page = page.toSorted((a, b) => args.includes("--reverse") ? b.id.localeCompare(a.id) : a.id.localeCompare(b.id));',
+    'const limit = Number(flag("-n")); if (Number.isFinite(limit) && limit > 0) page = page.slice(0, limit);',
     'process.stdout.write(JSON.stringify(page));',
     "",
   ].join("\n"),
@@ -84,7 +91,7 @@ writeFileSync(
     'line=""',
     'for a in "$@"; do line="${line}${a}\t"; done',
     `printf '%s\\n' "\${line%\t}" >> "${BD_LOG}"`,
-    `if [ "$1" = query ] && [[ "$2" == type=message* ]]; then exec "${process.execPath}" "${BD_STUB_JS}" "${SCENARIO}" "$2" "${STUCK_CURSOR}"; fi`,
+    `if [ "$1" = list ] && [ "$2" = --status ] && [ "$4" = --title-contains ]; then exec "${process.execPath}" "${BD_STUB_JS}" "${SCENARIO}" "$@"; fi`,
     `if [ "$1" = show ]; then if [ "$(head -c 1 "${SCENARIO}")" != "[" ]; then cat "${SCENARIO}"; exit 0; fi; exec "${process.execPath}" -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const r=v.find(x=>x&&x.id===process.argv[2]);process.stdout.write(JSON.stringify(r??[]))' "${SCENARIO}" "$2"; fi`,
     `if [ "$1" = close ]; then printf '{"id":"%s","status":"closed"}\\n' "$2"; exit 0; fi`,
     `cat "${SCENARIO}"`,
@@ -126,9 +133,11 @@ const message = (i, createdAt) => ({
   description: `body ${i}`,
   status: "open",
   issue_type: "message",
+  ephemeral: true,
   created_at: createdAt,
 });
-// bd query emits NEWEST-first; build n messages that way so the sort is observable.
+// Build n messages newest-first; the faithful list stub re-sorts the complete
+// issues+wisp merge before applying any nonzero output limit.
 const newestFirstMessages = (n) =>
   Array.from({ length: n }, (_, k) => {
     const i = n - k; // n, n-1, …, 1
@@ -167,7 +176,6 @@ after(async () => {
 });
 beforeEach(() => {
   rmSync(BD_LOG, { force: true });
-  rmSync(STUCK_CURSOR, { force: true });
 });
 
 const call = async (name, args = {}) => {
@@ -177,20 +185,24 @@ const call = async (name, args = {}) => {
 
 // ── (a) get_messages ──────────────────────────────────────────────────────
 
-test("get_messages: bd argv is the query with -n 200 (bounded, not -n 0)", async () => {
+test("get_messages: bd argv uses the complete issues+wisp list boundary with explicit infra visibility", async () => {
   setScenario([]);
   const { text, isError } = await call("get_messages");
   assert.equal(isError, false);
   assert.equal(text, "No unread messages.");
   assert.deepEqual(lastCall(), [
-    "query",
-    `type=message AND status=open AND title="->${AGENT}]"`,
+    "list",
+    "--status",
+    "open",
+    "--title-contains",
+    `->${AGENT}]`,
+    "--include-infra",
     "--sort",
     "id",
     "--reverse",
     "--json",
     "-n",
-    "200",
+    "0",
   ]);
 });
 
@@ -234,6 +246,17 @@ test("get_messages: non-array bd body is still an ERROR, never an empty inbox (a
   assert.match(text, /NOT an empty inbox/);
 });
 
+test("get_messages: malformed complete scan is a fixed hard error before mutation", async () => {
+  setScenario({ invalidJson: true });
+  const { text, isError } = await call("get_messages");
+  assert.equal(isError, true);
+  assert.equal(
+    text,
+    "ERROR: unread scan returned invalid JSON; no messages were delivered or acknowledged — retry get_messages",
+  );
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+});
+
 test("message tools fail before BEADS when the MCP principal token binding is no longer valid", async () => {
   chmodSync(AGENT_TOKEN, 0o644);
   try {
@@ -271,6 +294,39 @@ test("mark_as_read closes only an open message addressed and currently authorize
   assert.equal(result.isError, true);
   assert.match(result.text, /not currently authorized/);
   assert.deepEqual(calls().map((argv) => argv[0]), ["show", "update"], "withheld row is labelled but never closed");
+
+  rmSync(BD_LOG, { force: true });
+  const gladosManifest = join(AGENTS, "glados", "manifest.json");
+  writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", window: "glados", role: "test", enabled: false }));
+  try {
+    setScenario([{ ...own, status: "closed", close_reason: "delivered" }]);
+    result = await call("mark_as_read", { message_id: own.id });
+    assert.equal(result.isError, false, result.text);
+    assert.deepEqual(calls().map((argv) => argv[0]), ["show"], "duplicate delivered ack is a no-op without policy recheck");
+  } finally {
+    writeFileSync(gladosManifest, JSON.stringify({ name: "glados", model: "codex/test", window: "glados", role: "test", enabled: true }));
+  }
+
+  rmSync(BD_LOG, { force: true });
+  setScenario([{ ...foreign, status: "closed", close_reason: "delivered" }]);
+  result = await call("mark_as_read", { message_id: foreign.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /not addressed to this principal/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"]);
+
+  rmSync(BD_LOG, { force: true });
+  setScenario([{ ...own, status: "closed", close_reason: "cancelled" }]);
+  result = await call("mark_as_read", { message_id: own.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /message record unavailable/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"]);
+
+  rmSync(BD_LOG, { force: true });
+  setScenario([{ ...own, issue_type: "task" }]);
+  result = await call("mark_as_read", { message_id: own.id });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /message record unavailable/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["show"]);
 });
 
 test("send_message accepts an enabled never-booted registry recipient and rejects disabled/unknown before write", async () => {
@@ -306,7 +362,7 @@ test("authorization loss withholds the original unread id without delivering or 
     assert.equal(result.isError, false);
     assert.equal(result.text, "No unread messages.");
     const invoked = calls();
-    assert.equal(invoked[0][0], "query");
+    assert.equal(invoked[0][0], "list");
     assert.deepEqual(invoked[1], [
       "update",
       "aperture-wisp-0077",
@@ -339,10 +395,10 @@ test("authorization filtering cannot starve an allowed row behind 201 withheld r
   assert.equal(result.isError, false, result.text);
   assert.match(result.text, /^\[aperture-wisp-0001\] From glados: authorized payload$/m);
   assert.doesNotMatch(result.text, /denied \d+/);
-  const queries = calls().filter((argv) => argv[0] === "query");
-  assert.equal(queries.length, 2, "201 denied rows force exactly one bounded cursor page");
-  assert.equal(queries.every((argv) => hasFlag(argv, "-n", 200)), true, "every SELECT stays capped");
-  assert.match(queries[1][1], / AND id<"aperture-wisp-1\d+"$/);
+  const scans = calls().filter((argv) => argv[0] === "list");
+  assert.equal(scans.length, 1, "one complete native list scan sees the authorized row beyond the denied prefix");
+  assert.equal(hasFlag(scans[0], "-n", 0), true, "bd receives no pre-sort row limit");
+  assert.equal(hasFlag(scans[0], "--include-infra"), true, "real message wisps are not hidden by list defaults");
   assert.equal(calls().filter((argv) => argv[0] === "close").length, 0, "withholding never acknowledges");
 });
 
@@ -352,19 +408,39 @@ test("authorized delivery applies the exact 200 cap after filtering without dupl
   assert.equal(result.isError, false);
   const ids = [...result.text.matchAll(/^\[(aperture-wisp-\d+)\]/gm)].map((match) => match[1]);
   assert.equal(ids.length, 200);
-  assert.equal(new Set(ids).size, 200, "no duplicate survives a cursor boundary");
+  assert.equal(new Set(ids).size, 200, "no duplicate survives the complete scan boundary");
   assert.equal(ids[0], "aperture-wisp-0002", "the oldest retained authorized row is 2");
   assert.equal(ids.at(-1), "aperture-wisp-0201", "the newest authorized row is retained");
   assert.match(result.text, /200 most recent currently authorized unread messages/);
 });
 
-test("unread pagination fails explicitly when a full page does not advance", async () => {
-  setScenario(newestFirstMessages(200));
-  writeFileSync(STUCK_CURSOR, "repeat");
+test("unread complete scan fails explicitly on stdout overflow before any policy mutation", async () => {
+  setScenario({ oversized: true });
   const result = await call("get_messages");
   assert.equal(result.isError, true);
-  assert.match(result.text, /^ERROR: unread pagination (did not advance|returned a duplicate message id)$/);
-  assert.equal(calls().filter((argv) => argv[0] === "query").length, 2);
+  assert.match(result.text, /^ERROR: unread message backlog exceeds the bounded scan capacity/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+  assert.equal(calls().some((argv) => argv[0] === "update" || argv[0] === "close"), false);
+});
+
+test("unread complete scan rejects ambiguous rows before labels or acknowledgements", async () => {
+  const duplicated = message(33, "2026-09-01T00:00:00.000Z");
+  setScenario([duplicated, duplicated]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.text, /^ERROR: unread scan returned an invalid or ambiguous message row$/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+});
+
+test("unread issues+wisp merge rejects a non-message row with a message-shaped title", async () => {
+  setScenario([{
+    ...task("aperture-task-shaped", 2),
+    title: `[glados->${AGENT}] not actually a message`,
+  }]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.text, /^ERROR: unread scan returned an invalid or ambiguous message row$/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
 });
 
 // ── (b) include_done push-down ───────────────────────────────────────────

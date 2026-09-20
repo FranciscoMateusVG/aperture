@@ -5,7 +5,8 @@
 // suite runs the REAL replay path: on agent hello, replayUnread() →
 // beads.ts getUnreadMessages() shells out to
 //
-//   bd query 'type=message AND status=open AND title="->AGENT]"' --json -n 200
+//   bd list --status open --title-contains '->AGENT]' --include-infra
+//     --sort id --reverse --json -n 0
 //
 // and each returned row becomes one {type:"message", id, from, preview} frame
 // (from = first group of /\[(.+?)->(.+?)\]/ on title; preview = first 60 chars
@@ -26,7 +27,7 @@
 // Pins:
 //   a. replay-on-connect       — 2 seeded unread rows → exactly 2 message
 //                                frames (id + from + 60-char preview truncation),
-//                                stderr `replay` count=2, exactly ONE bd query
+//                                stderr `replay` count=2, exactly ONE bd list
 //                                call with the exact getUnreadMessages argv
 //   b. replay-exactly-once-per-connect — rows still unread (agent never called
 //                                mark_as_read) → reconnect replays the same 2
@@ -218,14 +219,18 @@ function bdCalls(dataDir) {
 
 /** The exact argv shape beads.ts getUnreadMessages passes to bd. */
 const unreadQueryArgv = (agent) => [
-  "query",
-  `type=message AND status=open AND title="->${agent}]"`,
+  "list",
+  "--status",
+  "open",
+  "--title-contains",
+  `->${agent}]`,
+  "--include-infra",
   "--sort",
   "id",
   "--reverse",
   "--json",
   "-n",
-  "200", // UNREAD_LIMIT (aperture-84bby): bounded replay, was 0 (unlimited)
+  "0", // complete scan; beads.ts applies the 200 delivery cap after policy
 ];
 
 function connect(port) {

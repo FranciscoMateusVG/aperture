@@ -79,7 +79,14 @@ function setUnread(rows) {
 }
 
 function msgRow(id, from, to, body) {
-  return { id, title: `[${from}->${to}] ${body.slice(0, 60)}`, description: body };
+  return {
+    id,
+    title: `[${from}->${to}] ${body.slice(0, 60)}`,
+    description: body,
+    status: "open",
+    issue_type: "message",
+    ephemeral: true,
+  };
 }
 
 async function waitFor(cond, what, timeoutMs = 5000, stepMs = 20) {

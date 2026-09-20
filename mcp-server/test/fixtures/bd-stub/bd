@@ -3,10 +3,11 @@
 # test/hub-replay.test.mjs to pin the WS hub's replay-on-reconnect behavior
 # (aperture-xt16e) without touching hub code or a real BEADS store.
 #
-# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages; each page stays
-#           bounded at UNREAD_LIMIT and advances by strict id cursor):
-#   bd query 'type=message AND status=open AND title="->RECIPIENT]" [AND id<"CURSOR"]' \
-#     --sort id --reverse --json -n 200
+# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages and bd 1.0.2
+#           list semantics: full issues+wisp merge, then sort, stdout bounded
+#           by the caller rather than a pre-sort row limit):
+#   bd list --status open --title-contains '->RECIPIENT]' --include-infra \
+#     --sort id --reverse --json -n 0
 #     → prints the JSON array in $BD_STUB_DIR/unread-RECIPIENT.json, or [] if
 #       that file is absent.
 #
@@ -49,23 +50,21 @@ if [[ $# -eq 5 && "$1" == "update" && "$3" == "--add-label" && "$5" == "--json" 
   exit 0
 fi
 
-# The primary recognized shape: paginated getUnreadMessages query.
-if [[ $# -eq 8 && "$1" == "query" && "$3" == "--sort" && "$4" == "id" && "$5" == "--reverse" && "$6" == "--json" && "$7" == "-n" && "$8" == "200" ]]; then
-  query="$2"
-  re='^type=message AND status=open AND title="->([^]]+)\]"( AND id<"([a-z0-9._-]+)")?$'
-  if [[ "$query" =~ $re ]]; then
+# The primary recognized shape: complete getUnreadMessages list scan.
+if [[ $# -eq 12 && "$1" == "list" && "$2" == "--status" && "$3" == "open" && "$4" == "--title-contains" && "$6" == "--include-infra" && "$7" == "--sort" && "$8" == "id" && "$9" == "--reverse" && "${10}" == "--json" && "${11}" == "-n" && "${12}" == "0" ]]; then
+  title_filter="$5"
+  re='^->([^]]+)\]$'
+  if [[ "$title_filter" =~ $re ]]; then
     recipient="${BASH_REMATCH[1]}"
-    cursor="${BASH_REMATCH[3]:-}"
     seed="$BD_STUB_DIR/unread-${recipient}.json"
     if [[ -f "$seed" ]]; then
-      node - "$seed" "$cursor" <<'NODE'
+      node - "$seed" "$title_filter" <<'NODE'
 const fs = require("node:fs");
 const rows = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const cursor = process.argv[3];
+const titleFilter = process.argv[3].toLowerCase();
 const page = rows
-  .filter((row) => !cursor || row.id < cursor)
-  .sort((a, b) => b.id.localeCompare(a.id))
-  .slice(0, 200);
+  .filter((row) => row.status === "open" && String(row.title ?? "").toLowerCase().includes(titleFilter))
+  .sort((a, b) => b.id.localeCompare(a.id));
 process.stdout.write(JSON.stringify(page));
 NODE
     else
