@@ -1277,7 +1277,10 @@ struct RevokedState {
     revoked_through_generation: u64,
     revoked_token_ids: Vec<String>,
 }
-fn revoked_metadata(home: &Path, snapshot: &OwnershipSnapshot) -> Result<bool, ReplacementError> {
+pub(crate) fn revoked_metadata(
+    home: &Path,
+    snapshot: &OwnershipSnapshot,
+) -> Result<bool, ReplacementError> {
     let bad = || ReplacementError::RevocationUnverified;
     let owner: OwnerRecord = read_private_json(
         &home
