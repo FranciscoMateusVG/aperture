@@ -149,7 +149,9 @@ inconsistent evidence; never delete them or recycle archived identity/generation
    `cargo build --manifest-path src-tauri/Cargo.toml --release --bin aperture-boot
    --bin aperture-team-control` (one command). Record the actual Cargo output
    directory, both executable hashes and compiler versions. Do not point the
-   consumer at an unrelated stale debug build or change its configured override.
+   consumer at an unrelated stale debug build. Production uses this fixed path;
+   `APERTURE_TEAM_CONTROL_BIN` is a fixture/test override only, not a production
+   deployment mechanism (source contract confirmed by Rex).
    Publication belongs in the existing native recipe/lifecycle, not a new
    transport or auto-install-on-tool-call path. Before publication, validate the
    destination parents without following caller-controlled symlinks, current UID
