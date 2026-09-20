@@ -20,7 +20,7 @@ export function renderReplacementEvidence(view: ReplacementView | null, pending 
 export function renderArchiveEvidence(view: ArchiveView | null, pending = false): string {
   const states = view?.checks ?? { reconciliation: "unknown", reviews: "unknown", metrics: "unknown", process_stop: "unknown", revocation: "unknown", remote_effects: "unknown", worktrees: "unknown" };
   const shown = Object.fromEntries(Object.entries(states).map(([k, v]) => [k, pending ? "pending" : v])) as Record<string, RuntimeCheckState>;
-  return `<p class="v4-status">${pending ? "Archive operation pending — awaiting backend evidence" : view ? `Backend archive state: ${e(view.state)}` : "Archive readiness is unknown"}</p>${checks(shown)}${view ? runtimeBlockers(view) : ""}<p class="v4-meta">No client-side rollback, deletion or identity reuse. Empty blocker lists are not proof of readiness.</p>`;
+  return `<p class="v4-status">${pending ? "Checking archive readiness — read-only request pending" : view ? `Backend archive state: ${e(view.state)}` : "Archive readiness is unknown"}</p>${checks(shown)}${view ? runtimeBlockers(view) : ""}${view?.state === "pending" ? '<p class="v4-notice">Awaiting approval and archival by GLaDOS. This checklist does not authorize or perform archival.</p>' : ""}<p class="v4-meta">Read-only checklist. Empty blocker lists do not grant approval; no archive, deletion or identity reuse is requested here.</p>`;
 }
 
 export interface LifecycleOptions {
@@ -44,11 +44,11 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
   let prepared: PreparedReplacementView | null = null, latest: ReplacementView | null = null, archived: ArchiveView | null = null;
   let inflight = false, refreshing = false, needsRefresh = false, closed = false, preparationExpired = false;
   const dialog = document.createElement("dialog"); dialog.className = "v4-dialog"; dialog.setAttribute("aria-labelledby", "v4-runtime-title");
-  dialog.innerHTML = `<div class="v4-dialog__body"><h2 id="v4-runtime-title">${options.kind === "replace" ? "Replace worker" : "Archive team"}</h2><p>${e(seat || team.snapshot.team)}</p>
-    ${options.kind === "replace" ? `<div class="v4-field"><label for="v4-runtime-selection">Replacement · exact immutable policy tuple</label><select id="v4-runtime-selection"></select></div><label class="v4-radio-label"><input type="checkbox" data-confirm> I confirm this configuration change, including harness, reasoning and budget intent. Backend authorization still applies.</label><p class="v4-meta">Snapshot and configured fallbacks determine choices; the catalog alone does not grant replacement authority.</p>` : '<p>The backend will verify reconciliation, reviews, metrics, processes, revocation, remote effects and worktree preservation. This action may archive the team if every native gate passes; it is not a read-only check.</p>'}
+  dialog.innerHTML = `<div class="v4-dialog__body"><h2 id="v4-runtime-title">${options.kind === "replace" ? "Replace worker" : "Archive checklist"}</h2><p>${e(seat || team.snapshot.team)}</p>
+    ${options.kind === "replace" ? `<div class="v4-field"><label for="v4-runtime-selection">Replacement · exact immutable policy tuple</label><select id="v4-runtime-selection"></select></div><label class="v4-radio-label"><input type="checkbox" data-confirm> I confirm this configuration change, including harness, reasoning and budget intent. Backend authorization still applies.</label><p class="v4-meta">Snapshot and configured fallbacks determine choices; the catalog alone does not grant replacement authority.</p>` : '<p>Check reconciliation, reviews, metrics, processes, revocation, remote effects and worktree preservation. This request is read-only: it cannot archive the team. Approval and archival belong to GLaDOS through a separate authenticated control action.</p>'}
     <div data-evidence></div><p role="status" aria-live="polite" data-status></p><p class="v4-error" role="alert" data-error tabindex="-1"></p>
-    <p class="v4-meta">Closing does not cancel or undo an initiated stop, revoke or archive. There is no cancellation RPC.</p></div>
-    <div class="v4-dialog__actions"><button class="v4-button" data-action="refresh">Refresh state</button>${options.kind === "replace" ? '<button class="v4-button" data-action="prepare">Prepare / stop / verify</button><button class="v4-button v4-button--primary" data-action="start">Start replacement</button>' : '<button class="v4-button v4-button--primary" data-action="archive">Verify and archive</button>'}<button class="v4-button" data-action="close">Close</button></div>`;
+    <p class="v4-meta">${options.kind === "replace" ? "Closing does not cancel or undo an initiated stop or revoke. There is no cancellation RPC." : "Closing this checklist does not approve or request archival."}</p></div>
+    <div class="v4-dialog__actions"><button class="v4-button" data-action="refresh">Refresh state</button>${options.kind === "replace" ? '<button class="v4-button" data-action="prepare">Prepare / stop / verify</button><button class="v4-button v4-button--primary" data-action="start">Start replacement</button>' : '<button class="v4-button v4-button--primary" data-action="archive">Check archive readiness</button>'}<button class="v4-button" data-action="close">Close</button></div>`;
   const evidence = dialog.querySelector<HTMLElement>("[data-evidence]")!;
   const status = dialog.querySelector<HTMLElement>("[data-status]")!;
   const error = dialog.querySelector<HTMLElement>("[data-error]")!;
@@ -88,10 +88,10 @@ export function openTeamLifecycle(options: LifecycleOptions): HTMLDialogElement 
     if (archive) archive.disabled = inflight || needsRefresh || !available;
     if (!available) status.textContent = "Not available: the backend has not enabled this capability, or its authoritative generation is missing/changed. No operation was requested by opening this dialog.";
     else if (refreshing) status.textContent = "Refreshing authoritative state. Refresh does not initiate a lifecycle operation.";
-    else if (inflight) status.textContent = "Waiting for native evidence. No successful outcome is confirmed yet.";
+    else if (inflight) status.textContent = options.kind === "archive" ? "Checking native evidence only. No archival was requested." : "Waiting for native evidence. No successful outcome is confirmed yet.";
     else if (preparationExpired) status.textContent = "Start blocked. Refresh authoritative state and prepare again; the completed stop and revocation are not undone.";
-    else if (needsRefresh) status.textContent = "Refresh authoritative state before another operation. Prior effects are not undone.";
-    else status.textContent = "Only returned native evidence can enable a start or confirm archival.";
+    else if (needsRefresh) status.textContent = options.kind === "archive" ? "Refresh authoritative state before checking again. Archival requires approval by GLaDOS." : "Refresh authoritative state before another operation. Prior effects are not undone.";
+    else status.textContent = options.kind === "archive" ? "Read-only checklist. Approval and archival remain with GLaDOS." : "Only returned native evidence can enable a replacement start.";
   }
   selection?.addEventListener("change", () => {
     if (inflight || needsRefresh) return;

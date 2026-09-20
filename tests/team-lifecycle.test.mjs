@@ -79,9 +79,10 @@ test("generation changes and lost capability disable start before invocation", a
   await f.click("start"); assert.equal(f.calls.length, 1); assert.equal(f.buttons.start.disabled, true);
  });
 });
-test("archive CTA is explicitly effectful, unknown review blocks completion, no local rollback", async () => {
+test("archive CTA is explicitly read-only; unknown review does not imply archival", async () => {
  await run({ kind: "archive", call: () => ({ team: "t1", generation: 1, state: "blocked", checks: { reconciliation: "verified", reviews: "unknown", metrics: "verified", process_stop: "verified", revocation: "verified", remote_effects: "unknown", worktrees: "unknown" }, blockers: [{ code: "E_REVIEW_MISSING", reference: "fixture-review" }] }) }, async f => {
-  assert.match(f.dialog.innerHTML, /not a read-only check/); assert.match(f.dialog.innerHTML, /Verify and archive/); await f.click("archive");
+  assert.match(f.dialog.innerHTML, /request is read-only/); assert.match(f.dialog.innerHTML, /Check archive readiness/);
+  assert.doesNotMatch(f.dialog.innerHTML, /may archive|Verify and archive|undo an initiated.*archive/); await f.click("archive");
   assert.match(f.evidence.innerHTML, /Backend archive state: blocked/); assert.doesNotMatch(f.evidence.innerHTML, /Backend archive state: archived/); assert.equal(f.buttons.archive.disabled, true); assert.equal(f.calls.length, 1);
  });
 });
@@ -117,5 +118,31 @@ test("transport loss after completed Prepare still yields unknown, not expiry's 
   assert.doesNotMatch(f.evidence.innerHTML, /completed preparation evidence retained/);
   assert.doesNotMatch(f.error.textContent, /remains stopped and revoked|SENTINEL_PRIVATE/);
   assert.equal(f.calls.length, 2); assert.equal(f.buttons.start.disabled, true);
+ });
+});
+
+test("complete archive checklist remains pending GLaDOS, with selectors only and no approval claim", async () => {
+ await run({ kind: "archive", call: () => ({ team: "t1", generation: 1, state: "pending",
+  checks: { reconciliation: "verified", reviews: "verified", metrics: "verified", process_stop: "verified", revocation: "verified", remote_effects: "verified", worktrees: "verified" }, blockers: [] }) }, async f => {
+  assert.match(f.dialog.innerHTML, /separate authenticated control action/);
+  await f.click("archive");
+  assert.deepEqual(f.calls, [["team_archive", { input: { team: "t1", expected_generation: 1 } }]]);
+  assert.match(f.evidence.innerHTML, /Backend archive state: pending/);
+  assert.match(f.evidence.innerHTML, /Awaiting approval and archival by GLaDOS/);
+  assert.match(f.evidence.innerHTML, /does not authorize or perform archival/);
+  assert.doesNotMatch(f.evidence.innerHTML, /Backend archive state: archived|notification sent/);
+  assert.match(f.status.textContent, /requires approval by GLaDOS/);
+  await f.click("archive"); assert.equal(f.calls.length, 1);
+ });
+});
+test("archive pending request copy describes checking, never an archive operation", async () => {
+ let resolve;
+ await run({ kind: "archive", call: () => new Promise(r => { resolve = r; }) }, async f => {
+  const pending = f.click("archive");
+  assert.match(f.evidence.innerHTML, /read-only request pending/);
+  assert.match(f.status.textContent, /No archival was requested/);
+  assert.doesNotMatch(f.evidence.innerHTML, /Archive operation pending/);
+  resolve({ team: "t1", generation: 1, state: "blocked", checks: { reconciliation: "unknown", reviews: "unknown", metrics: "unknown", process_stop: "unknown", revocation: "unknown", remote_effects: "unknown", worktrees: "unknown" }, blockers: [] });
+  await pending;
  });
 });

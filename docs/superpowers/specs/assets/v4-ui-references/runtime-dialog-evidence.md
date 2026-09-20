@@ -16,7 +16,7 @@ Peppy `docs/runtime-v4-p3-ui-contract.md` at 16b29cbf3003fe5511cfc9a71a204a6d7b7
 - Private owner fields are rejected at the boundary. Serialization is an exact selector/intent allowlist; no actor, proof, PID, thread, token, timestamp, arbitrary path or authority flags.
 - Failed/model-unverified/ambiguous outcome retains unknown/failure and requires an explicit state refresh. No automatic retry or locally incremented generation.
 - Closing does not claim cancellation/rollback. A completed native response after close can cause only an authoritative read refresh, never a second lifecycle call.
-- Archive has one **Verify and archive** CTA: the reserved command is effectful, not a read-only readiness probe. Returned archived requires verified checks and no blockers; transport/journal ambiguity never implies rollback or completion. No new endpoint or cleanup operation.
+- **Superseded by P4 contract qihtdz/v35l6x:** Archive uses **Check archive readiness**, a read-only checklist. Complete inventory remains pending approval/archival by GLaDOS through separate authenticated control; this UI cannot perform it. No new endpoint, authority fields or cleanup operation.
 - Checkpoint now and separate Stop remain unavailable: those auth/runtime seams are not frozen by this contract.
 
 ## Evidence
@@ -48,3 +48,23 @@ negative control. Pre-fix expiry regression **RED**, transport control **PASS**;
 current full source suite **159/159 PASS**, Vite build and diff-check PASS.
 No DTO/layout/backend change. Native expiry/stop/revocation, WKWebView and installed
 runtime behavior remain NOT_RUN; this is source evidence only.
+
+## P4 read-only archive copy correction (parent d131e810)
+
+Rex v35l6x / native source 20765139827d9ba4def46e6792acd133757ff755
+supersedes the original effectful UI contract. The existing team_archive command
+projects a read-only checklist. Its complete inventory returns pending; approval
+and actual archive require the separate authenticated GLaDOS control action.
+
+This bounded delta changes only display copy/CTA and focused assertions. It does
+not alter DTOs, selectors, wrappers, capabilities, hashes, proofs, authority or
+native code. The dialog says **Check archive readiness**; pending explicitly
+awaits GLaDOS. Opening/closing/checking never claims to request archival.
+Capability false still produces zero invokes. The prior illustrative references
+are not installed screenshots and do not override this corrected contract.
+
+Three copy regressions fail on parent d131e810 and pass here: read-only CTA,
+complete checklist awaiting GLaDOS, and in-flight checking rather than archiving.
+Full existing source suite **161/161 PASS**, build and diff-check PASS.
+Native composition, final archive control, browser/WKWebView and installed runtime
+remain NOT_RUN; no capability was enabled and no live action was performed.
