@@ -13,7 +13,7 @@ use crate::journal::{
     JournalMove, JournalObjectKind, JournalOperation, JournalRoot, JournalRoots,
 };
 use crate::owner::{try_lock, AdvisoryLock, OwnerStore};
-use crate::state::{AppState, ExecutionTuple, Harness, OwnerSummary, ReasoningEffort};
+use crate::state::{AppState, ExecutionTuple, Harness, OwnerState, OwnerSummary, ReasoningEffort};
 use crate::team_auth::{authenticate_glados_control, authenticate_seat_control, AuthenticatedActor};
 use crate::team_checkpoint::{CheckpointContext, CheckpointError, CheckpointPayload, CheckpointWriter};
 use crate::team_replacement::{
@@ -531,6 +531,7 @@ pub enum TeamControlRequest {
     InspectRemote(InspectRemoteInput),
     ResolveRemote(ResolveRemoteInput),
     Replace(AgentReplaceInput),
+    Archive(ArchiveTeamInput),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -543,6 +544,7 @@ pub enum TeamControlResponse {
     InspectRemote(RemoteInventoryView),
     ResolveRemote(ResolutionReceipt),
     Replace(ReplacementView),
+    Archive(ArchiveView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1144,6 +1146,7 @@ impl TeamEngine {
                 moves,
                 step: 0,
                 preimage_sha256: request.snapshot_sha256.clone(),
+                archive_approval: None,
             }).map_err(TeamError::from_message)?;
         }
         let roots = JournalRoots {
@@ -1772,7 +1775,14 @@ fn archive_check(blockers: &[RuntimeBlocker], codes: &[&str]) -> RuntimeCheckSta
     if blockers.iter().any(|b| codes.contains(&b.code.as_str())) { RuntimeCheckState::Blocked } else { RuntimeCheckState::Verified }
 }
 
-fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveView> {
+struct ArchiveInspection {
+    view: ArchiveView,
+    approval: crate::journal::ArchiveJournalApproval,
+    snapshot: TeamSnapshot,
+    state: TeamStateFile,
+}
+
+fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveInspection> {
     validate_team_name(&input.team)?;
     if input.expected_generation == 0 { return Err(TeamError::new("E_GENERATION_MISMATCH", "archive generation is invalid")); }
     let view = engine.read_team_view(&input.team)?;
@@ -1787,6 +1797,17 @@ fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
         .map_err(|e| TeamError::new(&e.code, "archive runtime inventory is unavailable"))?;
     let mut blockers: Vec<RuntimeBlocker> = beads.structural_blockers(&seats).into_iter()
         .map(|b| RuntimeBlocker { code:b.code, reference:b.reference }).collect();
+    let owner_sha256 = native.seats.iter().map(|seat| (seat.seat.clone(), seat.owner_sha256.clone())).collect();
+    let owner_store = OwnerStore::new(engine.paths.owners.clone());
+    let owner_states = view.snapshot.seats.iter().map(|seat| {
+        let owner = owner_store.read_owner(&seat.name).map_err(TeamError::from_message)?;
+        let state = match owner.state {
+            OwnerState::Active => "active",
+            OwnerState::Stale => "stale",
+            _ => return Err(TeamError::new("E_ARCHIVE_OWNER_INVALID", "archive owner is not terminal")),
+        };
+        Ok((seat.name.clone(), state.to_string()))
+    }).collect::<TeamResult<Vec<_>>>()?;
     for seat in native.seats {
         blockers.extend(seat.blockers.into_iter().map(|b| RuntimeBlocker { code:b.code, reference:b.reference }));
     }
@@ -1801,8 +1822,27 @@ fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
         remote_effects: archive_check(&blockers, &["E_REMOTE_UNCERTAIN"]),
         worktrees: archive_check(&blockers, &["E_WORKTREE_UNPROTECTED","E_REPO_BINDING_UNAVAILABLE"]),
     };
-    Ok(ArchiveView { team:input.team.clone(), generation:input.expected_generation,
-        state:if blockers.is_empty(){"pending".into()}else{"blocked".into()}, checks, blockers })
+    let public = ArchiveView { team:input.team.clone(), generation:input.expected_generation,
+        state:if blockers.is_empty(){"pending".into()}else{"blocked".into()}, checks, blockers };
+    Ok(ArchiveInspection {
+        view: public,
+        approval: crate::journal::ArchiveJournalApproval {
+            generation: input.expected_generation,
+            epic_id: epic.into(),
+            record_sha256: beads.record_sha256,
+            inventory_sha256: beads.inventory_sha256,
+            native_sha256: native.sha256,
+            owner_sha256,
+            owner_states,
+            approved_by: "glados".into(),
+        },
+        snapshot: view.snapshot,
+        state: view.state,
+    })
+}
+
+fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveView> {
+    collect_archive(engine, input).map(|result| result.view)
 }
 
 fn permit_store(
@@ -2068,6 +2108,36 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
                 checks: verified_replacement_checks(),
                 owner: Some(owner),
                 blockers: vec![],
+            }))
+        }
+        TeamControlRequest::Archive(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            if crate::team_archive_finalize::has_journal(&engine.paths.home, &input.team) {
+                crate::team_archive_finalize::finalize(
+                    &engine.paths.home, &actor, &input.team, input.expected_generation, None,
+                ).map_err(TeamError::from_message)?;
+            } else {
+                let inspection = collect_archive(&engine, &input)?;
+                if !inspection.view.blockers.is_empty() {
+                    return Ok(TeamControlResponse::Archive(inspection.view));
+                }
+                crate::team_archive_finalize::finalize(
+                    &engine.paths.home, &actor, &input.team, input.expected_generation,
+                    Some(crate::team_archive_finalize::FreshArchive {
+                        snapshot: &inspection.snapshot,
+                        state: &inspection.state,
+                        approval: &inspection.approval,
+                    }),
+                ).map_err(TeamError::from_message)?;
+            }
+            Ok(TeamControlResponse::Archive(ArchiveView {
+                team: input.team, generation: input.expected_generation, state: "archived".into(),
+                checks: ArchiveChecks {
+                    reconciliation: RuntimeCheckState::Verified, reviews: RuntimeCheckState::Verified,
+                    metrics: RuntimeCheckState::Verified, process_stop: RuntimeCheckState::Verified,
+                    revocation: RuntimeCheckState::Verified, remote_effects: RuntimeCheckState::Verified,
+                    worktrees: RuntimeCheckState::Verified,
+                }, blockers: vec![],
             }))
         }
     }
@@ -2448,6 +2518,7 @@ mod tests {
             step: moves.len(),
             moves,
             preimage_sha256: request.snapshot_sha256,
+            archive_approval: None,
         }).unwrap();
         let marker = home.join(".claude/aperture").join(&seats[0]).join(".complete");
         fs::remove_file(&marker).unwrap();

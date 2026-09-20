@@ -516,6 +516,10 @@ impl OwnerStore {
 
     pub(crate) fn mark_stale(&self, actor: &AuthenticatedActor, seat: &str, expected_generation: u64) -> Result<OwnerRecord, String> {
         let _lock = self.lock(seat)?;
+        self.mark_stale_locked(actor, seat, expected_generation)
+    }
+
+    pub(crate) fn mark_stale_locked(&self, actor: &AuthenticatedActor, seat: &str, expected_generation: u64) -> Result<OwnerRecord, String> {
         let mut record = self.read_unlocked(seat)?;
         if record.generation != expected_generation { return Err("E_GENERATION_MISMATCH: owner generation changed".into()); }
         record.state = OwnerState::Stale;
@@ -527,6 +531,10 @@ impl OwnerStore {
 
     pub(crate) fn read_owner(&self, seat: &str) -> Result<OwnerRecord, String> {
         let _lock = self.lock(seat)?;
+        self.read_unlocked(seat)
+    }
+
+    pub(crate) fn read_owner_locked(&self, seat: &str) -> Result<OwnerRecord, String> {
         self.read_unlocked(seat)
     }
 

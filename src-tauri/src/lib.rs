@@ -12,6 +12,7 @@ mod team_checkpoint;
 mod team_replacement;
 mod team_process;
 mod team_archive;
+mod team_archive_finalize;
 mod poller;
 mod state;
 mod tmux;

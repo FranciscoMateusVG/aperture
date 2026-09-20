@@ -54,6 +54,20 @@ pub struct Journal {
     /// Progress hint only. Recovery always reconciles the physical tree.
     pub step: usize,
     pub preimage_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_approval: Option<ArchiveJournalApproval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveJournalApproval {
+    pub generation: u64,
+    pub epic_id: String,
+    pub record_sha256: String,
+    pub inventory_sha256: String,
+    pub native_sha256: String,
+    pub owner_sha256: Vec<(String, String)>,
+    pub owner_states: Vec<(String, String)>,
+    pub approved_by: String,
 }
 
 #[derive(Debug, Clone)]
@@ -421,7 +435,7 @@ fn physical_state(roots: &JournalRoots, mv: &JournalMove) -> Result<(PhysicalMov
 }
 
 pub fn write_journal(path: &Path, journal: &Journal) -> Result<(), String> {
-    if journal.schema_version != 1 || journal.moves.is_empty() || journal.step > journal.moves.len() {
+    if !valid_journal(journal) {
         return Err("E_JOURNAL_INCONSISTENT: invalid journal shape".into());
     }
     write_private_json_atomic(path, journal, false)
@@ -429,10 +443,34 @@ pub fn write_journal(path: &Path, journal: &Journal) -> Result<(), String> {
 
 pub fn read_journal(path: &Path) -> Result<Journal, String> {
     let journal: Journal = read_private_json(path)?;
-    if journal.schema_version != 1 || journal.moves.is_empty() || journal.step > journal.moves.len() {
+    if !valid_journal(&journal) {
         return Err("E_JOURNAL_INCONSISTENT: invalid journal shape".into());
     }
     Ok(journal)
+}
+
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_journal(journal: &Journal) -> bool {
+    if journal.schema_version != 1 || journal.moves.is_empty() || journal.step > journal.moves.len() || !valid_hash(&journal.preimage_sha256) {
+        return false;
+    }
+    match (&journal.operation, &journal.archive_approval) {
+        (JournalOperation::Activate, None) => true,
+        (JournalOperation::Archive, Some(approval)) => approval.generation > 0
+            && !approval.epic_id.is_empty()
+            && valid_hash(&approval.record_sha256)
+            && valid_hash(&approval.inventory_sha256)
+            && valid_hash(&approval.native_sha256)
+            && !approval.owner_sha256.is_empty()
+            && approval.owner_sha256.iter().all(|(seat, hash)| !seat.is_empty() && valid_hash(hash))
+            && approval.owner_states.len() == approval.owner_sha256.len()
+            && approval.owner_states.iter().all(|(seat, state)| !seat.is_empty() && matches!(state.as_str(), "active" | "stale"))
+            && approval.approved_by == "glados",
+        _ => false,
+    }
 }
 
 pub fn apply_or_recover_journal(path: &Path, roots: &JournalRoots) -> Result<Journal, String> {
@@ -481,7 +519,7 @@ mod tests {
         for p in [&roots.teams, &roots.staging, &roots.agents, &roots.owner] { ensure_private_dir(p).unwrap(); }
         ensure_private_dir(&roots.staging.join("u/seats/s1")).unwrap();
         let journal_path = roots.teams.join("journal.json");
-        let journal = Journal { schema_version:1, operation:JournalOperation::Activate, team:"t1".into(), uuid:"u".into(), moves:vec![JournalMove { from_root:JournalRoot::Staging, from_rel:"u/seats/s1".into(), to_root:JournalRoot::Agents, to_rel:"s1".into(), kind:JournalObjectKind::Directory }], step:0, preimage_sha256:"0".repeat(64) };
+        let journal = Journal { schema_version:1, operation:JournalOperation::Activate, team:"t1".into(), uuid:"u".into(), moves:vec![JournalMove { from_root:JournalRoot::Staging, from_rel:"u/seats/s1".into(), to_root:JournalRoot::Agents, to_rel:"s1".into(), kind:JournalObjectKind::Directory }], step:0, preimage_sha256:"0".repeat(64), archive_approval:None };
         write_journal(&journal_path, &journal).unwrap();
         rename_no_replace(&roots.staging.join("u/seats/s1"), &roots.agents.join("s1")).unwrap();
         let recovered = apply_or_recover_journal(&journal_path, &roots).unwrap();
@@ -498,7 +536,7 @@ mod tests {
         ensure_private_dir(&roots.staging.join("u/seats/s1")).unwrap();
         ensure_private_dir(&roots.agents.join("s1")).unwrap();
         let path = roots.teams.join("journal.json");
-        write_journal(&path, &Journal { schema_version:1, operation:JournalOperation::Activate, team:"t1".into(), uuid:"u".into(), moves:vec![JournalMove { from_root:JournalRoot::Staging, from_rel:"u/seats/s1".into(), to_root:JournalRoot::Agents, to_rel:"s1".into(), kind:JournalObjectKind::Directory }], step:0, preimage_sha256:"0".repeat(64) }).unwrap();
+        write_journal(&path, &Journal { schema_version:1, operation:JournalOperation::Activate, team:"t1".into(), uuid:"u".into(), moves:vec![JournalMove { from_root:JournalRoot::Staging, from_rel:"u/seats/s1".into(), to_root:JournalRoot::Agents, to_rel:"s1".into(), kind:JournalObjectKind::Directory }], step:0, preimage_sha256:"0".repeat(64), archive_approval:None }).unwrap();
         assert!(apply_or_recover_journal(&path, &roots).unwrap_err().contains("E_JOURNAL_INCONSISTENT"));
         assert!(roots.staging.join("u/seats/s1").exists());
         assert!(roots.agents.join("s1").exists());
