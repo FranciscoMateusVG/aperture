@@ -151,7 +151,8 @@ impl PendingChild {
                 .processes
                 .iter()
                 .any(|p| p.pid == actual.pid && p.start_time == actual.start_time)
-            || actual.token_id.is_empty()
+            || owner.provisional_token_id.as_deref() != Some(actual.token_id.as_str())
+            || actual.token_id.len() != 64
             || team_process::state(&self.identity) != ProcessState::Same
         {
             return Err(GateError::Owner);
@@ -254,14 +255,22 @@ mod tests {
         fn attach(&self, p: &PendingChild) {
             let micros = team_process::birth_micros(p.identity()).unwrap();
             self.store
+                .bind_and_publish_token(
+                    &AuthenticatedActor::launcher(),
+                    &self.reservation,
+                    "a".repeat(64),
+                    || Ok(()),
+                )
+                .unwrap();
+            self.store
                 .record_start_candidate(
                     &AuthenticatedActor::launcher(),
                     &self.reservation,
                     Incarnation {
                         pid: p.identity().pid,
                         start_time: micros,
-                        thread_id: "fixture-thread".into(),
-                        token_id: "fixture-token-id".into(),
+                        thread_id: String::new(),
+                        token_id: "a".repeat(64),
                         harness: Harness::Codex,
                         model: "fixture-model".into(),
                         reasoning: None,

@@ -315,9 +315,8 @@ pub(crate) mod managed {
     /// candidate yet. Publication is one no-replace write using shared dir-fd
     /// secure IO + file/parent fsync. An existing/partial token is never reused,
     /// overwritten or deleted here. Any failure leaves evidence for recovery.
-    /// UNWIRED: composition must bind the provisional digest in OwnerRecord
-    /// before publication using the shared owner seam; this isolated publisher
-    /// alone is not crash-safe start orchestration.
+    /// The shared owner store binds the digest durably before the publication
+    /// callback; failure retains that identity for exact native revoke cleanup.
     pub(crate) fn provision(
         home: &Path,
         team: &str,
@@ -355,10 +354,12 @@ pub(crate) mod managed {
             _ => return Err(TokenError::Authority),
         }
         let store = OwnerStore::new(home.join(".aperture/run/owner"));
-        let _seat = store
-            .lock(&reservation.seat)
-            .map_err(|_| TokenError::Generation)?;
-        let before = current(home, reservation)?;
+        let before = {
+            let _seat = store
+                .lock(&reservation.seat)
+                .map_err(|_| TokenError::Generation)?;
+            current(home, reservation)?
+        };
         let revoked = prior_revocations(home, reservation)?;
         let root = home.join(".aperture/run/hub-tokens");
         ensure_private_dir(&root).map_err(|_| TokenError::Unsafe)?;
@@ -382,21 +383,41 @@ pub(crate) mod managed {
         if revoked.contains(&token_id) {
             return Err(TokenError::Revocation);
         }
-        before_publish(&path)?; // private fixture-only failure/race boundary
-        if current(home, reservation)? != before || prior_revocations(home, reservation)? != revoked
-        {
+        if before.provisional_token_id.is_some() {
             return Err(TokenError::Generation);
         }
-        write_private_bytes_atomic(&path, &token.0, false).map_err(|_| TokenError::Io)?;
-        let mut file = open_private_file_nofollow(&path).map_err(|_| TokenError::Unsafe)?;
-        let mut readback = PrivateToken(vec![]);
-        file.by_ref()
-            .take(65)
-            .read_to_end(&mut readback.0)
+        let mut expected = before;
+        expected.provisional_token_id = Some(token_id.clone());
+        store
+            .bind_and_publish_token(actor, reservation, token_id.clone(), || {
+                // This callback executes only after durable binding and while the
+                // SAME shared owner lock is held. No nested owner writer/lock.
+                let publish = || -> Result<(), TokenError> {
+                    before_publish(&path)?; // private fixture-only failure/race seam
+                    if current(home, reservation)? != expected
+                        || prior_revocations(home, reservation)? != revoked
+                    {
+                        return Err(TokenError::Generation);
+                    }
+                    write_private_bytes_atomic(&path, &token.0, false)
+                        .map_err(|_| TokenError::Io)?;
+                    let mut file =
+                        open_private_file_nofollow(&path).map_err(|_| TokenError::Unsafe)?;
+                    let mut readback = PrivateToken(vec![]);
+                    file.by_ref()
+                        .take(65)
+                        .read_to_end(&mut readback.0)
+                        .map_err(|_| TokenError::Io)?;
+                    if readback.0.len() != 64 || digest(&readback.0) != token_id {
+                        return Err(TokenError::Unsafe);
+                    }
+                    Ok(())
+                };
+                publish().map_err(|_| {
+                    "E_TOKEN_PUBLICATION: exact managed token publication failed".to_string()
+                })
+            })
             .map_err(|_| TokenError::Io)?;
-        if readback.0.len() != 64 || digest(&readback.0) != token_id {
-            return Err(TokenError::Unsafe);
-        }
         Ok(ManagedToken {
             path,
             token_id,
@@ -625,6 +646,47 @@ pub(crate) mod managed {
                 Err(TokenError::Io)
             ));
             assert!(!f.path().exists());
+        }
+        #[test]
+        fn digest_is_durable_under_owner_lock_before_publish_and_failure_is_not_retried() {
+            let f = Fixture::new();
+            let expected = digest(&[b'a'; 64]);
+            let reached = std::cell::Cell::new(false);
+            let result = provision_checked(&f.home, "t1", &AuthenticatedActor::launcher(), &f.reservation,
+                || Ok(PrivateToken(vec![b'a'; 64])), |path| {
+                    reached.set(true);
+                    let owner: OwnerRecord = read_private_json(&f.owner_path()).unwrap();
+                    assert_eq!(owner.provisional_token_id.as_deref(), Some(expected.as_str()));
+                    assert!(owner.incarnation.is_none());
+                    assert!(!path.exists());
+                    let store = OwnerStore::new(f.home.join(".aperture/run/owner"));
+                    assert!(store.lock(&f.reservation.seat).is_err());
+                    Err(TokenError::Io)
+                });
+            assert!(result.is_err());
+            assert!(reached.get());
+            assert!(!f.path().exists());
+            let after: OwnerRecord = read_private_json(&f.owner_path()).unwrap();
+            assert_eq!(after.provisional_token_id, Some(expected));
+            assert!(f.call().is_err());
+            assert_eq!(read_private_json::<OwnerRecord>(&f.owner_path()).unwrap(), after);
+            assert!(!f.path().exists());
+        }
+        #[test]
+        fn owner_change_after_binding_blocks_publication_without_repairing_state() {
+            let f = Fixture::new();
+            let result = provision_checked(&f.home, "t1", &AuthenticatedActor::launcher(), &f.reservation,
+                || Ok(PrivateToken(vec![b'a'; 64])), |_| {
+                    let mut row: OwnerRecord = read_private_json(&f.owner_path()).unwrap();
+                    row.generation += 1;
+                    write_private_json_atomic(&f.owner_path(), &row, true).unwrap();
+                    Ok(())
+                });
+            assert!(result.is_err());
+            assert!(!f.path().exists());
+            let row: OwnerRecord = read_private_json(&f.owner_path()).unwrap();
+            assert_eq!(row.generation, 2);
+            assert_eq!(row.provisional_token_id, Some(digest(&[b'a'; 64])));
         }
         #[test]
         fn post_publication_crash_residue_is_preserved_not_retried() {

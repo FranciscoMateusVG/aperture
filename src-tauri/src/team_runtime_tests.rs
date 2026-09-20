@@ -1008,15 +1008,7 @@ mod legacy_guard_tests {
     impl Fixture {
         fn new() -> Self {
             let p = std::env::temp_dir().join(format!(
-                "aperture-k310b-guard-{}",
-                format!(
-                    "{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                )
+                "aperture-k310b-guard-{}", uuid::Uuid::new_v4()
             ));
             std::fs::create_dir(&p).unwrap();
             std::fs::create_dir(p.join("seat")).unwrap();
@@ -1026,6 +1018,19 @@ mod legacy_guard_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap()
+        }
+    }
+    #[test]
+    fn parallel_fixtures_do_not_share_clock_derived_paths() {
+        let fixtures = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16).map(|_| s.spawn(Fixture::new)).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        let mut paths = std::collections::HashSet::new();
+        for f in &fixtures {
+            assert!(paths.insert(f.0.clone()));
+            let name = f.0.file_name().unwrap().to_str().unwrap();
+            assert!(uuid::Uuid::parse_str(name.strip_prefix("aperture-k310b-guard-").unwrap()).is_ok());
         }
     }
     #[test]

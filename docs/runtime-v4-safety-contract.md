@@ -279,12 +279,15 @@ source fixtures.
 provisioner remains byte-identical. It validates the native Starting reservation,
 team membership, canonical private roots and prior revocation floor, generates
 fresh entropy privately, and publishes with shared no-replace/file+directory
-fsync. Existing token files are never reused or removed. This publisher alone
-is **not crash-safe orchestration**: composition must durably bind its provisional
-token digest to the shared owner reservation before canonical publication, so
-failure before PID attachment can use the same owner-bound revoke path. That
-shared owner/TS extension is being supplied by the integrator; no launch path
-calls this isolated helper yet.
+fsync. Existing token files are never reused or removed. The publisher now uses
+`OwnerStore::bind_and_publish_token`: the shared owner lock binds and fsyncs the
+provisional digest BEFORE invoking no-replace publication. The callback never
+relocks the owner; it verifies the bound record and revocation floor, then writes
+and reads back the token. Publication failure retains the exact provisional
+identity without an incarnation, allowing owner-bound cleanup rather than a
+fake PID/thread or automatic retry. Ten publisher fixtures include actual
+lock-held/durable-preimage observation and failure preservation. The complete
+spawn-failure revoke journey is still not wired or proven.
 
 `team_replacement::launch_gate` starts an internal pipe-gated child in its own
 session/process group. The shell program is fixed and all executable arguments
