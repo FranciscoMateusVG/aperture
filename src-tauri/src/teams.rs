@@ -20,7 +20,8 @@ use crate::team_replacement::{
     CheckpointRecovery, ReplacementError, ReplacementPhase, StartSelection,
 };
 use crate::team_replacement::native::{
-    bootstrap_authorized, prepare_operator, start_operator,
+    bootstrap_authorized, prepare_operator, replace_authorized, start_operator,
+    ReplacementAuthority,
 };
 use crate::team_replacement::remote::{
     inspect_authorized, resolve_native, RemoteError, RemoteInventoryView, RemoteTarget,
@@ -514,6 +515,7 @@ pub enum TeamControlResponse {
     Checkpoint(CheckpointReceipt),
     InspectRemote(RemoteInventoryView),
     ResolveRemote(ResolutionReceipt),
+    Replace(ReplacementView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1938,7 +1940,43 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             .map(TeamControlResponse::ResolveRemote)
             .map_err(remote_error)
         }
-        TeamControlRequest::Replace(_input) => Err(TeamError::new("E_CONTROL_UNAVAILABLE", "native replacement adapter is not integrated")),
+        TeamControlRequest::Replace(input) => {
+            let actor = authenticate_seat_control().map_err(TeamError::from_message)?;
+            let target_seat = input.target_seat;
+            let target = RemoteTarget {
+                team: actor.team().to_string(),
+                seat: target_seat.clone(),
+                expected_generation: input.expected_generation,
+            };
+            let selection = selection_from_tuple(&input.selection)?;
+            let result = replace_authorized(
+                &engine.paths.home,
+                ReplacementAuthority::Lead(&actor),
+                target,
+                &selection,
+                &[],
+            )
+            .map_err(replacement_error)?;
+            let owner = owner_summary(&engine.paths.home, &target_seat)?;
+            if owner.generation != result.started.generation
+                || owner.state != crate::state::OwnerState::Active
+            {
+                return Err(TeamError::new(
+                    "E_CONTROL_UNKNOWN",
+                    "replacement owner readback is inconsistent",
+                ));
+            }
+            Ok(TeamControlResponse::Replace(ReplacementView {
+                team: actor.team().to_string(),
+                seat: target_seat,
+                generation: result.started.generation,
+                phase: ReplacementPhase::Started,
+                checkpoint_recovery: result.checkpoint_recovery,
+                checks: verified_replacement_checks(),
+                owner: Some(owner),
+                blockers: vec![],
+            }))
+        }
     }
 }
 
