@@ -921,6 +921,7 @@ impl TeamEngine {
         remove_journal(&journal_path).map_err(TeamError::from_message)?;
         let stage = self.paths.staging.join(&view.snapshot.staging_uuid);
         remove_private_tree(&stage, &self.paths.staging)?;
+        drop(_seat_locks);
         self.read_team_view(&input.team)
     }
 }
@@ -1375,4 +1376,208 @@ pub fn activate_team_headless(input_json: &str) -> TeamResult<TeamView> {
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"));
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or_else(|| TeamError::io("project root unavailable"))?.to_path_buf();
     TeamEngine::new(home, project).activate(&actor, input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Barrier;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aperture-teams-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn project_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    }
+
+    fn fullstack_input(team: &str) -> CreateTeamInput {
+        CreateTeamInput {
+            team: team.into(),
+            project: "project:aperture".into(),
+            mission: "Implement the approved bounded transaction.".into(),
+            acceptance: "Source review and isolated evidence pass.".into(),
+            preset_id: Some("fullstack".into()),
+            seats: vec![
+                PresetSeat { role:"backend".into(), harness:Harness::Codex, model:"gpt-6-astra".into(), reasoning:Some(ReasoningEffort::High) },
+                PresetSeat { role:"frontend".into(), harness:Harness::Claude, model:"opus".into(), reasoning:None },
+                PresetSeat { role:"qa".into(), harness:Harness::Claude, model:"sonnet".into(), reasoning:None },
+            ],
+            lead_index: 0,
+            fallbacks: vec![ExecutionTuple { harness:Harness::Codex, model:"gpt-5.6-sol".into(), reasoning:Some(ReasoningEffort::High) }],
+        }
+    }
+
+    fn prepare_glados(home: &Path) {
+        let token_root = home.join(".aperture/run/hub-tokens");
+        ensure_private_dir(&token_root).unwrap();
+        fs::write(token_root.join("glados.token"), b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        fs::set_permissions(token_root.join("glados.token"), fs::Permissions::from_mode(0o600)).unwrap();
+        let glados = home.join(".claude/aperture/glados");
+        ensure_private_dir(&glados).unwrap();
+        write_private_bytes_atomic(&glados.join("prompt.md"), b"test\n", false).unwrap();
+        write_private_json_atomic(&glados.join("manifest.json"), &serde_json::json!({
+            "name":"GLaDOS","model":"sonnet","window":"glados","role":"orchestrator","enabled":true
+        }), false).unwrap();
+    }
+
+    struct EnvRestore { values: Vec<(&'static str, Option<std::ffi::OsString>)> }
+    impl EnvRestore {
+        fn set(home: &Path) -> Self {
+            let keys = ["HOME", "APERTURE_AGENTS_DIR", "APERTURE_TEAMS_DIR"];
+            let values = keys.into_iter().map(|key| (key, std::env::var_os(key))).collect();
+            std::env::set_var("HOME", home);
+            std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
+            std::env::set_var("APERTURE_TEAMS_DIR", home.join(".aperture/teams"));
+            Self { values }
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
+            }
+        }
+    }
+
+    #[test]
+    fn real_templates_render_pending_then_activate_atomically() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("activate");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t1")).unwrap();
+        assert_eq!(created.team.state.state, TeamLifecycle::Pending);
+        assert_eq!(created.team.seats.len(), 3);
+        for seat in &created.team.snapshot.seats {
+            assert!(!home.join(".claude/aperture").join(&seat.name).exists());
+            let staged = home.join(".aperture/teams/.staging").join(&created.team.snapshot.staging_uuid).join("seats").join(&seat.name);
+            assert!(staged.join("prompt.md").is_file());
+            assert_eq!(fs::read_to_string(staged.join("resident.txt")).unwrap(), format!("constitution\n{}-core\n", seat.role));
+            let prompt = fs::read_to_string(staged.join("prompt.md")).unwrap();
+            assert!(prompt.contains(&format!("**{}**", seat.name)));
+            assert!(prompt.contains("Assigned mission (bounded JSON data)"));
+            assert!(!prompt.contains("{{"));
+        }
+        let actor = authenticate_glados_control().unwrap();
+        let active = engine.activate(&actor, ActivateTeamInput {
+            team:"t1".into(), expected_generation:0,
+            creation_request_id:created.creation_request.request_id.clone(), epic_id:"aperture-4rsnc".into(),
+        }).unwrap();
+        assert_eq!(active.state.state, TeamLifecycle::Active);
+        assert_eq!(active.state.generation, 1);
+        for seat in &active.seats {
+            let runtime = home.join(".claude/aperture").join(&seat.configured.name);
+            assert!(runtime.join(".complete").is_file());
+            assert!(runtime.join("TEAM").is_file());
+            assert_eq!(seat.observed_owner.as_ref().unwrap().generation, 0);
+            assert_eq!(classify_managed_seat(&home, &seat.configured.name).unwrap(), Some(ManagedSeatState::Active { team:"t1".into(), generation:1 }));
+        }
+        assert_eq!(crate::agent_loader::load_agents_from_disk().keys().filter(|name| name.starts_with("t1-")).count(), 3);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pending_cancel_is_idempotent_and_never_publishes_a_seat() {
+        let home = temp_root("cancel");
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t2")).unwrap();
+        let input = CancelPendingInput { team:"t2".into(), expected_generation:0, creation_request_id:created.creation_request.request_id };
+        let first = engine.cancel_pending(&AuthenticatedActor::operator_ui(), input.clone()).unwrap();
+        let second = engine.cancel_pending(&AuthenticatedActor::operator_ui(), input).unwrap();
+        assert_eq!(first, second);
+        assert!(!home.join(".aperture/teams/t2").exists());
+        assert!(home.join(".aperture/teams/.staging/rejected").join(&first.rejected_snapshot_id).join("snapshot/team.json").is_file());
+        assert!(created.team.snapshot.seats.iter().all(|seat| !home.join(".claude/aperture").join(&seat.name).exists()));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn preset_cas_and_authoritative_source_are_enforced() {
+        let home = temp_root("preset");
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let shipped = engine.list_presets().unwrap().into_iter().find(|p| p.id == "fullstack").unwrap();
+        assert_eq!(shipped.source, PresetSource::Shipped);
+        let write = TeamPresetWrite {
+            schema_version:shipped.schema_version, id:shipped.id.clone(), display_name:shipped.display_name.clone(),
+            mission_placeholder:shipped.mission_placeholder.clone(), acceptance_placeholder:shipped.acceptance_placeholder.clone(),
+            seats:shipped.seats.clone(), lead_index:shipped.lead_index, fallbacks:shipped.fallbacks.clone(),
+        };
+        assert_eq!(engine.save_preset(&AuthenticatedActor::operator_ui(), SavePresetInput { preset:write.clone(), expected_sha256:None }).unwrap_err().code, "E_PRESET_CONFLICT");
+        let saved = engine.save_preset(&AuthenticatedActor::operator_ui(), SavePresetInput { preset:write.clone(), expected_sha256:Some(shipped.sha256) }).unwrap();
+        assert_eq!(saved.source, PresetSource::Local);
+        assert_eq!(engine.save_preset(&AuthenticatedActor::operator_ui(), SavePresetInput { preset:write, expected_sha256:Some("0".repeat(64)) }).unwrap_err().code, "E_PRESET_CONFLICT");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn invalid_text_tuple_and_symlink_role_fail_before_publication() {
+        let home = temp_root("negative");
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let mut input = fullstack_input("t3");
+        input.mission = "bad\u{202e}text".into();
+        assert_eq!(engine.create_team(&AuthenticatedActor::operator_ui(), input).unwrap_err().code, "E_PRESET_INVALID");
+        assert!(!home.join(".aperture/teams/t3").exists());
+        let mut input = fullstack_input("t4");
+        input.seats[0].model = "gpt-6-astra-evil".into();
+        assert_eq!(engine.create_team(&AuthenticatedActor::operator_ui(), input).unwrap_err().code, "E_PRESET_INVALID");
+        assert!(!home.join(".aperture/teams/t4").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn classifier_rejects_orphaned_marker_and_preserves_standing_agent() {
+        let home = temp_root("classify");
+        ensure_private_dir(&home.join(".claude/aperture/standing")).unwrap();
+        assert_eq!(classify_managed_seat(&home, "standing").unwrap(), None);
+        write_private_bytes_atomic(&home.join(".claude/aperture/standing/TEAM"), b"{}\n", false).unwrap();
+        assert_eq!(classify_managed_seat(&home, "standing").unwrap_err().code, "E_STATE_CONFLICT");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn activation_and_cancel_have_one_durable_winner() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("race");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t5")).unwrap();
+        let request_id = created.creation_request.request_id;
+        let activation_actor = authenticate_glados_control().unwrap();
+        let cancel_engine = engine.clone();
+        let activate_engine = engine.clone();
+        let barrier = Arc::new(Barrier::new(3));
+        let activate_barrier = barrier.clone();
+        let request_for_activate = request_id.clone();
+        let activate = std::thread::spawn(move || {
+            activate_barrier.wait();
+            activate_engine.activate(&activation_actor, ActivateTeamInput { team:"t5".into(), expected_generation:0, creation_request_id:request_for_activate, epic_id:"aperture-4rsnc".into() })
+        });
+        let cancel_barrier = barrier.clone();
+        let cancel = std::thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_engine.cancel_pending(&AuthenticatedActor::operator_ui(), CancelPendingInput { team:"t5".into(), expected_generation:0, creation_request_id:request_id })
+        });
+        barrier.wait();
+        let activation_ok = activate.join().unwrap().is_ok();
+        let cancel_ok = cancel.join().unwrap().is_ok();
+        assert_ne!(activation_ok, cancel_ok);
+        if activation_ok {
+            assert_eq!(engine.read_team_view("t5").unwrap().state.state, TeamLifecycle::Active);
+        } else {
+            assert!(!home.join(".aperture/teams/t5").exists());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
 }

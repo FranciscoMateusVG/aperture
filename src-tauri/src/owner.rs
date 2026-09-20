@@ -329,6 +329,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::Command;
 
     fn root() -> PathBuf {
         let path = std::env::temp_dir().join(format!("aperture-owner-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
@@ -364,6 +365,48 @@ mod tests {
         assert!(store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap_err().contains("E_OWNER_CORRUPT"));
         write_private_json_atomic(&store.record_path("t1-backend"), &serde_json::json!({"bad":true}), false).unwrap();
         assert!(store.reserve_start(&actor, "t1-backend", 0, tuple("gpt-6-astra")).unwrap_err().contains("E_OWNER_CORRUPT"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owner_cas_process_child() {
+        let Some(root) = std::env::var_os("APERTURE_OWNER_CAS_CHILD_ROOT") else { return; };
+        let gate = PathBuf::from(&root).join("go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !gate.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(gate.exists(), "parent did not release CAS child");
+        let store = OwnerStore::new(PathBuf::from(root).join("owner"));
+        match store.reserve_start(&AuthenticatedActor::launcher(), "t1-backend", 0, tuple("gpt-6-astra")) {
+            Ok(_) => println!("OWNER_CAS_WIN"),
+            Err(error) => assert!(error.contains("E_LOCK_HELD") || error.contains("E_GENERATION_MISMATCH") || error.contains("E_STATE_CONFLICT"), "unexpected loser: {error}"),
+        }
+    }
+
+    #[test]
+    fn generation_cas_is_atomic_across_two_os_processes() {
+        if std::env::var_os("APERTURE_OWNER_CAS_CHILD_ROOT").is_some() { return; }
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        store.initialize_owner(&AuthenticatedActor::launcher(), "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        // Spawn both children before releasing the shared file gate.
+        let root_a = root.clone();
+        let exe_a = exe.clone();
+        let child_a = std::thread::spawn(move || Command::new(exe_a).args(["--exact", "owner::tests::owner_cas_process_child", "--nocapture"]).env("APERTURE_OWNER_CAS_CHILD_ROOT", root_a).output().unwrap());
+        let root_b = root.clone();
+        let exe_b = exe.clone();
+        let child_b = std::thread::spawn(move || Command::new(exe_b).args(["--exact", "owner::tests::owner_cas_process_child", "--nocapture"]).env("APERTURE_OWNER_CAS_CHILD_ROOT", root_b).output().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(root.join("go"), b"go").unwrap();
+        let outputs = [child_a.join().unwrap(), child_b.join().unwrap()];
+        assert!(outputs.iter().all(|output| output.status.success()), "child failure: {:?}", outputs.iter().map(|o| String::from_utf8_lossy(&o.stderr)).collect::<Vec<_>>());
+        let wins = outputs.iter().filter(|output| String::from_utf8_lossy(&output.stdout).contains("OWNER_CAS_WIN")).count();
+        assert_eq!(wins, 1, "exactly one process must win generation zero");
+        let record = store.read_owner("t1-backend").unwrap();
+        assert_eq!(record.generation, 1);
+        assert_eq!(record.state, OwnerState::Starting);
         fs::remove_dir_all(root).unwrap();
     }
 }
