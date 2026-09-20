@@ -684,6 +684,7 @@ test("managed identity revocation is durable, exact-generation, and fail-closed"
       (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 1,
       "generation one revocation ack",
     );
+    const revokeStartedAt = Date.now();
     launcher.send(JSON.stringify({
       type: "revoke_generation",
       seat: "p1-a-worker",
@@ -696,9 +697,13 @@ test("managed identity revocation is durable, exact-generation, and fail-closed"
       seat: "p1-a-worker",
       generation: 1,
       token_deleted: true,
-      sockets_closed: 1,
+      token_absent_verified: true,
+      token_directory_synced: true,
+      sockets_close_requested: 1,
+      sockets_closed_verified: 1,
     });
     assert.equal((await generationOneClose).code, 4001);
+    assert.ok(Date.now() - revokeStartedAt <= 1_000, "exact socket close is observed within one second");
     assert.equal(existsSync(join(hub.tokenDir, "p1-a-worker.token")), false, "exact token file deleted durably");
     const repeatedGenerationOneAck = waitFor(
       launcher,
@@ -717,7 +722,10 @@ test("managed identity revocation is durable, exact-generation, and fail-closed"
       seat: "p1-a-worker",
       generation: 1,
       token_deleted: false,
-      sockets_closed: 0,
+      token_absent_verified: true,
+      token_directory_synced: true,
+      sockets_close_requested: 0,
+      sockets_closed_verified: 0,
     });
 
     writeFileSync(join(hub.tokenDir, "p1-a-worker.token"), TOKENS["p1-a-worker"], { mode: 0o600 });

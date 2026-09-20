@@ -51,7 +51,7 @@
  *   APERTURE_RUN_DIR        — where presence.json lands (default ~/.aperture/run)
  */
 import { WebSocketServer, WebSocket } from "ws";
-import { constants, closeSync, fstatSync, fsyncSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -365,21 +365,63 @@ function validateExactToken(seat: string, expectedTokenId: string): void {
   }
 }
 
-function deleteExactToken(seat: string, expectedTokenId: string): boolean {
+interface TokenDeletionProof {
+  tokenDeleted: boolean;
+  tokenAbsentVerified: true;
+  tokenDirectorySynced: true;
+}
+
+function deleteExactToken(seat: string, expectedTokenId: string): TokenDeletionProof {
   const path = join(TOKEN_DIR, `${seat}.token`);
+  let tokenDeleted = false;
   try {
     validateExactToken(seat, expectedTokenId);
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  unlinkSync(path);
+  try {
+    unlinkSync(path);
+    tokenDeleted = true;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const dirFd = openSync(TOKEN_DIR, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-  return true;
+  try {
+    const stat = fstatSync(dirFd);
+    if (!stat.isDirectory() || (stat.mode & 0o077) !== 0) throw new Error("unsafe token directory");
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      throw new Error("token directory owner mismatch");
+    }
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
+  }
+  try {
+    lstatSync(path);
+    throw new Error("token path still exists after revocation");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return { tokenDeleted, tokenAbsentVerified: true, tokenDirectorySynced: true };
 }
 
-function handleRevokeGeneration(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): void {
+function closeManagedSocket(candidate: WebSocket): Promise<boolean> {
+  if (candidate.readyState === WebSocket.CLOSED) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (closed: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(closed);
+    };
+    const timer = setTimeout(() => finish(false), 1_000);
+    candidate.once("close", () => finish(candidate.readyState === WebSocket.CLOSED));
+    candidate.close(4001, "generation revoked");
+  });
+}
+
+async function handleRevokeGeneration(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): Promise<void> {
   if (conn.role !== "subscriber" || conn.agent !== "watchdog") {
     log("revocation_rejected", { reason: "launcher_control_required" });
     send(ws, { type: "error", code: "E_CONTROL_UNAUTHORIZED" });
@@ -405,26 +447,43 @@ function handleRevokeGeneration(ws: WebSocket, conn: Conn, msg: Record<string, u
       && current.revoked_token_ids.includes(requestedTokenId);
     if (!alreadyRevoked) validateExactToken(seat, requestedTokenId);
     revokeGeneration(seat, generation as number, requestedTokenId);
-    const tokenDeleted = deleteExactToken(seat, requestedTokenId);
-    let socketsClosed = 0;
+    const tokenProof = deleteExactToken(seat, requestedTokenId);
+    const matchingSockets: WebSocket[] = [];
     for (const [candidate, identity] of conns) {
       if (
         identity.agent === seat &&
         identity.generation === generation &&
         identity.tokenId === requestedTokenId
       ) {
-        socketsClosed += 1;
-        candidate.close(4001, "generation revoked");
+        matchingSockets.push(candidate);
       }
     }
-    log("generation_revoked", { seat, generation, token_deleted: tokenDeleted, sockets_closed: socketsClosed });
+    const closeResults = await Promise.all(matchingSockets.map(closeManagedSocket));
+    const socketsClosed = closeResults.filter(Boolean).length;
+    if (socketsClosed !== matchingSockets.length) {
+      log("revocation_failed", { seat, generation, reason: "socket_close_unverified" });
+      send(ws, { type: "error", code: "E_REVOCATION_INCOMPLETE" });
+      return;
+    }
+    log("generation_revoked", {
+      seat,
+      generation,
+      token_deleted: tokenProof.tokenDeleted,
+      token_absent_verified: tokenProof.tokenAbsentVerified,
+      token_directory_synced: tokenProof.tokenDirectorySynced,
+      sockets_close_requested: matchingSockets.length,
+      sockets_closed_verified: socketsClosed,
+    });
     send(ws, {
       type: "ok",
       control: "revoke_generation",
       seat,
       generation,
-      token_deleted: tokenDeleted,
-      sockets_closed: socketsClosed,
+      token_deleted: tokenProof.tokenDeleted,
+      token_absent_verified: tokenProof.tokenAbsentVerified,
+      token_directory_synced: tokenProof.tokenDirectorySynced,
+      sockets_close_requested: matchingSockets.length,
+      sockets_closed_verified: socketsClosed,
     });
   } catch {
     log("revocation_failed", { seat, generation });
@@ -622,7 +681,7 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "revoke_generation") {
-      handleRevokeGeneration(ws, conn, msg);
+      void handleRevokeGeneration(ws, conn, msg);
       return;
     }
 
