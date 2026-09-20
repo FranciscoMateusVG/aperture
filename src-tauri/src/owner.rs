@@ -271,6 +271,9 @@ impl OwnerStore {
         reservation: &StartReservation,
         incarnation: Incarnation,
     ) -> Result<OwnerRecord, String> {
+        if !actor.is_launcher() {
+            return Err("E_CONTROL_UNAUTHORIZED: launcher actor required".into());
+        }
         let _lock = self.lock(&reservation.seat)?;
         let mut record = self.read_unlocked(&reservation.seat)?;
         require_reservation(&record, reservation)?;
@@ -280,6 +283,12 @@ impl OwnerStore {
         validate_incarnation(&incarnation)?;
         if record.provisional_token_id.as_deref() != Some(&incarnation.token_id) {
             return Err("E_PROCESS_IDENTITY: candidate token is not the reserved identity".into());
+        }
+        if let Some(existing) = record.incarnation.as_ref() {
+            if existing == &incarnation {
+                return Ok(record);
+            }
+            return Err("E_PROCESS_IDENTITY: gated candidate is already recorded".into());
         }
         record.incarnation = Some(incarnation);
         record.writer = actor.principal().into();
@@ -607,7 +616,25 @@ mod tests {
         store.initialize_owner(&actor, "t2-backend", tuple("gpt-6-astra")).unwrap();
         let reservation = store.reserve_start(&actor, "t2-backend", 0, tuple("gpt-6-astra")).unwrap();
         bind_token(&store, &actor, &reservation);
-        store.record_start_candidate(&actor, &reservation, candidate("gpt-6-astra")).unwrap();
+        let first_candidate = candidate("gpt-6-astra");
+        store.record_start_candidate(&actor, &reservation, first_candidate.clone()).unwrap();
+        assert_eq!(
+            store.record_start_candidate(&actor, &reservation, first_candidate.clone()).unwrap().incarnation,
+            Some(first_candidate.clone()),
+        );
+        let mut replacement_candidate = first_candidate;
+        replacement_candidate.processes.push(ProcessIdentity {
+            pid: 124,
+            start_time: 457,
+            ppid: 123,
+            pgid: 123,
+            cmdline_sha256: "b".repeat(64),
+            cwd: "/tmp/work".into(),
+        });
+        assert!(store
+            .record_start_candidate(&actor, &reservation, replacement_candidate)
+            .unwrap_err()
+            .contains("already recorded"));
         let before = store.read_owner("t2-backend").unwrap();
         let mut wrong = RuntimeObservation {
             pid: 999,
