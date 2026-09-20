@@ -29,7 +29,7 @@ fn require_legacy_lifecycle_at(
 
 /// Authoritative native classification, independent of UI visibility or cached
 /// AppState. Only a proven standing seat may enter legacy lifecycle effects.
-fn require_legacy_lifecycle(name: &str) -> Result<(), String> {
+pub(crate) fn require_legacy_lifecycle(name: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)

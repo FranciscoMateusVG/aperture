@@ -116,3 +116,17 @@ fn archived_directory_membership_denies_without_runtime_marker() {
     .unwrap();
     denied(&f.0, &f.roots());
 }
+
+#[test]
+fn watchdog_guard_precedes_nudge_teardown_and_shared_boot() {
+    let source = include_str!("watchdog.rs");
+    let body = source.split("fn execute_rekick(").nth(1).unwrap()
+        .split("fn ring_operator(").next().unwrap();
+    let gate = body.find("if crate::agents::require_legacy_lifecycle(name).is_err()").unwrap();
+    let after_gate = &body[gate..];
+    assert!(after_gate.find("return;").unwrap() < after_gate.find("match tier").unwrap());
+    for effect in ["tmux_send_keys(", "tmux_kill_window(", "stop_app_server(",
+                   "remove_file(", "boot_agent_headless("] {
+        assert!(gate < body.find(effect).unwrap(), "effect before guard: {effect}");
+    }
+}
