@@ -1616,16 +1616,16 @@ fn scan_team_memberships(
         if !valid_short_id(&name, 16) || !real_dir_inside(root, &entry.path()) {
             return Err(TeamError::new("E_PATH_UNSAFE", "team registry contains an unsafe entry"));
         }
-        if fs::symlink_metadata(journal_root.join(format!("{name}.archive.json"))).is_ok() {
-            return Err(TeamError::new(
-                "E_JOURNAL_INCONSISTENT",
-                "team archive is incomplete",
-            ));
-        }
         let snapshot: TeamSnapshot = read_private_json(&entry.path().join("team.json")).map_err(TeamError::from_message)?;
         let state: TeamStateFile = read_private_json(&entry.path().join("state.json")).map_err(TeamError::from_message)?;
         validate_stored_team(&name, &snapshot, &state)?;
         if snapshot.seats.iter().any(|candidate| candidate.name == seat) {
+            if fs::symlink_metadata(journal_root.join(format!("{name}.archive.json"))).is_ok() {
+                return Err(TeamError::new(
+                    "E_JOURNAL_INCONSISTENT",
+                    "team archive is incomplete",
+                ));
+            }
             if found.is_some() { return Err(TeamError::state("seat belongs to multiple team snapshots")); }
             *found = Some(if archived_root || state.state == TeamLifecycle::Archived {
                 ManagedSeatState::Archived
@@ -2172,6 +2172,7 @@ mod tests {
                 "E_JOURNAL_INCONSISTENT",
             );
         }
+        assert_eq!(classify_managed_seat(&home, "standing").unwrap(), None);
         assert_eq!(crate::agent_loader::load_agents_from_disk().keys().filter(|name| name.starts_with("t1-")).count(), 0);
         fs::remove_dir_all(home).unwrap();
     }
