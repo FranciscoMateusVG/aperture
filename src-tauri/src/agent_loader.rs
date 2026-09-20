@@ -135,6 +135,7 @@ struct TeamGrant {
 struct TeamSnapshot {
     team: String,
     project: String,
+    repo: String,
     lead: String,
     seats: Vec<TeamSeat>,
     #[serde(default)]
@@ -197,6 +198,7 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     if state.state != "active"
         || snapshot.team != name
         || !is_valid_project_label(&snapshot.project)
+        || !crate::teams::repository_binding_is_allowed(&snapshot.project, &snapshot.repo)
         || !is_valid_seat_name(&snapshot.lead)
     {
         return None;
@@ -807,6 +809,7 @@ mod tests {
             serde_json::json!({
                 "team": team,
                 "project": "project:aperture",
+                "repo": "aperture",
                 "lead": seats[0].0,
                 "seats": seats.iter().map(|(name, role)| serde_json::json!({"name": name, "role": role})).collect::<Vec<_>>(),
                 "grants": []

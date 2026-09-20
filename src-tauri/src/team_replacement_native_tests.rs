@@ -73,7 +73,7 @@ fn snapshot() -> OwnershipSnapshot {
 }
 fn team() -> TeamSnapshot {
     serde_json::from_value(serde_json::json!({
-        "schema_version":1,"team":"t1","project":"project:aperture","mission":"fixture","acceptance":"fixture",
+        "schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture",
         "preset":{"id":null,"sha256":null},"lead":"t1-lead",
         "seats":[{"name":"t1-worker","role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],
         "fallbacks":[{"harness":"codex","model":"gpt-6-astra","reasoning":"medium"}],"grants":[],

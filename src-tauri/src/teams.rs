@@ -1167,6 +1167,13 @@ fn valid_repo_key(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+pub(crate) fn repository_binding_is_allowed(project: &str, repo: &str) -> bool {
+    valid_repo_key(repo)
+        && REPO_CATALOG.iter().any(|(allowed_project, allowed_repo, _)| {
+            *allowed_project == project && *allowed_repo == repo
+        })
+}
+
 fn repository_is_available(home: &Path, repo: &str) -> bool {
     if !valid_repo_key(repo) { return false; }
     let projects = home.join("projects");
@@ -1202,7 +1209,7 @@ fn repository_catalog(home: &Path) -> Vec<RepositoryCatalogEntry> {
 /// catalog. Project labels scope the allowlist but never choose a repository.
 pub(crate) fn resolve_repository(home: &Path, project: &str, repo: &str) -> TeamResult<PathBuf> {
     if repo.is_empty() { return Err(TeamError::new("E_REPO_REQUIRED", "repository selection is required")); }
-    if !valid_repo_key(repo) || !REPO_CATALOG.iter().any(|(allowed_project, allowed_repo, _)| *allowed_project == project && *allowed_repo == repo) {
+    if !repository_binding_is_allowed(project, repo) {
         return Err(TeamError::new("E_REPO_NOT_IN_CATALOG", "repository is not allowlisted for the selected project"));
     }
     if !repository_is_available(home, repo) {
@@ -1390,9 +1397,7 @@ fn validate_stored_team(team: &str, snapshot: &TeamSnapshot, state: &TeamStateFi
     if snapshot.schema_version != 1 || state.schema_version != 1 || snapshot.team != team || !PROJECTS.contains(&snapshot.project.as_str()) {
         return Err(TeamError::state("team snapshot identity is invalid"));
     }
-    if !valid_repo_key(&snapshot.repo)
-        || !REPO_CATALOG.iter().any(|(project, repo, _)| *project == snapshot.project && *repo == snapshot.repo)
-    {
+    if !repository_binding_is_allowed(&snapshot.project, &snapshot.repo) {
         return Err(TeamError::state("team snapshot repository binding is invalid"));
     }
     validate_team_name(&snapshot.team)?;
