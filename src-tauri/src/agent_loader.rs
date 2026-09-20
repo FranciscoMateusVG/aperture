@@ -16,7 +16,7 @@ use crate::state::AgentDef;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Per-agent metadata loaded from `~/.claude/aperture/<agent>/manifest.json`.
 ///
@@ -158,6 +158,15 @@ fn path_entry_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+fn archive_journal_path(teams_root: &Path, team: &str) -> Option<PathBuf> {
+    let aperture_root = teams_root.parent()?;
+    Some(
+        aperture_root
+            .join("run/team-journals")
+            .join(format!("{team}.archive.json")),
+    )
+}
+
 fn path_inside(root: &Path, path: &Path) -> bool {
     match (fs::canonicalize(root), fs::canonicalize(path)) {
         (Ok(root), Ok(path)) => path.starts_with(root),
@@ -176,7 +185,12 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     let state_path = dir.join("state.json");
     let team_path = dir.join("team.json");
     let journal_path = dir.join("journal.json");
-    if !is_real_file(&state_path) || !is_real_file(&team_path) || path_entry_exists(&journal_path) {
+    let archive_journal = archive_journal_path(root, name)?;
+    if !is_real_file(&state_path)
+        || !is_real_file(&team_path)
+        || path_entry_exists(&journal_path)
+        || path_entry_exists(&archive_journal)
+    {
         return None;
     }
     if !path_inside(&dir, &state_path) || !path_inside(&dir, &team_path) {
@@ -184,12 +198,16 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     }
     let state_before = fs::read_to_string(&state_path).ok()?;
     let team_before = fs::read_to_string(&team_path).ok()?;
-    if path_entry_exists(&journal_path) {
+    if path_entry_exists(&journal_path) || path_entry_exists(&archive_journal) {
         return None;
     }
     let team_after = fs::read_to_string(&team_path).ok()?;
     let state_after = fs::read_to_string(&state_path).ok()?;
-    if path_entry_exists(&journal_path) || state_before != state_after || team_before != team_after {
+    if path_entry_exists(&journal_path)
+        || path_entry_exists(&archive_journal)
+        || state_before != state_after
+        || team_before != team_after
+    {
         return None;
     }
     let state: TeamState = serde_json::from_str(&state_before).ok()?;
@@ -856,6 +874,11 @@ mod tests {
         fs::write(teams.join("p1/journal.json"), "{}").unwrap();
         let during_transition = load_agents_from_roots(&agents, &teams);
         assert!(!during_transition.contains_key("p1-backend"));
+        fs::remove_file(teams.join("p1/journal.json")).unwrap();
+        fs::create_dir_all(root.join("run/team-journals")).unwrap();
+        fs::write(root.join("run/team-journals/p1.archive.json"), "{}").unwrap();
+        let during_archive = load_agents_from_roots(&agents, &teams);
+        assert!(!during_archive.contains_key("p1-backend"));
         let _ = fs::remove_dir_all(root);
     }
 

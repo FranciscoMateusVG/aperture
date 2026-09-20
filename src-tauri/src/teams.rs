@@ -1554,16 +1554,17 @@ fn validate_epic_id(value: &str) -> TeamResult<()> {
 pub(crate) fn classify_managed_seat(home: &Path, seat: &str) -> TeamResult<Option<ManagedSeatState>> {
     if !is_valid_seat_name(seat) { return Err(TeamError::name("invalid seat id")); }
     let teams_root = home.join(".aperture/teams");
+    let journal_root = home.join(".aperture/run/team-journals");
     let agents_root = home.join(".claude/aperture");
     let marker = agents_root.join(seat).join("TEAM");
     let marker_exists = fs::symlink_metadata(&marker).is_ok();
     let mut found: Option<ManagedSeatState> = None;
     match fs::symlink_metadata(&teams_root) {
         Ok(_) => {
-            scan_team_memberships(&teams_root, seat, false, &mut found)?;
+            scan_team_memberships(&teams_root, &journal_root, seat, false, &mut found)?;
             let archive = teams_root.join("archive");
             match fs::symlink_metadata(&archive) {
-                Ok(_) => scan_team_memberships(&archive, seat, true, &mut found)?,
+                Ok(_) => scan_team_memberships(&archive, &journal_root, seat, true, &mut found)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(TeamError::io("team archive registry unreadable")),
             }
@@ -1591,7 +1592,13 @@ pub(crate) fn classify_managed_seat(home: &Path, seat: &str) -> TeamResult<Optio
     }
 }
 
-fn scan_team_memberships(root: &Path, seat: &str, archived_root: bool, found: &mut Option<ManagedSeatState>) -> TeamResult<()> {
+fn scan_team_memberships(
+    root: &Path,
+    journal_root: &Path,
+    seat: &str,
+    archived_root: bool,
+    found: &mut Option<ManagedSeatState>,
+) -> TeamResult<()> {
     validate_repo_or_private_dir(root)?;
     for entry in fs::read_dir(root).map_err(|_| TeamError::io("team registry unreadable"))? {
         let entry = entry.map_err(|_| TeamError::io("team registry unreadable"))?;
@@ -1599,6 +1606,12 @@ fn scan_team_memberships(root: &Path, seat: &str, archived_root: bool, found: &m
         if name.starts_with('.') || (!archived_root && matches!(name.as_str(), "archive" | "presets")) { continue; }
         if !valid_short_id(&name, 16) || !real_dir_inside(root, &entry.path()) {
             return Err(TeamError::new("E_PATH_UNSAFE", "team registry contains an unsafe entry"));
+        }
+        if fs::symlink_metadata(journal_root.join(format!("{name}.archive.json"))).is_ok() {
+            return Err(TeamError::new(
+                "E_JOURNAL_INCONSISTENT",
+                "team archive is incomplete",
+            ));
         }
         let snapshot: TeamSnapshot = read_private_json(&entry.path().join("team.json")).map_err(TeamError::from_message)?;
         let state: TeamStateFile = read_private_json(&entry.path().join("state.json")).map_err(TeamError::from_message)?;
@@ -2138,6 +2151,19 @@ mod tests {
             assert_eq!(classify_managed_seat(&home, &seat.configured.name).unwrap(), Some(ManagedSeatState::Active { team:"t1".into(), generation:1 }));
         }
         assert_eq!(crate::agent_loader::load_agents_from_disk().keys().filter(|name| name.starts_with("t1-")).count(), 3);
+        ensure_private_dir(&home.join(".aperture/run/team-journals")).unwrap();
+        write_private_json_atomic(
+            &home.join(".aperture/run/team-journals/t1.archive.json"),
+            &serde_json::json!({"fixture": true}),
+            false,
+        ).unwrap();
+        for seat in &active.seats {
+            assert_eq!(
+                classify_managed_seat(&home, &seat.configured.name).unwrap_err().code,
+                "E_JOURNAL_INCONSISTENT",
+            );
+        }
+        assert_eq!(crate::agent_loader::load_agents_from_disk().keys().filter(|name| name.starts_with("t1-")).count(), 0);
         fs::remove_dir_all(home).unwrap();
     }
 
