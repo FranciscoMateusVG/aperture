@@ -5,7 +5,7 @@
 // suite runs the REAL replay path: on agent hello, replayUnread() →
 // beads.ts getUnreadMessages() shells out to
 //
-//   bd list --status open --title-contains '->AGENT]' --include-infra
+//   bd list --type message --status open --title-contains '->AGENT]' --include-infra
 //     --sort id --reverse --json -n 0
 //
 // and each returned row becomes one {type:"message", id, from, preview} frame
@@ -220,6 +220,8 @@ function bdCalls(dataDir) {
 /** The exact argv shape beads.ts getUnreadMessages passes to bd. */
 const unreadQueryArgv = (agent) => [
   "list",
+  "--type",
+  "message",
   "--status",
   "open",
   "--title-contains",

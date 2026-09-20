@@ -74,7 +74,7 @@ export function runBd(args: string[]): Promise<string> {
 
 // bd 1.0.2 `query` applies its row limit before its CLI sort, so it cannot be
 // cursor-paged without skipping rows. `list --sort ... -n 0` reads the complete
-// filtered issues+wisp set before sorting. Bound that command's stdout here:
+// filtered message-wisp set before sorting. Bound that command's stdout here:
 // an oversized backlog is a hard, recoverable error rather than a partial or
 // falsely empty inbox. This bounds IPC consumption, not bd's internal scan.
 export const UNREAD_SCAN_MAX_BYTES = 8 * 1024 * 1024;
@@ -629,7 +629,7 @@ export async function createMessage(
  *
  * Authorization is evaluated before this output cap. bd 1.0.2 query limits
  * before sorting and list has no ordered cursor. We instead use list's
- * complete issues+wisp merge with `--sort` (which forces its SQL Limit=0),
+ * complete message-wisp scan with `--sort` (which forces its SQL Limit=0),
  * protected by UNREAD_SCAN_MAX_BYTES. It then keeps the 200 newest authorized
  * rows and renders that batch oldest-first. This prevents durable open
  * `withheld:*` rows from starving later authorized messages without losing
@@ -727,15 +727,18 @@ export async function getUnreadMessages(recipient: string): Promise<string> {
   // `withheld:*` rows deliberately stay open so a later grant/lead change can
   // authorize the same stable message id. Therefore the row cap must be
   // applied AFTER policy, not to bd's first page: 200 denied rows must never
-  // starve an authorized row at position 201. `--include-infra` keeps message
-  // wisps visible; leaving Ephemeral unset makes SearchIssues merge ordinary
-  // rows and wisps, matching the old query boundary. Exact message type,
-  // status and recipient are validated below before any policy mutation.
+  // starve an authorized row at position 201. `--type message` makes bd 1.0.2
+  // select the infra/wisp storage where message creation and migration 007 put
+  // these records; `--include-infra` is explicit defense against default infra
+  // hiding. Exact type, status and recipient are still validated below before
+  // any policy mutation.
   const registry = loadSeatRegistry();
   const allowed: Record<string, unknown>[] = [];
   const seenIds = new Set<string>();
   const raw = await runBdUnreadScan([
     "list",
+    "--type",
+    "message",
     "--status",
     "open",
     "--title-contains",

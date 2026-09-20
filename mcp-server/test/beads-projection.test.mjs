@@ -12,7 +12,7 @@
 // long-lived server child serves every test.
 //
 // Pins:
-//   (a) get_messages uses bd 1.0.2 list's complete issues+wisp merge with a
+//   (a) get_messages uses bd 1.0.2 list's complete message-wisp scan with a
 //       dedicated stdout bound, renders at most 200 oldest-first, and appends the
 //       cap notice ONLY when exactly 200 rows came back; the aperture-q6gov
 //       non-array → ERROR path is intact.
@@ -72,8 +72,9 @@ writeFileSync(
     'if (!Array.isArray(value)) { process.stdout.write(JSON.stringify(value)); process.exit(0); }',
     'const flag = (name) => { const i=args.indexOf(name); return i < 0 ? null : args[i+1]; };',
     '// Faithful bd 1.0.2 list boundary: infra is hidden unless explicitly included;',
-    '// Ephemeral unset merges ordinary issues+wisp rows; --sort runs on the full set before -n.',
+    '// exact infra type selects message wisps; --sort runs on the full set before -n.',
     'let page = args.includes("--include-infra") ? value : value.filter((row) => row.issue_type !== "message");',
+    'const type = flag("--type"); if (type) page = page.filter((row) => row.issue_type === type);',
     'const status = flag("--status"); if (status) page = page.filter((row) => row.status === status);',
     'const title = flag("--title-contains"); if (title) page = page.filter((row) => String(row.title ?? "").toLowerCase().includes(title.toLowerCase()));',
     'if (flag("--sort") === "id") page = page.toSorted((a, b) => args.includes("--reverse") ? b.id.localeCompare(a.id) : a.id.localeCompare(b.id));',
@@ -91,7 +92,7 @@ writeFileSync(
     'line=""',
     'for a in "$@"; do line="${line}${a}\t"; done',
     `printf '%s\\n' "\${line%\t}" >> "${BD_LOG}"`,
-    `if [ "$1" = list ] && [ "$2" = --status ] && [ "$4" = --title-contains ]; then exec "${process.execPath}" "${BD_STUB_JS}" "${SCENARIO}" "$@"; fi`,
+    `if [ "$1" = list ] && [ "$2" = --type ] && [ "$4" = --status ] && [ "$6" = --title-contains ]; then exec "${process.execPath}" "${BD_STUB_JS}" "${SCENARIO}" "$@"; fi`,
     `if [ "$1" = show ]; then if [ "$(head -c 1 "${SCENARIO}")" != "[" ]; then cat "${SCENARIO}"; exit 0; fi; exec "${process.execPath}" -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const r=v.find(x=>x&&x.id===process.argv[2]);process.stdout.write(JSON.stringify(r??[]))' "${SCENARIO}" "$2"; fi`,
     `if [ "$1" = close ]; then printf '{"id":"%s","status":"closed"}\\n' "$2"; exit 0; fi`,
     `cat "${SCENARIO}"`,
@@ -185,13 +186,15 @@ const call = async (name, args = {}) => {
 
 // ── (a) get_messages ──────────────────────────────────────────────────────
 
-test("get_messages: bd argv uses the complete issues+wisp list boundary with explicit infra visibility", async () => {
+test("get_messages: bd argv uses the complete message-wisp list boundary with explicit infra visibility", async () => {
   setScenario([]);
   const { text, isError } = await call("get_messages");
   assert.equal(isError, false);
   assert.equal(text, "No unread messages.");
   assert.deepEqual(lastCall(), [
     "list",
+    "--type",
+    "message",
     "--status",
     "open",
     "--title-contains",
@@ -432,11 +435,21 @@ test("unread complete scan rejects ambiguous rows before labels or acknowledgeme
   assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
 });
 
-test("unread issues+wisp merge rejects a non-message row with a message-shaped title", async () => {
+test("unread message selection excludes a legitimate non-message title match and still delivers the message", async () => {
+  const realMessage = message(34, "2026-09-01T00:00:01.000Z");
   setScenario([{
     ...task("aperture-task-shaped", 2),
     title: `[glados->${AGENT}] not actually a message`,
-  }]);
+  }, realMessage]);
+  const result = await call("get_messages");
+  assert.equal(result.isError, false, result.text);
+  assert.match(result.text, new RegExp(`^\\[${realMessage.id}\\] From glados: body 34$`, "m"));
+  assert.doesNotMatch(result.text, /not actually a message/);
+  assert.deepEqual(calls().map((argv) => argv[0]), ["list"]);
+});
+
+test("unread post-parse defense rejects a malformed row returned by the message boundary", async () => {
+  setScenario([{ ...message(35, "2026-09-01T00:00:02.000Z"), id: "../invalid" }]);
   const result = await call("get_messages");
   assert.equal(result.isError, true);
   assert.match(result.text, /^ERROR: unread scan returned an invalid or ambiguous message row$/);

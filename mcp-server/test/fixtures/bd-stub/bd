@@ -4,9 +4,9 @@
 # (aperture-xt16e) without touching hub code or a real BEADS store.
 #
 # Contract (mirrors mcp-server/src/beads.ts getUnreadMessages and bd 1.0.2
-#           list semantics: full issues+wisp merge, then sort, stdout bounded
+#           list semantics: complete message-wisp selection, then sort, stdout bounded
 #           by the caller rather than a pre-sort row limit):
-#   bd list --status open --title-contains '->RECIPIENT]' --include-infra \
+#   bd list --type message --status open --title-contains '->RECIPIENT]' --include-infra \
 #     --sort id --reverse --json -n 0
 #     → prints the JSON array in $BD_STUB_DIR/unread-RECIPIENT.json, or [] if
 #       that file is absent.
@@ -51,8 +51,8 @@ if [[ $# -eq 5 && "$1" == "update" && "$3" == "--add-label" && "$5" == "--json" 
 fi
 
 # The primary recognized shape: complete getUnreadMessages list scan.
-if [[ $# -eq 12 && "$1" == "list" && "$2" == "--status" && "$3" == "open" && "$4" == "--title-contains" && "$6" == "--include-infra" && "$7" == "--sort" && "$8" == "id" && "$9" == "--reverse" && "${10}" == "--json" && "${11}" == "-n" && "${12}" == "0" ]]; then
-  title_filter="$5"
+if [[ $# -eq 14 && "$1" == "list" && "$2" == "--type" && "$3" == "message" && "$4" == "--status" && "$5" == "open" && "$6" == "--title-contains" && "$8" == "--include-infra" && "$9" == "--sort" && "${10}" == "id" && "${11}" == "--reverse" && "${12}" == "--json" && "${13}" == "-n" && "${14}" == "0" ]]; then
+  title_filter="$7"
   re='^->([^]]+)\]$'
   if [[ "$title_filter" =~ $re ]]; then
     recipient="${BASH_REMATCH[1]}"
@@ -63,7 +63,7 @@ const fs = require("node:fs");
 const rows = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const titleFilter = process.argv[3].toLowerCase();
 const page = rows
-  .filter((row) => row.status === "open" && String(row.title ?? "").toLowerCase().includes(titleFilter))
+  .filter((row) => row.issue_type === "message" && row.status === "open" && String(row.title ?? "").toLowerCase().includes(titleFilter))
   .sort((a, b) => b.id.localeCompare(a.id));
 process.stdout.write(JSON.stringify(page));
 NODE
