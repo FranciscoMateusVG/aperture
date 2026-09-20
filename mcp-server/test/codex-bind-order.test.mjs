@@ -47,8 +47,9 @@ mkdirSync(TEAMS);
 mkdirSync(join(AGENTS, "glados"));
 writeFileSync(
   join(AGENTS, "glados", "manifest.json"),
-  JSON.stringify({ model: "claude/test", role: "orchestrator", enabled: true }),
+  JSON.stringify({ name: "glados", model: "claude/test", window: "glados", role: "orchestrator", enabled: true }),
 );
+writeFileSync(join(AGENTS, "glados", "prompt.md"), "fixture");
 writeFileSync(UNREAD_FILE, "[]\n");
 writeFileSync(BD_STUB, `#!/bin/sh\ncat "$FAKE_BD_UNREAD_FILE"\n`, { mode: 0o755 });
 
@@ -120,8 +121,9 @@ async function scenario(t, { threads = [], delays = {}, failures = {} } = {}) {
   mkdirSync(join(AGENTS, agent));
   writeFileSync(
     join(AGENTS, agent, "manifest.json"),
-    JSON.stringify({ model: "codex/gpt-test", role: "test", enabled: true }),
+    JSON.stringify({ name: agent, model: "codex/gpt-test", window: agent, role: "test", enabled: true }),
   );
+  writeFileSync(join(AGENTS, agent, "prompt.md"), "fixture");
   const sock = join(TMP, `${agent}.sock`);
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
   const server = new FakeAppServer(sock, { threads, delays, failures });
@@ -181,7 +183,7 @@ test("Codex deliverUnread rechecks current registry and does not inject after re
 
   writeFileSync(
     join(AGENTS, agent, "manifest.json"),
-    JSON.stringify({ model: "codex/gpt-test", role: "test", enabled: false }),
+    JSON.stringify({ name: agent, model: "codex/gpt-test", window: agent, role: "test", enabled: false }),
   );
   setUnread([msgRow("m-withheld", "glados", agent, "body must never enter the Codex thread")]);
   bridge.deliver();

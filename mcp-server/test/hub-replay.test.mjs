@@ -105,8 +105,9 @@ async function spawnHub({ bdFail = false } = {}) {
       mkdirSync(join(emptyAgentsDir, principal), { recursive: true });
       writeFileSync(
         join(emptyAgentsDir, principal, "manifest.json"),
-        JSON.stringify({ model: "claude/test", role: "test", enabled: true }),
+        JSON.stringify({ name: principal, model: "claude/test", window: principal, role: "test", enabled: true }),
       );
+      writeFileSync(join(emptyAgentsDir, principal, "prompt.md"), "fixture");
     }
   }
 
@@ -219,6 +220,9 @@ function bdCalls(dataDir) {
 const unreadQueryArgv = (agent) => [
   "query",
   `type=message AND status=open AND title="->${agent}]"`,
+  "--sort",
+  "id",
+  "--reverse",
   "--json",
   "-n",
   "200", // UNREAD_LIMIT (aperture-84bby): bounded replay, was 0 (unlimited)
@@ -346,9 +350,9 @@ test("replay-on-connect: 2 unread rows → exactly 2 message frames, one bd quer
     await sleep(300);
     const msgs = frames.filter((f) => f.type === "message");
     assert.equal(msgs.length, 2, "exactly 2 message frames replayed");
-    assert.deepEqual(msgs[0], row1Expected, "row 1 frame: id/from/preview match");
-    assert.deepEqual(msgs[1], row2Expected, "row 2 frame: 60-char preview, newline → space");
-    assert.equal(msgs[1].preview.length, 60, "preview truncated to exactly 60 chars");
+    assert.deepEqual(msgs[0], row2Expected, "newest/tie-break row: 60-char preview, newline → space");
+    assert.deepEqual(msgs[1], row1Expected, "older/tie-break row: id/from/preview match");
+    assert.equal(msgs[0].preview.length, 60, "preview truncated to exactly 60 chars");
 
     // Evidence: exactly ONE bd invocation for this connect, exact argv shape.
     const calls = bdCalls(hub.dataDir);
@@ -376,7 +380,7 @@ test("authorization loss withholds replay durably while preserving the original 
     const before = readFileSync(seedPath);
     writeFileSync(
       join(hub.agentsDir, "glados", "manifest.json"),
-      JSON.stringify({ model: "claude/test", role: "test", enabled: false }),
+      JSON.stringify({ name: "glados", model: "claude/test", window: "glados", role: "test", enabled: false }),
     );
 
     const agent = await connect(hub.port);
@@ -418,8 +422,8 @@ test("replay-exactly-once-per-connect: rows still unread → reconnect replays s
     await sleep(200);
     assert.deepEqual(
       firstFrames.filter((f) => f.type === "message"),
-      [row1Expected, row2Expected],
-      "connect #1: each frame exactly once, in row order",
+      [row2Expected, row1Expected],
+      "connect #1: each frame exactly once, in deterministic newest/id order",
     );
 
     // Disconnect (agent never called mark_as_read — rows stay unread in the
@@ -443,7 +447,7 @@ test("replay-exactly-once-per-connect: rows still unread → reconnect replays s
     await sleep(200);
     assert.deepEqual(
       secondFrames.filter((f) => f.type === "message"),
-      [row1Expected, row2Expected],
+      [row2Expected, row1Expected],
       "connect #2: same 2 frames replayed again, each exactly once",
     );
 

@@ -55,7 +55,7 @@ import { constants, closeSync, fstatSync, openSync, readFileSync, readdirSync } 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { getUnreadMessages } from "./beads.js";
+import { getUnreadMessages, persistDeniedNotification } from "./beads.js";
 import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
 import { writePresenceSnapshot, PRESENCE_FILE, type PresenceEntry, type PresenceState } from "./presence-snapshot.js";
 import { authorizeMessage, isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
@@ -308,7 +308,7 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
   return { ok: true };
 }
 
-function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): void {
+async function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): Promise<void> {
   const to = typeof msg.to === "string" ? msg.to : "";
   const id = typeof msg.id === "string" ? msg.id : "";
   const from = conn.agent ?? "unknown";
@@ -319,7 +319,21 @@ function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): 
   }
   const authorization = authorizeMessage(loadSeatRegistry(), from, to);
   if (!authorization.allowed) {
-    log("notify_withheld", { to, id, from, reason: authorization.reason });
+    try {
+      const reason = await persistDeniedNotification(id, from, to);
+      log("notify_withheld", { to, id, from, reason });
+    } catch {
+      // Metadata only: never log the stored message body, bd stderr, or a
+      // parsed record. The fixed reason distinguishes persistence failure
+      // without turning observability into a content side channel.
+      // A forged/mismatched id remains withheld but cannot label another row.
+      log("notify_withhold_failed", {
+        to,
+        id,
+        from,
+        reason: "authoritative_binding_failed",
+      });
+    }
     send(ws, { type: "ok", id, outcome: "withheld" });
     return;
   }
@@ -467,7 +481,7 @@ wss.on("connection", (ws) => {
     }
 
     if (conn.role === "producer" && msg.type === "notify") {
-      handleNotify(ws, conn, msg);
+      void handleNotify(ws, conn, msg);
       return;
     }
 

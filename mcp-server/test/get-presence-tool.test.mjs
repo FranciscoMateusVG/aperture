@@ -47,8 +47,9 @@ for (const d of [HOME, RUN, TEAMS, TOKENS, join(AGENTS, "shared"), ...ROSTER.map
 for (const name of ROSTER) {
   writeFileSync(
     join(AGENTS, name, "manifest.json"),
-    JSON.stringify({ name, model: "claude/test", role: "test", enabled: true }),
+    JSON.stringify({ name, model: "claude/test", window: name, role: "test", enabled: true }),
   );
+  writeFileSync(join(AGENTS, name, "prompt.md"), "fixture");
 }
 const WHEATLEY_TOKEN = join(TOKENS, "wheatley.token");
 writeFileSync(WHEATLEY_TOKEN, "11".repeat(32), { mode: 0o600 });

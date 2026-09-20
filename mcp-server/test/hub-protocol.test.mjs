@@ -98,21 +98,46 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
   // ~104 bytes on macOS.
   const runDir = mkdtempSync(join(tmpdir(), "hr-"));
   const presenceFile = join(runDir, "presence.json");
+  const bdMessageFile = join(runDir, "bd-message.json");
+  const bdCallsFile = join(runDir, "bd-calls.log");
+  const bdStub = join(runDir, "bd-stub");
+  writeFileSync(bdMessageFile, "[]");
+  writeFileSync(
+    bdStub,
+    [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "$HUB_BD_LOG"',
+      'if [ "$1" = show ] && [ "$3" = --json ]; then cat "$HUB_BD_MESSAGE_FILE"; exit 0; fi',
+      'if [ "$1" = update ] && [ "$3" = --add-label ] && [ "$5" = --json ]; then printf \'{"id":"%s","status":"open","labels":["%s"]}\\n\' "$2" "$4"; exit 0; fi',
+      'echo "hub protocol bd stub: unexpected argv" >&2',
+      "exit 2",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
   for (const [principal, token] of Object.entries(TOKENS)) {
     writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
     if (principal !== "watchdog" && principal !== "operator") {
       mkdirSync(join(emptyAgentsDir, principal), { recursive: true });
       writeFileSync(
         join(emptyAgentsDir, principal, "manifest.json"),
-        JSON.stringify({ model: principal === codexAgent ? "codex/gpt-5-codex" : "claude/test", role: "test", enabled: true }),
+        JSON.stringify({
+          name: principal,
+          model: principal === codexAgent ? "codex/gpt-5-codex" : "claude/test",
+          window: principal,
+          role: "test",
+          enabled: true,
+        }),
       );
+      writeFileSync(join(emptyAgentsDir, principal, "prompt.md"), "fixture");
     }
   }
   mkdirSync(join(emptyAgentsDir, "nobody-home"), { recursive: true });
   writeFileSync(
     join(emptyAgentsDir, "nobody-home", "manifest.json"),
-    JSON.stringify({ model: "claude/test", role: "test", enabled: true }),
+    JSON.stringify({ name: "nobody-home", model: "claude/test", window: "nobody-home", role: "test", enabled: true }),
   );
+  writeFileSync(join(emptyAgentsDir, "nobody-home", "prompt.md"), "fixture");
   if (teamRegistry) {
     for (const name of ["p1-a-lead", "p1-a-worker", "p1-b-lead"]) {
       writeFileSync(join(emptyAgentsDir, name, "TEAM"), "");
@@ -150,6 +175,9 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
       // Never let the developer's real ~/.aperture/agent-config.json model
       // overrides leak into discovery.
       APERTURE_AGENT_CONFIG_PATH: join(runDir, "no-such-agent-config.json"),
+      BD_PATH: bdStub,
+      HUB_BD_MESSAGE_FILE: bdMessageFile,
+      HUB_BD_LOG: bdCallsFile,
       // Codex bridge reconnect cadence (default 10s) — fast so a bridge whose
       // socket appears/disappears during a test is observed promptly.
       APERTURE_CODEX_RECONNECT_MS: "200",
@@ -215,7 +243,11 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
-  return { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, stop };
+  const setBdMessage = (row) => writeFileSync(bdMessageFile, JSON.stringify(row));
+  const bdCalls = () => existsSync(bdCallsFile)
+    ? readFileSync(bdCallsFile, "utf8").split("\n").filter(Boolean)
+    : [];
+  return { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, setBdMessage, bdCalls, stop };
 }
 
 function connect(port) {
@@ -536,6 +568,13 @@ test("team registry is enforced at the hub: dynamic hello, lead route, and non-l
 
     const workerProducer = await connect(hub.port);
     await authenticate(hub, workerProducer, "producer", "p1-a-worker");
+    hub.setBdMessage({
+      id: "worker-route",
+      issue_type: "message",
+      status: "open",
+      title: "[p1-a-worker->p1-b-lead] must not be delivered",
+      labels: [],
+    });
     const deniedAck = waitFor(
       workerProducer,
       (m) => m.type === "ok" && m.id === "worker-route",
@@ -555,6 +594,40 @@ test("team registry is enforced at the hub: dynamic hello, lead route, and non-l
         && e.to === "p1-b-lead"
         && e.reason === "nonlead",
       "metadata-only nonlead withholding log",
+    );
+    assert.deepEqual(hub.bdCalls(), [
+      "show worker-route --json",
+      "update worker-route --add-label withheld:nonlead --json",
+    ], "denied live notify durably labels the authoritative open row before any replay");
+
+    hub.setBdMessage({
+      id: "different-row",
+      issue_type: "message",
+      status: "open",
+      title: "[glados->p1-b-lead] unrelated",
+      labels: [],
+    });
+    const forgedAck = waitFor(
+      workerProducer,
+      (m) => m.type === "ok" && m.id === "forged-id",
+      "forged-id withholding ack",
+    );
+    workerProducer.send(JSON.stringify({
+      type: "notify",
+      to: "p1-b-lead",
+      id: "forged-id",
+      from: "p1-a-worker",
+      preview: "must not annotate another row",
+    }));
+    assert.equal((await forgedAck).outcome, "withheld");
+    await hub.waitForEvent(
+      (e) => e.event === "notify_withhold_failed" && e.id === "forged-id",
+      "forged notification binding failure",
+    );
+    assert.equal(
+      hub.bdCalls().filter((line) => line.startsWith("update ")).length,
+      1,
+      "forged id/from/to binding cannot label the unrelated stored message",
     );
     closeAll(leadProducer, workerProducer);
   } finally {

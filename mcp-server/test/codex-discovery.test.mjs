@@ -16,7 +16,8 @@ process.env.APERTURE_TEAMS_DIR = TEAMS;
 function manifest(name, model) {
   const dir = join(AGENTS, name);
   mkdirSync(dir);
-  writeFileSync(join(dir, "manifest.json"), JSON.stringify({ model }));
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify({ name, model, window: name, role: "test" }));
+  writeFileSync(join(dir, "prompt.md"), "fixture");
 }
 
 manifest("rex", "opus");

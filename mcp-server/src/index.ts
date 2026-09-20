@@ -17,6 +17,15 @@ if (!AGENT_NAME) {
   process.exit(1);
 }
 
+// Authenticate the canonical enabled principal before deriving ANY path from
+// AGENT_NAME. In particular, MailboxStore.ensureMailbox and MessageQueue.start
+// create directories/files; a malformed ../-style identity must exit without
+// touching APERTURE_MAILBOX, HOME, or the send-queue tree.
+if (!hasAuthenticatedMcpIdentity(AGENT_NAME)) {
+  console.error("AGENT_NAME is not an authenticated enabled registry principal");
+  process.exit(1);
+}
+
 const agentRole = process.env.AGENT_ROLE ?? "agent";
 const agentModel = process.env.AGENT_MODEL ?? "unknown";
 const mailboxDir = process.env.APERTURE_MAILBOX; // optional override
@@ -145,7 +154,7 @@ server.tool(
           isError: true,
         };
       }
-      await markMessageRead(message_id);
+      await markMessageRead(message_id, AGENT_NAME!);
       return { content: [{ type: "text", text: `Message ${message_id} marked as read.` }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };

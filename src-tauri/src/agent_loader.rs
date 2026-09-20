@@ -51,6 +51,14 @@ fn default_enabled() -> bool {
     true
 }
 
+fn is_reserved_seat_principal(name: &str) -> bool {
+    matches!(name, "operator" | "watchdog")
+}
+
+fn is_coordination_trio(name: &str) -> bool {
+    matches!(name, "glados" | "wheatley" | "peppy")
+}
+
 fn aperture_root() -> String {
     // APERTURE_AGENTS_DIR (aperture-syepg) overrides the registry root. The
     // boot-verification harness (aperture-xt16e) points this at a stub registry
@@ -195,7 +203,12 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     }
     let mut names = HashSet::new();
     for seat in &snapshot.seats {
-        if !is_valid_seat_name(&seat.name) || seat.role.trim().is_empty() || !names.insert(seat.name.clone()) {
+        if !is_valid_seat_name(&seat.name)
+            || is_reserved_seat_principal(&seat.name)
+            || is_coordination_trio(&seat.name)
+            || seat.role.trim().is_empty()
+            || !names.insert(seat.name.clone())
+        {
             return None;
         }
     }
@@ -270,7 +283,7 @@ fn load_agents_from_roots(root: &Path, team_root: &Path) -> HashMap<String, Agen
         }
         let dir_name = entry.file_name().to_string_lossy().to_string();
         // Reserved names: shared/ holds skill symlinks, _* are scratch dirs.
-        if dir_name == "shared" || dir_name.starts_with('_') {
+        if dir_name == "shared" || dir_name.starts_with('_') || is_reserved_seat_principal(&dir_name) {
             continue;
         }
         if !is_valid_seat_name(&dir_name) || !is_real_dir(&path) || !path_inside(root, &path) {
@@ -285,6 +298,10 @@ fn load_agents_from_roots(root: &Path, team_root: &Path) -> HashMap<String, Agen
             || (!is_team_seat && membership_count > 0)
         {
             eprintln!("[aperture] skipping '{}': unsafe TEAM marker", dir_name);
+            continue;
+        }
+        if is_team_seat && is_coordination_trio(&dir_name) {
+            eprintln!("[aperture] skipping '{}': fixed coordination seat cannot be a team seat", dir_name);
             continue;
         }
 
@@ -308,6 +325,10 @@ fn load_agents_from_roots(root: &Path, team_root: &Path) -> HashMap<String, Agen
                 || !is_real_file(&path.join(".complete")))
         {
             eprintln!("[aperture] skipping '{}': incomplete or unsafe team seat", dir_name);
+            continue;
+        }
+        if fs::read(&prompt_path).is_err() {
+            eprintln!("[aperture] skipping '{}': unreadable prompt.md", dir_name);
             continue;
         }
 
@@ -335,6 +356,14 @@ fn load_agents_from_roots(root: &Path, team_root: &Path) -> HashMap<String, Agen
         };
 
         if !manifest.enabled {
+            continue;
+        }
+        if manifest.name.trim().is_empty()
+            || manifest.model.trim().is_empty()
+            || manifest.window.trim().is_empty()
+            || manifest.role.trim().is_empty()
+        {
+            eprintln!("[aperture] skipping '{}': blank required manifest field", dir_name);
             continue;
         }
 
@@ -824,6 +853,110 @@ mod tests {
         fs::write(teams.join("p1/journal.json"), "{}").unwrap();
         let during_transition = load_agents_from_roots(&agents, &teams);
         assert!(!during_transition.contains_key("p1-backend"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_rejects_missing_or_malformed_boot_fields_and_prompt() {
+        let root = temp_dir("v4-required-fields");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+
+        write_agent(&agents, "missing-prompt", true, false);
+        fs::remove_file(agents.join("missing-prompt/prompt.md")).unwrap();
+        for field in ["name", "model", "window", "role"] {
+            let name = format!("bad-{field}");
+            write_agent(&agents, &name, true, false);
+            let path = agents.join(&name).join("manifest.json");
+            let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            fs::write(path, value.to_string()).unwrap();
+        }
+        write_agent(&agents, "bad-malformed", true, false);
+        let malformed_path = agents.join("bad-malformed/manifest.json");
+        let mut malformed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&malformed_path).unwrap()).unwrap();
+        malformed["window"] = serde_json::json!(42);
+        fs::write(malformed_path, malformed.to_string()).unwrap();
+        for (name, field, value) in [
+            ("bad-enabled", "enabled", serde_json::json!("yes")),
+            ("bad-emoji", "emoji", serde_json::json!(42)),
+            ("bad-kind", "kind", serde_json::json!(42)),
+        ] {
+            write_agent(&agents, name, true, false);
+            let path = agents.join(name).join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            manifest[field] = value;
+            fs::write(path, manifest.to_string()).unwrap();
+        }
+
+        assert!(load_agents_from_roots(&agents, &teams).is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loader_preserves_readable_repo_owned_legacy_symlinks() {
+        let root = temp_dir("v4-legacy-links");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        let source = root.join("source");
+        let linked = agents.join("legacy-link");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            source.join("manifest.json"),
+            serde_json::json!({
+                "name": "legacy-link",
+                "model": "claude/test",
+                "window": "legacy-link",
+                "role": "legacy",
+                "enabled": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(source.join("prompt.md"), "legacy prompt").unwrap();
+        std::os::unix::fs::symlink(source.join("manifest.json"), linked.join("manifest.json"))
+            .unwrap();
+        std::os::unix::fs::symlink(source.join("prompt.md"), linked.join("prompt.md")).unwrap();
+
+        let loaded = load_agents_from_roots(&agents, &teams);
+        assert!(loaded.contains_key("legacy-link"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_rejects_reserved_team_collisions_but_preserves_fixed_legacy_trio() {
+        let root = temp_dir("v4-reserved");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+        for name in ["operator", "watchdog", "glados", "wheatley", "peppy", "rex"] {
+            write_agent(&agents, name, true, name != "rex");
+        }
+        for name in ["operator", "watchdog", "glados", "wheatley", "peppy"] {
+            write_team(&teams, &format!("team-{name}"), "active", &[(name, "lead")]);
+        }
+        let loaded = load_agents_from_roots(&agents, &teams);
+        assert_eq!(loaded.keys().cloned().collect::<Vec<_>>(), vec!["rex".to_string()]);
+
+        for name in ["glados", "wheatley", "peppy"] {
+            fs::remove_file(agents.join(name).join("TEAM")).unwrap();
+            fs::remove_file(agents.join(name).join(".complete")).unwrap();
+        }
+        let legacy = load_agents_from_roots(&agents, &teams);
+        for name in ["glados", "wheatley", "peppy"] {
+            assert!(legacy.contains_key(name), "{name} should remain a fixed legacy principal");
+        }
+        assert!(!legacy.contains_key("operator"));
+        assert!(!legacy.contains_key("watchdog"));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,7 +1,12 @@
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { authorizeMessage, loadSeatRegistry } from "./seat-registry.js";
+import {
+  authorizeMessage,
+  isValidSeatName,
+  loadSeatRegistry,
+  type MessageDenialReason,
+} from "./seat-registry.js";
 
 const BEADS_DIR = resolve(homedir(), ".aperture", ".beads");
 const BD_PATH = process.env.BD_PATH ?? "bd";
@@ -570,69 +575,164 @@ export async function createMessage(
  * row count. 200 keeps a worst-case reply bounded; the agent drains the rest by
  * marking these read and calling again — formatUnreadMessages says so.
  *
- * Ordering (verified against bd 1.0.2): `bd query` returns NEWEST-first, and
- * `--sort created -r` does not help because bd applies `-n` BEFORE `-r`
- * (`--sort created -r -n 3` returned the 3 newest, merely reversed). So when a
- * backlog exceeds the cap the slice is the 200 MOST RECENT messages, not the
- * oldest. formatUnreadMessages re-sorts them oldest-first so the agent still
- * processes each batch in chronological order. (`bd list --include-infra
- * --type message --sort created -r -n N` does yield the true oldest N, but
- * list applies different default hiding rules to infra/ephemeral beads — not
- * worth the silent-drop risk for a subcommand swap.)
+ * Authorization is evaluated before this output cap. The implementation pages
+ * the full finite open set through bd's supported `--sort id --reverse` plus
+ * `id<cursor`, keeping each SELECT and retained result bounded at 200. It then
+ * keeps the 200 newest authorized rows and formatUnreadMessages renders that
+ * batch oldest-first. This prevents durable open `withheld:*` rows from
+ * starving later authorized messages without losing re-authorization.
  */
 export const UNREAD_LIMIT = 200;
+
+const MESSAGE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const MESSAGE_TITLE_RE = /^\[([a-z0-9][a-z0-9_-]{0,30})->([a-z0-9][a-z0-9_-]{0,30})\](?: |$)/;
+
+interface StoredMessageEnvelope {
+  id: string;
+  from: string;
+  to: string;
+  labels: string[];
+}
+
+async function readOpenMessageEnvelope(messageId: string): Promise<StoredMessageEnvelope> {
+  if (!MESSAGE_ID_RE.test(messageId)) throw new Error("invalid message id");
+  const raw = await runBd(["show", messageId, "--json"]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error("message record unavailable");
+  }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  if (rows.length !== 1 || !rows[0] || typeof rows[0] !== "object" || Array.isArray(rows[0])) {
+    throw new Error("message record unavailable");
+  }
+  const row = rows[0] as Record<string, unknown>;
+  const type = row.issue_type ?? row.type;
+  const title = typeof row.title === "string" ? row.title : "";
+  const match = title.match(MESSAGE_TITLE_RE);
+  if (
+    row.id !== messageId ||
+    type !== "message" ||
+    row.status !== "open" ||
+    !match
+  ) {
+    throw new Error("message record unavailable");
+  }
+  return {
+    id: messageId,
+    from: match[1]!,
+    to: match[2]!,
+    labels: Array.isArray(row.labels)
+      ? row.labels.filter((value): value is string => typeof value === "string")
+      : [],
+  };
+}
+
+async function addWithheldLabel(
+  envelope: StoredMessageEnvelope,
+  reason: MessageDenialReason,
+): Promise<void> {
+  const label = `withheld:${reason}`;
+  if (!envelope.labels.includes(label)) {
+    await runBd(["update", envelope.id, "--add-label", label, "--json"]);
+  }
+}
+
+function newestMessageFirst(a: Record<string, unknown>, b: Record<string, unknown>): number {
+  const created = (value: Record<string, unknown>): string =>
+    typeof value.created_at === "string" ? value.created_at : "";
+  const byCreated = created(b).localeCompare(created(a));
+  if (byCreated !== 0) return byCreated;
+  const aId = typeof a.id === "string" ? a.id : "";
+  const bId = typeof b.id === "string" ? b.id : "";
+  return bId.localeCompare(aId);
+}
 
 /**
  * Query unread (open) messages for a specific recipient — at most UNREAD_LIMIT.
  * Returns the raw bd JSON array (string); callers parse it.
  */
 export async function getUnreadMessages(recipient: string): Promise<string> {
-  // Query all open messages, then filter by recipient in title
-  // bd query title= does contains search, so title=->recipient matches [sender->recipient]
-  const raw = await runBd([
-    "query",
-    `type=message AND status=open AND title="->${recipient}]"`,
-    "--json",
-    "-n",
-    String(UNREAD_LIMIT),
-  ]);
-  const parsed = JSON.parse(raw) as unknown;
-  if (!Array.isArray(parsed)) return raw;
+  if (!isValidSeatName(recipient)) throw new Error("invalid unread recipient");
 
   // §4.10 delivery authorization is current-state authorization. The same
   // helper feeds MCP get_messages, WS replay and Codex deliverUnread, so an
   // archived/demoted seat cannot receive an already-stored message through a
   // different delivery surface. Withholding is durable metadata on the
   // original open message: it preserves the stable id and is NOT an ack.
+  // `withheld:*` rows deliberately stay open so a later grant/lead change can
+  // authorize the same stable message id. Therefore the row cap must be
+  // applied AFTER policy, not to bd's first page: 200 denied rows must never
+  // starve an authorized row at position 201. Scan by a strict id cursor with
+  // every individual SELECT capped, retain only the newest 200 authorized
+  // rows in memory, and re-evaluate the whole finite open set each call.
   const registry = loadSeatRegistry();
   const allowed: Record<string, unknown>[] = [];
-  for (const value of parsed) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const row = value as Record<string, unknown>;
-    const title = typeof row.title === "string" ? row.title : "";
-    const match = title.match(/^\[([^\]]+)->([^\]]+)\]/);
-    const sender = match?.[1] ?? "";
-    const addressedTo = match?.[2] ?? "";
-    const decision = addressedTo === recipient
-      ? authorizeMessage(registry, sender, recipient)
-      : { allowed: false as const, reason: "unknown_recipient" as const };
-    if (decision.allowed) {
-      allowed.push(row);
-      continue;
+  const seenIds = new Set<string>();
+  const baseQuery = `type=message AND status=open AND title="->${recipient}]"`;
+  let cursor: string | null = null;
+  for (;;) {
+    const query = cursor === null ? baseQuery : `${baseQuery} AND id<"${cursor}"`;
+    const raw = await runBd([
+      "query",
+      query,
+      "--sort",
+      "id",
+      "--reverse",
+      "--json",
+      "-n",
+      String(UNREAD_LIMIT),
+    ]);
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return raw;
+    if (parsed.length > UNREAD_LIMIT) throw new Error("bd unread page exceeded limit");
+
+    const pageIds: string[] = [];
+    for (const value of parsed) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const row = value as Record<string, unknown>;
+      const id = typeof row.id === "string" ? row.id : "";
+      if (!MESSAGE_ID_RE.test(id)) throw new Error("invalid message id in unread page");
+      if (seenIds.has(id)) throw new Error("unread pagination returned a duplicate message id");
+      seenIds.add(id);
+      pageIds.push(id);
+
+      const title = typeof row.title === "string" ? row.title : "";
+      const match = title.match(MESSAGE_TITLE_RE);
+      const sender = match?.[1] ?? "";
+      const addressedTo = match?.[2] ?? "";
+      const decision = addressedTo === recipient
+        ? authorizeMessage(registry, sender, recipient)
+        : { allowed: false as const, reason: "unknown_recipient" as const };
+      if (decision.allowed) {
+        allowed.push(row);
+        allowed.sort(newestMessageFirst);
+        if (allowed.length > UNREAD_LIMIT) allowed.length = UNREAD_LIMIT;
+        continue;
+      }
+      await addWithheldLabel({
+        id,
+        from: sender,
+        to: addressedTo,
+        labels: Array.isArray(row.labels)
+          ? row.labels.filter((value): value is string => typeof value === "string")
+          : [],
+      }, decision.reason);
     }
-    const id = typeof row.id === "string" ? row.id : "";
-    if (!id) continue;
-    const label = `withheld:${decision.reason}`;
-    const labels = Array.isArray(row.labels) ? row.labels : [];
-    if (!labels.includes(label)) {
-      await runBd(["update", id, "--add-label", label, "--json"]);
+
+    if (parsed.length < UNREAD_LIMIT) break;
+    const next = pageIds.sort((a, b) => a.localeCompare(b))[0];
+    if (!next || (cursor !== null && next.localeCompare(cursor) >= 0)) {
+      throw new Error("unread pagination did not advance");
     }
+    cursor = next;
   }
   return JSON.stringify(allowed);
 }
 
 /** The line get_messages appends when the reply hit UNREAD_LIMIT. */
-export const UNREAD_CAP_NOTICE = `Showing the ${UNREAD_LIMIT} most recent unread messages (oldest first); older messages are still queued. Call get_messages again after marking these read.`;
+export const UNREAD_CAP_NOTICE = `Showing the ${UNREAD_LIMIT} most recent currently authorized unread messages (oldest first). Additional authorized messages may remain queued; call get_messages again after marking these read.`;
 
 /**
  * Render the get_messages reply body: one `[id] From sender: body` block per
@@ -643,7 +743,13 @@ export const UNREAD_CAP_NOTICE = `Showing the ${UNREAD_LIMIT} most recent unread
 export function formatUnreadMessages(messages: Record<string, unknown>[]): string {
   const created = (m: Record<string, unknown>): string =>
     typeof m.created_at === "string" ? m.created_at : "";
-  const ordered = [...messages].sort((a, b) => created(a).localeCompare(created(b)));
+  const ordered = [...messages].sort((a, b) => {
+    const byCreated = created(a).localeCompare(created(b));
+    if (byCreated !== 0) return byCreated;
+    const aId = typeof a.id === "string" ? a.id : "";
+    const bId = typeof b.id === "string" ? b.id : "";
+    return aId.localeCompare(bId);
+  });
   const blocks = ordered.map((m) => {
     const title = typeof m.title === "string" ? m.title : "";
     const from = title.match(/\[(.+?)->(.+?)\]/)?.[1] ?? "unknown";
@@ -659,6 +765,34 @@ export function formatUnreadMessages(messages: Record<string, unknown>[]): strin
 /**
  * Mark a message as read by closing it.
  */
-export async function markMessageRead(messageId: string): Promise<string> {
+export async function markMessageRead(messageId: string, recipient: string): Promise<string> {
+  if (!isValidSeatName(recipient)) throw new Error("invalid message recipient");
+  const envelope = await readOpenMessageEnvelope(messageId);
+  if (envelope.to !== recipient) throw new Error("message is not addressed to this principal");
+  const decision = authorizeMessage(loadSeatRegistry(), envelope.from, recipient);
+  if (!decision.allowed) {
+    await addWithheldLabel(envelope, decision.reason);
+    throw new Error("message is not currently authorized for delivery");
+  }
   return runBd(["close", messageId, "--reason", "delivered", "--json"]);
+}
+
+/**
+ * Persist a denied live notify on the authoritative open row. The caller's id,
+ * sender and recipient must all match the stored message before any label is
+ * written; a forged notify can therefore never annotate another row.
+ */
+export async function persistDeniedNotification(
+  messageId: string,
+  claimedFrom: string,
+  claimedTo: string,
+): Promise<MessageDenialReason> {
+  const envelope = await readOpenMessageEnvelope(messageId);
+  if (envelope.from !== claimedFrom || envelope.to !== claimedTo) {
+    throw new Error("notification does not match stored message");
+  }
+  const decision = authorizeMessage(loadSeatRegistry(), envelope.from, envelope.to);
+  if (decision.allowed) throw new Error("notification is currently authorized");
+  await addWithheldLabel(envelope, decision.reason);
+  return decision.reason;
 }

@@ -3,9 +3,10 @@
 # test/hub-replay.test.mjs to pin the WS hub's replay-on-reconnect behavior
 # (aperture-xt16e) without touching hub code or a real BEADS store.
 #
-# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages; -n 200 = UNREAD_LIMIT,
-#           aperture-84bby — bounded replay, was -n 0):
-#   bd query 'type=message AND status=open AND title="->RECIPIENT]"' --json -n 200
+# Contract (mirrors mcp-server/src/beads.ts getUnreadMessages; each page stays
+#           bounded at UNREAD_LIMIT and advances by strict id cursor):
+#   bd query 'type=message AND status=open AND title="->RECIPIENT]" [AND id<"CURSOR"]' \
+#     --sort id --reverse --json -n 200
 #     → prints the JSON array in $BD_STUB_DIR/unread-RECIPIENT.json, or [] if
 #       that file is absent.
 #
@@ -48,15 +49,25 @@ if [[ $# -eq 5 && "$1" == "update" && "$3" == "--add-label" && "$5" == "--json" 
   exit 0
 fi
 
-# The primary recognized shape: query <getUnreadMessages-query> --json -n 200
-if [[ $# -eq 5 && "$1" == "query" && "$3" == "--json" && "$4" == "-n" && "$5" == "200" ]]; then
+# The primary recognized shape: paginated getUnreadMessages query.
+if [[ $# -eq 8 && "$1" == "query" && "$3" == "--sort" && "$4" == "id" && "$5" == "--reverse" && "$6" == "--json" && "$7" == "-n" && "$8" == "200" ]]; then
   query="$2"
-  re='^type=message AND status=open AND title="->(.+)\]"$'
+  re='^type=message AND status=open AND title="->([^]]+)\]"( AND id<"([a-z0-9._-]+)")?$'
   if [[ "$query" =~ $re ]]; then
     recipient="${BASH_REMATCH[1]}"
+    cursor="${BASH_REMATCH[3]:-}"
     seed="$BD_STUB_DIR/unread-${recipient}.json"
     if [[ -f "$seed" ]]; then
-      cat "$seed"
+      node - "$seed" "$cursor" <<'NODE'
+const fs = require("node:fs");
+const rows = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const cursor = process.argv[3];
+const page = rows
+  .filter((row) => !cursor || row.id < cursor)
+  .sort((a, b) => b.id.localeCompare(a.id))
+  .slice(0, 200);
+process.stdout.write(JSON.stringify(page));
+NODE
     else
       echo "[]"
     fi

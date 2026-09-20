@@ -37,16 +37,22 @@ const TMP = mkdtempSync(join(tmpdir(), "memory-tools-"));
 const HOME = join(TMP, "home");
 const RUN = join(TMP, "run");
 const AGENTS = join(TMP, "agents");
+const TEAMS = join(TMP, "teams");
 const SIDECAR = join(TMP, "memory-meta.json");
 const CACHE = join(RUN, "memory-index.json");
 const BD_STUB = join(TMP, "bd");
 const BD_FAIL_FLAG = join(TMP, "bd-fail");
 const TOKEN_FILE = join(TMP, "hub-tokens", "wheatley.token");
 
-for (const d of [HOME, RUN, join(AGENTS, "shared"), join(AGENTS, "wheatley"), dirname(TOKEN_FILE)]) {
+for (const d of [HOME, RUN, TEAMS, join(AGENTS, "shared"), join(AGENTS, "wheatley"), dirname(TOKEN_FILE)]) {
   mkdirSync(d, { recursive: true });
 }
 writeFileSync(TOKEN_FILE, "ab".repeat(32), { mode: 0o600 });
+writeFileSync(
+  join(AGENTS, "wheatley", "manifest.json"),
+  JSON.stringify({ name: "wheatley", model: "codex/test", window: "wheatley", role: "test", enabled: true }),
+);
+writeFileSync(join(AGENTS, "wheatley", "prompt.md"), "fixture");
 
 // ── fixtures ──
 const RAW_TOKEN = "dk_live_abc123XYZ789secretvalue0001";
@@ -96,6 +102,8 @@ const BASE_ENV = {
   APERTURE_MEMORY_CACHE: CACHE,
   APERTURE_MEMORY_META: SIDECAR,
   APERTURE_AGENTS_DIR: AGENTS,
+  APERTURE_TEAMS_DIR: TEAMS,
+  APERTURE_HUB_TOKEN_DIR: dirname(TOKEN_FILE),
   BD_PATH: BD_STUB,
   APERTURE_WS_PORT: "1",
 };
@@ -107,7 +115,12 @@ before(async () => {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [SERVER],
-    env: { ...BASE_ENV, AGENT_NAME: "wheatley", AGENT_ROLE: "test" },
+    env: {
+      ...BASE_ENV,
+      AGENT_NAME: "wheatley",
+      AGENT_ROLE: "test",
+      APERTURE_HUB_TOKEN_FILE: TOKEN_FILE,
+    },
     stderr: "pipe",
   });
   client = new Client({ name: "memory-tools-test", version: "0.0.0" });

@@ -35,7 +35,14 @@ function fixture() {
 function agent(root, name, { enabled = true, role = "worker", team = false } = {}) {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "manifest.json"), JSON.stringify({ name, model: "codex/test", role, enabled }));
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify({
+    name,
+    model: "codex/test",
+    window: name,
+    role,
+    enabled,
+  }));
+  writeFileSync(join(dir, "prompt.md"), "fixture");
   if (team) {
     writeFileSync(join(dir, "TEAM"), "");
     writeFileSync(join(dir, ".complete"), "");
@@ -132,6 +139,85 @@ test("unsafe symlinks and ambiguous memberships fail closed", () => {
     assert.equal(registry.seats.has("shared-lead"), false);
     assert.equal(registry.seats.has("missing-marker"), false, "team membership cannot downgrade to legacy");
     assert.equal(registry.seats.has("journal-link"), false, "even a broken journal symlink fails closed");
+  } finally {
+    f.close();
+  }
+});
+
+test("registry eligibility matches boot requirements and preserves valid legacy symlinks", () => {
+  const f = fixture();
+  try {
+    agent(f.agents, "missing-prompt");
+    rmSync(join(f.agents, "missing-prompt", "prompt.md"));
+    for (const field of ["name", "model", "window", "role"]) {
+      const name = `bad-${field}`;
+      agent(f.agents, name);
+      const manifest = JSON.parse(readFileSync(join(f.agents, name, "manifest.json"), "utf8"));
+      delete manifest[field];
+      writeFileSync(join(f.agents, name, "manifest.json"), JSON.stringify(manifest));
+    }
+    agent(f.agents, "bad-malformed");
+    const malformed = JSON.parse(readFileSync(join(f.agents, "bad-malformed", "manifest.json"), "utf8"));
+    malformed.window = 42;
+    writeFileSync(join(f.agents, "bad-malformed", "manifest.json"), JSON.stringify(malformed));
+    for (const [name, field, value] of [
+      ["bad-enabled", "enabled", "yes"],
+      ["bad-emoji", "emoji", 42],
+      ["bad-kind", "kind", 42],
+    ]) {
+      agent(f.agents, name);
+      const manifest = JSON.parse(readFileSync(join(f.agents, name, "manifest.json"), "utf8"));
+      manifest[field] = value;
+      writeFileSync(join(f.agents, name, "manifest.json"), JSON.stringify(manifest));
+    }
+
+    const source = join(f.root, "legacy-source");
+    mkdirSync(source);
+    writeFileSync(join(source, "manifest.json"), JSON.stringify({
+      name: "legacy-link",
+      model: "claude/test",
+      window: "legacy-link",
+      role: "legacy",
+      enabled: true,
+    }));
+    writeFileSync(join(source, "prompt.md"), "legacy prompt");
+    const linked = join(f.agents, "legacy-link");
+    mkdirSync(linked);
+    symlinkSync(join(source, "manifest.json"), join(linked, "manifest.json"));
+    symlinkSync(join(source, "prompt.md"), join(linked, "prompt.md"));
+
+    const registry = loadSeatRegistry({ agentsRoot: f.agents, teamsRoot: f.teams });
+    assert.deepEqual([...registry.seats.keys()], ["legacy-link"]);
+  } finally {
+    f.close();
+  }
+});
+
+test("reserved principals and fixed trio cannot be introduced by team snapshots", () => {
+  const f = fixture();
+  try {
+    for (const name of ["operator", "watchdog", "glados", "wheatley", "peppy", "rex"]) {
+      agent(f.agents, name, { team: name !== "rex" });
+    }
+    for (const name of ["operator", "watchdog", "glados", "wheatley", "peppy"]) {
+      team(f.teams, `team-${name}`, {
+        lead: name,
+        seats: [{ name, role: "lead" }],
+      });
+    }
+    const registry = loadSeatRegistry({ agentsRoot: f.agents, teamsRoot: f.teams });
+    assert.deepEqual([...registry.seats.keys()], ["rex"], "invalid snapshots do not poison a genuine legacy seat");
+
+    for (const name of ["glados", "wheatley", "peppy"]) {
+      rmSync(join(f.agents, name, "TEAM"));
+      rmSync(join(f.agents, name, ".complete"));
+    }
+    const legacy = loadSeatRegistry({ agentsRoot: f.agents, teamsRoot: f.teams });
+    for (const name of ["glados", "wheatley", "peppy"]) {
+      assert.equal(legacy.seats.has(name), true, `${name} remains a fixed legacy principal`);
+    }
+    assert.equal(legacy.seats.has("operator"), false);
+    assert.equal(legacy.seats.has("watchdog"), false);
   } finally {
     f.close();
   }

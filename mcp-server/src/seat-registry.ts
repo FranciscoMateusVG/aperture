@@ -11,6 +11,7 @@ import { basename, join, relative, resolve, sep } from "node:path";
 export const SEAT_NAME_SOURCE = "^[a-z0-9][a-z0-9_-]{0,30}$";
 export const SEAT_NAME_RE = new RegExp(SEAT_NAME_SOURCE);
 export const COORDINATION_TRIO = new Set(["glados", "wheatley", "peppy"]);
+export const RESERVED_SEAT_PRINCIPALS = new Set(["operator", "watchdog"]);
 
 export function isValidSeatName(name: string): boolean {
   return SEAT_NAME_RE.test(name);
@@ -178,7 +179,13 @@ function readActiveTeam(root: string, dirName: string): ActiveTeam | null {
     const seatNames = new Set<string>();
     for (const value of raw.seats) {
       if (!isPlainObject(value) || typeof value.name !== "string" || typeof value.role !== "string") return null;
-      if (!isValidSeatName(value.name) || value.role.trim() === "" || seatNames.has(value.name)) return null;
+      if (
+        !isValidSeatName(value.name) ||
+        RESERVED_SEAT_PRINCIPALS.has(value.name) ||
+        COORDINATION_TRIO.has(value.name) ||
+        value.role.trim() === "" ||
+        seatNames.has(value.name)
+      ) return null;
       seatNames.add(value.name);
       seats.push({ name: value.name, role: value.role });
     }
@@ -227,7 +234,14 @@ function readEnabledManifest(path: string, allowSymlink: boolean): Record<string
     const stat = lstatSync(path);
     if ((!stat.isFile() && !stat.isSymbolicLink()) || (!allowSymlink && stat.isSymbolicLink())) return null;
     const manifest = parseJsonObject(readFileSync(path, "utf8"));
-    if (!manifest || manifest.enabled === false) return null;
+    if (!manifest) return null;
+    if (manifest.enabled !== undefined && typeof manifest.enabled !== "boolean") return null;
+    if (manifest.enabled === false) return null;
+    if (manifest.emoji !== undefined && typeof manifest.emoji !== "string") return null;
+    if (manifest.kind !== undefined && typeof manifest.kind !== "string") return null;
+    for (const field of ["name", "model", "window", "role"] as const) {
+      if (typeof manifest[field] !== "string" || manifest[field].trim() === "") return null;
+    }
     return manifest;
   } catch {
     return null;
@@ -257,7 +271,12 @@ export function loadSeatRegistry(options: { agentsRoot?: string; teamsRoot?: str
       entries = [];
     }
     for (const name of entries) {
-      if (name === "shared" || name.startsWith("_") || !isValidSeatName(name)) continue;
+      if (
+        name === "shared" ||
+        name.startsWith("_") ||
+        RESERVED_SEAT_PRINCIPALS.has(name) ||
+        !isValidSeatName(name)
+      ) continue;
       const dir = join(aRoot, name);
       if (!isRealDirectory(dir) || !pathInside(aRoot, dir)) continue;
       const marker = join(dir, "TEAM");
@@ -269,11 +288,23 @@ export function loadSeatRegistry(options: { agentsRoot?: string; teamsRoot?: str
       // malformed. Likewise a symlink TEAM marker is an invalid team seat,
       // not a legacy seat.
       if ((!isTeamSeat && memberships.length > 0) || (markerExists && !isTeamSeat)) continue;
+      if (isTeamSeat && COORDINATION_TRIO.has(name)) continue;
       // Legacy just-setup registries intentionally use repo-owned symlinks for
       // manifest.json. P1 team seats are runtime-owned and reject all such
       // indirection at this trust boundary.
       const manifest = readEnabledManifest(join(dir, "manifest.json"), !isTeamSeat);
       if (!manifest) continue;
+      const promptPath = join(dir, "prompt.md");
+      try {
+        const promptStat = lstatSync(promptPath);
+        const promptEntryAllowed = promptStat.isFile() || (!isTeamSeat && promptStat.isSymbolicLink());
+        if (!promptEntryAllowed) continue;
+        // Follow legacy repo-owned symlinks, but require a readable file. Team
+        // seats stay runtime-owned real files at this boundary.
+        readFileSync(promptPath);
+      } catch {
+        continue;
+      }
 
       if (!isTeamSeat) {
         const role = typeof manifest.role === "string" ? manifest.role : "legacy";
