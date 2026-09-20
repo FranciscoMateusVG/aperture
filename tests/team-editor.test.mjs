@@ -5,7 +5,8 @@ import assert from "node:assert/strict";
 import { createServer } from "vite";
 import { preset, catalog, clone, created } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
-const { openTeamEditor } = await vite.ssrLoadModule("/src/components/TeamEditor.ts"); await vite.close();
+const { openTeamEditor } = await vite.ssrLoadModule("/src/components/TeamEditor.ts");
+const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts"); await vite.close();
 const decode = s => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 function fixture() {
  const named = new Map(), ids = new Map(), controls = [];
@@ -115,5 +116,23 @@ test("blank preset, cancel/Escape and source accessibility contracts", async () 
  await run({ mode: "blank", preset: undefined }, async f => {
   assert.match(f.dialog.html, /<label for="v4-presetId">/); assert.match(f.dialog.html, /role="alert"/); assert.match(f.dialog.html, /aria-live="polite"/);
   await f.submit(); assert.match(f.errors.textContent, /1 and 99 seats/); await f.escape(); assert.equal(f.dialog.open, false); assert.equal(f.document.activeElement, f.origin);
+ });
+});
+
+test("malformed durable create echo stays in editor, preserves draft, never saved", async () => {
+ let saved = 0;
+ const api = createTeamCommands(async (_command, args) => { const response = created(args.input); response.team.snapshot.mission = "Different durable mission"; return response; });
+ await run({ submitTeam: api.create, saved: () => saved++ }, async f => {
+  await f.input("team", "t1"); await f.input("mission", "My exact mission"); await f.submit();
+  assert.equal(saved, 0); assert.equal(f.dialog.open, true); assert.equal(f.named.get("mission").value, "My exact mission");
+  assert.match(f.errors.textContent, /could not be confirmed/); assert.equal(f.form.attrs["aria-busy"], "false");
+ });
+});
+test("malformed durable preset echo stays in editor and never calls saved", async () => {
+ let saved = 0;
+ const api = createTeamCommands(async () => ({ ...clone(preset), source: "local", display_name: "Wrong echo" }));
+ await run({ mode: "edit", submitPreset: api.savePreset, saved: () => saved++ }, async f => {
+  await f.input("displayName", "My exact title"); await f.submit(); assert.equal(saved, 0); assert.equal(f.dialog.open, true);
+  assert.equal(f.named.get("displayName").value, "My exact title"); assert.match(f.errors.textContent, /could not be confirmed/);
  });
 });

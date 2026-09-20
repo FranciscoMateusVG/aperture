@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { CancelPendingInput, CreateTeamInput, TeamPresetInput } from "../types";
-import { parseCancelled, parseTeamCatalog, parseTeamCreateResult, parseTeamPreset, parseTeamPresets, parseTeams } from "./team-contract";
-import { snapshotTeamDraft } from "./team-draft";
+import { parseCancelled, parseTeamCatalog, parseTeamCreateResult, parseTeamPreset, parseTeamPresets, parseTeams, sameSeats, sameFallbacks, samePresetContent } from "./team-contract";
+import { deriveTeamSeatNames, snapshotTeamDraft } from "./team-draft";
 
 type Invoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 /** Explicit command allowlist, no activation/actor/grants/path inputs. Injectable only for tests. */
@@ -13,7 +13,12 @@ export function createTeamCommands(call: Invoke) {
     create: async (input: CreateTeamInput) => {
       const request = snapshotTeamDraft(input);
       const result = parseTeamCreateResult(await call("team_create", { input: request }));
-      if (result.team.snapshot.team !== request.team || result.team.snapshot.project !== request.project) {
+      const echoed = result.team.snapshot;
+      const names = deriveTeamSeatNames(request.team, request.seats);
+      if (echoed.team !== request.team || echoed.project !== request.project ||
+        echoed.mission !== request.mission || echoed.acceptance !== request.acceptance || echoed.preset.id !== request.preset_id ||
+        !sameSeats(echoed.seats, request.seats) || echoed.seats.some((seat, i) => seat.name !== names[i]) ||
+        echoed.lead !== names[request.lead_index] || !sameFallbacks(echoed.fallbacks, request.fallbacks)) {
         throw { code: "E_RESPONSE_INVALID", message: "Team response did not match request" };
       }
       return result;
@@ -25,7 +30,7 @@ export function createTeamCommands(call: Invoke) {
         fallbacks: preset.fallbacks.map(({ harness, model, reasoning }) => ({ harness, model, reasoning })),
       }, expected_sha256: expectedSha256 };
       const result = parseTeamPreset(await call("team_save_preset", { input }));
-      if (result.id !== id) throw { code: "E_RESPONSE_INVALID", message: "Preset response did not match request" };
+      if (result.source !== "local" || !samePresetContent(result, input.preset_without_source)) throw { code: "E_RESPONSE_INVALID", message: "Preset response did not match request" };
       return result;
     },
     cancel: async ({ team, expected_generation, creation_request_id }: CancelPendingInput) =>

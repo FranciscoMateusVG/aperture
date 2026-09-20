@@ -13,7 +13,7 @@ Source base `origin/master` 2703dc4. Task aperture-zfmd5. Layout approved by GLa
 
 ## Source tests
 
-`node --test tests/seat-name-ui.test.mjs tests/team-draft.test.mjs tests/team-contract.test.mjs tests/team-editor.test.mjs tests/teams-area.test.mjs` → 56/56 PASS.
+`node --test tests/seat-name-ui.test.mjs tests/team-draft.test.mjs tests/team-contract.test.mjs tests/team-editor.test.mjs tests/teams-area.test.mjs` → 83/83 PASS.
 
 `npm run build` → TypeScript and Vite PASS. No install/setup/restart or live team operation executed.
 
@@ -26,3 +26,11 @@ Tests use existing node:test + Vite SSR with a limited FakeElement handler-contr
 - Independent Izzy source review on immutable head.
 - Faithful WKWebView geometry/focus/pixel comparison at 1280×800 and 1024×768: **NOT_RUN**, not waived.
 - Scoped installed primary journey/runtime/model/provider observations: **NOT_RUN**; source is not installed adoption.
+
+## HUS4K bounded response-boundary correction
+
+Review at 5fb56cc found successful-but-noncorresponding write echoes were accepted. Focused regressions first reproduced 16 response-echo failures before the correction; the contract suite then passed 40/40. Create now requires pending generation 0 and exact echoed mission/acceptance/preset ID/ordered seats with canonical derived names/selected lead/ordered fallback tuples. Preset save requires the exact submitted content, source local and the already-required valid SHA-256 digest shape. Malformed durable echoes keep the actual editor open, retain draft input and never call saved(). Digest bytes are backend-derived, not recomputed using an invented serialization.
+
+Root resolved OwnerSummary semantics in aperture-wisp-9a9kk2 following Rex source clarification p0vomv: seat configured is the immutable snapshot; owner configured is the incarnation request. Owner g0 must match its snapshot; later requests must match the exact snapshot tuple or an authorized snapshot fallback. Active actual must be present and equal requested. Non-active observations may be absent/divergent and never imply success. Team lifecycle CAS and seat incarnation CAS are independent; no numeric equality is imposed. UI labels distinguish Snapshot / Requested / Observed. Six owner/label regressions failed before this correction; authorized fallback and non-active divergence remain accepted. No DTO field renamed.
+
+This is owner evidence, awaiting independent replacement-head review; it is not a QA verdict or installed/runtime claim.

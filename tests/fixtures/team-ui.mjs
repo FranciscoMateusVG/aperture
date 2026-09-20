@@ -13,5 +13,13 @@ export function team(lifecycle = "pending") {
  const snapshot = { schema_version: 1, team: "t1", project: "project:aperture", mission: "Scoped mission", acceptance: "Reviewed evidence", preset: { id: "fullstack", sha256: preset.sha256 }, lead: "t1-backend", seats: preset.seats.map(s => ({ ...s, name: `t1-${s.role}` })), fallbacks: preset.fallbacks, grants: [], created_at: "2026-09-20T00:00:00Z", creation_request_id: "fixture-request", staging_uuid: "fixture-staging" };
  return { snapshot, state: { schema_version: 1, state: lifecycle, generation: lifecycle === "pending" ? 0 : 1, epic_id: null, failure: null, updated_at: snapshot.created_at }, seats: snapshot.seats.map(configured => ({ configured, observed_owner: null })), capabilities: { cancel: lifecycle === "pending", activate: false, start: false, checkpoint: false, replace: false, archive: false } };
 }
-export function created() { const t = team(); return { team: t, creation_request: { schema_version: 1, request_id: t.snapshot.creation_request_id, team: "t1", project: t.snapshot.project, snapshot_sha256: "b".repeat(64), expected_generation: 0, created_at: t.snapshot.created_at } }; }
+export function created(input) {
+ const t = team();
+ if (input) {
+  const counts = new Map();
+  const seats = input.seats.map(s => { const n = (counts.get(s.role) ?? 0) + 1; counts.set(s.role, n); return { ...s, name: `${input.team}-${s.role}${n === 1 ? "" : `-${n}`}` }; });
+  Object.assign(t.snapshot, { team: input.team, project: input.project, mission: input.mission, acceptance: input.acceptance, preset: { id: input.preset_id, sha256: preset.sha256 }, seats, lead: seats[input.lead_index]?.name, fallbacks: clone(input.fallbacks) });
+  t.seats = seats.map(configured => ({ configured, observed_owner: null }));
+ }
+ return { team: t, creation_request: { schema_version: 1, request_id: t.snapshot.creation_request_id, team: t.snapshot.team, project: t.snapshot.project, snapshot_sha256: "b".repeat(64), expected_generation: 0, created_at: t.snapshot.created_at } }; }
 export const clone = v => structuredClone(v);

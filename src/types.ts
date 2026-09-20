@@ -105,10 +105,13 @@ export interface TeamCatalog {
 }
 export interface TeamSeat extends PresetSeat { name: string }
 export interface OwnerSummary {
+  /** Per-seat incarnation CAS, independent of TeamView.state.generation. */
   generation: number;
   state: "starting" | "active" | "stale" | "quarantined";
   since: string;
+  /** Current/most-recent incarnation request, not the immutable TeamSeat snapshot. */
   configured: ExecutionTuple;
+  /** Runtime observation; active requires equality with configured, non-active may differ. */
   actual: ExecutionTuple | null;
   process_count: number;
   thread_bound: boolean;
