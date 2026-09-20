@@ -244,6 +244,7 @@ pub fn run() {
             teams::team_bootstrap_seat,
             teams::team_prepare_replacement,
             teams::team_start_replacement,
+            teams::team_archive,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

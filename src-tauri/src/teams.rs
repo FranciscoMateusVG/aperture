@@ -477,6 +477,33 @@ pub struct BootstrapView {
     pub blockers: Vec<RuntimeBlocker>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveTeamInput {
+    pub team: String,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArchiveChecks {
+    pub reconciliation: RuntimeCheckState,
+    pub reviews: RuntimeCheckState,
+    pub metrics: RuntimeCheckState,
+    pub process_stop: RuntimeCheckState,
+    pub revocation: RuntimeCheckState,
+    pub remote_effects: RuntimeCheckState,
+    pub worktrees: RuntimeCheckState,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArchiveView {
+    pub team: String,
+    pub generation: u64,
+    pub state: String,
+    pub checks: ArchiveChecks,
+    pub blockers: Vec<RuntimeBlocker>,
+}
+
 /// Target selectors only. The authenticated lead's team, seat and generation
 /// are derived from the current canonical capability and never accepted here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1741,6 +1768,43 @@ fn owner_summary(home: &Path, seat: &str) -> TeamResult<OwnerSummary> {
         .map_err(TeamError::from_message)
 }
 
+fn archive_check(blockers: &[RuntimeBlocker], codes: &[&str]) -> RuntimeCheckState {
+    if blockers.iter().any(|b| codes.contains(&b.code.as_str())) { RuntimeCheckState::Blocked } else { RuntimeCheckState::Verified }
+}
+
+fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveView> {
+    validate_team_name(&input.team)?;
+    if input.expected_generation == 0 { return Err(TeamError::new("E_GENERATION_MISMATCH", "archive generation is invalid")); }
+    let view = engine.read_team_view(&input.team)?;
+    if view.state.state != TeamLifecycle::Active || view.state.generation != input.expected_generation {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "archive team generation changed"));
+    }
+    let epic = view.state.epic_id.as_deref().ok_or_else(|| TeamError::new("E_RECONCILIATION_INCOMPLETE", "active team epic is unavailable"))?;
+    let seats: Vec<_> = view.snapshot.seats.iter().map(|s| s.name.clone()).collect();
+    let beads = crate::team_archive::beads::collect_native(&engine.paths.home, &input.team, input.expected_generation, epic, &[])
+        .map_err(|e| TeamError::new(e.code(), "archive reconciliation inventory is unavailable"))?;
+    let native = crate::team_archive::native::inspect_native(&engine.paths.home, &input.team, input.expected_generation, &[])
+        .map_err(|e| TeamError::new(&e.code, "archive runtime inventory is unavailable"))?;
+    let mut blockers: Vec<RuntimeBlocker> = beads.structural_blockers(&seats).into_iter()
+        .map(|b| RuntimeBlocker { code:b.code, reference:b.reference }).collect();
+    for seat in native.seats {
+        blockers.extend(seat.blockers.into_iter().map(|b| RuntimeBlocker { code:b.code, reference:b.reference }));
+    }
+    blockers.sort_by(|a,b| (&a.code,&a.reference).cmp(&(&b.code,&b.reference)));
+    blockers.dedup_by(|a,b| a.code == b.code && a.reference == b.reference);
+    let checks = ArchiveChecks {
+        reconciliation: archive_check(&blockers, &["E_RECONCILIATION_INCOMPLETE","E_RECONCILIATION_COVERAGE","E_CREATION_GATE_VIOLATION","E_UNFINISHED_SEAT_WORK","E_COMPLETED_WITHOUT_EVIDENCE","E_CANCEL_UNAPPROVED","E_TRANSFER_UNACCEPTED","E_OPEN_CHILDREN"]),
+        reviews: archive_check(&blockers, &["E_REVIEW_MISSING"]),
+        metrics: archive_check(&blockers, &["E_METRIC_UNMET"]),
+        process_stop: archive_check(&blockers, &["E_STOP_UNVERIFIED","E_ARCHIVE_OWNER_INVALID","E_ARCHIVE_OWNER_UNSUPPORTED","E_ARCHIVE_NEVER_STARTED_UNVERIFIED"]),
+        revocation: archive_check(&blockers, &["E_REVOCATION_UNVERIFIED"]),
+        remote_effects: archive_check(&blockers, &["E_REMOTE_UNCERTAIN"]),
+        worktrees: archive_check(&blockers, &["E_WORKTREE_UNPROTECTED","E_REPO_BINDING_UNAVAILABLE"]),
+    };
+    Ok(ArchiveView { team:input.team.clone(), generation:input.expected_generation,
+        state:if blockers.is_empty(){"pending".into()}else{"blocked".into()}, checks, blockers })
+}
+
 fn permit_store(
     state: &tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> TeamResult<Arc<Mutex<crate::state::RuntimePermitStore>>> {
@@ -1883,6 +1947,13 @@ pub fn team_start_replacement(
         owner: Some(owner),
         blockers: vec![],
     })
+}
+
+/// Read-only archive checklist. Mutation remains disabled until the
+/// authenticated GLaDOS finalizer and rollback journal are composed.
+#[tauri::command]
+pub fn team_archive(input: ArchiveTeamInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<ArchiveView> {
+    inspect_archive(&engine_from_state(&state)?, &input)
 }
 
 /// Common headless control entrypoint. The caller supplies selectors only;
