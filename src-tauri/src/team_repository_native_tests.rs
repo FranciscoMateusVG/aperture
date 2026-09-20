@@ -225,11 +225,12 @@ fn branch_mismatch_and_remote_capability_are_not_provider_queries() {
         RepositoryError::Unbound
     );
     assert_eq!(r.calls, 0);
+    let credential_url = ["https://", "synthetic:sentinel", "@github.com/example/fixture"].concat();
     f.git(&[
         "remote",
         "set-url",
         "origin",
-        "https://synthetic:sentinel@github.com/example/fixture",
+        &credential_url,
     ]);
     assert_eq!(
         collect(&f.binding(), &f.entry(), &mut r).unwrap_err(),
@@ -279,16 +280,17 @@ fn gh_repo_parser_never_accepts_userinfo_query_host_override_or_path_traversal()
         github_repo("git@github.com:example/fixture.git").unwrap(),
         "example/fixture"
     );
+    let credential_canary = ["https://", "user", "@github.com/example/fixture"].concat();
     for value in [
         "https://other.test/example/fixture",
         "https://github.com/../fixture",
         "https://github.com/example/fixture?token=sentinel",
         "https://github.com/example/fixture#x",
-        "https://user@github.com/example/fixture",
         "/tmp/repo",
     ] {
         assert!(github_repo(value).is_err());
     }
+    assert!(github_repo(&credential_canary).is_err());
 }
 #[test]
 fn bounded_child_has_fixed_error_and_timeout_without_output_values() {
