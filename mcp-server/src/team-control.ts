@@ -30,6 +30,7 @@ export interface PendingTeamView {
   snapshot: {
     team: string;
     project: string;
+    repo: string;
     creation_request_id: string;
   };
   state: { state: "pending"; generation: number };
@@ -147,6 +148,7 @@ export function parsePendingList(value: Record<string, unknown>): PendingListRes
       !snapshot || !state ||
       typeof snapshot.team !== "string" ||
       typeof snapshot.project !== "string" ||
+      typeof snapshot.repo !== "string" ||
       typeof snapshot.creation_request_id !== "string" ||
       state.state !== "pending" ||
       !Number.isSafeInteger(state.generation)

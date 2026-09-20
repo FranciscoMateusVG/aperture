@@ -51,6 +51,14 @@ const PROJECTS: &[&str] = &[
     "project:frame",
 ];
 
+const REPO_CATALOG: &[(&str, &str, &str)] = &[
+    ("project:aperture", "aperture", "Aperture"),
+    ("project:beads-galaxy", "beads-galaxy", "Beads Galaxy"),
+    ("project:frame", "frame", "Frame"),
+    ("project:incluir", "monorepo-incluir", "Programa Incluir"),
+    ("project:incluir", "eunenem", "EuNeném"),
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamError {
     pub code: String,
@@ -172,6 +180,16 @@ pub struct RoleCatalogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryCatalogEntry {
+    pub project: String,
+    pub repo: String,
+    pub display_name: String,
+    /// Native availability is informational. The create and activation paths
+    /// re-resolve the fixed catalog entry before mutating anything.
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamLimits {
     pub max_seats: usize,
     pub max_fallbacks: usize,
@@ -189,6 +207,7 @@ pub struct TeamLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamCatalog {
     pub roles: Vec<RoleCatalogEntry>,
+    pub repositories: Vec<RepositoryCatalogEntry>,
     pub execution_tuples: Vec<ExecutionTuple>,
     pub limits: TeamLimits,
 }
@@ -198,6 +217,7 @@ pub struct TeamCatalog {
 pub struct CreateTeamInput {
     pub team: String,
     pub project: String,
+    pub repo: String,
     pub mission: String,
     pub acceptance: String,
     pub preset_id: Option<String>,
@@ -241,6 +261,7 @@ pub struct TeamSnapshot {
     pub schema_version: u32,
     pub team: String,
     pub project: String,
+    pub repo: String,
     pub mission: String,
     pub acceptance: String,
     pub preset: PresetSnapshotRef,
@@ -279,6 +300,7 @@ pub struct CreationRequestDTO {
     pub request_id: String,
     pub team: String,
     pub project: String,
+    pub repo: String,
     pub snapshot_sha256: String,
     pub expected_generation: u64,
     pub created_at: String,
@@ -466,6 +488,7 @@ impl TeamEngine {
         let roles = self.role_catalog()?;
         Ok(TeamCatalog {
             roles,
+            repositories: repository_catalog(&self.paths.home),
             execution_tuples: execution_catalog(),
             limits: TeamLimits {
                 max_seats: MAX_SEATS,
@@ -597,6 +620,7 @@ impl TeamEngine {
         self.paths.ensure_runtime_roots()?;
         validate_team_name(&input.team)?;
         if !PROJECTS.contains(&input.project.as_str()) { return Err(TeamError::name("project is not in the canonical taxonomy")); }
+        resolve_repository(&self.paths.home, &input.project, &input.repo)?;
         validate_text(&input.mission, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "mission")?;
         validate_text(&input.acceptance, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "acceptance")?;
         let role_ids: HashSet<String> = self.role_catalog()?.into_iter().map(|r| r.id).collect();
@@ -627,6 +651,7 @@ impl TeamEngine {
             schema_version: 1,
             team: input.team.clone(),
             project: input.project.clone(),
+            repo: input.repo.clone(),
             mission: input.mission.clone(),
             acceptance: input.acceptance.clone(),
             preset: PresetSnapshotRef { id: preset.map(|p| p.id.clone()), sha256: preset.map(|p| p.sha256.clone()) },
@@ -644,6 +669,7 @@ impl TeamEngine {
             request_id,
             team: input.team.clone(),
             project: input.project.clone(),
+            repo: input.repo.clone(),
             snapshot_sha256: sha256(&snapshot_bytes),
             expected_generation: 0,
             created_at: now.clone(),
@@ -953,6 +979,10 @@ impl TeamEngine {
         if view.state.state != TeamLifecycle::Pending || view.state.generation != input.expected_generation {
             return Err(TeamError::new("E_GENERATION_MISMATCH", "pending team generation changed"));
         }
+        // Availability is deliberately checked again under the team lock. A
+        // catalog entry disappearing between create and approval must not
+        // publish a team whose immutable repository cannot be resolved.
+        resolve_repository(&self.paths.home, &view.snapshot.project, &view.snapshot.repo)?;
 
         let mut seat_names: Vec<_> = view.snapshot.seats.iter().map(|seat| seat.name.clone()).collect();
         seat_names.sort();
@@ -1128,6 +1158,57 @@ fn validate_repo_root(path: &Path) -> TeamResult<()> {
         return Err(TeamError::new("E_PATH_UNSAFE", "repository source is unsafe"));
     }
     Ok(())
+}
+
+fn valid_repo_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn repository_is_available(home: &Path, repo: &str) -> bool {
+    if !valid_repo_key(repo) { return false; }
+    let projects = home.join("projects");
+    let root = projects.join(repo);
+    let Ok(projects_meta) = fs::symlink_metadata(&projects) else { return false; };
+    let Ok(root_meta) = fs::symlink_metadata(&root) else { return false; };
+    let Ok(git_meta) = fs::symlink_metadata(root.join(".git")) else { return false; };
+    let uid = unsafe { libc::geteuid() };
+    projects_meta.is_dir()
+        && !projects_meta.file_type().is_symlink()
+        && projects_meta.uid() == uid
+        && projects_meta.mode() & 0o022 == 0
+        && root_meta.is_dir()
+        && !root_meta.file_type().is_symlink()
+        && root_meta.uid() == uid
+        && root_meta.mode() & 0o022 == 0
+        && !git_meta.file_type().is_symlink()
+        && git_meta.uid() == uid
+        && git_meta.mode() & 0o022 == 0
+        && (git_meta.is_dir() || (git_meta.is_file() && git_meta.nlink() == 1))
+}
+
+fn repository_catalog(home: &Path) -> Vec<RepositoryCatalogEntry> {
+    REPO_CATALOG.iter().map(|(project, repo, display_name)| RepositoryCatalogEntry {
+        project: (*project).into(),
+        repo: (*repo).into(),
+        display_name: (*display_name).into(),
+        available: repository_is_available(home, repo),
+    }).collect()
+}
+
+/// Resolve a caller-selected repository key through the immutable native
+/// catalog. Project labels scope the allowlist but never choose a repository.
+pub(crate) fn resolve_repository(home: &Path, project: &str, repo: &str) -> TeamResult<PathBuf> {
+    if repo.is_empty() { return Err(TeamError::new("E_REPO_REQUIRED", "repository selection is required")); }
+    if !valid_repo_key(repo) || !REPO_CATALOG.iter().any(|(allowed_project, allowed_repo, _)| *allowed_project == project && *allowed_repo == repo) {
+        return Err(TeamError::new("E_REPO_NOT_IN_CATALOG", "repository is not allowlisted for the selected project"));
+    }
+    if !repository_is_available(home, repo) {
+        return Err(TeamError::new("E_REPO_UNAVAILABLE", "selected repository is unavailable"));
+    }
+    Ok(home.join("projects").join(repo))
 }
 
 fn real_dir_inside(root: &Path, path: &Path) -> bool {
@@ -1309,6 +1390,11 @@ fn validate_stored_team(team: &str, snapshot: &TeamSnapshot, state: &TeamStateFi
     if snapshot.schema_version != 1 || state.schema_version != 1 || snapshot.team != team || !PROJECTS.contains(&snapshot.project.as_str()) {
         return Err(TeamError::state("team snapshot identity is invalid"));
     }
+    if !valid_repo_key(&snapshot.repo)
+        || !REPO_CATALOG.iter().any(|(project, repo, _)| *project == snapshot.project && *repo == snapshot.repo)
+    {
+        return Err(TeamError::state("team snapshot repository binding is invalid"));
+    }
     validate_team_name(&snapshot.team)?;
     validate_text(&snapshot.mission, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "mission")?;
     validate_text(&snapshot.acceptance, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "acceptance")?;
@@ -1345,6 +1431,7 @@ fn validate_request(snapshot: &TeamSnapshot, state: &TeamStateFile, request: &Cr
         || request.request_id != snapshot.creation_request_id
         || request.team != snapshot.team
         || request.project != snapshot.project
+        || request.repo != snapshot.repo
         || request.snapshot_sha256 != sha256(&bytes)
         || request.expected_generation != 0
         || (state.state == TeamLifecycle::Pending && state.generation != request.expected_generation)
@@ -1596,6 +1683,11 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        for component in ["projects", "projects/aperture", "projects/aperture/.git"] {
+            let directory = path.join(component);
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         path
     }
 
@@ -1607,6 +1699,7 @@ mod tests {
         CreateTeamInput {
             team: team.into(),
             project: "project:aperture".into(),
+            repo: "aperture".into(),
             mission: "Implement the approved bounded transaction.".into(),
             acceptance: "Source review and isolated evidence pass.".into(),
             preset_id: Some("fullstack".into()),
@@ -1745,6 +1838,56 @@ mod tests {
         let saved = engine.save_preset(&AuthenticatedActor::operator_ui(), SavePresetInput { preset:write.clone(), expected_sha256:Some(shipped.sha256) }).unwrap();
         assert_eq!(saved.source, PresetSource::Local);
         assert_eq!(engine.save_preset(&AuthenticatedActor::operator_ui(), SavePresetInput { preset:write, expected_sha256:Some("0".repeat(64)) }).unwrap_err().code, "E_PRESET_CONFLICT");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repository_catalog_and_create_binding_are_authoritative() {
+        let home = temp_root("repo-binding");
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let catalog = engine.catalog().unwrap();
+        assert!(catalog.repositories.iter().any(|entry| {
+            entry.project == "project:aperture" && entry.repo == "aperture" && entry.available
+        }));
+        assert_eq!(catalog.repositories.iter().filter(|entry| entry.project == "project:incluir").count(), 2);
+        assert!(!catalog.repositories.iter().any(|entry| entry.project == "project:mempalace"));
+
+        let mut missing = fullstack_input("repo-missing");
+        missing.repo.clear();
+        assert_eq!(engine.create_team(&AuthenticatedActor::operator_ui(), missing).unwrap_err().code, "E_REPO_REQUIRED");
+
+        let mut path_like = fullstack_input("repo-path");
+        path_like.repo = "../aperture".into();
+        assert_eq!(engine.create_team(&AuthenticatedActor::operator_ui(), path_like).unwrap_err().code, "E_REPO_NOT_IN_CATALOG");
+
+        let mut wrong_project = fullstack_input("repo-project");
+        wrong_project.project = "project:frame".into();
+        assert_eq!(engine.create_team(&AuthenticatedActor::operator_ui(), wrong_project).unwrap_err().code, "E_REPO_NOT_IN_CATALOG");
+
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("repo-echo")).unwrap();
+        assert_eq!(created.team.snapshot.repo, "aperture");
+        assert_eq!(created.creation_request.repo, created.team.snapshot.repo);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repository_disappearance_blocks_activation_before_publication() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("repo-disappears");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("repo-gone")).unwrap();
+        fs::remove_dir_all(home.join("projects/aperture/.git")).unwrap();
+        let error = engine.activate(&authenticate_glados_control().unwrap(), ActivateTeamInput {
+            team: "repo-gone".into(),
+            expected_generation: 0,
+            creation_request_id: created.creation_request.request_id,
+            epic_id: "aperture-4rsnc".into(),
+        }).unwrap_err();
+        assert_eq!(error.code, "E_REPO_UNAVAILABLE");
+        assert_eq!(engine.read_team_view("repo-gone").unwrap().state.state, TeamLifecycle::Pending);
+        assert!(created.team.snapshot.seats.iter().all(|seat| !home.join(".claude/aperture").join(&seat.name).exists()));
         fs::remove_dir_all(home).unwrap();
     }
 

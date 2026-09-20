@@ -17,7 +17,7 @@ impl Fixture {
         let dir = home.join(".aperture/teams/t1");
         ensure_private_dir(&dir).unwrap();
         write_private_json_atomic(&dir.join("team.json"),&serde_json::json!({
-            "schema_version":1,"team":"t1","project":"project:aperture","mission":"fixture","acceptance":"fixture",
+            "schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture",
             "preset":{"id":null,"sha256":null},"lead":LEAD,
             "seats":[{"name":TARGET,"role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"},{"name":LEAD,"role":"lead","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],
             "fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()

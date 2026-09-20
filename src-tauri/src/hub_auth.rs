@@ -442,7 +442,7 @@ pub(crate) mod managed {
                 ));
                 let dir = home.join(".aperture/teams/t1");
                 ensure_private_dir(&dir).unwrap();
-                write_private_json_atomic(&dir.join("team.json"),&serde_json::json!({"schema_version":1,"team":"t1","project":"project:aperture","mission":"fixture","acceptance":"fixture","preset":{"id":null,"sha256":null},"lead":"t1-worker","seats":[{"name":"t1-worker","role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()}),false).unwrap();
+                write_private_json_atomic(&dir.join("team.json"),&serde_json::json!({"schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture","preset":{"id":null,"sha256":null},"lead":"t1-worker","seats":[{"name":"t1-worker","role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()}),false).unwrap();
                 write_private_json_atomic(&dir.join("state.json"),&serde_json::json!({"schema_version":1,"state":"active","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-20T00:00:00Z"}),false).unwrap();
                 let seat = home.join(".claude/aperture/t1-worker");
                 ensure_private_dir(&seat).unwrap();

@@ -14,7 +14,7 @@ const requestId = "11111111-1111-4111-8111-111111111111";
 const pending = parsePendingList({
   action: "list_pending",
   result: [{
-    snapshot: { team: "alpha", project: "project:aperture", creation_request_id: requestId },
+    snapshot: { team: "alpha", project: "project:aperture", repo: "aperture", creation_request_id: requestId },
     state: { state: "pending", generation: 0 },
   }],
 });

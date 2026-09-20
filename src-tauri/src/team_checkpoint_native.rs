@@ -213,7 +213,7 @@ mod tests {
             ));
             let team = home.join(".aperture/teams/t1");
             ensure_private_dir(&team).unwrap();
-            write_private_json_atomic(&team.join("team.json"),&serde_json::json!({"schema_version":1,"team":"t1","project":"project:aperture","mission":"Fixture","acceptance":"Fixture","preset":{"id":null,"sha256":null},"lead":"t1-backend","seats":[{"name":"t1-backend","role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()}),false).unwrap();
+            write_private_json_atomic(&team.join("team.json"),&serde_json::json!({"schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"Fixture","acceptance":"Fixture","preset":{"id":null,"sha256":null},"lead":"t1-backend","seats":[{"name":"t1-backend","role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()}),false).unwrap();
             write_private_json_atomic(&team.join("state.json"),&serde_json::json!({"schema_version":1,"state":"active","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-20T00:00:00Z"}),false).unwrap();
             let seat = home.join(".claude/aperture/t1-backend");
             ensure_private_dir(&seat).unwrap();

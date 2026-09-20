@@ -17,7 +17,7 @@ impl Fixture {
         let team = home.join(".aperture/teams/t1");
         ensure_private_dir(&team).unwrap();
         write_private_json_atomic(&team.join("team.json"), &serde_json::json!({
-            "schema_version":1,"team":"t1","project":"project:aperture",
+            "schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture",
             "mission":"Fixture","acceptance":"Fixture","preset":{"id":null,"sha256":null},
             "lead":SEAT,"seats":[{"name":SEAT,"role":"backend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],
             "fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z",
