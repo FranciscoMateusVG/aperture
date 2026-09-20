@@ -449,6 +449,7 @@ function gladosControlDenied(): { content: Array<{ type: "text"; text: string }>
 }
 
 const teamIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,15}$/);
+const seatIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,30}$/);
 const requestIdSchema = z.string().uuid();
 const epicIdSchema = z.string().regex(/^aperture-[a-z0-9][a-z0-9-]{0,63}$/);
 
@@ -508,6 +509,135 @@ server.tool(
       const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
       assertActivationMatchesPending(pending, { ...input, epic_id: "aperture-selector-only" });
       const result = await invokeTeamControl({ action: "cancel", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── V4 managed-seat control ──
+
+// These tools carry selectors and bounded data only. The Rust child is the
+// authority: it opens the canonical current bearer, derives the managed seat,
+// generation, team and lead policy, then revalidates them before mutation.
+// This MCP-side check is defense in depth for a seat archived mid-session.
+function managedSeatControlDenied(): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  if (AGENT_NAME && hasAuthenticatedMcpIdentity(AGENT_NAME)) return null;
+  return {
+    content: [{ type: "text", text: "ERROR: E_CONTROL_UNAUTHORIZED current managed-seat capability required" }],
+    isError: true,
+  };
+}
+
+const sha40Schema = z.string().regex(/^[a-f0-9]{40}$/);
+const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+const checkpointPayloadSchema = z.object({
+  task_id: z.string().min(1).max(100),
+  worktree: z.string().min(1).max(512),
+  branch: z.string().min(1).max(512),
+  head_sha: sha40Schema,
+  dirty_files: z.array(z.string().min(1).max(512)).max(200),
+  open_pr: z.object({
+    repository: z.string().min(1).max(200),
+    number: z.number().int().positive(),
+    head_sha: sha40Schema,
+  }).strict().nullable(),
+  running_procs: z.array(z.object({
+    pid: z.number().int().min(2),
+    start_time: z.string().min(1).max(80),
+  }).strict()).max(256),
+  decisions: z.array(z.object({
+    code: z.string().min(1).max(64),
+    text: z.string().min(1).max(1024),
+    evidence_ref: z.string().min(1).max(200).nullable(),
+  }).strict()).max(32),
+  next_step: z.string().min(1).max(1024),
+  remote_effects: z.array(z.object({
+    kind: z.enum(["ssh", "deploy", "ci", "provider", "shell"]),
+    reference: z.string().min(1).max(200),
+    // A worker may report its view, but the native inventory deliberately
+    // projects every checkpoint declaration as untrusted/unknown until an
+    // authorized resolution fact exists.
+    state: z.enum(["finished", "cancelled", "unknown"]),
+  }).strict()).max(64),
+}).strict();
+
+server.tool(
+  "team_checkpoint",
+  "Managed seat only: append one bounded checkpoint for the caller's current owner generation. Team, seat, generation, writer, sequence and validation are derived by the native control child.",
+  { schema_version: z.literal(1), payload: checkpointPayloadSchema },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "checkpoint", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_inspect_remote_effects",
+  "Managed team lead only: inspect the native remote-effect uncertainty inventory for one current seat generation. This is read-only and does not treat declarations as observations.",
+  { target_seat: seatIdSchema, expected_generation: z.number().int().positive() },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "inspect_remote", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_resolve_remote_effect",
+  "Managed team lead only: append one authenticated decision for an exact native inventory hash. This records authorized_decision, never provider observation or zero effects.",
+  {
+    target_seat: seatIdSchema,
+    expected_generation: z.number().int().positive(),
+    resolution: z.object({
+      expected_inventory_hash: sha256Schema,
+      scope: z.enum(["effect_resolution", "inventory_risk_acceptance"]),
+      reference: z.string().min(1).max(200).nullable(),
+      decision: z.enum(["finished", "cancelled", "proceed_with_unobserved_effects"]),
+      evidence_ref: z.string().min(1).max(200),
+    }).strict(),
+  },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "resolve_remote", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_replace_in_policy",
+  "Managed team lead only: replace one same-team seat at an exact target generation with an exact snapshot/fallback execution tuple. The native child derives caller authority and performs stop, revocation, reconciliation, fresh start and model verification; timeout is an unknown outcome and is never retried automatically.",
+  {
+    target_seat: seatIdSchema,
+    expected_generation: z.number().int().positive(),
+    selection: z.object({
+      harness: z.enum(["claude", "codex"]),
+      model: z.string().min(1).max(128),
+      reasoning: z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]).nullable(),
+    }).strict(),
+  },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "replace", input });
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };

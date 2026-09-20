@@ -35,10 +35,44 @@ export interface ReplacementSelectors {
   };
 }
 
+export interface CheckpointSelectors {
+  schema_version: number;
+  payload: {
+    task_id: string;
+    worktree: string;
+    branch: string;
+    head_sha: string;
+    dirty_files: string[];
+    open_pr: null | { repository: string; number: number; head_sha: string };
+    running_procs: Array<{ pid: number; start_time: string }>;
+    decisions: Array<{ code: string; text: string; evidence_ref: string | null }>;
+    next_step: string;
+    remote_effects: Array<{ kind: string; reference: string; state: string }>;
+  };
+}
+
+export interface RemoteTargetSelectors {
+  target_seat: string;
+  expected_generation: number;
+}
+
+export interface RemoteResolutionSelectors extends RemoteTargetSelectors {
+  resolution: {
+    expected_inventory_hash: string;
+    scope: "effect_resolution" | "inventory_risk_acceptance";
+    reference: string | null;
+    decision: "finished" | "cancelled" | "proceed_with_unobserved_effects";
+    evidence_ref: string;
+  };
+}
+
 export type TeamControlRequest =
   | { action: "list_pending" }
   | { action: "approve"; input: ActivationSelectors }
   | { action: "cancel"; input: CancelSelectors }
+  | { action: "checkpoint"; input: CheckpointSelectors }
+  | { action: "inspect_remote"; input: RemoteTargetSelectors }
+  | { action: "resolve_remote"; input: RemoteResolutionSelectors }
   | { action: "replace"; input: ReplacementSelectors };
 
 export interface PendingTeamView {
