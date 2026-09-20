@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800" role="img" aria-label="Aperture V4 grouped mixed design reference">
+<rect width="1280" height="800" fill="#0f0f1a"/>
+<rect x="0" y="0" width="1280" height="64" rx="0" fill="#0c0c18" stroke="#2a2a4a"/>
+<text x="24" y="39" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="700">APERTURE</text>
+<text x="205" y="39" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Sessions</text>
+<text x="308" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Presets</text>
+<text x="1036" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">DESIGN • synthetic fixture</text>
+<text x="32" y="108" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="28" font-weight="600">Sessions</text>
+<rect x="1101" y="80" width="147" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="1115" y="108" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Browse presets</text>
+<text x="32" y="151" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="600">COORDINATION</text>
+<rect x="32.0" y="169" width="397.3333333333333" height="66" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="48.0" y="195" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="600">GLaDOS</text>
+<text x="48.0" y="218" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Existing roster · state from launcher</text>
+<rect x="437.3333333333333" y="169" width="397.3333333333333" height="66" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="453.3333333333333" y="195" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="600">Wheatley</text>
+<text x="453.3333333333333" y="218" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Existing roster · state from launcher</text>
+<rect x="842.6666666666666" y="169" width="397.3333333333333" height="66" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="858.6666666666666" y="195" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="600">Peppy</text>
+<text x="858.6666666666666" y="218" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Existing roster · state from launcher</text>
+<text x="32" y="277" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="18" font-weight="600">Standing specialists</text>
+<text x="280" y="277" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Preserved during migration</text>
+<rect x="32" y="297" width="1216" height="54" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="48" y="330" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Vance    Rex    Izzy    Scout    Cipher — existing controls unchanged</text>
+<text x="32" y="402" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="22" font-weight="600">fitt-relaunch</text>
+<text x="252" y="402" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">ACTIVE · lead: backend · epic: fixture-001</text>
+<rect x="1101" y="371" width="147" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="1115" y="399" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Archive…</text>
+<text x="32" y="433" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Mission: rebuild the booking experience</text>
+<rect x="32" y="452" width="1216" height="171" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="48" y="484" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="600">fitt-relaunch-backend · LEAD</text>
+<text x="1052" y="484" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">g2 · rate-limited</text>
+<text x="48" y="516" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Configured: Codex / gpt-6-astra / high</text>
+<text x="640.0" y="516" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Observed: unknown — not verified</text>
+<text x="48" y="548" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Checkpoint: stale · Context: unavailable</text>
+<rect x="48" y="563" width="90" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="62" y="591" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Open</text>
+<rect x="150" y="563" width="165" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="164" y="591" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Checkpoint now</text>
+<rect x="327" y="563" width="170" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="341" y="591" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Replace worker…</text>
+<rect x="509" y="563" width="90" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="523" y="591" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Stop</text>
+<rect x="32" y="647" width="1216" height="58" rx="6" fill="#1a1a2e" stroke="#2a2a4a"/>
+<text x="48" y="672" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">next-slice · PENDING</text>
+<text x="48" y="694" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Waiting for epic approval. No workers visible or started.</text>
+<text x="24" y="784" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="11" font-weight="400">Design reference only · no command invoked · not an installed-app capture</text>
+</svg>

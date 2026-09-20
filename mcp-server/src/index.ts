@@ -10,6 +10,12 @@ import { notifyHub } from "./hub-notify.js";
 import { presenceReport, describePresence, type PresenceReport } from "./presence-snapshot.js";
 import { buildIndex, recall, recallFull, recallStats, RECALL_K_MAX, RECALL_FULL_MAX_BYTES } from "./memory-index.js";
 import { authorizeMessage, hasAuthenticatedMcpIdentity, loadSeatRegistry } from "./seat-registry.js";
+import {
+  assertActivationMatchesPending,
+  assertAuthorizedEpic,
+  invokeTeamControl,
+  parsePendingList,
+} from "./team-control.js";
 
 const AGENT_NAME = process.env.AGENT_NAME;
 if (!AGENT_NAME) {
@@ -295,7 +301,7 @@ server.tool(
     priority: z.number().min(0).max(4).describe("Priority 0-4 (0 = highest)"),
     description: z.string().optional().describe("Task description. NOTE: avoid literal XML/HTML close-tag patterns like `</reason>`, `</notes>`, `</description>` inside the text — the tool-argument wire format can misinterpret them as parameter terminators, causing argument truncation. If you must reference such tags, use `&lt;/reason&gt;` or paraphrase (e.g. \"the reason field\")."),
     type: z.enum(["task", "bug", "feature", "chore", "epic"]).optional().describe("Task type. Defaults to 'task'."),
-    labels: z.array(z.string()).optional().describe("Labels to apply at creation. If provided, MUST contain exactly one `project:<name>` label (canonical: project:aperture, project:incluir, project:beads-galaxy, project:mempalace). If omitted, no labels are set — add the project label separately via update_task add_labels."),
+    labels: z.array(z.string()).optional().describe("Labels to apply at creation. If provided, MUST contain exactly one `project:<name>` label (canonical: project:aperture, project:incluir, project:beads-galaxy, project:mempalace, project:frame). If omitted, no labels are set — add the project label separately via update_task add_labels."),
     assignee: z.string().optional().describe("Assignee (agent name: glados, wheatley, peppy, izzy, vance, rex, scout, cipher — or any string). Set without a separate update call."),
     acceptance: z.string().optional().describe("Testable acceptance criteria. NOTE: avoid literal XML/HTML close-tag patterns like `</acceptance>` inside the text; they can be misread as parameter terminators. Use `&lt;/...&gt;` or paraphrase."),
     blocked_by: z.array(z.string()).optional().describe("Task IDs that block this one. Each is wired up via `bd dep add <new> <blocker>` after creation."),
@@ -311,7 +317,7 @@ server.tool(
           return {
             content: [{
               type: "text",
-              text: `ERROR: project label required: must include exactly one project:<name> label (got ${projectLabels.length}: ${JSON.stringify(projectLabels)}). Canonical taxonomy: project:aperture, project:incluir, project:beads-galaxy, project:mempalace.`,
+              text: `ERROR: project label required: must include exactly one project:<name> label (got ${projectLabels.length}: ${JSON.stringify(projectLabels)}). Canonical taxonomy: project:aperture, project:incluir, project:beads-galaxy, project:mempalace, project:frame.`,
             }],
             isError: true,
           };
@@ -430,6 +436,247 @@ server.tool(
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
   }
+);
+
+// ── V4 team activation control ──
+
+function gladosControlDenied(): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  if (AGENT_NAME === "glados" && hasAuthenticatedMcpIdentity("glados")) return null;
+  return {
+    content: [{ type: "text", text: "ERROR: E_CONTROL_UNAUTHORIZED exact authenticated GLaDOS context required" }],
+    isError: true,
+  };
+}
+
+const teamIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,15}$/);
+const seatIdSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,30}$/);
+const requestIdSchema = z.string().uuid();
+const epicIdSchema = z.string().regex(/^aperture-[a-z0-9][a-z0-9-]{0,63}$/);
+
+server.tool(
+  "team_list_activation_requests",
+  "GLaDOS-only: list durable pending team activation requests. This reads the Rust transaction engine; it does not claim to wake or notify GLaDOS.",
+  {},
+  async () => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
+      return { content: [{ type: "text", text: JSON.stringify(pending.result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_approve_activation",
+  "GLaDOS-only: approve one exact pending team request after verifying its active authorized epic and project label. Uses the authenticated Rust transaction engine; no caller actor field is accepted.",
+  {
+    team: teamIdSchema,
+    expected_generation: z.number().int().nonnegative(),
+    creation_request_id: requestIdSchema,
+    epic_id: epicIdSchema,
+  },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
+      const matched = assertActivationMatchesPending(pending, input);
+      const epic = await queryTasks("show", input.epic_id, { fields: "full" });
+      assertAuthorizedEpic(epic, input.epic_id, matched.snapshot.project);
+      const result = await invokeTeamControl({ action: "approve", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_cancel_activation",
+  "GLaDOS-only: cancel one exact pending team request through the same locked Rust transaction engine. Operator UI cancel remains a separate human action.",
+  {
+    team: teamIdSchema,
+    expected_generation: z.number().int().nonnegative(),
+    creation_request_id: requestIdSchema,
+  },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
+      assertActivationMatchesPending(pending, { ...input, epic_id: "aperture-selector-only" });
+      const result = await invokeTeamControl({ action: "cancel", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_archive",
+  "GLaDOS-only: recollect the complete archive inventory, durably approve its exact hashes, and archive one active team through the native journal. A blocked checklist performs no archive mutation.",
+  { team: teamIdSchema, expected_generation: z.number().int().positive() },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "archive", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_rollback_archive",
+  "GLaDOS-only manual inverse for an archived or partially archived team. Uses the durable byte manifest and no-replace journal; missing or conflicting evidence fails closed.",
+  { team: teamIdSchema, expected_generation: z.number().int().positive() },
+  async (input) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "rollback_archive", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── V4 managed-seat control ──
+
+// These tools carry selectors and bounded data only. The Rust child is the
+// authority: it opens the canonical current bearer, derives the managed seat,
+// generation, team and lead policy, then revalidates them before mutation.
+// This MCP-side check is defense in depth for a seat archived mid-session.
+function managedSeatControlDenied(): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  if (AGENT_NAME && hasAuthenticatedMcpIdentity(AGENT_NAME)) return null;
+  return {
+    content: [{ type: "text", text: "ERROR: E_CONTROL_UNAUTHORIZED current managed-seat capability required" }],
+    isError: true,
+  };
+}
+
+const sha40Schema = z.string().regex(/^[a-f0-9]{40}$/);
+const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+const checkpointPayloadSchema = z.object({
+  task_id: z.string().min(1).max(100),
+  worktree: z.string().min(1).max(512),
+  branch: z.string().min(1).max(512),
+  head_sha: sha40Schema,
+  dirty_files: z.array(z.string().min(1).max(512)).max(200),
+  open_pr: z.object({
+    repository: z.string().min(1).max(200),
+    number: z.number().int().positive(),
+    head_sha: sha40Schema,
+  }).strict().nullable(),
+  running_procs: z.array(z.object({
+    pid: z.number().int().min(2),
+    start_time: z.string().min(1).max(80),
+  }).strict()).max(256),
+  decisions: z.array(z.object({
+    code: z.string().min(1).max(64),
+    text: z.string().min(1).max(1024),
+    evidence_ref: z.string().min(1).max(200).nullable(),
+  }).strict()).max(32),
+  next_step: z.string().min(1).max(1024),
+  remote_effects: z.array(z.object({
+    kind: z.enum(["ssh", "deploy", "ci", "provider", "shell"]),
+    reference: z.string().min(1).max(200),
+    // A worker may report its view, but the native inventory deliberately
+    // projects every checkpoint declaration as untrusted/unknown until an
+    // authorized resolution fact exists.
+    state: z.enum(["finished", "cancelled", "unknown"]),
+  }).strict()).max(64),
+}).strict();
+
+server.tool(
+  "team_checkpoint",
+  "Managed seat only: append one bounded checkpoint for the caller's current owner generation. Team, seat, generation, writer, sequence and validation are derived by the native control child.",
+  // Unknown u32 schemas reach the native writer and are retained as rejected
+  // evidence; the transport must not silently erase that recovery history.
+  { schema_version: z.number().int().nonnegative().max(0xffff_ffff), payload: checkpointPayloadSchema },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "checkpoint", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_inspect_remote_effects",
+  "Managed team lead only: inspect the native remote-effect uncertainty inventory for one current seat generation. This is read-only and does not treat declarations as observations.",
+  { target_seat: seatIdSchema, expected_generation: z.number().int().positive() },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "inspect_remote", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_resolve_remote_effect",
+  "Managed team lead only: append one authenticated decision for an exact native inventory hash. This records authorized_decision, never provider observation or zero effects.",
+  {
+    target_seat: seatIdSchema,
+    expected_generation: z.number().int().positive(),
+    resolution: z.object({
+      expected_inventory_hash: sha256Schema,
+      scope: z.enum(["effect_resolution", "inventory_risk_acceptance"]),
+      reference: z.string().min(1).max(200).nullable(),
+      decision: z.enum(["finished", "cancelled", "proceed_with_unobserved_effects"]),
+      evidence_ref: z.string().min(1).max(200),
+    }).strict(),
+  },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "resolve_remote", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_replace_in_policy",
+  "Managed team lead only: replace one same-team seat at an exact target generation with an exact snapshot/fallback execution tuple. The native child derives caller authority and performs stop, revocation, reconciliation, fresh start and model verification; timeout is an unknown outcome and is never retried automatically.",
+  {
+    target_seat: seatIdSchema,
+    expected_generation: z.number().int().positive(),
+    selection: z.object({
+      harness: z.enum(["claude", "codex"]),
+      model: z.string().min(1).max(128),
+      reasoning: z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]).nullable(),
+    }).strict(),
+  },
+  async (input) => {
+    const denied = managedSeatControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "replace", input });
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
 );
 
 server.tool(

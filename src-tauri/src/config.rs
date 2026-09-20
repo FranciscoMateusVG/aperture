@@ -6,6 +6,7 @@
 
 use crate::state::AppState;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub fn load_agent_overrides(home: &str) -> HashMap<String, String> {
     let path = format!("{}/.aperture/agent-config.json", home);
@@ -57,5 +58,6 @@ pub fn default_state() -> AppState {
         mcp_sentry_server_path: format!("{}/mcp-server-sentry/dist/index.js", project_dir),
         db_path: format!("{}/.aperture/messages.db", home),
         project_dir,
+        team_preparations: Arc::new(Mutex::new(crate::state::RuntimePermitStore::new())),
     }
 }

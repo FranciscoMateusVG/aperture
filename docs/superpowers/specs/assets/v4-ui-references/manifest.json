@@ -1,0 +1,209 @@
+{
+  "status": "layout-approved",
+  "approver": "GLaDOS aperture-wisp-ivi8hg, 2026-09-20; layout only, not runtime",
+  "sourceBase": "2703dc47d0f41f2c0e0dc417ed7c14d8df4a393a",
+  "sources": [
+    "src/style.css",
+    "spec v2.7 \u00a73 ASCII mockups"
+  ],
+  "theme": "dark navy/amber approved by GLaDOS 2026-09-20 aperture-wisp-cvx2gl",
+  "capture": "NOT_CAPTURED: authored vectors, logical geometry only; no WKWebView/browser/runtime/pixel-match claim",
+  "devicePixelRatio": null,
+  "font": "-apple-system, BlinkMacSystemFont, sans-serif",
+  "animations": "none",
+  "references": [
+    {
+      "file": "library-default-1280x800.svg",
+      "sha256": "ef29c990689f2ef88e4fb26ca6c3a8c872697e02beb2a86fd2a58cb85fd32038",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "wizard-default-1280x800.svg",
+      "sha256": "fc4ee21ebf1b1f0ff8b0e9f3721d5acbc609e825e235e190dee48c06b3ce9216",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "grouped-mixed-1280x800.svg",
+      "sha256": "0b764a1992a683e8c3d2be2dec9763479047f0f21df2ee1f79d6dffdd5059b58",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "archive-blocked-1280x800.svg",
+      "sha256": "8dc302c8f1c627b84caa94a783108ec294d7ddd0869d22c13a89fc671094e0b6",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-checkpoint_pending-1280x800.svg",
+      "sha256": "954f8435e6a8d32c1b561b7c441640fc1d5c2cbf7074b695d2601f1ef240094f",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-stopping-1280x800.svg",
+      "sha256": "388628790f7abc1cb72888a9ed1e741db5653806a363d9582e9fcb5bdcc2b058",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-revoking-1280x800.svg",
+      "sha256": "27e65c1c50e096d5ea393dd8ae10162268f2b6fe4a828965033c040bced87266",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-remote_uncertain-1280x800.svg",
+      "sha256": "0e2d5926c04bf1bf1d0702c9f117503798556bff6c58cb30cfd180729da7ec48",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-ready-1280x800.svg",
+      "sha256": "56adbae8e1d301243d48225dc81ebbdfadcb5217479117ed4ba61edd8c72983f",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-blocked-1280x800.svg",
+      "sha256": "c72f1393637637ba59a187796f51e4cc6a976b51824f831c410e0119f92e5e78",
+      "viewport": [
+        1280,
+        800
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "library-default-1024x768.svg",
+      "sha256": "dff427308d83d75f5ec57e286585990fb1a9f147db42a9011914fc6708342515",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "wizard-default-1024x768.svg",
+      "sha256": "767241cc5e961d766635fe449e02ae42e8f401c754df1e3a315c1f406f209303",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "grouped-mixed-1024x768.svg",
+      "sha256": "d991bc7ce74de03267e7a40c04215dae3a69cebb9e592428994f188eca03a896",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "archive-blocked-1024x768.svg",
+      "sha256": "b510ffa05990e9e385a1c0729960ffd84b866a9866fff13b41aeabe78ba79937",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-checkpoint_pending-1024x768.svg",
+      "sha256": "2c13a704c04fee8b4081726608694335ec5c317b8c20f40c69607235f6d9d68c",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-stopping-1024x768.svg",
+      "sha256": "75597c3b3d86b2d0177ece7b2c0190c87d9775ab1aea64fab3358c0dd6d48a5d",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-revoking-1024x768.svg",
+      "sha256": "9066d9e51ab0a1b57674859c600b400a344200180d9e978c361533c7a91441ee",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-remote_uncertain-1024x768.svg",
+      "sha256": "287b61fae558d2d5c586e5f8b110716c3875113a553670371d944e96b9138c0a",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-ready-1024x768.svg",
+      "sha256": "dc3f5f19fd96cf87c77d1c6a0fa4c63397098b24273988ce7b6733bcc169dc07",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    },
+    {
+      "file": "replace-blocked-1024x768.svg",
+      "sha256": "37db92ac1760df05ef0432231a00104fa15c205a4c15d0abac56e076a9c42388",
+      "viewport": [
+        1024,
+        768
+      ],
+      "format": "design-native SVG"
+    }
+  ],
+  "designArtifacts": [
+    {
+      "file": "tokens.css",
+      "sha256": "631791f9ae576a9ed5e3242209da0e12d044d1651b41f309e1279bdd62c0152c"
+    },
+    {
+      "file": "components.css",
+      "sha256": "2d7b940c9641d5df383115da1a6917aa8e70211760b4dc268aacfc0153da0fa6"
+    }
+  ],
+  "corrections": [
+    "Wizard says configured fallbacks, not approved list; catalog membership never implies team authorization."
+  ]
+}
