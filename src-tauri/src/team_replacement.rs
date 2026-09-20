@@ -76,15 +76,9 @@ pub struct RemoteInventory {
     /// True only for adapters that durably track admission/result. Empty
     /// transcript/checkpoint metadata MUST NOT set this true.
     pub complete_observation: bool,
-    /// Backend-attested lead/operator resolution, never a browser boolean.
-    pub explicit_resolution: Option<RemoteResolutionRecord>,
-}
-#[derive(Debug, Clone)]
-pub struct RemoteResolutionRecord {
-    pub actor: String,
-    pub evidence_ref: String,
-    pub generation: u64,
-    pub authenticated: bool,
+    /// Native append-only authorization projection. It never changes observed
+    /// effect states or complete_observation and is not caller-deserializable.
+    pub(crate) explicit_resolution: Option<remote::RemoteProjection>,
 }
 #[derive(Debug, Clone)]
 pub struct RevocationProof {
@@ -321,21 +315,11 @@ fn reconcile<R: ReplacementRuntime>(
         return Err(ReplacementError::UnownedProcess);
     }
     let remote = r.remote_effects(s)?;
-    let resolved = remote
-        .explicit_resolution
-        .as_ref()
-        .map(|x| {
-            x.authenticated
-                && x.generation == s.generation
-                && !x.actor.is_empty()
-                && !x.evidence_ref.is_empty()
-        })
-        .unwrap_or(false);
-    if (!remote.complete_observation && !resolved)
-        || remote
-            .effects
-            .iter()
-            .any(|e| e.reference.is_empty() || e.resolution == RemoteResolution::Unknown)
+    let resolved = remote.explicit_resolution.as_ref()
+        .is_some_and(|p| p.permits(s.generation, &remote.effects, remote.complete_observation));
+    if remote.effects.iter().any(|e| e.reference.is_empty())
+        || (!resolved && (!remote.complete_observation
+            || remote.effects.iter().any(|e| e.resolution == RemoteResolution::Unknown)))
     {
         return Err(ReplacementError::RemoteUncertain);
     }
@@ -504,3 +488,6 @@ pub fn start<R: ReplacementRuntime>(
 #[cfg(test)]
 #[path = "team_runtime_tests.rs"]
 mod runtime_tests;
+
+#[path = "team_remote_native.rs"]
+pub(crate) mod remote;

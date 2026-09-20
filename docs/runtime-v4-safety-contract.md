@@ -194,3 +194,50 @@ GUI/headless managed start path, actual-model observation and cleanup, durable
 hub revoke acknowledgment, authoritative archive reconciliation, and the full
 crash/two-process composition suite remain required. Pure fixtures alone do not
 satisfy these gates or authorize installation.
+
+## Native remote authorization seam (root pye513, source only)
+
+`team_replacement::remote` owns one native inventory/fact projection over the
+existing checkpoint and journal substrate. `inspect_native`, `resolve_native`
+and `project_native` take a trusted home plus target team/seat/generation CAS.
+Resolution alone additionally takes `ResolutionAuthority::Operator` referencing
+an existing internal OperatorUi actor, or `Lead` referencing the authenticated
+seat control identity. Neither is deserializable. Control supplies only the
+strict `ResolutionRequest`: inventory hash CAS, scope, optional reference,
+decision and bounded evidence reference. The existing agent replace input stays
+exactly target seat, expected generation and execution selection.
+
+Inventory collects the union of retained references from this target generation's
+bounded, hash-validated checkpoints. Worker-declared finished/cancelled states
+remain **Unknown**; no instrumented external adapter exists here. Even an empty
+history has `complete_observation=false`. Sorted references plus generation and
+observed states determine the native inventory hash. The current limits are
+1,024 checkpoint directory entries, 16 MiB selected checkpoint bytes, 64 distinct
+references and 256 resolution facts. Limits/corrupt/unknown-schema histories fail
+closed, never truncate to a convenient empty inventory.
+
+Facts are private append-only files in the existing checkpoint sidecar substrate
+`checkpoints/<seat>/.remote-resolution`. They use team then lexical seat locks,
+current active owner/lead checks, the shared no-follow private IO, no-replace
+publication and fsync. Inventory/owner/capability are rechecked before publishing.
+Fact metadata/time/sequence/principal are native-derived; evidence references are
+bounded and sanitized, not arbitrary transcript/tool/provider payloads. Known
+sentinel filtering is not universal secret detection.
+
+Only OperatorUi may accept an incomplete inventory's unobserved-effect risk.
+An authenticated current lead may decide finished/cancelled for an existing
+reference on another seat in its immutable team, never itself. Each Unknown
+reference needs its own bound effect decision; inventory risk acceptance does
+not resolve named effects, and per-reference decisions do not make an incomplete
+inventory complete. Stale generation/hash facts grant nothing. Exact replay
+returns the original; conflicting same-scope facts fail closed rather than using
+latest-wins or letting a lead overwrite operator intent.
+
+Projection retains Unknown states and incomplete observation, recording
+`authorized_decision` separately. Durable fact readback establishes binding and
+persistence, **not truth or zero in-flight effects**. The replacement core reads
+this projection and checks exact generation/reference coverage; it cannot accept
+an authenticated boolean from a replacement request. Auth/control registration,
+human resolution UI and the complete native replacement journey still require
+composition and consolidated review. No live resolution, process effect, new
+capability or installation is authorized by this source checkpoint.

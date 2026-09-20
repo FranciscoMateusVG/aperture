@@ -138,7 +138,7 @@ fn read_raw_entries(dir: &Path, generation: u64) -> Result<Vec<CheckpointEntry>,
         if name.starts_with('.') && name.ends_with(".tmp") {
             continue;
         }
-        if name == ".validation" {
+        if name == ".validation" || name == ".remote-resolution" {
             // Validation facts have their own bounded schema and readers.
             validate_component_path(dir, &name, false).map_err(|_| CheckpointError::Unsafe)?;
             let meta =
