@@ -332,3 +332,108 @@ shared owner record/commit path, full-field mismatch matrix, missing/corrupt
 attempt, time/size bounds, private-file violations, recycled/dead/unreadable
 process state, owner/token races and revoked/corrupt/symlinked revocation state.
 They do not execute an actual Codex session or enable public lifecycle actions.
+
+## Native initial-journey composition checkpoint (K310B, 2026-09-20)
+
+This section supersedes earlier *unwired* descriptions for the concrete native
+start/cleanup and human-permit adapters. It is a **partial source checkpoint**,
+not V4 completion, release approval, capability enablement or installation.
+Archive acceptance remains open and its capability must remain false.
+
+### Exact internal entrypoints for Rex's composition
+
+All reside in `team_replacement::native`; none is registered by this change:
+
+- `bootstrap_authorized(home, actor, team, seat, expected_generation)` requires
+  native OperatorUi and exactly Stale owner g0. It derives the tuple from the
+  immutable snapshot; no replacement selector, fallback or legacy boot path.
+- `replace_authorized(home, ReplacementAuthority, RemoteTarget, selection,
+  sentinels)` is the agent one-shot path. Current authenticated lead identity
+  and target CAS remain distinct; no observations/resolutions in the request.
+- `prepare_operator(home, actor, team, seat, expected_generation, sentinels)`
+  returns `NativePreparedReplacement`, which is neither Clone nor serializable.
+  Its team/seat/generation/recovery getters are bounded metadata for the UI.
+- `start_operator(actor, NativePreparedReplacement, selection)` consumes that
+  object. The Tauri state map must remove the opaque ID before invocation.
+  Do not serialize the core permit or map one-shot replace onto these dialogs.
+
+The native success type is internal `StartedReplacement`: **do not serialize
+its thread ID**. Transport rereads/projects the safe OwnerSummary and fixed
+view contract. Runtime errors expose only `ReplacementError::code()`. Keep
+commands/capabilities gated until registration plus the integrated review.
+
+### Launch and D1 cleanup
+
+The installed Codex app-server is started once through the existing private
+seat socket, never the legacy respawn supervisor. Source/build/private-runtime
+pins, tuple, immutable repository and cwd identity are revalidated. A fresh
+private generation home contains bounded prompt/skills, native config and a
+non-model copy of the existing auth. Config publication is no-overwrite and
+preserves failed artifacts. No token/auth/password enters argv or receipts.
+Only the shared owner callback may bind/publish a fresh token; the pipe stays
+closed until exact PID/birth is durable. A failed release retains its exact
+child handle for cleanup instead of losing ownership evidence.
+
+The bridge's exact generation/token/PID/birth/model/reasoning/thread receipt is
+read, persisted through shared owner CAS and reread while observed-Starting.
+Active is never accepted as a receipt substitute. Only after this check does
+shared commit publish Active. A late failure even after Active commit stops
+and revokes the same candidate, then calls the shared launcher-only quarantine
+CAS; it does not erase incarnation/process-union evidence or start g+2.
+Uncertain cleanup remains UNKNOWN and requires reconciliation.
+
+### Worktree identity is not recovery freshness
+
+Bootstrap alone may use the bound repository root (not implicit edit authority).
+Replacement requires a previously authenticated/validated checkpoint binding
+for this target, then fresh membership in that repository's Git worktree list.
+Current artifact divergence makes recovery stale, but does not erase the
+historical authenticated worktree identity. Historical facts retain their raw
+Pending checkpoint projection; only fresh native artifact equality permits
+current recovery contents in the new prompt. Pending/none without another
+trusted task/seat binding fails `E_WORKTREE_UNBOUND` before lifecycle effects.
+One registered worktree, a project label, process cwd or a worker path alone
+never supplies that authority. No implicit worktree or new registry is created.
+The lead path may validate a candidate internally; OperatorUi never impersonates
+a lead. A stale recovery prompts inventory of the bound worktree, not guessed
+completion of previous effects.
+
+### Finite clocks and human pause
+
+Native total is 170 seconds; parent's replace watchdog is 180 seconds. Forward
+work ends by 130 seconds, retaining 40 seconds for cleanup: two capped native
+collectors (10+10), TERM/KILL verification (10+1), hub control (3), and metadata
+margin (6). Before the first effect the adapter requires 116 forward seconds
+plus this 40-second reserve; if preflight consumed the margin it fails before
+effects. Launch/observation receives at most 90 seconds (85 observation), never
+a renewed overall budget. Native collectors/control also honor the outer
+cleanup deadline. Missing checkpoint hook returns unavailable immediately;
+this adapter does not fabricate a 90-second hook acknowledgement or observer.
+Filesystem/kernel scheduling is not hard-real-time; watchdog timeout is UNKNOWN,
+not rollback or proof of no effects. Admission/terminal evidence blocks blind
+retry. Same-UID/kernel TOCTOU residuals remain as previously documented.
+
+Human Prepare writes terminal Ready and retains a **clock-free** object. Reading
+the dialog consumes no runtime budget. Start begins a fresh deadline and checks
+permit CAS, immutable pins, owner, stopped identities, revocation, inventory and
+selection again. Invalidation before new effects is `E_PREPARATION_EXPIRED`,
+blocked, preserving the previous stopped/revoked fact—not a rollback. Unknown
+is reserved for actually uncertain effects/transport. No arbitrary TTL added.
+
+### Evidence and remaining integrated gates
+
+Tests use temporary private files, synthetic auth/config/receipts, fake process
+observations, loopback fixture hub sockets and disposable pipe-gate children.
+No real Codex session, provider, live team process or installed auth is exercised.
+Native start/prepare/cleanup composition is source-tested, not a witnessed
+installed journey. Standing launcher behavior is not replaced.
+
+Rex still composes the native commands/state map with the already frozen UI and
+control bridge. QA/security must review the resulting exact head before any
+capability exposure/installation. The current native launch implementation is
+Codex-only; unsupported harness/control changes fail closed rather than using a
+legacy path. Archive remains required: Peppy still owes the bounded current
+BEADS epic/children inventory, typed authenticated per-item reconciliation and
+review/metric references, joined with exact-seat stop/revoke/remote evidence
+before using Rex's one journal. Notes/free text/caller booleans cannot fill that
+gap. No archive completion or installation is claimed by this checkpoint.

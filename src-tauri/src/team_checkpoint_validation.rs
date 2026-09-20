@@ -315,3 +315,34 @@ where
     revalidate()?;
     Ok(entries)
 }
+
+/// Historical authentication is path-binding evidence, NOT current artifact
+/// validity. Entries retain their raw Pending validation; callers must perform
+/// fresh native collection before treating recovery contents as current.
+pub(crate) fn historical_bindings_native<F>(
+    home: &Path,
+    ctx: &ValidationContext,
+    sentinels: &[String],
+    mut revalidate: F,
+) -> Result<Vec<CheckpointEntry>, CheckpointError>
+where
+    F: FnMut() -> Result<(), CheckpointError>,
+{
+    revalidate()?;
+    let history = open(home, ctx)?;
+    revalidate()?;
+    let entries = checked_entries(&history, ctx, sentinels)?;
+    let facts = read_facts(&history, ctx, &entries, sentinels)?;
+    let bound = entries
+        .into_iter()
+        .filter(|e| {
+            facts.iter().any(|f| {
+                f.checkpoint_id == e.checkpoint_id
+                    && f.content_hash == e.content_hash
+                    && f.result == CheckpointValidation::Ok
+            })
+        })
+        .collect();
+    revalidate()?;
+    Ok(bound)
+}

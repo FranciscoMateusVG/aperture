@@ -22,7 +22,7 @@ impl Fixture {
                 old_generation: 1,
                 admitted_at_ms: 1,
                 native_budget_ms: 170_000,
-                cleanup_reserve_ms: 30_000,
+                cleanup_reserve_ms: 40_000,
             },
             Deadline::new(),
         )
@@ -75,15 +75,15 @@ fn fixed_budget_reserves_cleanup_and_never_renews() {
     assert_eq!(
         d.forward_at(
             FORWARD_AFTER_FIRST_EFFECT,
-            d.started + Duration::from_secs(24)
+            d.started + Duration::from_secs(14)
         ),
         Err(ReplacementError::Deadline)
     );
     assert!(d
-        .forward_at(Duration::ZERO, d.started + Duration::from_secs(139))
+        .forward_at(Duration::ZERO, d.started + Duration::from_secs(129))
         .is_ok());
     assert_eq!(
-        d.forward_at(Duration::ZERO, d.started + Duration::from_secs(140)),
+        d.forward_at(Duration::ZERO, d.started + Duration::from_secs(130)),
         Err(ReplacementError::Deadline)
     );
     assert_eq!(
@@ -97,7 +97,7 @@ fn subprocess_deadline_cannot_spend_cleanup_reserve() {
     let d = Deadline::new();
     assert_eq!(
         d.forward_until(Duration::from_secs(1000)).unwrap(),
-        d.started + Duration::from_secs(140)
+        d.started + Duration::from_secs(130)
     );
     assert!(d.forward_until(Duration::from_secs(2)).unwrap() < d.cleanup_until());
 }
@@ -157,7 +157,7 @@ fn no_active_success_after_forward_deadline_or_without_observed_owner() {
     let mut a = f.attempt();
     a.admit_effects().unwrap();
     assert_eq!(a.finish_active(), Err(ReplacementError::OutcomeUnknown));
-    a.budget.started = Instant::now() - Duration::from_secs(140);
+    a.budget.started = Instant::now() - Duration::from_secs(130);
     assert_eq!(a.finish_active(), Err(ReplacementError::Deadline));
     assert!(!a.dir.join("terminal.json").exists());
     assert_eq!(a.finish_unknown(), Err(ReplacementError::OutcomeUnknown));
@@ -268,4 +268,154 @@ fn admission_preserves_time_already_spent_in_repository_preflight() {
     assert_eq!(a.budget.started, original);
     assert_eq!(a.admit_effects(), Err(ReplacementError::Deadline));
     assert!(!a.dir.join("effects.json").exists());
+}
+
+#[test]
+fn bootstrap_g0_has_separate_exact_admission_and_never_relaxes_replace() {
+    let f = Fixture::new();
+    f.managed();
+    let path = f.0.join(".aperture/run/owner/t1-worker.json");
+    let mut owner: OwnerRecord = read_private_json(&path).unwrap();
+    owner.generation = 0;
+    owner.state = OwnerState::Stale;
+    owner.incarnation = None;
+    write_private_json_atomic(&path, &owner, true).unwrap();
+    let actor = AuthenticatedActor::launcher();
+    assert!(matches!(
+        RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 0, Deadline::new()),
+        Err(ReplacementError::GenerationMismatch)
+    ));
+    let a =
+        RuntimeAttempt::begin_bootstrap(&f.0, &actor, "t1", "t1-worker", Deadline::new()).unwrap();
+    assert_eq!(a.admitted.old_generation, 0);
+    assert!(a.dir.ends_with("t1-worker/g0"));
+    assert!(matches!(
+        RuntimeAttempt::begin_bootstrap(&f.0, &actor, "t1", "t1-worker", Deadline::new()),
+        Err(ReplacementError::OutcomeUnknown)
+    ));
+    assert_eq!(read_private_json::<OwnerRecord>(&path).unwrap(), owner);
+}
+#[test]
+fn bootstrap_rejects_every_nonvirgin_owner_before_admission() {
+    for variant in 0..8 {
+        let f = Fixture::new();
+        f.managed();
+        let path = f.0.join(".aperture/run/owner/t1-worker.json");
+        let mut owner: OwnerRecord = read_private_json(&path).unwrap();
+        owner.generation = 0;
+        owner.state = OwnerState::Stale;
+        owner.incarnation = None;
+        match variant {
+            0 => owner.generation = 1,
+            1 => owner.state = OwnerState::Starting,
+            2 => owner.state = OwnerState::Active,
+            3 => owner.state = OwnerState::Quarantined,
+            4 => owner.provisional_token_id = Some("a".repeat(64)),
+            5 => owner.reservation_nonce_sha256 = Some("b".repeat(64)),
+            6 => owner.schema_version = 99,
+            _ => owner.requested.model = "other-model".into(),
+        }
+        write_private_json_atomic(&path, &owner, true).unwrap();
+        assert!(RuntimeAttempt::begin_bootstrap(
+            &f.0,
+            &AuthenticatedActor::launcher(),
+            "t1",
+            "t1-worker",
+            Deadline::new()
+        )
+        .is_err());
+        assert!(!f.0.join(".aperture/teams/t1/runtime-attempts").exists());
+    }
+}
+#[test]
+fn bootstrap_missing_corrupt_owner_and_operator_direct_admission_fail_closed() {
+    for corrupt in [false, true] {
+        let f = Fixture::new();
+        f.managed();
+        let path = f.0.join(".aperture/run/owner/t1-worker.json");
+        if corrupt {
+            std::fs::write(&path, b"{}").unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert!(RuntimeAttempt::begin_bootstrap(
+            &f.0,
+            &AuthenticatedActor::launcher(),
+            "t1",
+            "t1-worker",
+            Deadline::new()
+        )
+        .is_err());
+        assert!(!f.0.join(".aperture/teams/t1/runtime-attempts").exists());
+    }
+    let f = Fixture::new();
+    assert!(matches!(
+        RuntimeAttempt::begin_bootstrap(
+            &f.0,
+            &AuthenticatedActor::operator_ui(),
+            "t1",
+            "t1-worker",
+            Deadline::new()
+        ),
+        Err(ReplacementError::AuthorizationRequired)
+    ));
+    assert!(!f.0.join(".aperture").exists());
+}
+
+#[test]
+fn human_ready_is_terminal_clock_free_and_start_gets_new_nonrenewable_budget() {
+    let f = Fixture::new();
+    f.managed();
+    let actor = AuthenticatedActor::launcher();
+    let mut a = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+    a.admit_effects().unwrap();
+    let old_start = a.budget.started;
+    let ready = a.finish_ready().unwrap();
+    let old_dir = ready.dir.clone();
+    let terminal: Fact = read_private_json(&old_dir.join("terminal.json")).unwrap();
+    assert_eq!(terminal.kind, FactKind::Ready);
+    let new_budget = Deadline::new();
+    let next_start = new_budget.started;
+    assert!(next_start > old_start);
+    let mut start = ready.start(new_budget).unwrap();
+    assert_eq!(start.budget.started, next_start);
+    assert!(start.dir.ends_with("g1/start"));
+    assert!(!start.effects_admitted());
+    start.finish_failed().unwrap();
+    let old_terminal: Fact = read_private_json(&old_dir.join("terminal.json")).unwrap();
+    assert_eq!(old_terminal, terminal);
+}
+#[test]
+fn human_permit_corruption_owner_drift_or_consumed_path_is_expired_not_unknown() {
+    for variant in 0..4 {
+        let f = Fixture::new();
+        f.managed();
+        let actor = AuthenticatedActor::launcher();
+        let mut a =
+            RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
+        a.admit_effects().unwrap();
+        let ready = a.finish_ready().unwrap();
+        match variant {
+            0 => std::fs::write(ready.dir.join("terminal.json"), b"{}").unwrap(),
+            1 => {
+                let p = f.0.join(".aperture/run/owner/t1-worker.json");
+                let mut o: OwnerRecord = read_private_json(&p).unwrap();
+                o.generation = 2;
+                write_private_json_atomic(&p, &o, true).unwrap();
+            }
+            2 => {
+                ensure_private_dir(&ready.dir.join("start")).unwrap();
+            }
+            _ => {
+                let p = f.0.join(".aperture/run/owner/t1-worker.json");
+                let mut o: OwnerRecord = read_private_json(&p).unwrap();
+                o.state = OwnerState::Quarantined;
+                write_private_json_atomic(&p, &o, true).unwrap();
+            }
+        }
+        assert!(matches!(
+            ready.start(Deadline::new()),
+            Err(ReplacementError::PreparationExpired)
+        ));
+    }
 }

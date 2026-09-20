@@ -236,3 +236,48 @@ fn private_reader_is_bounded_and_rejects_symlink_or_unsafe_mode() {
     assert!(read_bearer(&home, "../other").is_err());
     std::fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn never_published_bearer_does_not_fabricate_reconnect_witness() {
+    let (address, server) = fixture(ack(), None);
+    let proof = exchange_optional(
+        address,
+        &Bearer("a".repeat(64)),
+        None,
+        "t1-worker",
+        1,
+        &"c".repeat(64),
+    )
+    .unwrap();
+    assert!(proof.durable && proof.sockets_closed && proof.token_deleted);
+    assert_eq!(proof.reconnect_code, 0);
+    assert_eq!(server.join().unwrap(), 1);
+}
+#[test]
+fn unlaunched_floor_rejects_corruption_ambiguity_and_noncanonical_digests() {
+    use crate::journal::{ensure_private_dir, write_private_json_atomic};
+    let home =
+        std::env::temp_dir().join(format!("aperture-floor-fixture-{}", uuid::Uuid::new_v4()));
+    let root = home.join(".aperture/run/revocations");
+    ensure_private_dir(&root).unwrap();
+    let path = root.join("t1-worker.json");
+    let valid = serde_json::json!({"schema_version":1,"seat":"t1-worker","revoked_through_generation":1,"revoked_token_ids":["a".repeat(64)]});
+    write_private_json_atomic(&path, &valid, false).unwrap();
+    verify_floor(&home, "t1-worker", 1, &"a".repeat(64)).unwrap();
+    for i in 0..8 {
+        let mut v = valid.clone();
+        match i {
+            0 => v["schema_version"] = 2.into(),
+            1 => v["seat"] = "other".into(),
+            2 => v["revoked_through_generation"] = 2.into(),
+            3 => v["revoked_token_ids"] = serde_json::json!(["a".repeat(64), "a".repeat(64)]),
+            4 => v["revoked_token_ids"] = serde_json::json!(["a".repeat(64), "not-a-digest"]),
+            5 => v["revoked_token_ids"] = serde_json::json!(["b".repeat(64), "a".repeat(64)]),
+            6 => v["revoked_token_ids"] = serde_json::json!([]),
+            _ => v["unexpected"] = true.into(),
+        }
+        write_private_json_atomic(&path, &v, true).unwrap();
+        assert!(verify_floor(&home, "t1-worker", 1, &"a".repeat(64)).is_err());
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}

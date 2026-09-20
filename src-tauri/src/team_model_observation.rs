@@ -198,8 +198,12 @@ where
         || owner.state != OwnerState::Starting
         || owner.requested.harness != Harness::Codex
         || owner.requested.reasoning.is_none()
-        || candidate.observed
-        || !candidate.thread_id.is_empty()
+        || (!candidate.observed && !candidate.thread_id.is_empty())
+        || (candidate.observed
+            && (candidate.thread_id.is_empty()
+                || candidate.harness != owner.requested.harness
+                || candidate.model != owner.requested.model
+                || candidate.reasoning != owner.requested.reasoning))
         || owner.reservation_nonce_sha256.as_deref()
             != Some(digest(reservation.nonce().as_bytes()).as_str())
         || owner.provisional_token_id.as_deref() != Some(candidate.token_id.as_str())
@@ -246,6 +250,7 @@ where
         || receipt.actual_model != owner.requested.model
         || Some(attempt.requested_reasoning) != owner.requested.reasoning
         || Some(receipt.actual_reasoning.clone()) != owner.requested.reasoning
+        || (candidate.observed && candidate.thread_id != receipt.thread_id)
         || receipt.thread_id.is_empty()
         || receipt.thread_id.len() > 128
         || !receipt

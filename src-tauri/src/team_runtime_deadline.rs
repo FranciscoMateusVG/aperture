@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const TOTAL: Duration = Duration::from_secs(170);
-const CLEANUP: Duration = Duration::from_secs(30);
+// Two native collectors10+10, TERM10/KILL1, hub3, bounded metadata margin6.
+const CLEANUP: Duration = Duration::from_secs(40);
 // Stop11 + post-stop collection10 + revoke3 + launch/observe90 + metadata2.
 const FORWARD_AFTER_FIRST_EFFECT: Duration = Duration::from_secs(116);
 
@@ -69,6 +70,7 @@ struct Admission {
 #[serde(rename_all = "snake_case")]
 enum FactKind {
     EffectsMayHaveOccurred,
+    Ready,
     Active,
     Failed,
     Unknown,
@@ -91,6 +93,69 @@ pub(crate) struct RuntimeAttempt {
     effects_admitted: bool,
     terminal: bool,
 }
+/// Clock-free, opaque, one-use human preparation authority. No caller fields.
+pub(crate) struct ReadyAttempt {
+    home: PathBuf,
+    dir: PathBuf,
+    admitted: Admission,
+}
+impl ReadyAttempt {
+    pub(crate) fn start(self, budget: Deadline) -> Result<RuntimeAttempt, ReplacementError> {
+        let expired = || ReplacementError::PreparationExpired;
+        budget.forward(Duration::ZERO)?;
+        let _team = try_lock(
+            &self.home.join(".aperture/run/team-locks"),
+            &self.admitted.team,
+        )
+        .map_err(|_| expired())?;
+        let store = OwnerStore::new(self.home.join(".aperture/run/owner"));
+        let _seat = store.lock(&self.admitted.seat).map_err(|_| expired())?;
+        let current: Admission =
+            read_private_json(&self.dir.join("admitted.json")).map_err(|_| expired())?;
+        let terminal: Fact =
+            read_private_json(&self.dir.join("terminal.json")).map_err(|_| expired())?;
+        if current != self.admitted
+            || terminal
+                != (Fact {
+                    schema_version: 1,
+                    attempt_id: self.admitted.attempt_id.clone(),
+                    kind: FactKind::Ready,
+                })
+        {
+            return Err(expired());
+        }
+        match classify_managed_seat(&self.home, &self.admitted.seat).map_err(|_| expired())? {
+            Some(ManagedSeatState::Active { team, .. }) if team == self.admitted.team => {}
+            _ => return Err(expired()),
+        }
+        let owner: OwnerRecord =
+            read_private_json(&store.record_path(&self.admitted.seat)).map_err(|_| expired())?;
+        if owner.schema_version != 1
+            || owner.seat != self.admitted.seat
+            || owner.generation != self.admitted.old_generation
+            || owner.state != OwnerState::Active
+            || owner.provisional_token_id.is_some()
+            || !owner.incarnation.as_ref().is_some_and(|i| {
+                i.observed
+                    && i.model == owner.requested.model
+                    && i.harness == owner.requested.harness
+                    && i.reasoning == owner.requested.reasoning
+            })
+        {
+            return Err(expired());
+        }
+        let dir = validate_component_path(&self.dir, "start", true).map_err(|_| expired())?;
+        if !matches!(std::fs::symlink_metadata(&dir),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+        {
+            return Err(expired());
+        }
+        ensure_private_dir(&dir).map_err(|_| expired())?;
+        let mut admitted = self.admitted.clone();
+        admitted.attempt_id = uuid::Uuid::new_v4().to_string();
+        admitted.admitted_at_ms = chrono::Utc::now().timestamp_millis();
+        RuntimeAttempt::publish(&self.home, dir, admitted, budget)
+    }
+}
 impl RuntimeAttempt {
     /// Called only after native action authority, repo and launch preflight.
     /// Launcher identity and current managed owner are rechecked under locks.
@@ -102,8 +167,30 @@ impl RuntimeAttempt {
         generation: u64,
         budget: Deadline,
     ) -> Result<Self, ReplacementError> {
+        if generation == 0 {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        Self::begin_checked(home, actor, team, seat, generation, budget, false)
+    }
+    pub(crate) fn begin_bootstrap(
+        home: &Path,
+        actor: &AuthenticatedActor,
+        team: &str,
+        seat: &str,
+        budget: Deadline,
+    ) -> Result<Self, ReplacementError> {
+        Self::begin_checked(home, actor, team, seat, 0, budget, true)
+    }
+    fn begin_checked(
+        home: &Path,
+        actor: &AuthenticatedActor,
+        team: &str,
+        seat: &str,
+        generation: u64,
+        budget: Deadline,
+        bootstrap: bool,
+    ) -> Result<Self, ReplacementError> {
         if !actor.is_launcher()
-            || generation == 0
             || team.len() > 16
             || !crate::agent_loader::is_valid_seat_name(team)
             || !crate::agent_loader::is_valid_seat_name(seat)
@@ -125,14 +212,37 @@ impl RuntimeAttempt {
             .map_err(|_| ReplacementError::NativeFailure)?;
         let owner: OwnerRecord = read_private_json(&store.record_path(seat))
             .map_err(|_| ReplacementError::GenerationMismatch)?;
+        let state_ok = if bootstrap {
+            owner.generation == 0
+                && owner.state == OwnerState::Stale
+                && owner.incarnation.is_none()
+                && owner.reservation_nonce_sha256.is_none()
+                && owner.provisional_token_id.is_none()
+        } else {
+            owner.state == OwnerState::Active
+                && owner.provisional_token_id.is_none()
+                && owner.incarnation.as_ref().is_some_and(|i| i.observed)
+        };
         if owner.schema_version != 1
             || owner.seat != seat
             || owner.generation != generation
-            || owner.state != OwnerState::Active
-            || owner.provisional_token_id.is_some()
-            || !owner.incarnation.as_ref().is_some_and(|i| i.observed)
+            || !state_ok
         {
             return Err(ReplacementError::GenerationMismatch);
+        }
+        if bootstrap {
+            let snapshot: crate::teams::TeamSnapshot =
+                read_private_json(&home.join(".aperture/teams").join(team).join("team.json"))
+                    .map_err(|_| ReplacementError::GenerationMismatch)?;
+            let seats: Vec<_> = snapshot.seats.iter().filter(|s| s.name == seat).collect();
+            if snapshot.team != team
+                || seats.len() != 1
+                || owner.requested.harness != seats[0].harness
+                || owner.requested.model != seats[0].model
+                || owner.requested.reasoning != seats[0].reasoning
+            {
+                return Err(ReplacementError::GenerationMismatch);
+            }
         }
         let team_dir = validate_component_path(&home.join(".aperture/teams"), team, false)
             .map_err(|_| ReplacementError::NativeFailure)?;
@@ -162,7 +272,7 @@ impl RuntimeAttempt {
                 old_generation: generation,
                 admitted_at_ms: chrono::Utc::now().timestamp_millis(),
                 native_budget_ms: 170_000,
-                cleanup_reserve_ms: 30_000,
+                cleanup_reserve_ms: CLEANUP.as_millis() as u64,
             },
             budget,
         )
@@ -189,6 +299,24 @@ impl RuntimeAttempt {
             terminal: false,
         })
     }
+    /// Human prepare is terminal and factual; no clock runs while a person
+    /// reads the dialog. The retained native permit is consumed by Start.
+    pub(crate) fn finish_ready(mut self) -> Result<ReadyAttempt, ReplacementError> {
+        self.budget.forward(Duration::ZERO)?;
+        if self.terminal {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        self.fact("terminal.json", FactKind::Ready)?;
+        self.terminal = true;
+        Ok(ReadyAttempt {
+            home: self.home,
+            dir: self.dir,
+            admitted: self.admitted,
+        })
+    }
+    pub(crate) fn effects_admitted(&self) -> bool {
+        self.effects_admitted
+    }
     pub(crate) fn budget(&self) -> &Deadline {
         &self.budget
     }
@@ -210,7 +338,7 @@ impl RuntimeAttempt {
         if actual != self.admitted {
             return Err(ReplacementError::OutcomeUnknown);
         }
-        if kind == FactKind::Active {
+        if matches!(kind, FactKind::Active | FactKind::Ready) {
             let owner: OwnerRecord = read_private_json(&store.record_path(&self.admitted.seat))
                 .map_err(|_| ReplacementError::OutcomeUnknown)?;
             if owner.schema_version != 1
@@ -219,7 +347,7 @@ impl RuntimeAttempt {
                     != self
                         .admitted
                         .old_generation
-                        .checked_add(1)
+                        .checked_add(if kind == FactKind::Active { 1 } else { 0 })
                         .ok_or(ReplacementError::OutcomeUnknown)?
                 || owner.state != OwnerState::Active
                 || owner.provisional_token_id.is_some()

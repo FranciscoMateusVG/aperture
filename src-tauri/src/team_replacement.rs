@@ -123,6 +123,8 @@ pub enum ReplacementError {
     LaunchUnavailable,
     Deadline,
     OutcomeUnknown,
+    PreparationExpired,
+    WorktreeUnbound,
 }
 impl ReplacementError {
     pub fn code(&self) -> &'static str {
@@ -142,6 +144,8 @@ impl ReplacementError {
             Self::LaunchUnavailable => "E_LAUNCH_UNAVAILABLE",
             Self::Deadline => "E_RUNTIME_DEADLINE",
             Self::OutcomeUnknown => "E_CONTROL_UNKNOWN",
+            Self::PreparationExpired => "E_PREPARATION_EXPIRED",
+            Self::WorktreeUnbound => "E_WORKTREE_UNBOUND",
         }
     }
 }
@@ -516,3 +520,6 @@ pub(crate) mod repository;
 
 #[path = "team_runtime_deadline.rs"]
 pub(crate) mod deadline;
+
+#[path = "team_launch_native.rs"]
+pub(crate) mod launch;

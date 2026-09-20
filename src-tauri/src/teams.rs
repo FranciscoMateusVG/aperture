@@ -1312,7 +1312,7 @@ fn parse_role_skills(text: &str, role: &str) -> TeamResult<Vec<String>> {
     Ok(skills)
 }
 
-fn copy_private_tree_bounded(source: &Path, destination: &Path, budget: usize) -> TeamResult<usize> {
+pub(crate) fn copy_private_tree_bounded(source: &Path, destination: &Path, budget: usize) -> TeamResult<usize> {
     if !real_dir_inside(source, source) { return Err(TeamError::new("E_PATH_UNSAFE", "skill source is unsafe")); }
     ensure_private_dir(destination).map_err(TeamError::from_message)?;
     let mut entries: Vec<_> = fs::read_dir(source).map_err(|_| TeamError::io("skill source unreadable"))?

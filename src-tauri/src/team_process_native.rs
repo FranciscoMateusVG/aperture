@@ -66,6 +66,24 @@ pub(crate) fn collect_native(
     seat: &str,
     generation: u64,
 ) -> Result<OwnershipSnapshot, ReplacementError> {
+    collect_native_until(
+        home,
+        team,
+        seat,
+        generation,
+        Instant::now() + Duration::from_secs(10),
+    )
+}
+pub(crate) fn collect_native_until(
+    home: &Path,
+    team: &str,
+    seat: &str,
+    generation: u64,
+    until: Instant,
+) -> Result<OwnershipSnapshot, ReplacementError> {
+    if Instant::now() >= until {
+        return Err(ReplacementError::Deadline);
+    }
     if !crate::agent_loader::is_valid_seat_name(seat)
         || !crate::agent_loader::is_valid_seat_name(team)
         || team.len() > 16
@@ -87,7 +105,12 @@ pub(crate) fn collect_native(
     {
         return Err(ReplacementError::GenerationMismatch);
     }
-    collect(&record, &mut NativeSource::new())
+    collect(
+        &record,
+        &mut NativeSource {
+            deadline: until.min(Instant::now() + Duration::from_secs(10)),
+        },
+    )
 }
 /// Metadata for the exact child held by the native pipe gate, before any
 /// harness exec. A caller PID/path cannot construct PendingChild. This observes

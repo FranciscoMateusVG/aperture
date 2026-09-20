@@ -192,9 +192,38 @@ fn exchange(
     generation: u64,
     token_id: &str,
 ) -> Result<RevocationProof, ReplacementError> {
+    exchange_optional(address, watchdog, Some(old), seat, generation, token_id)
+}
+fn exchange_optional(
+    address: SocketAddr,
+    watchdog: &Bearer,
+    old: Option<&Bearer>,
+    seat: &str,
+    generation: u64,
+    token_id: &str,
+) -> Result<RevocationProof, ReplacementError> {
+    exchange_optional_until(
+        address,
+        watchdog,
+        old,
+        seat,
+        generation,
+        token_id,
+        Instant::now() + Duration::from_secs(3),
+    )
+}
+fn exchange_optional_until(
+    address: SocketAddr,
+    watchdog: &Bearer,
+    old: Option<&Bearer>,
+    seat: &str,
+    generation: u64,
+    token_id: &str,
+    until: Instant,
+) -> Result<RevocationProof, ReplacementError> {
     // One total bound across both handshakes/reads/writes. Per-read socket
     // timeouts alone could be renewed forever by a fragmented handshake/frame.
-    let total_deadline = Instant::now() + Duration::from_secs(3);
+    let total_deadline = until.min(Instant::now() + Duration::from_secs(3));
     let mut control = connect_at(address, total_deadline)?;
     send(
         &mut control,
@@ -236,27 +265,29 @@ fn exchange(
     let _ = control.close(None);
     // One negative reconnect with the original in-memory bearer. Never rewrite
     // the deleted file and never substitute a newer generation/token.
-    let mut denied = connect_at(address, total_deadline)?;
-    send(
-        &mut denied,
-        serde_json::json!({"type":"hello","role":"producer","agent":seat,
+    if let Some(old) = old {
+        let mut denied = connect_at(address, total_deadline)?;
+        send(
+            &mut denied,
+            serde_json::json!({"type":"hello","role":"producer","agent":seat,
         "generation":generation,"token_id":token_id,"token":old.0}),
-        total_deadline,
-    )?;
-    let reconnect_deadline = (Instant::now() + DEADLINE).min(total_deadline);
-    let mut rejected = false;
-    for _ in 0..FRAME_COUNT_CAP {
-        match read_before(&mut denied, reconnect_deadline)? {
-            Message::Close(Some(frame)) if u16::from(frame.code) == 4003 => {
-                rejected = true;
-                break;
+            total_deadline,
+        )?;
+        let reconnect_deadline = (Instant::now() + DEADLINE).min(total_deadline);
+        let mut rejected = false;
+        for _ in 0..FRAME_COUNT_CAP {
+            match read_before(&mut denied, reconnect_deadline)? {
+                Message::Close(Some(frame)) if u16::from(frame.code) == 4003 => {
+                    rejected = true;
+                    break;
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                _ => return Err(failure()),
             }
-            Message::Ping(_) | Message::Pong(_) => continue,
-            _ => return Err(failure()),
         }
-    }
-    if !rejected {
-        return Err(failure());
+        if !rejected {
+            return Err(failure());
+        }
     }
     // token_deleted is per-call mutation history; confirmed absence+fsync is
     // the safety fact. An idempotent already-absent ACK is valid evidence.
@@ -267,7 +298,7 @@ fn exchange(
         sockets_closed: true,
         close_code: 4001,
         close_elapsed_ms: elapsed,
-        reconnect_code: 4003,
+        reconnect_code: if old.is_some() { 4003 } else { 0 },
         token_deleted: ack.token_absent_verified,
     })
 }
@@ -278,6 +309,14 @@ pub(crate) fn revoke_stopped(
     home: &Path,
     recorded: &PersistedProcessSnapshot,
 ) -> Result<RevocationProof, ReplacementError> {
+    revoke_stopped_before(home, recorded, Instant::now() + Duration::from_secs(3))
+}
+pub(crate) fn revoke_stopped_before(
+    home: &Path,
+    recorded: &PersistedProcessSnapshot,
+    until: Instant,
+) -> Result<RevocationProof, ReplacementError> {
+    remaining(until)?;
     let snapshot = recorded.snapshot();
     if snapshot
         .processes
@@ -308,16 +347,138 @@ pub(crate) fn revoke_stopped(
     if digest != incarnation.token_id {
         return Err(failure());
     }
-    exchange(
+    exchange_optional_until(
         HUB,
         &watchdog,
-        &old,
+        Some(&old),
         &snapshot.seat,
         snapshot.generation,
         &digest,
+        until,
     )
 }
 
 #[cfg(test)]
 #[path = "team_revoke_native_tests.rs"]
 mod tests;
+
+/// Failed publication before any candidate was attached. No synthetic PID,
+/// thread or bearer is minted to obtain an ACK. If publication never produced
+/// a readable bearer, durable floor+factual ACK is checked but negative reconnect
+/// is deliberately NOT claimed. The same owner lock binds this unlaunched case.
+pub(crate) fn revoke_unlaunched(
+    home: &Path,
+    team: &str,
+    res: &crate::owner::StartReservation,
+) -> Result<(), ReplacementError> {
+    revoke_unlaunched_before(home, team, res, Instant::now() + Duration::from_secs(3))
+}
+pub(crate) fn revoke_unlaunched_before(
+    home: &Path,
+    team: &str,
+    res: &crate::owner::StartReservation,
+    until: Instant,
+) -> Result<(), ReplacementError> {
+    remaining(until)?;
+    let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
+        .map_err(|_| failure())?;
+    match crate::teams::classify_managed_seat(home, &res.seat).map_err(|_| failure())? {
+        Some(crate::teams::ManagedSeatState::Active { team: actual, .. }) if actual == team => {}
+        _ => return Err(failure()),
+    }
+    let store = crate::owner::OwnerStore::new(home.join(".aperture/run/owner"));
+    let _seat = store.lock(&res.seat).map_err(|_| failure())?;
+    let owner: OwnerRecord =
+        crate::journal::read_private_json(&store.record_path(&res.seat)).map_err(|_| failure())?;
+    if owner.schema_version != 1
+        || owner.seat != res.seat
+        || owner.generation != res.generation
+        || owner.state != crate::state::OwnerState::Starting
+        || owner.incarnation.is_some()
+        || owner.reservation_nonce_sha256.as_deref()
+            != Some(format!("{:x}", Sha256::digest(res.nonce().as_bytes())).as_str())
+    {
+        return Err(failure());
+    }
+    let Some(token_id) = owner.provisional_token_id.as_ref() else {
+        return Ok(());
+    };
+    if token_id.len() != 64
+        || !token_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(failure());
+    }
+    let path = home
+        .join(".aperture/run/hub-tokens")
+        .join(format!("{}.token", res.seat));
+    let old = match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(_) => Some(read_bearer(home, &res.seat)?),
+        _ => return Err(failure()),
+    };
+    if old
+        .as_ref()
+        .is_some_and(|b| format!("{:x}", Sha256::digest(b.0.as_bytes())) != *token_id)
+    {
+        return Err(failure());
+    }
+    let watchdog = read_bearer(home, "watchdog")?;
+    exchange_optional_until(
+        HUB,
+        &watchdog,
+        old.as_ref(),
+        &res.seat,
+        res.generation,
+        token_id,
+        until,
+    )?;
+    if !matches!(std::fs::symlink_metadata(&path),Err(e) if e.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Err(failure());
+    }
+    verify_floor(home, &res.seat, res.generation, token_id)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRevocationFloor {
+    schema_version: u32,
+    seat: String,
+    revoked_through_generation: u64,
+    revoked_token_ids: Vec<String>,
+}
+fn verify_floor(
+    home: &Path,
+    seat: &str,
+    generation: u64,
+    token_id: &str,
+) -> Result<(), ReplacementError> {
+    let state: NativeRevocationFloor = crate::journal::read_private_json(
+        &home
+            .join(".aperture/run/revocations")
+            .join(format!("{seat}.json")),
+    )
+    .map_err(|_| failure())?;
+    let mut sorted = state.revoked_token_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    let valid = |s: &str| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if state.schema_version != 1
+        || state.seat != seat
+        || state.revoked_through_generation != generation
+        || state.revoked_token_ids.is_empty()
+        || state.revoked_token_ids.len() > 10000
+        || sorted != state.revoked_token_ids
+        || !state.revoked_token_ids.iter().all(|s| valid(s))
+        || !valid(token_id)
+        || !state.revoked_token_ids.iter().any(|s| s == token_id)
+    {
+        return Err(failure());
+    }
+    Ok(())
+}

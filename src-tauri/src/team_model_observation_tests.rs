@@ -119,6 +119,10 @@ fn exact_native_receipt_is_read_only_then_shared_owner_cas_binds_actual() {
         stored.incarnation.as_ref().unwrap().processes,
         before.incarnation.unwrap().processes
     );
+    // Activation re-reads the same receipt after durable observed-Starting.
+    let observed_again = f.read().unwrap().into_runtime_observation();
+    assert_eq!(observed_again.thread_id, "native-thread");
+    assert_eq!(f.owner(), stored);
     assert_eq!(
         f.store
             .commit_start(&AuthenticatedActor::launcher(), &f.reservation)
@@ -270,4 +274,30 @@ fn revoked_identity_or_corrupt_or_symlink_store_cannot_be_observed() {
     )
     .unwrap();
     assert!(f.read().is_err());
+}
+
+#[test]
+fn observed_starting_receipt_recheck_never_changes_thread_or_tuple() {
+    for changed in ["thread_id", "actual_model", "actual_reasoning"] {
+        let f = Fixture::new();
+        f.store
+            .record_runtime_observation(
+                &AuthenticatedActor::launcher(),
+                &f.reservation,
+                f.read().unwrap().into_runtime_observation(),
+            )
+            .unwrap();
+        let before = f.owner();
+        f.alter(
+            "observation",
+            changed,
+            json!(if changed == "actual_reasoning" {
+                "low"
+            } else {
+                "different"
+            }),
+        );
+        assert!(f.read().is_err());
+        assert_eq!(f.owner(), before);
+    }
 }

@@ -676,6 +676,49 @@ mod tests {
         assert_eq!(std::fs::read(f.dir().join("1-1.json")).unwrap(), before);
     }
     #[test]
+    fn historical_binding_survives_divergence_without_claiming_current_validity() {
+        let f = Fixture::new();
+        write_native(&f.0, &ctx(), 1, payload(), 0, &[], || Ok(())).unwrap();
+        assert!(
+            validation::historical_bindings_native(&f.0, &lead_context(), &[], || Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+        validation::validate_native(&f.0, &lead_context(), 1, 1, &[], || Ok(()), actual).unwrap();
+        validation::validate_native(
+            &f.0,
+            &lead_context(),
+            1,
+            2,
+            &[],
+            || Ok(()),
+            |e| {
+                let mut a = actual(e)?;
+                a.head_sha = "b".repeat(40);
+                Ok(a)
+            },
+        )
+        .unwrap();
+        let projected =
+            validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(())).unwrap();
+        assert!(matches!(
+            projected[0].validation,
+            CheckpointValidation::Divergent { .. }
+        ));
+        let bound =
+            validation::historical_bindings_native(&f.0, &lead_context(), &[], || Ok(())).unwrap();
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].payload.worktree, payload().worktree);
+        assert_eq!(bound[0].content_hash, projected[0].content_hash);
+        assert_eq!(bound[0].validation, CheckpointValidation::Pending);
+        assert!(
+            validation::historical_bindings_native(&f.0, &lead_context(), &[], || Err(
+                CheckpointError::Generation
+            ))
+            .is_err()
+        );
+    }
+    #[test]
     fn corrupt_hash_fact_status_or_hardlink_fails_closed() {
         for mode in 0..4 {
             let f = Fixture::new();
@@ -704,6 +747,10 @@ mod tests {
             }
             assert!(
                 validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(()))
+                    .is_err()
+            );
+            assert!(
+                validation::historical_bindings_native(&f.0, &lead_context(), &[], || Ok(()))
                     .is_err()
             );
         }

@@ -351,7 +351,7 @@ fn catalog_directory_called_git_alone_is_not_real_repository() {
     assert!(resolve_native(&f.home, "t1", Instant::now() + Duration::from_secs(5)).is_err());
 }
 #[test]
-fn real_repo_binding_cannot_accidentally_enable_uncomposed_launch() {
+fn one_registered_worktree_without_mission_binding_cannot_enable_launch() {
     let f = Fixture::new();
     snapshot_file(&f);
     let actor = crate::team_auth::AuthenticatedActor::operator_ui();
@@ -372,7 +372,7 @@ fn real_repo_binding_cannot_accidentally_enable_uncomposed_launch() {
     );
     assert_eq!(
         result.unwrap_err(),
-        crate::team_replacement::ReplacementError::LaunchUnavailable
+        crate::team_replacement::ReplacementError::WorktreeUnbound
     );
     assert!(!f.home.join(".aperture/run").exists());
 }

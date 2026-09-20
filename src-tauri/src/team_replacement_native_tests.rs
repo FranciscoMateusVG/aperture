@@ -302,3 +302,26 @@ fn controls_change_requires_real_grant_not_just_fallback_membership() {
         ReplacementError::AuthorizationRequired
     );
 }
+
+#[test]
+fn bootstrap_is_operator_g0_only_and_never_creates_state_for_bad_selector() {
+    let f = Fixture::new();
+    let home = f.0.join("absent");
+    assert_eq!(
+        bootstrap_authorized(&home, &AuthenticatedActor::launcher(), "t1", "t1-worker", 0)
+            .unwrap_err(),
+        ReplacementError::AuthorizationRequired
+    );
+    assert_eq!(
+        bootstrap_authorized(
+            &home,
+            &AuthenticatedActor::operator_ui(),
+            "t1",
+            "t1-worker",
+            1
+        )
+        .unwrap_err(),
+        ReplacementError::GenerationMismatch
+    );
+    assert!(!home.exists());
+}

@@ -44,6 +44,10 @@ pub(crate) struct ReleasedChild {
     child: Child,
     identity: ProcessIdentity,
 }
+pub(crate) struct ReleaseFailure {
+    pub(crate) error: GateError,
+    pub(crate) child: Option<ReleasedChild>,
+}
 impl ReleasedChild {
     pub(crate) fn identity(&self) -> &ProcessIdentity {
         &self.identity
@@ -127,57 +131,84 @@ impl PendingChild {
     /// Release only after the actual owner file, under its OS lock, contains
     /// this exact reserved generation/root birth. Actual-model observation is
     /// deliberately still false until the harness native response arrives.
+    #[cfg(test)]
     pub(crate) fn release(
-        mut self,
+        self,
         store: &OwnerStore,
         reservation: &StartReservation,
     ) -> Result<ReleasedChild, GateError> {
-        let _lock = store
-            .lock(&reservation.seat)
-            .map_err(|_| GateError::Owner)?;
-        let owner: OwnerRecord = read_private_json(&store.record_path(&reservation.seat))
-            .map_err(|_| GateError::Owner)?;
-        let actual = owner.incarnation.as_ref().ok_or(GateError::Owner)?;
-        let nonce = format!("{:x}", Sha256::digest(reservation.nonce().as_bytes()));
-        if owner.schema_version != 1
-            || owner.seat != reservation.seat
-            || owner.state != OwnerState::Starting
-            || owner.generation != reservation.generation
-            || owner.reservation_nonce_sha256.as_deref() != Some(nonce.as_str())
-            || actual.observed
-            || actual.pid != self.identity.pid
-            || team_process::birth_micros(&self.identity).ok() != Some(actual.start_time)
-            || !actual
-                .processes
-                .iter()
-                .any(|p| p.pid == actual.pid && p.start_time == actual.start_time)
-            || owner.provisional_token_id.as_deref() != Some(actual.token_id.as_str())
-            || actual.token_id.len() != 64
-            || team_process::state(&self.identity) != ProcessState::Same
-        {
-            return Err(GateError::Owner);
-        }
-        let child = self.child.as_mut().ok_or(GateError::Release)?;
-        if child
-            .try_wait()
-            .map_err(|_| GateError::ExitUnverified)?
-            .is_some()
-        {
-            return Err(GateError::Release);
-        }
-        let mut gate = self.gate.take().ok_or(GateError::Release)?;
-        // One short pipe write, no replay. A lost/ambiguous result requires the
-        // owner's exact stop/revoke cleanup, never another release/start.
-        if gate.write_all(b"APERTURE_RELEASE\n").is_err() {
+        self.release_retaining(store, reservation)
+            .map_err(|mut failure| {
+                if let Some(child) = failure.child.as_mut() {
+                    let _ = wait_exit(&mut child.child);
+                }
+                failure.error
+            })
+    }
+    /// A release failure may have delivered the pipe byte. Preserve the exact
+    /// child/reaper handle for the owner's stop+revoke path; never drop it and
+    /// pretend an absent wait result proves the process ended.
+    pub(crate) fn release_retaining(
+        mut self,
+        store: &OwnerStore,
+        reservation: &StartReservation,
+    ) -> Result<ReleasedChild, ReleaseFailure> {
+        let result = (|| -> Result<(), GateError> {
+            let _lock = store
+                .lock(&reservation.seat)
+                .map_err(|_| GateError::Owner)?;
+            let owner: OwnerRecord = read_private_json(&store.record_path(&reservation.seat))
+                .map_err(|_| GateError::Owner)?;
+            let actual = owner.incarnation.as_ref().ok_or(GateError::Owner)?;
+            let nonce = format!("{:x}", Sha256::digest(reservation.nonce().as_bytes()));
+            if owner.schema_version != 1
+                || owner.seat != reservation.seat
+                || owner.state != OwnerState::Starting
+                || owner.generation != reservation.generation
+                || owner.reservation_nonce_sha256.as_deref() != Some(nonce.as_str())
+                || actual.observed
+                || actual.pid != self.identity.pid
+                || team_process::birth_micros(&self.identity).ok() != Some(actual.start_time)
+                || !actual
+                    .processes
+                    .iter()
+                    .any(|p| p.pid == actual.pid && p.start_time == actual.start_time)
+                || owner.provisional_token_id.as_deref() != Some(actual.token_id.as_str())
+                || actual.token_id.len() != 64
+                || team_process::state(&self.identity) != ProcessState::Same
+            {
+                return Err(GateError::Owner);
+            }
+            let child = self.child.as_mut().ok_or(GateError::Release)?;
+            if child
+                .try_wait()
+                .map_err(|_| GateError::ExitUnverified)?
+                .is_some()
+            {
+                return Err(GateError::Release);
+            }
+            let mut gate = self.gate.take().ok_or(GateError::Release)?;
+            // One short pipe write, no replay. A lost/ambiguous result requires the
+            // owner's exact stop/revoke cleanup, never another release/start.
+            if gate.write_all(b"APERTURE_RELEASE\n").is_err() {
+                drop(gate);
+                return Err(GateError::Release);
+            }
             drop(gate);
-            let _ = wait_exit(child);
-            return Err(GateError::Release);
-        }
-        drop(gate);
-        Ok(ReleasedChild {
-            child: self.child.take().ok_or(GateError::Release)?,
+            Ok(())
+        })();
+        self.gate.take();
+        let child = self.child.take().map(|child| ReleasedChild {
+            child,
             identity: self.identity.clone(),
-        })
+        });
+        match (result, child) {
+            (Ok(()), Some(child)) => Ok(child),
+            (result, child) => Err(ReleaseFailure {
+                error: result.err().unwrap_or(GateError::Release),
+                child,
+            }),
+        }
     }
     pub(crate) fn cancel(mut self) -> Result<ExitStatus, GateError> {
         self.gate.take();
@@ -380,6 +411,22 @@ mod tests {
         );
         assert!(!f.marker().exists());
         child.cancel().unwrap();
+        assert!(!f.marker().exists());
+    }
+    #[test]
+    fn failed_release_retains_exact_child_for_native_reaping_without_exec() {
+        let f = Fixture::new();
+        let pending = spawn(f.spec()).unwrap();
+        let expected = pending.identity().clone();
+        let mut failure = match pending.release_retaining(&f.store, &f.reservation) {
+            Ok(_) => panic!("ownerless release"),
+            Err(e) => e,
+        };
+        assert_eq!(failure.error, GateError::Owner);
+        let retained = failure.child.as_mut().unwrap();
+        assert_eq!(retained.identity(), &expected);
+        assert!(!wait_exit(&mut retained.child).unwrap().success());
+        assert_eq!(team_process::state(&expected), ProcessState::Gone);
         assert!(!f.marker().exists());
     }
 }
