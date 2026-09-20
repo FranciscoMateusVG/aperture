@@ -128,6 +128,17 @@ pub(crate) struct RuntimeObservation {
     pub actual: ExecutionTuple,
 }
 
+/// Exact native identity of a candidate whose start failed after ownership was
+/// persisted. This is an internal CAS selector, not a command DTO or cleanup
+/// assertion supplied by a managed seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedStartIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    pub token_id: String,
+    pub thread_id: String,
+}
+
 impl StartReservation {
     pub(crate) fn nonce(&self) -> &str { &self.nonce }
 }
@@ -393,6 +404,73 @@ impl OwnerStore {
         Ok(record)
     }
 
+    /// Quarantine an exact failed candidate after native stop and durable
+    /// revocation have already completed. Unlike `abort_start`, this also
+    /// handles the narrow crash window after `commit_start` made the same
+    /// candidate Active but before the lifecycle attempt could record its
+    /// terminal success. No process evidence is discarded.
+    pub(crate) fn quarantine_failed_start(
+        &self,
+        actor: &AuthenticatedActor,
+        reservation: &StartReservation,
+        expected: &FailedStartIdentity,
+    ) -> Result<OwnerRecord, String> {
+        if !actor.is_launcher() {
+            return Err("E_CONTROL_UNAUTHORIZED: launcher actor required".into());
+        }
+        if expected.pid == 0
+            || expected.start_time == 0
+            || !is_token_id(&expected.token_id)
+            || expected.thread_id.len() > 128
+            || (!expected.thread_id.is_empty()
+                && !expected
+                    .thread_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+        {
+            return Err("E_PROCESS_IDENTITY: failed-start identity is invalid".into());
+        }
+        let _lock = self.lock(&reservation.seat)?;
+        let mut record = self.read_unlocked(&reservation.seat)?;
+        if record.generation != reservation.generation {
+            return Err("E_GENERATION_MISMATCH: start reservation changed".into());
+        }
+        match record.state {
+            OwnerState::Starting => require_reservation(&record, reservation)?,
+            OwnerState::Active => {
+                if record.reservation_nonce_sha256.is_some()
+                    || record.provisional_token_id.is_some()
+                {
+                    return Err("E_OWNER_CORRUPT: active owner retains provisional authority".into());
+                }
+            }
+            _ => return Err("E_STATE_CONFLICT: failed-start owner is not quarantinable".into()),
+        }
+        let incarnation = record
+            .incarnation
+            .as_ref()
+            .ok_or_else(|| "E_OWNER_CORRUPT: owner incarnation is missing".to_string())?;
+        validate_incarnation(incarnation)?;
+        if incarnation.pid != expected.pid
+            || incarnation.start_time != expected.start_time
+            || incarnation.token_id != expected.token_id
+            || incarnation.thread_id != expected.thread_id
+        {
+            return Err("E_PROCESS_IDENTITY: failed-start candidate changed".into());
+        }
+        if record.state == OwnerState::Active
+            && incarnation.execution_tuple().as_ref() != Some(&record.requested)
+        {
+            return Err("E_MODEL_UNVERIFIED: active failed-start tuple is not exact".into());
+        }
+        record.state = OwnerState::Quarantined;
+        record.reservation_nonce_sha256 = None;
+        record.since = now();
+        record.writer = actor.principal().into();
+        self.write_unlocked(&record, true)?;
+        Ok(record)
+    }
+
     /// Refresh the exact root+descendant identity set immediately before a
     /// launcher stop. No caller-supplied provenance is persisted, and no
     /// process may be signalled unless this CAS succeeds first.
@@ -530,6 +608,7 @@ mod tests {
     fn tuple(model: &str) -> ExecutionTuple { ExecutionTuple { harness: Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High) } }
     fn token_id() -> String { "a".repeat(64) }
     fn candidate(model: &str) -> Incarnation { Incarnation { pid:123, start_time:456, thread_id:String::new(), token_id:token_id(), harness:Harness::Codex, model:model.into(), reasoning:Some(ReasoningEffort::High), observed:false, processes:vec![ProcessIdentity { pid:123,start_time:456,ppid:1,pgid:123,cmdline_sha256:"a".repeat(64),cwd:"/tmp/work".into() }] } }
+    fn failed_identity(thread_id: &str) -> FailedStartIdentity { FailedStartIdentity { pid:123, start_time:456, token_id:token_id(), thread_id:thread_id.into() } }
     fn bind_token(store: &OwnerStore, actor: &AuthenticatedActor, reservation: &StartReservation) {
         store.bind_and_publish_token(actor, reservation, token_id(), || Ok(())).unwrap();
     }
@@ -666,6 +745,83 @@ mod tests {
         let active = store.commit_start(&actor, &reservation).unwrap();
         assert_eq!(active.state, OwnerState::Active);
         assert_eq!(active.provisional_token_id, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_start_quarantine_is_exact_launcher_cas_and_preserves_starting_evidence() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let launcher = AuthenticatedActor::launcher();
+        store.initialize_owner(&launcher, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&launcher, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+        bind_token(&store, &launcher, &reservation);
+        store.record_start_candidate(&launcher, &reservation, candidate("gpt-6-astra")).unwrap();
+        let mut expanded = candidate("gpt-6-astra").processes;
+        expanded.push(ProcessIdentity { pid:124,start_time:457,ppid:123,pgid:123,cmdline_sha256:"b".repeat(64),cwd:"/tmp/work".into() });
+        store.record_process_snapshot(&launcher, "t1-backend", 1, 123, 456, expanded).unwrap();
+        let before = store.read_owner("t1-backend").unwrap();
+
+        assert!(store.quarantine_failed_start(
+            &AuthenticatedActor::operator_ui(), &reservation, &failed_identity("")
+        ).unwrap_err().contains("E_CONTROL_UNAUTHORIZED"));
+        for wrong in [
+            FailedStartIdentity { pid:999, ..failed_identity("") },
+            FailedStartIdentity { start_time:999, ..failed_identity("") },
+            FailedStartIdentity { token_id:"b".repeat(64), ..failed_identity("") },
+            FailedStartIdentity { thread_id:"other".into(), ..failed_identity("") },
+        ] {
+            assert!(store.quarantine_failed_start(&launcher, &reservation, &wrong).unwrap_err().contains("E_PROCESS_IDENTITY"));
+            assert_eq!(store.read_owner("t1-backend").unwrap(), before);
+        }
+
+        let quarantined = store.quarantine_failed_start(&launcher, &reservation, &failed_identity("")).unwrap();
+        assert_eq!(quarantined.state, OwnerState::Quarantined);
+        assert_eq!(quarantined.generation, 1);
+        assert_eq!(quarantined.incarnation, before.incarnation);
+        assert_eq!(quarantined.provisional_token_id, before.provisional_token_id);
+        assert_eq!(quarantined.requested, before.requested);
+        assert!(quarantined.reservation_nonce_sha256.is_none());
+
+        let next = store.reserve_start(&launcher, "t1-backend", 1, tuple("gpt-6-astra")).unwrap();
+        let next_before = store.read_owner("t1-backend").unwrap();
+        assert!(store.quarantine_failed_start(&launcher, &reservation, &failed_identity("")).unwrap_err().contains("E_GENERATION_MISMATCH"));
+        assert_eq!(store.read_owner("t1-backend").unwrap(), next_before);
+        assert_eq!(next.generation, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_start_quarantine_accepts_only_same_exact_active_candidate() {
+        let root = root();
+        let store = OwnerStore::new(root.join("owner"));
+        let launcher = AuthenticatedActor::launcher();
+        store.initialize_owner(&launcher, "t1-backend", tuple("gpt-6-astra")).unwrap();
+        let reservation = store.reserve_start(&launcher, "t1-backend", 0, tuple("gpt-6-astra")).unwrap();
+        bind_token(&store, &launcher, &reservation);
+        store.record_start_candidate(&launcher, &reservation, candidate("gpt-6-astra")).unwrap();
+        observe(&store, &launcher, &reservation, "gpt-6-astra");
+        let active = store.commit_start(&launcher, &reservation).unwrap();
+
+        let mut wrong = failed_identity("thread");
+        wrong.thread_id = "other".into();
+        assert!(store.quarantine_failed_start(&launcher, &reservation, &wrong).unwrap_err().contains("E_PROCESS_IDENTITY"));
+        assert_eq!(store.read_owner("t1-backend").unwrap(), active);
+
+        let mut corrupt = active.clone();
+        corrupt.incarnation.as_mut().unwrap().model = "gpt-5.6-sol".into();
+        write_private_json_atomic(&store.record_path("t1-backend"), &corrupt, true).unwrap();
+        assert!(store.quarantine_failed_start(&launcher, &reservation, &failed_identity("thread")).unwrap_err().contains("E_MODEL_UNVERIFIED"));
+        assert_eq!(store.read_owner("t1-backend").unwrap(), corrupt);
+        write_private_json_atomic(&store.record_path("t1-backend"), &active, true).unwrap();
+
+        let quarantined = store.quarantine_failed_start(&launcher, &reservation, &failed_identity("thread")).unwrap();
+        assert_eq!(quarantined.state, OwnerState::Quarantined);
+        assert_eq!(quarantined.generation, active.generation);
+        assert_eq!(quarantined.incarnation, active.incarnation);
+        assert_eq!(quarantined.requested, active.requested);
+        assert!(quarantined.provisional_token_id.is_none());
+        assert!(quarantined.reservation_nonce_sha256.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
