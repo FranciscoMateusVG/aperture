@@ -306,3 +306,29 @@ release, wrong/absent birth rejection, parent EOF and argument-as-data handling.
 These are not live harness, gateway, team replacement or provider tests. The
 full one-shot adapter, provisional-token crash composition and actual-model
 observation remain unproven; public capabilities and installation remain off.
+
+### Native actual-model receipt consumer
+
+`team_replacement::model_observation::read_native` reads only the fixed private
+bridge artifacts `<seat>.g<generation>.managed-start-attempt.json` and
+`<seat>.g<generation>.managed-observation.json`. It takes a native reservation,
+not a caller-supplied proof or artifact path. Strict schemas and an 8 KiB cap
+bind seat/generation/token/root PID+birth, requested model/reasoning, returned
+thread/model/reasoning and observation time to the current Starting owner.
+Both the attempt and final receipt are required. Time must be within this
+reservation's native start time and the current clock; clock anomalies block.
+
+The reader holds team then owner locks, checks the canonical token privately
+and the existing revocation history, verifies the exact native root identity
+before and after reading, and rechecks the owner and token before returning.
+Missing/corrupt/unsafe/stale/mismatched facts produce finite errors with no raw
+values. Returned `VerifiedObservation` is neither deserializable nor an Active
+owner. The existing owner CAS must still record the native observation and
+commit activation; the adapter must recheck process identity at effects. No
+claim of atomic OS process fencing or universal memory erasure is made.
+
+Eight focused tests use synthetic receipt/native-state fixtures, including the
+shared owner record/commit path, full-field mismatch matrix, missing/corrupt
+attempt, time/size bounds, private-file violations, recycled/dead/unreadable
+process state, owner/token races and revoked/corrupt/symlinked revocation state.
+They do not execute an actual Codex session or enable public lifecycle actions.

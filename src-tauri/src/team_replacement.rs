@@ -494,3 +494,6 @@ pub(crate) mod remote;
 
 #[path = "team_launch_gate.rs"]
 pub(crate) mod launch_gate;
+
+#[path = "team_model_observation.rs"]
+pub(crate) mod model_observation;
