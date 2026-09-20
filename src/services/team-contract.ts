@@ -1,3 +1,4 @@
+import { isRepositoryKey } from "./team-draft";
 import type { TeamCatalog, TeamPreset, TeamView, TeamCreateResult, CancelPendingResult, ExecutionTuple, PresetSeat, TeamPresetInput } from "../types";
 
 const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -40,6 +41,10 @@ const LIMITS = ["max_seats", "max_fallbacks", "max_role_skills", "max_preset_byt
 export function parseTeamCatalog(v: unknown): TeamCatalog {
   if (!record(v) || !arr(v.roles, r => record(r) && str(r.id) && str(r.display_name)) ||
     !arr(v.execution_tuples, isExecutionTuple) || !record(v.limits) || !LIMITS.every(k => int((v.limits as Record<string, unknown>)[k]))) return invalid();
+  if (!arr(v.repositories, r => record(r) && str(r.project) && isRepositoryKey(r.repo) &&
+    str(r.display_name) && r.display_name.trim().length > 0 && typeof r.available === "boolean")) return invalid();
+  const repos = v.repositories as TeamCatalog["repositories"];
+  if (new Set(repos.map(r => JSON.stringify([r.project, r.repo]))).size !== repos.length) return invalid();
   return v as unknown as TeamCatalog;
 }
 function owner(v: unknown): boolean {
@@ -49,7 +54,7 @@ function owner(v: unknown): boolean {
 export function parseTeamView(v: unknown): TeamView {
   if (!record(v) || !record(v.snapshot) || !record(v.state) || !record(v.capabilities)) return invalid();
   const s = v.snapshot, state = v.state;
-  if (s.schema_version !== 1 || ![s.team, s.project, s.mission, s.acceptance, s.lead, s.created_at, s.creation_request_id, s.staging_uuid].every(str) ||
+  if (s.schema_version !== 1 || !isRepositoryKey(s.repo) || ![s.team, s.project, s.mission, s.acceptance, s.lead, s.created_at, s.creation_request_id, s.staging_uuid].every(str) ||
     !record(s.preset) || !(s.preset.id === null || str(s.preset.id)) || !hash(s.preset.sha256) ||
     !arr(s.seats, teamSeat) || !arr(s.fallbacks, isExecutionTuple) || !Array.isArray(s.grants)) return invalid();
   if (state.schema_version !== 1 || !oneOf(state.state, ["pending", "active", "failed", "archived"]) || !int(state.generation) ||
@@ -87,7 +92,7 @@ export function parseTeamCreateResult(v: unknown): TeamCreateResult {
   const team = parseTeamView(v.team), r = v.creation_request;
   if (team.state.state !== "pending" || team.state.generation !== 0 || team.state.epic_id !== null || team.state.failure !== null) return invalid();
   if (r.schema_version !== 1 || ![r.request_id, r.team, r.project, r.created_at].every(str) || !hash(r.snapshot_sha256) || !int(r.expected_generation) ||
-    r.team !== team.snapshot.team || r.project !== team.snapshot.project || r.request_id !== team.snapshot.creation_request_id || r.expected_generation !== team.state.generation) return invalid();
+    !isRepositoryKey(r.repo) || r.repo !== team.snapshot.repo || r.team !== team.snapshot.team || r.project !== team.snapshot.project || r.request_id !== team.snapshot.creation_request_id || r.expected_generation !== team.state.generation) return invalid();
   return v as unknown as TeamCreateResult;
 }
 export function parseCancelled(v: unknown, team: string): CancelPendingResult {

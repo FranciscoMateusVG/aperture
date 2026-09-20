@@ -15,7 +15,7 @@ export function createTeamCommands(call: Invoke) {
       const result = parseTeamCreateResult(await call("team_create", { input: request }));
       const echoed = result.team.snapshot;
       const names = deriveTeamSeatNames(request.team, request.seats);
-      if (echoed.team !== request.team || echoed.project !== request.project ||
+      if (echoed.repo !== request.repo || echoed.team !== request.team || echoed.project !== request.project ||
         echoed.mission !== request.mission || echoed.acceptance !== request.acceptance || echoed.preset.id !== request.preset_id ||
         !sameSeats(echoed.seats, request.seats) || echoed.seats.some((seat, i) => seat.name !== names[i]) ||
         echoed.lead !== names[request.lead_index] || !sameFallbacks(echoed.fallbacks, request.fallbacks)) {

@@ -1,5 +1,5 @@
 import type { CreateTeamInput, ExecutionTuple, TeamCatalog, TeamPreset, TeamPresetInput } from "../types";
-import { deriveTeamSeatNames, snapshotTeamDraft, teamErrorCopy, validateTeamDraft, validHumanText, type DraftIssue } from "../services/team-draft";
+import { deriveTeamSeatNames, initialRepository, validateRepositoryDraft, snapshotTeamDraft, teamErrorCopy, validateTeamDraft, validHumanText, type DraftIssue } from "../services/team-draft";
 import { escapeHtml as e } from "../utils/html";
 
 export interface TeamEditorOptions {
@@ -16,15 +16,15 @@ const tupleKey = (v: ExecutionTuple) => JSON.stringify([v.harness, v.model, v.re
 export const tupleLabel = (v: ExecutionTuple) => `${v.harness} · ${v.model}${v.reasoning === null ? "" : ` · ${v.reasoning}`}`;
 const execution = (v: ExecutionTuple) => ({ harness: v.harness, model: v.model, reasoning: v.reasoning });
 
-export function createInitialTeamDraft(preset?: TeamPreset): CreateTeamInput {
+export function createInitialTeamDraft(preset?: TeamPreset, catalog?: TeamCatalog): CreateTeamInput {
   return {
-    team: "", project: "project:aperture", mission: preset?.mission_placeholder ?? "", acceptance: preset?.acceptance_placeholder ?? "",
+    team: "", project: "project:aperture", repo: initialRepository("project:aperture", catalog?.repositories ?? []), mission: preset?.mission_placeholder ?? "", acceptance: preset?.acceptance_placeholder ?? "",
     preset_id: preset?.id ?? null, lead_index: preset?.lead_index ?? 0,
     seats: preset?.seats.map(s => ({ ...s })) ?? [], fallbacks: preset?.fallbacks.map(execution) ?? [],
   };
 }
-export function validateCatalogDraft(draft: CreateTeamInput, catalog: TeamCatalog): DraftIssue[] {
-  const issues: DraftIssue[] = [];
+export function validateCatalogDraft(draft: CreateTeamInput, catalog: TeamCatalog, isTeam = true): DraftIssue[] {
+  const issues: DraftIssue[] = isTeam ? validateRepositoryDraft(draft, catalog.repositories) : [];
   const tuples = new Set(catalog.execution_tuples.map(tupleKey));
   draft.seats.forEach((seat, i) => {
     if (!catalog.roles.some(r => r.id === seat.role)) issues.push({ field: `seats.${i}.role`, message: "Choose a role from the current backend catalog." });
@@ -40,7 +40,7 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
   const { catalog, mode, preset } = options;
   const isTeam = mode === "create", editing = mode === "edit";
   const origin = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  let draft = createInitialTeamDraft(preset);
+  let draft = createInitialTeamDraft(preset, catalog);
   let busy = false;
   const dialog = document.createElement("dialog");
   dialog.className = "v4-dialog";
@@ -52,6 +52,7 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
     <div class="v4-pair">${isTeam
       ? field("team", "Team name", "", 'maxlength="16" autocomplete="off"') + `<div class="v4-field"><label for="v4-project">Project</label><select id="v4-project" name="project" aria-describedby="v4-error-project">${["aperture", "incluir", "beads-galaxy", "mempalace", "frame"].map(p => `<option value="project:${p}">project:${p}</option>`).join("")}</select><span class="v4-error" id="v4-error-project"></span></div>`
       : field("presetId", "Preset identifier", editing ? preset!.id : "", editing ? "readonly" : 'autocomplete="off"') + field("displayName", "Display name", mode === "duplicate" ? `${preset?.display_name ?? ""} copy` : preset?.display_name ?? "")}</div>
+    ${isTeam ? '<div class="v4-field" data-repository-field></div>' : ""}
     ${field("mission", isTeam ? "Mission" : "Mission placeholder", draft.mission)}
     ${field("acceptance", isTeam ? "Acceptance" : "Acceptance placeholder", draft.acceptance)}
     <fieldset><legend>Seats · exactly one lead</legend><div class="v4-seats"></div><div class="v4-actions"><button type="button" class="v4-button" data-action="add-seat">+ Add seat</button></div><p class="v4-error" id="v4-error-seats"></p><p class="v4-error" id="v4-error-lead_index"></p></fieldset>
@@ -65,6 +66,22 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
   const status = dialog.querySelector<HTMLElement>("[data-status]")!;
   const errors = dialog.querySelector<HTMLElement>("[data-errors]")!;
   const get = (name: string) => (form.elements.namedItem(name) as HTMLInputElement | HTMLSelectElement | null)?.value ?? "";
+  function renderRepository() {
+    if (!isTeam) return;
+    const choices = catalog.repositories.filter(r => r.project === draft.project);
+    const issue = validateRepositoryDraft(draft, catalog.repositories)[0];
+    dialog.querySelector<HTMLElement>("[data-repository-field]")!.innerHTML = `<label for="v4-repo">Repository · immutable team binding</label>
+      <select id="v4-repo" name="repo" required aria-describedby="v4-repo-help v4-error-repo" ${issue ? 'aria-invalid="true"' : ""}>
+      <option value="" ${draft.repo === "" ? "selected" : ""}>Choose repository…</option>
+      ${choices.map(r => `<option value="${e(r.repo)}" ${draft.repo === r.repo ? "selected" : ""} ${r.available ? "" : "disabled"}>${e(r.display_name)} · ${e(r.repo)}${r.available ? "" : " — unavailable locally"}</option>`).join("")}</select>
+      <p id="v4-repo-help" class="v4-meta">Explicitly submitted for GLaDOS approval. This binding cannot be changed later; it grants no permission to edit the repository.</p>
+      <span class="v4-error" id="v4-error-repo">${e(issue?.message ?? "")}</span>`;
+    updateSubmit();
+  }
+  function updateSubmit() {
+    const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    submit.disabled = busy || (isTeam && validateRepositoryDraft(draft, catalog.repositories).length > 0);
+  }
   function tupleOptions(current: ExecutionTuple) {
     const selected = catalog.execution_tuples.findIndex(t => tupleKey(t) === tupleKey(current));
     return `<option value="" ${selected < 0 ? "selected" : ""}>Choose execution…</option>` + catalog.execution_tuples.map((t, i) => `<option value="${i}" ${i === selected ? "selected" : ""}>${e(tupleLabel(t))}</option>`).join("");
@@ -74,7 +91,7 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
     return Number.isInteger(index) && catalog.execution_tuples[index] ? execution(catalog.execution_tuples[index]) : { harness: "codex", model: "", reasoning: null };
   }
   function capture() {
-    draft = { ...draft, team: isTeam ? get("team") : "preview", project: isTeam ? get("project") : "project:aperture", mission: get("mission"), acceptance: get("acceptance"),
+    draft = { ...draft, team: isTeam ? get("team") : "preview", project: isTeam ? get("project") : "project:aperture", repo: isTeam ? get("repo") : "", mission: get("mission"), acceptance: get("acceptance"),
       seats: draft.seats.map((_, i) => ({ role: get(`role-${i}`), ...selectedTuple(`execution-${i}`) })),
       fallbacks: draft.fallbacks.map((_, i) => selectedTuple(`fallback-${i}`)),
       lead_index: get("lead") === "" ? -1 : Number(get("lead")),
@@ -99,6 +116,7 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
     busy = value;
     form.setAttribute("aria-busy", String(value));
     form.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLSelectElement>("input,button,select").forEach(el => { el.disabled = value; });
+    updateSubmit();
     status.textContent = value ? "Waiting for the backend. No success is confirmed yet." : "";
   }
   function showIssues(issues: DraftIssue[]) {
@@ -120,7 +138,21 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
     if (busy) return;
     if ((event.target as HTMLInputElement).name === "team") previewNames();
   });
-  form.addEventListener("change", () => { if (!busy) { capture(); previewNames(); } });
+  form.addEventListener("change", event => {
+    if (busy) return;
+    capture();
+    if ((event.target as HTMLInputElement | null)?.name === "project") {
+      draft.repo = initialRepository(draft.project, catalog.repositories);
+      renderRepository();
+    } else if ((event.target as HTMLInputElement | null)?.name === "repo") {
+      // Keep the focused select node; replacing it on change loses native focus.
+      const issue = validateRepositoryDraft(draft, catalog.repositories)[0];
+      const control = form.elements.namedItem("repo") as HTMLSelectElement;
+      if (issue) control.setAttribute("aria-invalid", "true"); else control.removeAttribute("aria-invalid");
+      dialog.querySelector<HTMLElement>("#v4-error-repo")!.textContent = issue?.message ?? "";
+    }
+    previewNames(); updateSubmit();
+  });
   form.addEventListener("click", event => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-action]");
     if (!button || busy) return;
@@ -146,7 +178,7 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
   });
   form.addEventListener("submit", async event => {
     event.preventDefault(); if (busy) return; capture();
-    const issues = [...validateTeamDraft(draft, isTeam ? options.knownSeats : [], isTeam ? options.knownTeams : []), ...validateCatalogDraft(draft, catalog)];
+    const issues = [...validateTeamDraft(draft, isTeam ? options.knownSeats : [], isTeam ? options.knownTeams : []), ...validateCatalogDraft(draft, catalog, isTeam)];
     if (!isTeam) {
       if (!/^[a-z0-9][a-z0-9_-]{0,30}$/.test(get("presetId"))) issues.push({ field: "presetId", message: "Use a canonical lowercase preset identifier of 1–31 characters." });
       for (const field of ["displayName", "mission", "acceptance"]) if (!validHumanText(get(field), 80, 320)) issues.push({ field, message: "Use 1–80 characters without controls for preset text." });
@@ -165,6 +197,6 @@ export function openTeamEditor(options: TeamEditorOptions): HTMLDialogElement {
   });
   dialog.addEventListener("cancel", event => { if (busy) event.preventDefault(); });
   dialog.addEventListener("close", () => { dialog.remove(); if (origin?.isConnected) origin.focus(); });
-  renderSeats(); renderFallbacks(); document.body.appendChild(dialog); dialog.showModal();
+  renderRepository(); renderSeats(); renderFallbacks(); document.body.appendChild(dialog); dialog.showModal();
   return dialog;
 }

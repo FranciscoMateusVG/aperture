@@ -57,9 +57,9 @@ test("preset drafting is detached and catalog membership is not inferred", () =>
 });
 test("command wrappers pin exact names, envelopes, CAS, no authority inputs", async () => {
  const calls = []; const api = createTeamCommands(async (cmd, args) => { calls.push([cmd, args]); return cmd === "team_create" ? created(args.input) : cmd === "team_save_preset" ? { ...preset, source: "local" } : { team: "t1", cancelled: true, rejected_snapshot_id: "fixture-rejected" }; });
- const input = { ...createInitialTeamDraft(preset), team: "t1", actor: "glados", grants: ["forged"], creation_request_id: "forged" };
+ const input = { ...createInitialTeamDraft(preset, catalog), team: "t1", actor: "glados", grants: ["forged"], creation_request_id: "forged" };
  await api.create(input); const create = calls[0]; assert.equal(create[0], "team_create");
- assert.deepEqual(Object.keys(create[1].input).sort(), ["team", "project", "mission", "acceptance", "preset_id", "seats", "lead_index", "fallbacks"].sort());
+ assert.deepEqual(Object.keys(create[1].input).sort(), ["team", "project", "repo", "mission", "acceptance", "preset_id", "seats", "lead_index", "fallbacks"].sort());
  await api.savePreset(preset, preset.sha256); const save = calls[1][1].input;
  assert.equal(save.expected_sha256, preset.sha256); assert.equal("source" in save.preset_without_source, false); assert.equal("sha256" in save.preset_without_source, false);
  await api.cancel({ team: "t1", expected_generation: 0, creation_request_id: "fixture-request", actor: "glados" });
@@ -68,14 +68,14 @@ test("command wrappers pin exact names, envelopes, CAS, no authority inputs", as
 });
 test("write failures do not auto-retry and malformed success is rejected", async () => {
  let calls = 0; const api = createTeamCommands(async () => { calls++; return { success: true }; });
- await assert.rejects(api.create({ ...createInitialTeamDraft(preset), team: "t1" }), e => e.code === "E_RESPONSE_INVALID"); assert.equal(calls, 1);
+ await assert.rejects(api.create({ ...createInitialTeamDraft(preset, catalog), team: "t1" }), e => e.code === "E_RESPONSE_INVALID"); assert.equal(calls, 1);
  const rejected = createTeamCommands(async () => { throw { code: "E_PRESET_CONFLICT", message: "fixed" }; });
  await assert.rejects(rejected.savePreset(preset, preset.sha256), e => e.code === "E_PRESET_CONFLICT");
 });
 
 test("successful response for another team or preset is not accepted", async () => {
  const api = createTeamCommands(async cmd => cmd === "team_create" ? created() : { ...preset, id: "other" });
- await assert.rejects(api.create({ ...createInitialTeamDraft(preset), team: "another" }), e => e.code === "E_RESPONSE_INVALID");
+ await assert.rejects(api.create({ ...createInitialTeamDraft(preset, catalog), team: "another" }), e => e.code === "E_RESPONSE_INVALID");
  await assert.rejects(api.savePreset(preset, preset.sha256), e => e.code === "E_RESPONSE_INVALID");
 });
 
@@ -85,7 +85,7 @@ test("turn state uses observed hub facts only, not requested model or owner stat
 });
 
 
-const createInput = () => ({ ...createInitialTeamDraft(preset), team: "t1" });
+const createInput = () => ({ ...createInitialTeamDraft(preset, catalog), team: "t1" });
 for (const [name, mutate] of [
  ["active state/generation one", r => { r.team.state.state = "active"; r.team.state.generation = 1; r.creation_request.expected_generation = 1; }],
  ["altered immutable mission", r => r.team.snapshot.mission = "Different mission"],
@@ -153,4 +153,45 @@ test("non-active owners can show absent or divergent actual without a success cl
   const { t } = observedTeam({ state, actual }); assert.deepEqual(c.parseTeamView(t), t);
   assert.doesNotMatch(renderTeamGroup(t), /verified model|replacement succeeded|healthy/i);
  }
+});
+
+test("repository catalog is mandatory, shaped and unambiguous; empty is legitimate", () => {
+ for (const mutate of [
+  v => delete v.repositories,
+  v => v.repositories[0].available = "true",
+  v => v.repositories[0].repo = "/tmp/arbitrary",
+  v => v.repositories[0].repo = "../aperture",
+  v => v.repositories[0].display_name = "",
+  v => v.repositories.push(clone(v.repositories[0])),
+ ]) { const v = clone(catalog); mutate(v); rejects(() => c.parseTeamCatalog(v)); }
+ assert.deepEqual(c.parseTeamCatalog({ ...catalog, repositories: [] }).repositories, []);
+});
+test("repository choice uses served catalog only, never preset or project inference", () => {
+ const p = { ...clone(preset), repo: "forged-from-preset" };
+ assert.equal(createInitialTeamDraft(p).repo, "");
+ assert.equal(createInitialTeamDraft(p, catalog).repo, "aperture");
+ const changed = { ...catalog, repositories: [{ project: "project:aperture", repo: "native-new-key", display_name: "Native", available: true }] };
+ assert.equal(createInitialTeamDraft(p, changed).repo, "native-new-key");
+ assert.deepEqual(validateCatalogDraft({ ...createInitialTeamDraft(p, changed), team: "t1" }, changed), []);
+ for (const [project, repo, pattern] of [
+  ["project:incluir", "", /explicitly/],
+  ["project:incluir", "aperture", /backend catalog/],
+  ["project:aperture", "/tmp/aperture", /backend catalog/],
+  ["project:mempalace", "", /No repositories/],
+ ]) assert.match(validateCatalogDraft({ ...createInput(), project, repo }, catalog).find(i => i.field === "repo").message, pattern);
+ const absent = clone(catalog); absent.repositories[0].available = false;
+ assert.match(validateCatalogDraft(createInput(), absent).find(i => i.field === "repo").message, /unavailable locally/);
+});
+for (const [name, mutate] of [
+ ["missing snapshot", r => delete r.team.snapshot.repo],
+ ["missing request", r => delete r.creation_request.repo],
+ ["different request", r => r.creation_request.repo = "eunenem"],
+ ["both echo different repository", r => { r.team.snapshot.repo = "eunenem"; r.creation_request.repo = "eunenem"; }],
+ ["path instead of key", r => { r.team.snapshot.repo = "/tmp/aperture"; r.creation_request.repo = "/tmp/aperture"; }],
+]) test(`create rejects repository echo: ${name}`, async () => {
+ const api = createTeamCommands(async (_cmd, args) => { const r = created(args.input); mutate(r); return r; });
+ await assert.rejects(api.create(createInput()), e => e.code === "E_RESPONSE_INVALID");
+});
+test("immutable repository is visible in pending and active approval context", () => {
+ for (const state of ["pending", "active"]) assert.match(renderTeamGroup(team(state)), /repository: aperture \(immutable\)/);
 });

@@ -1,4 +1,4 @@
-import type { CreateTeamInput, ExecutionTuple, PresetSeat } from "../types";
+import type { CreateTeamInput, ExecutionTuple, PresetSeat, RepositoryCatalogEntry } from "../types";
 import { isValidSeatName } from "./seat-name";
 
 export interface DraftIssue { field: string; message: string }
@@ -28,6 +28,25 @@ function validTuple(tuple: ExecutionTuple): boolean {
   return typeof tuple.model === "string" && MODEL_RE.test(tuple.model) &&
     ((tuple.harness === "claude" && tuple.reasoning === null) ||
       (tuple.harness === "codex" && typeof tuple.reasoning === "string" && tuple.reasoning.trim().length > 0));
+}
+
+export const isRepositoryKey = (value: unknown): value is string =>
+  typeof value === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value);
+
+/** Choices are native read facts, never a TypeScript repository authority map. */
+export function initialRepository(project: string, repositories: readonly RepositoryCatalogEntry[]): string {
+  const choices = repositories.filter(r => r.project === project);
+  return choices.length === 1 ? choices[0].repo : "";
+}
+export function validateRepositoryDraft(input: Pick<CreateTeamInput, "project" | "repo">, repositories: readonly RepositoryCatalogEntry[]): DraftIssue[] {
+  const choices = repositories.filter(r => r.project === input.project);
+  const entry = choices.find(r => r.repo === input.repo);
+  const message = !choices.length ? "No repositories are configured for this project. Team creation is unavailable."
+    : !input.repo ? "Choose a repository explicitly before creating this team."
+    : !isRepositoryKey(input.repo) || !entry ? "Choose a repository from this project's backend catalog."
+    : !entry.available ? "This repository is unavailable locally. Creation is blocked until the backend can validate it."
+    : null;
+  return message ? [{ field: "repo", message }] : [];
 }
 
 /** Local affordance checks, not an independent permission/policy engine. */
@@ -69,6 +88,7 @@ export function snapshotTeamDraft(input: CreateTeamInput): CreateTeamInput {
   return {
     team: input.team,
     project: input.project,
+    repo: input.repo,
     preset_id: input.preset_id,
     lead_index: input.lead_index,
     mission: input.mission,
@@ -79,6 +99,9 @@ export function snapshotTeamDraft(input: CreateTeamInput): CreateTeamInput {
 }
 
 const ERROR_COPY: Record<string, string> = {
+  E_REPO_REQUIRED: "Choose a repository before creating this team.",
+  E_REPO_NOT_IN_CATALOG: "The repository does not belong to this project's backend catalog. Refresh and choose again.",
+  E_REPO_UNAVAILABLE: "The repository is unavailable locally. No team creation is confirmed; refresh before retrying.",
   E_NAME_INVALID: "A team or seat name is invalid. Check the highlighted name rules.",
   E_NAME_COLLISION: "A name is already reserved, active or archived. Choose another name.",
   E_PRESET_CONFLICT: "The preset changed elsewhere. Reload it before saving; your draft has not been applied.",

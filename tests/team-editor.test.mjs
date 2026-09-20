@@ -42,12 +42,15 @@ function fixture() {
  seats.querySelector = selector => named.get(/name="([^"]+)"/.exec(selector)?.[1]) ?? null;
  const fallbacks = new Element(); Object.defineProperty(fallbacks, "innerHTML", { set(html) { parse(html, /^fallback-/); } });
  fallbacks.querySelector = seats.querySelector;
+ const repoError = new Element();
+ const repository = new Element(); Object.defineProperty(repository, "innerHTML", { set(html) { parse(html, /^repo$/); repository.html = html; } });
+ const submit = new Element(); controls.push(submit);
  const form = new Element(); form.elements = { namedItem: name => named.get(name) ?? null };
  form.querySelectorAll = selector => selector === "input,button,select" ? controls : selector === "[aria-invalid]" ? [...named.values()].filter(e => "aria-invalid" in e.attrs) : [];
- form.querySelector = selector => selector === '[aria-invalid="true"]' ? [...named.values()].find(e => e.attrs["aria-invalid"] === "true") : selector.includes("add-seat") ? addSeat : addFallback;
+ form.querySelector = selector => selector === 'button[type="submit"]' ? submit : selector === '[aria-invalid="true"]' ? [...named.values()].find(e => e.attrs["aria-invalid"] === "true") : selector.includes("add-seat") ? addSeat : addFallback;
  const dialog = new Element();
  Object.defineProperty(dialog, "innerHTML", { set(html) { parse(html); dialog.html = html; } });
- dialog.querySelector = selector => ({ form, ".v4-seats": seats, ".v4-fallbacks": fallbacks, "[data-status]": status, "[data-errors]": errors })[selector];
+ dialog.querySelector = selector => ({ form, ".v4-seats": seats, ".v4-fallbacks": fallbacks, "[data-status]": status, "[data-errors]": errors, "[data-repository-field]": repository, "#v4-error-repo": repoError })[selector];
  dialog.contains = () => true; dialog.showModal = () => { dialog.open = true; };
  dialog.remove = () => { dialog.isConnected = false; };
  dialog.close = () => { dialog.open = false; void dialog.fire("close"); };
@@ -55,10 +58,10 @@ function fixture() {
  const prior = { document: globalThis.document, HTMLElement: globalThis.HTMLElement };
  globalThis.document = document; globalThis.HTMLElement = Element;
  return {
-  dialog, form, named, errors, status, document, origin, previews,
+  dialog, form, named, errors, status, document, origin, previews, repository, submitButton: submit,
   restore() { for (const [key, value] of Object.entries(prior)) if (value === undefined) delete globalThis[key]; else globalThis[key] = value; },
   input(name, value) { named.get(name).value = value; return form.fire("input", { target: named.get(name) }); },
-  change: () => form.fire("change"),
+  change: name => form.fire("change", { target: named.get(name) }),
   click(action, index) { const button = new Element(); button.dataset = { action, index: String(index) }; return form.fire("click", { target: button }); },
   submit() { return form.fire("submit", { preventDefault() {} }); },
   escape() { const ev = { prevented: false, preventDefault() { this.prevented = true; } }; return dialog.fire("cancel", ev).then(() => { if (!ev.prevented) dialog.close(); return ev; }); },
@@ -134,5 +137,71 @@ test("malformed durable preset echo stays in editor and never calls saved", asyn
  await run({ mode: "edit", submitPreset: api.savePreset, saved: () => saved++ }, async f => {
   await f.input("displayName", "My exact title"); await f.submit(); assert.equal(saved, 0); assert.equal(f.dialog.open, true);
   assert.equal(f.named.get("displayName").value, "My exact title"); assert.match(f.errors.textContent, /could not be confirmed/);
+ });
+});
+
+test("singleton repository is visibly selected and explicitly submitted; preset cannot choose it", async () => {
+ let sent;
+ await run({ preset: { ...clone(preset), repo: "forged" }, submitTeam: async input => { sent = input; return created(input); } }, async f => {
+  assert.equal(f.named.get("repo").value, "aperture");
+  assert.match(f.repository.html, /label for="v4-repo"/);
+  assert.match(f.repository.html, /immutable team binding/);
+  assert.match(f.repository.html, /aria-describedby="v4-repo-help v4-error-repo"/);
+  await f.input("team", "t1"); await f.submit(); assert.equal(sent.repo, "aperture");
+ });
+});
+test("project changes discard stale repository; multiple choices require explicit selection", async () => {
+ let sent, calls = 0;
+ await run({ submitTeam: async input => { sent = input; calls++; return created(input); } }, async f => {
+  await f.input("team", "t1"); await f.input("project", "project:incluir"); await f.change("project");
+  assert.equal(f.named.get("repo").value, ""); assert.equal(f.submitButton.disabled, true);
+  await f.submit(); assert.equal(calls, 0); assert.match(f.errors.textContent, /explicitly/);
+  const repoControl = f.named.get("repo"); repoControl.focus();
+  await f.input("repo", "eunenem"); await f.change("repo"); assert.equal(f.submitButton.disabled, false);
+  assert.equal(f.named.get("repo"), repoControl); assert.equal(f.document.activeElement, repoControl);
+  assert.equal(repoControl.attrs["aria-invalid"], undefined);
+  await f.input("project", "project:aperture"); await f.change("project"); assert.equal(f.named.get("repo").value, "aperture");
+  await f.input("project", "project:incluir"); await f.change("project"); assert.equal(f.named.get("repo").value, "");
+  await f.input("repo", "monorepo-incluir"); await f.change("repo"); await f.submit();
+  assert.equal(calls, 1); assert.equal(sent.repo, "monorepo-incluir"); assert.equal(sent.project, "project:incluir");
+ });
+});
+test("empty, unavailable and wrong-label repository never invoke create", async () => {
+ let calls = 0;
+ await run({ submitTeam: async () => { calls++; } }, async f => {
+  await f.input("team", "t1"); await f.input("project", "project:mempalace"); await f.change("project");
+  assert.match(f.repository.html, /No repositories/); assert.equal(f.submitButton.disabled, true);
+  await f.submit(); assert.equal(calls, 0);
+  await f.input("project", "project:incluir"); await f.change("project");
+  await f.input("repo", "aperture"); await f.submit(); assert.equal(calls, 0); assert.match(f.errors.textContent, /backend catalog/);
+ });
+ const unavailable = clone(catalog); unavailable.repositories[0].available = false;
+ await run({ catalog: unavailable, submitTeam: async () => { calls++; } }, async f => {
+  assert.equal(f.submitButton.disabled, true); assert.match(f.repository.html, /unavailable locally/);
+  await f.input("team", "t1"); await f.submit(); assert.equal(calls, 0);
+ });
+});
+test("preset edits remain independent of repository availability and never serialize a binding", async () => {
+ let sent;
+ await run({ mode: "edit", catalog: { ...clone(catalog), repositories: [] }, submitPreset: async input => { sent = input; return preset; } }, async f => {
+  assert.equal(f.named.has("repo"), false); await f.submit(); assert.ok(sent); assert.equal("repo" in sent, false);
+ });
+});
+test("native repository errors retain chosen draft without auto retry or false saved", async () => {
+ for (const code of ["E_REPO_REQUIRED", "E_REPO_NOT_IN_CATALOG", "E_REPO_UNAVAILABLE"]) {
+  let calls = 0, saved = 0;
+  await run({ submitTeam: async () => { calls++; throw { code, message: "/private/SENTINEL" }; }, saved: () => saved++ }, async f => {
+   await f.input("team", "t1"); await f.submit();
+   assert.equal(calls, 1); assert.equal(saved, 0); assert.equal(f.dialog.open, true); assert.equal(f.named.get("repo").value, "aperture");
+   assert.doesNotMatch(f.errors.textContent, /SENTINEL/); assert.match(f.errors.textContent, /repository/i);
+  });
+ }
+});
+test("wrong repository echo stays in editor and cannot publish a saved callback", async () => {
+ let saved = 0;
+ const api = createTeamCommands(async (_cmd, args) => { const r = created(args.input); r.team.snapshot.repo = "eunenem"; r.creation_request.repo = "eunenem"; return r; });
+ await run({ submitTeam: api.create, saved: () => saved++ }, async f => {
+  await f.input("team", "t1"); await f.submit(); assert.equal(saved, 0); assert.equal(f.dialog.open, true);
+  assert.equal(f.named.get("repo").value, "aperture"); assert.match(f.errors.textContent, /could not be confirmed/);
  });
 });

@@ -14,7 +14,7 @@ export function renderTeamGroup(team: TeamView, agents: readonly AgentDef[] = []
   };
   const { snapshot: s, state } = team;
   const active = state.state === "active";
-  return `<section class="v4-card"><div class="v4-toolbar"><div><h2>${e(s.team)}</h2><p class="v4-meta">${e(s.project)} · lead: ${e(s.lead)} · ${state.epic_id ? `epic: ${e(state.epic_id)}` : "epic: pending"}</p></div><span class="v4-badge v4-status">${e(state.state)} · g${state.generation}</span></div><p>${e(s.mission)}</p><p class="v4-meta">Acceptance: ${e(s.acceptance)}</p>
+  return `<section class="v4-card"><div class="v4-toolbar"><div><h2>${e(s.team)}</h2><p class="v4-meta">${e(s.project)} · repository: ${e(s.repo)} (immutable) · lead: ${e(s.lead)} · ${state.epic_id ? `epic: ${e(state.epic_id)}` : "epic: pending"}</p></div><span class="v4-badge v4-status">${e(state.state)} · g${state.generation}</span></div><p>${e(s.mission)}</p><p class="v4-meta">Acceptance: ${e(s.acceptance)}</p>
     ${state.state === "pending" ? '<p class="v4-notice">Awaiting registration and approval by GLaDOS. No workers have been started.</p>' : ""}
     ${state.state === "failed" ? `<p class="v4-notice" role="status">Recovery needs attention. ${e(teamErrorCopy(state.failure))}</p>` : ""}
     ${active ? `<div class="v4-stack">${team.seats.map(({ configured, observed_owner: owner }) => `<article class="v4-card"><h3>${e(configured.name)}${configured.name === s.lead ? " · LEAD" : ""}</h3>

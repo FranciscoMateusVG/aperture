@@ -74,6 +74,7 @@ export interface PresetSeat extends ExecutionTuple {
 export interface CreateTeamInput {
   team: string;
   project: string;
+  repo: string;
   mission: string;
   acceptance: string;
   preset_id: string | null;
@@ -94,7 +95,9 @@ export interface TeamPreset {
   source: "shipped" | "local";
   sha256: string;
 }
+export interface RepositoryCatalogEntry { project: string; repo: string; display_name: string; available: boolean }
 export interface TeamCatalog {
+  repositories: RepositoryCatalogEntry[];
   roles: { id: string; display_name: string }[];
   execution_tuples: ExecutionTuple[];
   limits: {
@@ -120,6 +123,7 @@ export interface TeamSnapshot {
   schema_version: 1;
   team: string;
   project: string;
+  repo: string;
   mission: string;
   acceptance: string;
   preset: { id: string | null; sha256: string };
@@ -147,7 +151,7 @@ export interface TeamView {
 
 export type TeamPresetInput = Omit<TeamPreset, "source" | "sha256">;
 export interface CreationRequestDTO {
-  schema_version: 1; request_id: string; team: string; project: string;
+  schema_version: 1; request_id: string; team: string; project: string; repo: string;
   snapshot_sha256: string; expected_generation: number; created_at: string;
 }
 export interface TeamCreateResult { team: TeamView; creation_request: CreationRequestDTO }
