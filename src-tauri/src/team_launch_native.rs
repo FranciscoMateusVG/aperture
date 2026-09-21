@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const BYTE_CAP: usize = 2 * 1024 * 1024;
+const INSTALLED_FILE_CAP: u64 = 128 * 1024 * 1024;
+// Native Codex distributions exceed 128 MiB; scripts retain the smaller bound.
+const CODEX_EXECUTABLE_CAP: u64 = 512 * 1024 * 1024;
 fn error() -> ReplacementError {
     ReplacementError::LaunchUnavailable
 }
@@ -52,6 +55,16 @@ fn private_dir(path: &Path) -> Result<(), ReplacementError> {
     Ok(())
 }
 fn installed_file(path: &Path) -> Result<String, ReplacementError> {
+    installed_file_with_cap(path, INSTALLED_FILE_CAP)
+}
+fn installed_pin(path: &Path, executable: &Path) -> Result<String, ReplacementError> {
+    if path == executable {
+        installed_file_with_cap(path, CODEX_EXECUTABLE_CAP)
+    } else {
+        installed_file(path)
+    }
+}
+fn installed_file_with_cap(path: &Path, cap: u64) -> Result<String, ReplacementError> {
     let m = std::fs::symlink_metadata(path).map_err(|_| error())?;
     if !m.is_file()
         || m.file_type().is_symlink()
@@ -67,16 +80,21 @@ fn installed_file(path: &Path) -> Result<String, ReplacementError> {
         .open(path)
         .map_err(|_| error())?;
     let now = file.metadata().map_err(|_| error())?;
-    if now.ino() != m.ino() || now.dev() != m.dev() || now.len() > 128 * 1024 * 1024 {
+    if now.ino() != m.ino() || now.dev() != m.dev() || now.len() > cap {
         return Err(error());
     }
     let mut h = Sha256::new();
-    let mut f = file;
+    let mut f = file.take(cap + 1);
+    let mut total = 0u64;
     let mut buffer = [0u8; 16384];
     loop {
         let n = f.read(&mut buffer).map_err(|_| error())?;
         if n == 0 {
             break;
+        }
+        total += n as u64;
+        if total > cap {
+            return Err(error());
         }
         h.update(&buffer[..n]);
     }
@@ -93,7 +111,7 @@ fn binary(home: &Path) -> Result<PathBuf, ReplacementError> {
         }
         // Installed package-manager symlinks are not caller-selected paths.
         let resolved = std::fs::canonicalize(candidate).map_err(|_| error())?;
-        installed_file(&resolved)?;
+        installed_pin(&resolved, &resolved)?;
         if std::fs::metadata(&resolved).map_err(|_| error())?.mode() & 0o111 == 0 {
             return Err(error());
         }
@@ -342,7 +360,7 @@ impl NativeLaunchBinding {
             infra.join("mcp-server/dist/index.js"),
             infra.join("mcp-server-sentry/dist/index.js"),
         ] {
-            pins.insert(p.clone(), installed_file(&p)?);
+            pins.insert(p.clone(), installed_pin(&p, &executable)?);
         }
         let meta = std::fs::symlink_metadata(&cwd).map_err(|_| error())?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -420,7 +438,7 @@ impl NativeLaunchBinding {
             let now = if p.starts_with(&self.runtime) {
                 hash(&bytes(p, BYTE_CAP)?.0)
             } else {
-                installed_file(p)?
+                installed_pin(p, &self.executable)?
             };
             if now != *before {
                 return Err(error());

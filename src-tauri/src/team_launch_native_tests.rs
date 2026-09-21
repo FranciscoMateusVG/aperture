@@ -290,3 +290,47 @@ fn socket_cleanup_metadata_boundary_rejects_files_links_and_cross_seat_paths() {
     unlink_socket(&f.home, "t1-worker").unwrap();
     assert!(!path.exists());
 }
+
+#[test]
+fn codex_large_executable_is_pinned_at_preflight_and_revalidation_only() {
+    let f = Fixture::new();
+    let binary = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&f.executable)
+        .unwrap();
+    // Sparse local fixture; never executed, no installed credentials/provider.
+    binary.set_len(INSTALLED_FILE_CAP + 1).unwrap();
+    assert!(installed_file(&f.executable).is_err());
+    let plan = f.plan().unwrap();
+    plan.revalidate(&Deadline::new()).unwrap();
+    assert!(!f.home.join(".aperture/run/managed").exists());
+    let script = f.infra.join("mcp-server/dist/index.js");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap()
+        .set_len(INSTALLED_FILE_CAP + 1)
+        .unwrap();
+    assert!(plan.revalidate(&Deadline::new()).is_err());
+    assert!(f.plan().is_err());
+    binary.set_len(CODEX_EXECUTABLE_CAP + 1).unwrap();
+    assert!(installed_pin(&f.executable, &f.executable).is_err());
+}
+
+#[test]
+fn codex_executable_larger_cap_keeps_installed_identity_guards() {
+    for variant in 0..3 {
+        let f = Fixture::new();
+        match variant {
+            0 => {
+                std::fs::remove_file(&f.executable).unwrap();
+                symlink(f.infra.join("mcp-server/start.sh"), &f.executable).unwrap();
+            }
+            1 => std::fs::hard_link(&f.executable, f.home.join("binary-alias")).unwrap(),
+            _ => std::fs::set_permissions(&f.executable, std::fs::Permissions::from_mode(0o777))
+                .unwrap(),
+        }
+        assert!(installed_pin(&f.executable, &f.executable).is_err());
+        assert!(f.plan().is_err());
+    }
+}
