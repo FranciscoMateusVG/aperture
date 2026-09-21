@@ -6,7 +6,8 @@ import { createServer } from "vite";
 import { preset, catalog, clone, created } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
 const { openTeamEditor } = await vite.ssrLoadModule("/src/components/TeamEditor.ts");
-const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts"); await vite.close();
+// The launcher no longer wraps team_create/team_save_preset; the editor only ever sees a submit rejection.
+await vite.close();
 const decode = s => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 function fixture() {
  const named = new Map(), ids = new Map(), controls = [];
@@ -122,19 +123,17 @@ test("blank preset, cancel/Escape and source accessibility contracts", async () 
  });
 });
 
-test("malformed durable create echo stays in editor, preserves draft, never saved", async () => {
+test("rejected create submission stays in editor, preserves draft, never saved", async () => {
  let saved = 0;
- const api = createTeamCommands(async (_command, args) => { const response = created(args.input); response.team.snapshot.mission = "Different durable mission"; return response; });
- await run({ submitTeam: api.create, saved: () => saved++ }, async f => {
+ await run({ submitTeam: async () => { throw { code: "E_RESPONSE_INVALID", message: "fixture" }; }, saved: () => saved++ }, async f => {
   await f.input("team", "t1"); await f.input("mission", "My exact mission"); await f.submit();
   assert.equal(saved, 0); assert.equal(f.dialog.open, true); assert.equal(f.named.get("mission").value, "My exact mission");
   assert.match(f.errors.textContent, /could not be confirmed/); assert.equal(f.form.attrs["aria-busy"], "false");
  });
 });
-test("malformed durable preset echo stays in editor and never calls saved", async () => {
+test("rejected preset submission stays in editor and never calls saved", async () => {
  let saved = 0;
- const api = createTeamCommands(async () => ({ ...clone(preset), source: "local", display_name: "Wrong echo" }));
- await run({ mode: "edit", submitPreset: api.savePreset, saved: () => saved++ }, async f => {
+ await run({ mode: "edit", submitPreset: async () => { throw { code: "E_RESPONSE_INVALID", message: "fixture" }; }, saved: () => saved++ }, async f => {
   await f.input("displayName", "My exact title"); await f.submit(); assert.equal(saved, 0); assert.equal(f.dialog.open, true);
   assert.equal(f.named.get("displayName").value, "My exact title"); assert.match(f.errors.textContent, /could not be confirmed/);
  });
@@ -197,10 +196,9 @@ test("native repository errors retain chosen draft without auto retry or false s
   });
  }
 });
-test("wrong repository echo stays in editor and cannot publish a saved callback", async () => {
+test("rejected repository submission stays in editor and cannot publish a saved callback", async () => {
  let saved = 0;
- const api = createTeamCommands(async (_cmd, args) => { const r = created(args.input); r.team.snapshot.repo = "eunenem"; r.creation_request.repo = "eunenem"; return r; });
- await run({ submitTeam: api.create, saved: () => saved++ }, async f => {
+ await run({ submitTeam: async () => { throw { code: "E_RESPONSE_INVALID", message: "fixture" }; }, saved: () => saved++ }, async f => {
   await f.input("team", "t1"); await f.submit(); assert.equal(saved, 0); assert.equal(f.dialog.open, true);
   assert.equal(f.named.get("repo").value, "aperture"); assert.match(f.errors.textContent, /could not be confirmed/);
  });

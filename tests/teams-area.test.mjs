@@ -10,38 +10,53 @@ async function setup(options, fn) {
  class El {
   innerHTML = ""; textContent = ""; attrs = {}; dataset = {}; disabled = false; hidden = false; handlers = {}; childButtons = []; tabIndex = 0;
   setAttribute(k, v) { this.attrs[k] = v; } hasAttribute(k) { return k in this.attrs; }
-  addEventListener(k, fn) { this.handlers[k] = fn; } closest() { return this; } before(el) { this.beforeElement = el; }
+  addEventListener(k, fn) { this.handlers[k] = fn; } closest() { return this; }
   appendChild(el) { this.child = el; } focus() { doc.activeElement = this; }
   querySelectorAll(s) { return s === "button" ? this.childButtons : []; }
  }
- const root = new El(), status = new El(), teams = new El(), presets = new El(), blank = new El(), refresh = new El(), sessions = new El(), library = new El(), tabs = new El(), legacy = new El();
- const sessionTab = new El(), presetTab = new El(); sessionTab.dataset.tab = "sessions"; presetTab.dataset.tab = "presets"; sessionTab.attrs["aria-selected"] = "true"; presetTab.attrs["aria-selected"] = "false";
- root.querySelector = s => ({ "[data-global-status]": status, "[data-teams]": teams, "[data-presets]": presets, '[data-action="blank"]': blank, "[data-refresh]": refresh, "#v4-sessions": sessions, "#v4-presets": library, '[role="tablist"]': tabs })[s] ?? [sessionTab, presetTab].find(t => t.attrs["aria-selected"] === "true");
- root.querySelectorAll = () => [sessionTab, presetTab];
- teams.childButtons.push(new El()); presets.childButtons.push(new El());
+ const root = new El(), status = new El(), teams = new El(), coordination = new El(), refresh = new El(), coordPanel = new El(), teamsPanel = new El(), tabs = new El(), legacy = new El();
+ const coordinationTab = new El(), teamsTab = new El(); coordinationTab.dataset.tab = "coordination"; teamsTab.dataset.tab = "teams"; coordinationTab.attrs["aria-selected"] = "true"; teamsTab.attrs["aria-selected"] = "false";
+ root.querySelector = s => ({ "[data-global-status]": status, "[data-teams]": teams, "[data-coordination]": coordination, "[data-refresh]": refresh, "#v4-coordination": coordPanel, "#v4-teams": teamsPanel, '[role="tablist"]': tabs })[s] ?? [coordinationTab, teamsTab].find(t => t.attrs["aria-selected"] === "true");
+ root.querySelectorAll = () => [coordinationTab, teamsTab];
+ teams.childButtons.push(new El());
  const prior = globalThis.document; const doc = { createElement: () => root }; globalThis.document = doc;
- const known = []; const api = { list: async () => [team()], presets: async () => [clone(preset)], catalog: async () => clone(catalog), ...options.api };
+ const known = []; const forbidden = name => async () => { throw new Error(`${name} must not be read by the launcher`); };
+ // presets/catalog are deliberately present and throwing: a refresh that touches them fails the test.
+ const api = { list: async () => [team()], presets: forbidden("presets"), catalog: forbidden("catalog"), ...options.api };
  const instance = createTeamsArea(new El(), legacy, { api, listAgents: async () => [{ name: "glados" }], openAgent: async () => {}, onTeamSeats: n => known.push(n), ...options, api });
- try { await tick(); await fn({ root, status, teams, presets, blank, refresh, sessions, library, legacy, tabs, doc, known, api, instance, El }); }
+ try { await tick(); await fn({ root, status, teams, coordination, refresh, coordPanel, teamsPanel, legacy, tabs, doc, known, api, instance, El }); }
  finally { if (prior === undefined) delete globalThis.document; else globalThis.document = prior; }
 }
-test("loads authoritative teams/presets and preserves actual standing roster before groups", async () => {
+test("loads authoritative teams only and mounts the standing roster inside Coordination", async () => {
  await setup({}, async f => {
-  assert.equal(f.teams.beforeElement, f.legacy); assert.deepEqual(f.known[0], ["t1-backend", "t1-qa"]);
-  assert.match(f.teams.innerHTML, /Awaiting registration and approval/); assert.match(f.presets.innerHTML, /Fullstack/); assert.equal(f.blank.disabled, false);
+  assert.equal(f.coordination.child, f.legacy); assert.deepEqual(f.known[0], ["t1-backend", "t1-qa"]);
+  assert.match(f.teams.innerHTML, /Awaiting registration and approval/); assert.match(f.status.textContent, /Team state loaded/);
+  // Initial visibility is declared in the component markup (the fake DOM does not parse innerHTML into element state).
+  assert.match(f.root.innerHTML, /<section id="v4-teams"[^>]*\bhidden>/); assert.doesNotMatch(f.root.innerHTML, /<section id="v4-coordination"[^>]*\bhidden/);
  });
 });
-test("backend unavailable is not empty success; last-known markup remains, actions disabled", async () => {
+test("no preset or creation controls are reachable from the launcher", async () => {
+ await setup({}, async f => {
+  assert.doesNotMatch(f.root.innerHTML, /data-presets|data-action="(blank|create|edit|duplicate)"|Presets|preset/i);
+  assert.match(f.root.innerHTML, /data-tab="coordination"/); assert.match(f.root.innerHTML, /data-tab="teams"/);
+  assert.doesNotMatch(f.teams.innerHTML, /data-action="(blank|create|edit|duplicate)"/);
+  for (const button of [new f.El(), new f.El(), new f.El(), new f.El()].map((b, i) => { b.dataset = { action: ["blank", "create", "edit", "duplicate"][i], preset: "fullstack" }; return b; })) {
+   await f.root.handlers.click({ target: button }); assert.equal(f.doc.activeElement, undefined);
+  }
+  assert.match(f.status.textContent, /Team state loaded/);
+ });
+});
+test("backend unavailable is not empty success; last-known markup remains, actions disabled, roster untouched", async () => {
  await setup({}, async f => {
   const before = f.teams.innerHTML; f.api.list = async () => { throw new Error("SENTINEL_SECRET"); };
   await f.instance.refresh(); assert.equal(f.teams.innerHTML, before); assert.match(f.status.textContent, /last known/);
-  assert.doesNotMatch(f.status.textContent, /SENTINEL_SECRET|No teams registered/); assert.equal(f.blank.disabled, true);
-  assert.equal(f.teams.childButtons[0].disabled, true); assert.equal(f.presets.childButtons[0].disabled, true);
+  assert.doesNotMatch(f.status.textContent, /SENTINEL_SECRET|No teams registered/);
+  assert.equal(f.teams.childButtons[0].disabled, true); assert.equal(f.coordination.child, f.legacy); assert.equal(f.coordPanel.hidden, false);
  });
 });
-test("initial missing command leaves teams unavailable, not fabricated presets or empty list", async () => {
- await setup({ api: { catalog: async () => { throw new Error("command not found"); } } }, async f => {
-  assert.equal(f.teams.innerHTML, ""); assert.equal(f.presets.innerHTML, ""); assert.equal(f.known.length, 0); assert.equal(f.blank.disabled, true); assert.match(f.status.textContent, /unavailable/);
+test("initial missing command leaves teams unavailable, not a fabricated empty list", async () => {
+ await setup({ api: { list: async () => { throw new Error("command not found"); } } }, async f => {
+  assert.equal(f.teams.innerHTML, ""); assert.equal(f.known.length, 0); assert.match(f.status.textContent, /unavailable/); assert.equal(f.coordination.child, f.legacy);
  });
 });
 test("pending cancellation sends exact generation/request and locks duplicate clicks", async () => {
@@ -53,12 +68,12 @@ test("pending cancellation sends exact generation/request and locks duplicate cl
   f.api.list = async () => []; resolve({ team: "t1", cancelled: true, rejected_snapshot_id: "fixture" }); await pending; assert.match(f.teams.innerHTML, /No teams registered/);
  });
 });
-test("tab handler follows arrow/home/end semantics and preserves roster visibility", async () => {
+test("tab handler follows arrow/home/end semantics between Coordination and Teams", async () => {
  await setup({}, async f => {
   let prevented = 0; const key = k => f.tabs.handlers.keydown({ key: k, preventDefault() { prevented++; } });
-  key("ArrowRight"); assert.equal(f.legacy.hidden, true); assert.equal(f.library.hidden, false); assert.equal(f.doc.activeElement.dataset.tab, "presets");
-  key("Home"); assert.equal(f.legacy.hidden, false); assert.equal(f.sessions.hidden, false); assert.equal(f.doc.activeElement.dataset.tab, "sessions");
-  key("End"); assert.equal(f.legacy.hidden, true); assert.equal(prevented, 3);
+  key("ArrowRight"); assert.equal(f.coordPanel.hidden, true); assert.equal(f.teamsPanel.hidden, false); assert.equal(f.doc.activeElement.dataset.tab, "teams");
+  key("Home"); assert.equal(f.coordPanel.hidden, false); assert.equal(f.teamsPanel.hidden, true); assert.equal(f.doc.activeElement.dataset.tab, "coordination");
+  key("End"); assert.equal(f.coordPanel.hidden, true); assert.equal(prevented, 3);
  });
 });
 

@@ -5,7 +5,7 @@ import { preset, catalog, team, created, clone } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
 const c = await vite.ssrLoadModule("/src/services/team-contract.ts");
 const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts");
-const { renderPresetCard, renderTeamGroup } = await vite.ssrLoadModule("/src/components/TeamsArea.ts");
+const { renderTeamGroup } = await vite.ssrLoadModule("/src/components/TeamsArea.ts");
 const { createInitialTeamDraft, validateCatalogDraft } = await vite.ssrLoadModule("/src/components/TeamEditor.ts");
 await vite.close();
 const rejects = f => assert.throws(f, e => e.code === "E_RESPONSE_INVALID");
@@ -46,37 +46,32 @@ test("pending hides worker controls and never claims notification/boot", () => {
  assert.doesNotMatch(html, /data-action="open-seat"|data-action="replace"|notification sent|workers running/);
 });
 test("all backend-provided content is escaped in render templates", () => {
- const injected = '<img src=x onerror="boom">'; const p = clone(preset); p.display_name = injected; p.id = injected; p.seats[0].model = injected;
+ const injected = '<img src=x onerror="boom">';
  const t = team("active"); t.snapshot.team = injected; t.snapshot.mission = injected; t.seats[0].configured.name = injected;
- for (const html of [renderPresetCard(p), renderTeamGroup(t)]) { assert.equal(html.includes("<img"), false); assert.match(html, /&lt;img/); }
+ const html = renderTeamGroup(t); assert.equal(html.includes("<img"), false); assert.match(html, /&lt;img/);
 });
 test("preset drafting is detached and catalog membership is not inferred", () => {
  const p = clone(preset), draft = createInitialTeamDraft(p); draft.seats[0].model = "unavailable-model";
  assert.equal(p.seats[0].model, "gpt-6-astra"); assert.ok(validateCatalogDraft(draft, catalog).some(x => x.field === "seats.0.execution"));
  draft.seats[0] = { ...p.seats[0], role: "unlisted" }; assert.ok(validateCatalogDraft(draft, catalog).some(x => x.field === "seats.0.role"));
 });
-test("command wrappers pin exact names, envelopes, CAS, no authority inputs", async () => {
- const calls = []; const api = createTeamCommands(async (cmd, args) => { calls.push([cmd, args]); return cmd === "team_create" ? created(args.input) : cmd === "team_save_preset" ? { ...preset, source: "local" } : { team: "t1", cancelled: true, rejected_snapshot_id: "fixture-rejected" }; });
- const input = { ...createInitialTeamDraft(preset, catalog), team: "t1", actor: "glados", grants: ["forged"], creation_request_id: "forged" };
- await api.create(input); const create = calls[0]; assert.equal(create[0], "team_create");
- assert.deepEqual(Object.keys(create[1].input).sort(), ["team", "project", "repo", "mission", "acceptance", "preset_id", "seats", "lead_index", "fallbacks"].sort());
- await api.savePreset(preset, preset.sha256); const save = calls[1][1].input;
- assert.equal(save.expected_sha256, preset.sha256); assert.equal("source" in save.preset_without_source, false); assert.equal("sha256" in save.preset_without_source, false);
- await api.cancel({ team: "t1", expected_generation: 0, creation_request_id: "fixture-request", actor: "glados" });
- assert.deepEqual(calls[2], ["team_cancel_pending", { input: { team: "t1", expected_generation: 0, creation_request_id: "fixture-request" } }]);
- assert.equal("activate" in api, false);
+test("launcher wrappers expose read and cancel only: exact names, envelopes, no creation/presets/authority inputs", async () => {
+ const calls = []; const api = createTeamCommands(async (cmd, args) => { calls.push([cmd, args]); return cmd === "team_list" ? [team()] : { team: "t1", cancelled: true, rejected_snapshot_id: "fixture" }; });
+ assert.deepEqual(await api.list(), [team()]); assert.deepEqual(calls[0], ["team_list", undefined]);
+ await api.cancel({ team: "t1", expected_generation: 0, creation_request_id: "fixture-request", actor: "glados", grants: ["forged"] });
+ assert.deepEqual(calls[1], ["team_cancel_pending", { input: { team: "t1", expected_generation: 0, creation_request_id: "fixture-request" } }]);
+ for (const removed of ["create", "savePreset", "presets", "catalog", "activate"]) assert.equal(removed in api, false, removed);
+ assert.deepEqual(Object.keys(api).sort(), ["cancel", "list"]);
 });
 test("write failures do not auto-retry and malformed success is rejected", async () => {
  let calls = 0; const api = createTeamCommands(async () => { calls++; return { success: true }; });
- await assert.rejects(api.create({ ...createInitialTeamDraft(preset, catalog), team: "t1" }), e => e.code === "E_RESPONSE_INVALID"); assert.equal(calls, 1);
- const rejected = createTeamCommands(async () => { throw { code: "E_PRESET_CONFLICT", message: "fixed" }; });
- await assert.rejects(rejected.savePreset(preset, preset.sha256), e => e.code === "E_PRESET_CONFLICT");
+ await assert.rejects(api.cancel({ team: "t1", expected_generation: 0, creation_request_id: "fixture-request" }), e => e.code === "E_RESPONSE_INVALID"); assert.equal(calls, 1);
+ const rejected = createTeamCommands(async () => { throw { code: "E_CAS_CONFLICT", message: "fixed" }; });
+ await assert.rejects(rejected.cancel({ team: "t1", expected_generation: 0, creation_request_id: "fixture-request" }), e => e.code === "E_CAS_CONFLICT");
 });
-
-test("successful response for another team or preset is not accepted", async () => {
- const api = createTeamCommands(async cmd => cmd === "team_create" ? created() : { ...preset, id: "other" });
- await assert.rejects(api.create({ ...createInitialTeamDraft(preset, catalog), team: "another" }), e => e.code === "E_RESPONSE_INVALID");
- await assert.rejects(api.savePreset(preset, preset.sha256), e => e.code === "E_RESPONSE_INVALID");
+test("successful cancel response for another team is not accepted", async () => {
+ const api = createTeamCommands(async () => ({ team: "other", cancelled: true, rejected_snapshot_id: "fixture" }));
+ await assert.rejects(api.cancel({ team: "t1", expected_generation: 0, creation_request_id: "fixture-request" }), e => e.code === "E_RESPONSE_INVALID");
 });
 
 test("turn state uses observed hub facts only, not requested model or owner state", () => {
@@ -86,41 +81,6 @@ test("turn state uses observed hub facts only, not requested model or owner stat
 
 
 const createInput = () => ({ ...createInitialTeamDraft(preset, catalog), team: "t1" });
-for (const [name, mutate] of [
- ["active state/generation one", r => { r.team.state.state = "active"; r.team.state.generation = 1; r.creation_request.expected_generation = 1; }],
- ["altered immutable mission", r => r.team.snapshot.mission = "Different mission"],
- ["altered acceptance", r => r.team.snapshot.acceptance = "Different evidence"],
- ["altered preset reference", r => r.team.snapshot.preset.id = "different-preset"],
- ["altered seat tuple", r => r.team.snapshot.seats[0].model = "gpt-5.6-sol"],
- ["altered derived seat name", r => { r.team.snapshot.seats[1].name = "t1-other"; }],
- ["altered lead", r => r.team.snapshot.lead = r.team.snapshot.seats[1].name],
- ["altered fallback", r => r.team.snapshot.fallbacks[0].reasoning = "low"],
- ["reordered seats", r => r.team.snapshot.seats.reverse()],
-]) test(`create rejects non-corresponding durable response: ${name}`, async () => {
- const request = createInput(); const response = created(request); mutate(response);
- const api = createTeamCommands(async () => response);
- await assert.rejects(api.create(request), e => e.code === "E_RESPONSE_INVALID");
-});
-for (const [name, mutate] of [
- ["shipped source", p => p.source = "shipped"],
- ["altered display name", p => p.display_name = "Different title"],
- ["altered mission placeholder", p => p.mission_placeholder = "Different mission"],
- ["altered acceptance placeholder", p => p.acceptance_placeholder = "Different evidence"],
- ["altered seat tuple", p => p.seats[0].model = "gpt-5.6-sol"],
- ["altered lead", p => p.lead_index = 1],
- ["altered fallbacks", p => p.fallbacks = []],
- ["invalid derived digest", p => p.sha256 = "invalid"],
-]) test(`save rejects non-corresponding durable response: ${name}`, async () => {
- const response = { ...clone(preset), source: "local" }; mutate(response);
- const api = createTeamCommands(async () => response);
- await assert.rejects(api.savePreset(preset, preset.sha256), e => e.code === "E_RESPONSE_INVALID");
-});
-test("exact pending g0 echo accepts repeated role names and selected lead without normalizing text", async () => {
- const request = createInput(); request.mission = "  Exact immutable mission  "; request.seats.push(clone(request.seats[0])); request.lead_index = 2;
- const api = createTeamCommands(async () => created(request)); const result = await api.create(request);
- assert.equal(result.team.snapshot.lead, "t1-backend-2"); assert.equal(result.team.snapshot.mission, request.mission);
-});
-
 function observedTeam({ generation = 2, state = "active", requested, actual } = {}) {
  const t = team("active"), snapshot = t.snapshot.seats[0], fallback = t.snapshot.fallbacks[0];
  t.seats[0].observed_owner = { generation, state, since: "2026-09-20T00:00:00Z", configured: clone(requested ?? fallback), actual: actual === undefined ? clone(requested ?? fallback) : actual, process_count: 1, thread_bound: true };
@@ -181,16 +141,6 @@ test("repository choice uses served catalog only, never preset or project infere
  ]) assert.match(validateCatalogDraft({ ...createInput(), project, repo }, catalog).find(i => i.field === "repo").message, pattern);
  const absent = clone(catalog); absent.repositories[0].available = false;
  assert.match(validateCatalogDraft(createInput(), absent).find(i => i.field === "repo").message, /unavailable locally/);
-});
-for (const [name, mutate] of [
- ["missing snapshot", r => delete r.team.snapshot.repo],
- ["missing request", r => delete r.creation_request.repo],
- ["different request", r => r.creation_request.repo = "eunenem"],
- ["both echo different repository", r => { r.team.snapshot.repo = "eunenem"; r.creation_request.repo = "eunenem"; }],
- ["path instead of key", r => { r.team.snapshot.repo = "/tmp/aperture"; r.creation_request.repo = "/tmp/aperture"; }],
-]) test(`create rejects repository echo: ${name}`, async () => {
- const api = createTeamCommands(async (_cmd, args) => { const r = created(args.input); mutate(r); return r; });
- await assert.rejects(api.create(createInput()), e => e.code === "E_RESPONSE_INVALID");
 });
 test("immutable repository is visible in pending and active approval context", () => {
  for (const state of ["pending", "active"]) assert.match(renderTeamGroup(team(state)), /repository: aperture \(immutable\)/);

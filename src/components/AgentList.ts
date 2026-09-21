@@ -10,6 +10,9 @@ type PendingOp = NonNullable<AgentDef["op_pending"]>;
 
 const LIFECYCLE_ERROR_TTL_MS = 15_000;
 
+/** The only fixed launcher seats. Everyone else runs as a temporary team seat under Teams. */
+const COORDINATION_SEATS: ReadonlySet<string> = new Set(["glados", "wheatley", "peppy"]);
+
 const OP_VERB: Record<PendingOp, string> = {
   starting: "start",
   stopping: "stop",
@@ -137,6 +140,7 @@ export function createAgentList(container: HTMLElement) {
     render();
     // Yield to let the browser paint the spinner before kicking off Tauri calls
     await new Promise(r => requestAnimationFrame(r));
+    // `agents` is already the coordination roster, so bulk ops never reach team seats.
     const targets = allRunning ? agents : agents.filter(a => a.status !== "running");
     // Each op reports its own rejection into the strip (runOp) and carries
     // its own op_pending entry; allSettled just waits for the fleet.
@@ -151,7 +155,9 @@ export function createAgentList(container: HTMLElement) {
    *  next poll. */
   function render() {
     const now = Date.now();
-    const agents: AgentDef[] = lastAgents.filter(a => !teamSeatNames.has(a.name)).map(a => ({
+    // Coordination roster: fixed seats only. Team seats (and any non-trio
+    // standing profile) never render here and never join bulk Start/Stop.
+    const agents: AgentDef[] = lastAgents.filter(a => COORDINATION_SEATS.has(a.name) && !teamSeatNames.has(a.name)).map(a => ({
       ...a,
       op_pending: pendingOps.get(a.name) ?? null,
     }));
@@ -188,7 +194,7 @@ export function createAgentList(container: HTMLElement) {
 
     const header = document.createElement("div");
     header.className = "agent-list__header";
-    header.innerHTML = `<h3 class="section-title">Agents</h3>`;
+    header.innerHTML = `<h3 class="section-title">Coordination</h3>`;
 
     const toggleAll = document.createElement("button");
     if (isBulkToggling) {
@@ -205,18 +211,7 @@ export function createAgentList(container: HTMLElement) {
     header.appendChild(toggleAll);
     wrapper.appendChild(header);
 
-    const coordination = new Set(["glados", "wheatley", "peppy"]);
-    for (const [title, group] of [
-      ["Coordination", agents.filter(a => coordination.has(a.name))],
-      ["Standing specialists", agents.filter(a => !coordination.has(a.name))],
-    ] as const) {
-      if (!group.length) continue;
-      const label = document.createElement("h3");
-      label.className = "section-title";
-      label.textContent = title;
-      wrapper.appendChild(label);
-      group.forEach(agent => wrapper.appendChild(createAgentCard(agent, modal, refresh, lifecycle)));
-    }
+    agents.forEach(agent => wrapper.appendChild(createAgentCard(agent, modal, refresh, lifecycle)));
   }
 
   async function refresh() {

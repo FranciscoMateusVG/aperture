@@ -1,14 +1,11 @@
 import { canBootstrapSeat, runtimeCommands, runtimeErrorCopy, type RuntimeCommands } from "../services/team-runtime";
-import type { AgentDef, TeamCatalog, TeamPreset, TeamView, TeamCreateResult } from "../types";
+import type { AgentDef, TeamView } from "../types";
 import { teamCommands, type TeamCommands } from "../services/team-commands";
 import { teamErrorCopy } from "../services/team-draft";
 import { escapeHtml as e } from "../utils/html";
-import { openTeamEditor, tupleLabel } from "./TeamEditor";
+import { tupleLabel } from "./TeamEditor";
 import { openTeamLifecycle } from "./TeamLifecycle";
 
-export function renderPresetCard(preset: TeamPreset): string {
-  return `<article class="v4-card"><h2>${e(preset.display_name)}</h2><p class="v4-meta">${e(preset.mission_placeholder)}</p><ul>${preset.seats.map((s, i) => `<li>${e(s.role)}${i === preset.lead_index ? " · lead" : ""}<br><span class="v4-meta">${e(tupleLabel(s))}</span></li>`).join("")}</ul><p class="v4-meta">${e(preset.source)} preset · snapshot on creation</p><div class="v4-actions"><button class="v4-button v4-button--primary" data-action="create" data-preset="${e(preset.id)}">New team from preset</button><button class="v4-button" data-action="edit" data-preset="${e(preset.id)}">Edit preset</button><button class="v4-button" data-action="duplicate" data-preset="${e(preset.id)}">Duplicate</button></div></article>`;
-}
 export function renderTeamGroup(team: TeamView, agents: readonly AgentDef[] = []): string {
   const turn = (name: string) => {
     const observed = agents.find(a => a.name === name)?.turn_state;
@@ -32,51 +29,55 @@ export interface TeamsAreaOptions {
   openAgent: (name: string) => Promise<void>;
   onTeamSeats: (names: string[]) => void;
 }
+/**
+ * Two launcher areas: Coordination (the fixed roster, mounted from `legacyRoster`)
+ * and Teams (project teams read from the backend). Team creation and presets are
+ * not launcher actions — GLaDOS creates teams through the authenticated control
+ * path, so refresh reads team state only and never touches presets or the catalog.
+ */
 export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElement, options: TeamsAreaOptions) {
   const api = options.api ?? teamCommands;
   const runtime = options.runtime ?? runtimeCommands;
   const root = document.createElement("section"); root.className = "v4";
-  root.innerHTML = `<div class="v4-tabs" role="tablist" aria-label="Launcher area"><button class="v4-tab" id="v4-sessions-tab" role="tab" aria-selected="true" aria-controls="v4-sessions" tabindex="0" data-tab="sessions">Sessions</button><button class="v4-tab" id="v4-presets-tab" role="tab" aria-selected="false" aria-controls="v4-presets" tabindex="-1" data-tab="presets">Presets</button></div><p class="v4-notice" role="status" aria-live="polite" data-global-status>Loading team state…</p><div class="v4-actions"><button class="v4-button" data-refresh>Refresh teams</button></div><section id="v4-sessions" role="tabpanel" aria-labelledby="v4-sessions-tab"><div class="v4-toolbar"><div><h1>Sessions</h1><p class="v4-meta">Coordination and standing specialists remain available below.</p></div></div><div class="v4-stack" data-teams></div></section><section id="v4-presets" role="tabpanel" aria-labelledby="v4-presets-tab" hidden><div class="v4-toolbar"><div><h1>A team starts with a clear mission.</h1><p class="v4-meta">Reusable presets. Independent snapshots. Existing teams stay unchanged.</p></div><button class="v4-button" data-action="blank" disabled>New blank preset</button></div><div class="v4-grid" data-presets></div></section>`;
+  root.innerHTML = `<div class="v4-tabs" role="tablist" aria-label="Launcher area"><button class="v4-tab" id="v4-coordination-tab" role="tab" aria-selected="true" aria-controls="v4-coordination" tabindex="0" data-tab="coordination">Coordination</button><button class="v4-tab" id="v4-teams-tab" role="tab" aria-selected="false" aria-controls="v4-teams" tabindex="-1" data-tab="teams">Teams</button></div><section id="v4-coordination" role="tabpanel" aria-labelledby="v4-coordination-tab"><div class="v4-toolbar"><div><h1>Coordination</h1><p class="v4-meta">Fixed seats only: GLaDOS, Wheatley and Peppy. Project team seats are listed under Teams.</p></div></div><div class="v4-stack" data-coordination></div></section><section id="v4-teams" role="tabpanel" aria-labelledby="v4-teams-tab" hidden><div class="v4-toolbar"><div><h1>Teams</h1><p class="v4-meta">Project teams are created and approved by GLaDOS. Team seats never join the coordination roster.</p></div></div><p class="v4-notice" role="status" aria-live="polite" data-global-status>Loading team state…</p><div class="v4-actions"><button class="v4-button" data-refresh>Refresh teams</button></div><div class="v4-stack" data-teams></div></section>`;
   container.appendChild(root);
   const status = root.querySelector<HTMLElement>("[data-global-status]")!;
   const teamsEl = root.querySelector<HTMLElement>("[data-teams]")!;
-  const presetsEl = root.querySelector<HTMLElement>("[data-presets]")!;
-  // Keep the actual standing roster (and its existing listeners) ahead of project teams.
-  teamsEl.before(legacyRoster);
-  const blank = root.querySelector<HTMLButtonElement>('[data-action="blank"]')!;
+  const coordinationEl = root.querySelector<HTMLElement>("[data-coordination]")!;
+  // The actual standing roster (and its existing listeners) lives inside Coordination and is independent of team state.
+  coordinationEl.appendChild(legacyRoster);
   const refreshButton = root.querySelector<HTMLButtonElement>("[data-refresh]")!;
-  let teams: TeamView[] = [], presets: TeamPreset[] = [], catalog: TeamCatalog | null = null, knownSeats: string[] = [];
+  let teams: TeamView[] = [];
   let busy = false, loaded = false, mutation = false;
   function switchTab(tab: string, focus = false) {
     root.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach(el => { const selected = el.dataset.tab === tab; el.setAttribute("aria-selected", String(selected)); el.tabIndex = selected ? 0 : -1; if (selected && focus) el.focus(); });
-    root.querySelector<HTMLElement>("#v4-sessions")!.hidden = tab !== "sessions";
-    root.querySelector<HTMLElement>("#v4-presets")!.hidden = tab !== "presets";
-    legacyRoster.hidden = tab !== "sessions";
+    root.querySelector<HTMLElement>("#v4-coordination")!.hidden = tab !== "coordination";
+    root.querySelector<HTMLElement>("#v4-teams")!.hidden = tab !== "teams";
   }
   root.querySelector('[role="tablist"]')!.addEventListener("keydown", event => {
     const key = (event as KeyboardEvent).key;
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(key)) return;
     event.preventDefault();
     const current = root.querySelector<HTMLElement>('[aria-selected="true"]')!.dataset.tab;
-    switchTab(key === "Home" ? "sessions" : key === "End" ? "presets" : current === "sessions" ? "presets" : "sessions", true);
+    switchTab(key === "Home" ? "coordination" : key === "End" ? "teams" : current === "coordination" ? "teams" : "coordination", true);
   });
+  function disableTeamActions() {
+    teamsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
+  }
   async function refresh() {
     if (busy || mutation) return;
-    busy = true; refreshButton.disabled = true; blank.disabled = true;
+    busy = true; refreshButton.disabled = true;
     status.textContent = loaded ? "Refreshing team state…" : "Loading team state…";
     try {
-      const [nextTeams, nextPresets, nextCatalog, agents] = await Promise.all([api.list(), api.presets(), api.catalog(), options.listAgents()]);
-      teams = nextTeams; presets = nextPresets; catalog = nextCatalog; knownSeats = agents.map(a => a.name);
+      const [nextTeams, agents] = await Promise.all([api.list(), options.listAgents()]);
+      teams = nextTeams;
       options.onTeamSeats(teams.flatMap(t => t.snapshot.seats.map(s => s.name)));
-      teamsEl.innerHTML = teams.length ? teams.map(t => renderTeamGroup(t, agents)).join("") : '<p class="v4-notice">No teams registered. Your standing roster is unchanged.</p>';
-      presetsEl.innerHTML = presets.length ? presets.map(renderPresetCard).join("") : '<p class="v4-notice">No presets are available. Create a blank preset from the backend catalog.</p>';
+      teamsEl.innerHTML = teams.length ? teams.map(t => renderTeamGroup(t, agents)).join("") : '<p class="v4-notice">No teams registered. Coordination seats are unchanged.</p>';
       loaded = true; status.textContent = "Team state loaded. Configured models are not inferred session observations.";
-      blank.disabled = !catalog.roles.length || !catalog.execution_tuples.length;
     } catch (error) {
       // Last-known state remains readable but cannot initiate any action.
-      loaded = false; status.textContent = `Team controls unavailable; any displayed data is last known. ${teamErrorCopy(error)} Standing roster remains independent.`;
-      teamsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
-      presetsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
+      loaded = false; status.textContent = `Team controls unavailable; any displayed data is last known. ${teamErrorCopy(error)} Coordination seats remain independent.`;
+      disableTeamActions();
     } finally { busy = false; refreshButton.disabled = false; }
   }
   root.addEventListener("click", async event => {
@@ -84,21 +85,8 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
     if (!button || button.disabled) return;
     if (button.dataset.tab) { switchTab(button.dataset.tab); return; }
     if (button.hasAttribute("data-refresh")) { void refresh(); return; }
-    if (!loaded || !catalog || busy || mutation) return;
+    if (!loaded || busy || mutation) return;
     const action = button.dataset.action;
-    if (["create", "edit", "duplicate", "blank"].includes(action ?? "")) {
-      const preset = presets.find(p => p.id === button.dataset.preset);
-      if (action !== "blank" && !preset) return;
-      openTeamEditor({ mode: action as "create" | "edit" | "duplicate" | "blank", preset, catalog,
-        knownTeams: teams.map(t => t.snapshot.team), knownSeats,
-        submitTeam: api.create, submitPreset: api.savePreset,
-        saved: (kind, result) => {
-          if (kind === "team") { switchTab("sessions"); const t = (result as TeamCreateResult).team; status.textContent = `Backend returned ${t.state.state}. Awaiting authoritative refresh.`; }
-          else status.textContent = "Preset saved by the backend. Refreshing library…";
-          void refresh();
-        },
-      }); return;
-    }
     const team = teams.find(t => t.snapshot.team === button.dataset.team);
     if (action === "bootstrap" && team && button.dataset.seat && canBootstrapSeat(team, button.dataset.seat)) {
       mutation = true; button.disabled = true; refreshButton.disabled = true;
@@ -115,9 +103,7 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
       } catch (error) {
         // Do not retry an ambiguous first start or reset its owner generation.
         mutation = false; loaded = false;
-        teamsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
-        presetsEl.querySelectorAll<HTMLButtonElement>("button").forEach(el => { el.disabled = true; });
-        blank.disabled = true;
+        disableTeamActions();
         status.textContent = runtimeErrorCopy(error) + " Refresh authoritative state before another action; no automatic retry was made.";
       } finally { refreshButton.disabled = false; }
       return;
