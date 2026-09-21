@@ -922,7 +922,7 @@ mod tests {
         write_team(&teams, "mural", "active", &[("mural-frontend", "frontend")]);
         let path = teams.join("mural/team.json");
         let mut snapshot: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        snapshot["project"] = serde_json::json!("project:incluir");
+        snapshot["project"] = serde_json::json!("project:eunenem-engine");
         snapshot["repo"] = serde_json::json!("eunenem-engine");
         fs::write(&path, snapshot.to_string()).unwrap();
         assert!(load_agents_from_roots(&agents, &teams).contains_key("mural-frontend"));
@@ -930,7 +930,7 @@ mod tests {
         // not permission to strand its workers or erase it from the roster.
         fs::write(root.join("repositories.json"), b"corrupt").unwrap();
         assert!(load_agents_from_roots(&agents, &teams).contains_key("mural-frontend"));
-        for (field, value) in [("repo", "../elsewhere"), ("project", "project:unknown")] {
+        for (field, value) in [("repo", "../elsewhere"), ("project", "project:../unknown")] {
             let mut invalid = snapshot.clone();
             invalid[field] = serde_json::json!(value);
             fs::write(&path, invalid.to_string()).unwrap();
