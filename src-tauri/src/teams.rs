@@ -64,6 +64,7 @@ const REPO_CATALOG: &[(&str, &str, &str)] = &[
     ("project:frame", "frame", "Frame"),
     ("project:incluir", "monorepo-incluir", "Programa Incluir"),
     ("project:incluir", "eunenem", "EuNeném"),
+    ("project:incluir", "eunenem-engine", "EuNeném Engine"),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2623,7 +2624,7 @@ mod tests {
         assert!(catalog.repositories.iter().any(|entry| {
             entry.project == "project:aperture" && entry.repo == "aperture" && entry.available
         }));
-        assert_eq!(catalog.repositories.iter().filter(|entry| entry.project == "project:incluir").count(), 2);
+        assert_eq!(catalog.repositories.iter().filter(|entry| entry.project == "project:incluir").count(), 3);
         assert!(!catalog.repositories.iter().any(|entry| entry.project == "project:mempalace"));
 
         let mut missing = fullstack_input("repo-missing");
@@ -2641,6 +2642,32 @@ mod tests {
         let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("repo-echo")).unwrap();
         assert_eq!(created.team.snapshot.repo, "aperture");
         assert_eq!(created.creation_request.repo, created.team.snapshot.repo);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn engine_repository_is_explicit_and_does_not_remap_legacy() {
+        let home = temp_root("engine-binding");
+        assert_eq!(resolve_repository(&home, "project:incluir", "eunenem-engine").unwrap_err().code, "E_REPO_UNAVAILABLE");
+        for repo in ["eunenem", "eunenem-engine"] {
+            let directory = home.join("projects").join(repo);
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(directory.join(".git")).unwrap();
+            fs::set_permissions(directory.join(".git"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(resolve_repository(&home, "project:incluir", repo).unwrap(), directory);
+        }
+        assert_eq!(resolve_repository(&home, "project:aperture", "eunenem-engine").unwrap_err().code, "E_REPO_NOT_IN_CATALOG");
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let catalog = engine.catalog().unwrap();
+        assert!(catalog.repositories.iter().any(|entry| entry.project == "project:incluir" && entry.repo == "eunenem-engine" && entry.available));
+        let mut input = fullstack_input("mural-test");
+        input.project = "project:incluir".into();
+        input.repo = "eunenem-engine".into();
+        let created = engine.create_team(&AuthenticatedActor::operator_ui(), input).unwrap();
+        assert_eq!(created.team.state.state, TeamLifecycle::Pending);
+        assert_eq!(created.team.snapshot.repo, "eunenem-engine");
+        assert_eq!(created.creation_request.repo, "eunenem-engine");
         fs::remove_dir_all(home).unwrap();
     }
 
