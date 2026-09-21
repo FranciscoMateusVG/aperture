@@ -340,6 +340,45 @@ pub struct TeamView {
     pub capabilities: TeamCapabilities,
 }
 
+fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapabilities {
+    let pending = *state == TeamLifecycle::Pending;
+    let active = *state == TeamLifecycle::Active;
+    let start = active && seats.iter().any(|seat| {
+        let configured = seat.configured.tuple();
+        configured.harness == Harness::Codex
+            && seat.observed_owner.as_ref().is_some_and(|owner| {
+                owner.generation == 0
+                    && owner.state == OwnerState::Stale
+                    && owner.configured == configured
+                    && owner.actual.is_none()
+                    && owner.process_count == 0
+                    && !owner.thread_bound
+            })
+    });
+    let replace = active && seats.iter().any(|seat| {
+        seat.observed_owner.as_ref().is_some_and(|owner| {
+            owner.generation > 0
+                && owner.state == OwnerState::Active
+                && owner.configured.harness == Harness::Codex
+                && owner.actual.as_ref() == Some(&owner.configured)
+                && owner.process_count > 0
+                && owner.thread_bound
+        })
+    });
+    TeamCapabilities {
+        cancel: pending,
+        activate: pending,
+        start,
+        // Checkpoints are authenticated managed-seat control actions. There is
+        // deliberately no operator/UI checkpoint command.
+        checkpoint: false,
+        replace,
+        // This exposes only the read-only checklist. Archive mutation remains
+        // an independently authenticated GLaDOS control action.
+        archive: active,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateTeamResult {
     pub team: TeamView,
@@ -978,19 +1017,12 @@ impl TeamEngine {
             };
             seats.push(TeamSeatView { configured: configured.clone(), observed_owner });
         }
-        let pending = state.state == TeamLifecycle::Pending;
+        let capabilities = team_capabilities(&state.state, &seats);
         Ok(TeamView {
             snapshot,
             state,
             seats,
-            capabilities: TeamCapabilities {
-                cancel: pending,
-                activate: pending,
-                start: false,
-                checkpoint: false,
-                replace: false,
-                archive: false,
-            },
+            capabilities,
         })
     }
 
@@ -2281,6 +2313,41 @@ mod tests {
             b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )
     }
+
+    fn capability_seat(
+        name: &str,
+        harness: Harness,
+        owner: Option<OwnerSummary>,
+    ) -> TeamSeatView {
+        let is_codex = harness == Harness::Codex;
+        TeamSeatView {
+            configured: TeamSeat {
+                name: name.into(),
+                role: "backend".into(),
+                model: if is_codex { "gpt-6-astra".into() } else { "sonnet".into() },
+                reasoning: is_codex.then_some(ReasoningEffort::High),
+                harness,
+            },
+            observed_owner: owner,
+        }
+    }
+
+    fn capability_owner(
+        configured: &TeamSeat,
+        generation: u64,
+        state: OwnerState,
+    ) -> OwnerSummary {
+        let active = state == OwnerState::Active;
+        OwnerSummary {
+            generation,
+            state,
+            since: "fixture-time".into(),
+            configured: configured.tuple(),
+            actual: active.then(|| configured.tuple()),
+            process_count: u32::from(active),
+            thread_bound: active,
+        }
+    }
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             for (key, value) in self.values.drain(..) {
@@ -2298,6 +2365,9 @@ mod tests {
         let engine = TeamEngine::new(home.clone(), project_root());
         let created = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("t1")).unwrap();
         assert_eq!(created.team.state.state, TeamLifecycle::Pending);
+        assert_eq!(created.team.capabilities, TeamCapabilities {
+            cancel: true, activate: true, start: false, checkpoint: false, replace: false, archive: false,
+        });
         assert_eq!(created.team.seats.len(), 3);
         for seat in &created.team.snapshot.seats {
             assert!(!home.join(".claude/aperture").join(&seat.name).exists());
@@ -2316,6 +2386,9 @@ mod tests {
         }).unwrap();
         assert_eq!(active.state.state, TeamLifecycle::Active);
         assert_eq!(active.state.generation, 1);
+        assert_eq!(active.capabilities, TeamCapabilities {
+            cancel: false, activate: false, start: true, checkpoint: false, replace: false, archive: true,
+        });
         for seat in &active.seats {
             let runtime = home.join(".claude/aperture").join(&seat.configured.name);
             assert!(runtime.join(".complete").is_file());
@@ -2339,6 +2412,92 @@ mod tests {
         assert_eq!(classify_managed_seat(&home, "standing").unwrap(), None);
         assert_eq!(crate::agent_loader::load_agents_from_disk().keys().filter(|name| name.starts_with("t1-")).count(), 0);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn capabilities_are_action_and_seat_eligible_without_enabling_claude() {
+        let mut codex = capability_seat("t1-backend", Harness::Codex, None);
+        codex.observed_owner = Some(capability_owner(
+            &codex.configured,
+            0,
+            OwnerState::Stale,
+        ));
+        let mut claude = capability_seat("t1-qa", Harness::Claude, None);
+        claude.observed_owner = Some(capability_owner(
+            &claude.configured,
+            0,
+            OwnerState::Stale,
+        ));
+
+        let mixed = vec![codex.clone(), claude.clone()];
+        assert_eq!(
+            team_capabilities(&TeamLifecycle::Active, &mixed),
+            TeamCapabilities {
+                cancel: false,
+                activate: false,
+                start: true,
+                checkpoint: false,
+                replace: false,
+                archive: true,
+            }
+        );
+        for lifecycle in [
+            TeamLifecycle::Pending,
+            TeamLifecycle::Failed,
+            TeamLifecycle::Archived,
+        ] {
+            let capabilities = team_capabilities(&lifecycle, &mixed);
+            assert!(!capabilities.start);
+            assert!(!capabilities.replace);
+            assert!(!capabilities.archive);
+            assert!(!capabilities.checkpoint);
+        }
+        for corrupt in [
+            |owner: &mut OwnerSummary| owner.actual = Some(owner.configured.clone()),
+            |owner: &mut OwnerSummary| owner.process_count = 1,
+            |owner: &mut OwnerSummary| owner.thread_bound = true,
+        ] {
+            let mut invalid = codex.clone();
+            corrupt(invalid.observed_owner.as_mut().unwrap());
+            assert!(!team_capabilities(&TeamLifecycle::Active, &[invalid]).start);
+        }
+
+        codex.observed_owner = Some(capability_owner(
+            &codex.configured,
+            1,
+            OwnerState::Active,
+        ));
+        let running = team_capabilities(&TeamLifecycle::Active, &[codex.clone(), claude.clone()]);
+        assert!(!running.start, "the stale Claude seat is not bootable by the Codex adapter");
+        assert!(running.replace);
+        assert!(running.archive);
+
+        let fallback = ExecutionTuple {
+            harness: Harness::Codex,
+            model: "gpt-5.6-sol".into(),
+            reasoning: Some(ReasoningEffort::High),
+        };
+        let owner = codex.observed_owner.as_mut().unwrap();
+        owner.configured = fallback.clone();
+        owner.actual = Some(fallback);
+        assert!(team_capabilities(&TeamLifecycle::Active, &[codex.clone()]).replace,
+            "an observed authorized Codex fallback remains replacement-eligible");
+
+        codex.observed_owner.as_mut().unwrap().actual = Some(ExecutionTuple {
+            harness: Harness::Codex,
+            model: "gpt-5.6-luna".into(),
+            reasoning: Some(ReasoningEffort::High),
+        });
+        assert!(!team_capabilities(&TeamLifecycle::Active, &[codex.clone()]).replace);
+
+        codex.observed_owner.as_mut().unwrap().state = OwnerState::Quarantined;
+        assert!(!team_capabilities(&TeamLifecycle::Active, &[codex]).replace);
+        claude.observed_owner = Some(capability_owner(
+            &claude.configured,
+            2,
+            OwnerState::Active,
+        ));
+        assert!(!team_capabilities(&TeamLifecycle::Active, &[claude]).replace);
     }
 
     #[test]

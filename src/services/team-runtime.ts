@@ -44,7 +44,8 @@ export function canBootstrapSeat(team: TeamView, seat: string): boolean {
   const snapshot = team.snapshot.seats.find(s => s.name === seat);
   const owner = team.seats.find(s => s.configured.name === seat)?.observed_owner;
   return team.state.state === "active" && team.capabilities?.start === true && !!snapshot && !!owner &&
-    owner.state === "stale" && owner.generation === 0 && sameExecutionTuple(owner.configured, snapshot);
+    snapshot.harness === "codex" && owner.state === "stale" && owner.generation === 0 &&
+    sameExecutionTuple(owner.configured, snapshot) && owner.actual === null && owner.process_count === 0 && !owner.thread_bound;
 }
 export function parseBootstrap(v: unknown, team: TeamView, seat: string): BootstrapView {
   const snapshot = team.snapshot.seats.find(s => s.name === seat);
@@ -62,6 +63,12 @@ export function ownerGeneration(team: TeamView, seat: string): number | null {
 function canInvoke(team: TeamView, capability: "replace" | "archive") {
   return team.state.state === "active" && team.capabilities?.[capability] === true;
 }
+export function canPrepareReplacement(team: TeamView, seat: string): boolean {
+  const owner = team.seats.find(s => s.configured.name === seat)?.observed_owner;
+  return canInvoke(team, "replace") && !!owner && owner.generation > 0 && owner.state === "active" &&
+    owner.configured.harness === "codex" && !!owner.actual && sameExecutionTuple(owner.configured, owner.actual) &&
+    owner.process_count > 0 && owner.thread_bound;
+}
 export function parseReplacement(v: unknown, team: TeamView, seat: string, prepared: boolean): ReplacementView | PreparedReplacementView {
   if (!obj(v) || !exact(v, prepared ? [...viewKeys, "preparation_id"] : viewKeys) || v.team !== team.snapshot.team || v.seat !== seat ||
     !number(v.generation) || !includes(v.phase, phases) || !includes(v.checkpoint_recovery, ["valid", "stale", "none"]) ||
@@ -76,6 +83,8 @@ export function canStartReplacement(team: TeamView, seat: string, prepared: Prep
   return canInvoke(team, "replace") && (ownerGeneration(team, seat) ?? 0) > 0 && !!prepared && prepared.team === team.snapshot.team && prepared.seat === seat &&
     prepared.generation === ownerGeneration(team, seat) && prepared.phase === "ready" && !!prepared.preparation_id &&
     prepared.blockers.length === 0 && Object.values(prepared.checks).every(v => v === "verified") &&
+    selection.harness === "codex" && !!prepared.owner && prepared.owner.configured.harness === "codex" &&
+    selection.harness === prepared.owner.configured.harness && selection.reasoning === prepared.owner.configured.reasoning &&
     authorizedSelections(team, seat).some(t => sameExecutionTuple(t, selection));
 }
 export function parseArchive(v: unknown, team: TeamView): ArchiveView {
@@ -97,7 +106,7 @@ export function createRuntimeCommands(call: Invoke) {
     },
     prepare: async (team: TeamView, seat: string): Promise<PreparedReplacementView> => {
       const generation = ownerGeneration(team, seat);
-      if (!canInvoke(team, "replace") || (generation === null || generation === 0)) return unavailable();
+      if (!canPrepareReplacement(team, seat) || generation === null) return unavailable();
       const result = parseReplacement(await call("team_prepare_replacement", { input: { team: team.snapshot.team, seat, expected_generation: generation } }), team, seat, true) as PreparedReplacementView;
       if (result.generation !== generation) return invalid();
       return result;

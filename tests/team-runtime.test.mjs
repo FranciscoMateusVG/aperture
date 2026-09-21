@@ -29,9 +29,55 @@ test("missing owner generation cannot borrow team generation or infer stopped", 
  await assert.rejects(r.createRuntimeCommands(async () => { calls++; }).prepare(t, "t1-backend"), e => e.code === "E_RUNTIME_UNAVAILABLE");
  assert.equal(calls, 0); assert.equal(r.ownerGeneration(t, "t1-backend"), null);
 });
+test("aggregated replace availability never enables an ineligible or Claude seat", async () => {
+ const states = ["starting", "stale", "quarantined"];
+ for (const state of states) {
+  const t = current(); t.seats[0].observed_owner.state = state; let calls = 0;
+  assert.equal(r.canPrepareReplacement(t, "t1-backend"), false);
+  await assert.rejects(r.createRuntimeCommands(async () => { calls++; }).prepare(t, "t1-backend"), e => e.code === "E_RUNTIME_UNAVAILABLE");
+  assert.equal(calls, 0);
+ }
+ const t = current();
+ const claude = t.snapshot.seats[1];
+ t.seats[1].observed_owner = { generation: 2, state: "active", since: "fixture-time",
+  configured: { harness: claude.harness, model: claude.model, reasoning: claude.reasoning },
+  actual: { harness: claude.harness, model: claude.model, reasoning: claude.reasoning }, process_count: 1, thread_bound: true };
+ let calls = 0;
+ assert.equal(r.canPrepareReplacement(t, claude.name), false);
+ await assert.rejects(r.createRuntimeCommands(async () => { calls++; }).prepare(t, claude.name), e => e.code === "E_RUNTIME_UNAVAILABLE");
+ assert.equal(calls, 0);
+});
+test("observed Codex fallback remains prepare-eligible without matching the initial snapshot tuple", async () => {
+ const t = current();
+ t.seats[0].observed_owner.configured = clone(preset.fallbacks[0]);
+ t.seats[0].observed_owner.actual = clone(preset.fallbacks[0]);
+ let calls = 0;
+ const api = r.createRuntimeCommands(async () => { calls++; return prepared(t); });
+ assert.equal(r.canPrepareReplacement(t, "t1-backend"), true);
+ await api.prepare(t, "t1-backend"); assert.equal(calls, 1);
+});
 test("prepare is separate; inputs have no proof or actors and use owner g4, not team g1", async () => {
  const t = current(), calls = []; const api = r.createRuntimeCommands(async (...args) => { calls.push(args); return prepared(t); });
  await api.prepare(t, "t1-backend"); assert.deepEqual(calls, [["team_prepare_replacement", { input: { team: "t1", seat: "t1-backend", expected_generation: 4 } }]]);
+});
+test("prepare permit remains startable after an authoritative same-generation refresh", async () => {
+ const initial = current(); let calls = 0;
+ const api = r.createRuntimeCommands(async name => {
+  calls++;
+  if (name === "team_prepare_replacement") return prepared(initial);
+  const result = prepared(initial); delete result.preparation_id;
+  return { ...result, generation: 5, phase: "started", owner: { ...result.owner, generation: 5, state: "active", actual: tuple() } };
+ });
+ const permit = await api.prepare(initial, "t1-backend");
+ const refreshed = clone(initial);
+ await api.start(refreshed, "t1-backend", permit, tuple());
+ assert.equal(calls, 2);
+});
+test("Claude replacement selection remains zero-invoke even when team replace is available", async () => {
+ const t = current(), p = prepared(t), selection = { harness: "claude", model: "sonnet", reasoning: null }; let calls = 0;
+ assert.equal(r.canStartReplacement(t, "t1-backend", p, selection), false);
+ await assert.rejects(r.createRuntimeCommands(async () => { calls++; }).start(t, "t1-backend", p, selection), e => e.code === "E_RUNTIME_UNAVAILABLE");
+ assert.equal(calls, 0);
 });
 for (const [label, mutate] of [
  ["no permit", p => p.preparation_id = null], ["unknown stop", p => p.checks.process_stop = "unknown"],
@@ -138,6 +184,10 @@ for (const [label, mutate] of [
  ["pending team", t => t.state.state = "pending"], ["missing owner", t => t.seats[0].observed_owner = null],
  ["starting owner", t => t.seats[0].observed_owner.state = "starting"], ["nonzero owner", t => t.seats[0].observed_owner.generation = 1],
  ["wrong configured tuple", t => t.seats[0].observed_owner.configured = preset.fallbacks[0]],
+ ["Claude configured seat", t => { const seat = t.snapshot.seats[0]; seat.harness = "claude"; seat.model = "sonnet"; seat.reasoning = null; t.seats[0].configured = clone(seat); t.seats[0].observed_owner.configured = { harness: "claude", model: "sonnet", reasoning: null }; }],
+ ["unexpected observed tuple", t => t.seats[0].observed_owner.actual = tuple()],
+ ["unexpected process evidence", t => t.seats[0].observed_owner.process_count = 1],
+ ["unexpected thread evidence", t => t.seats[0].observed_owner.thread_bound = true],
 ]) test(`bootstrap zero-invoke gate: ${label}`, async () => {
  const t = bootable(); mutate(t); let calls = 0;
  assert.equal(r.canBootstrapSeat(t, "t1-backend"), false);

@@ -66,6 +66,8 @@ function bootstrapTeam() {
  const t = team("active"); t.capabilities.start = true;
  const { harness, model, reasoning } = t.snapshot.seats[0];
  t.seats[0].observed_owner = { generation: 0, state: "stale", since: "fixture", configured: { harness, model, reasoning }, actual: null, process_count: 0, thread_bound: false };
+ const claude = t.snapshot.seats[1];
+ t.seats[1].observed_owner = { generation: 0, state: "stale", since: "fixture", configured: { harness: claude.harness, model: claude.model, reasoning: claude.reasoning }, actual: null, process_count: 0, thread_bound: false };
  return t;
 }
 test("bootstrap CTA exists only for active/stale g0 enabled seat, not other seats", async () => {
