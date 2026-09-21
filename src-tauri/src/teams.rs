@@ -563,6 +563,8 @@ pub struct ResolveRemoteInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", content = "input", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TeamControlRequest {
+    Catalog,
+    Create(CreateTeamInput),
     ListPending,
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
@@ -577,6 +579,8 @@ pub enum TeamControlRequest {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "action", content = "result", rename_all = "snake_case")]
 pub enum TeamControlResponse {
+    Catalog(TeamCatalog),
+    Create(CreateTeamResult),
     ListPending(Vec<TeamView>),
     Approve(TeamView),
     Cancel(CancelPendingResult),
@@ -779,7 +783,10 @@ impl TeamEngine {
     }
 
     pub fn create_team(&self, actor: &AuthenticatedActor, input: CreateTeamInput) -> TeamResult<CreateTeamResult> {
-        if actor.principal() != "operator" { return Err(TeamError::state("operator context required")); }
+        if actor.principal() != "operator" && !actor.is_glados() {
+            return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "operator or authenticated glados context required"));
+        }
+        if actor.is_glados() { actor.revalidate_before_mutation().map_err(TeamError::from_message)?; }
         self.paths.ensure_runtime_roots()?;
         validate_team_name(&input.team)?;
         if !PROJECTS.contains(&input.project.as_str()) { return Err(TeamError::name("project is not in the canonical taxonomy")); }
@@ -804,6 +811,7 @@ impl TeamEngine {
         };
         let seats = derive_seats(&input.team, &input.seats)?;
         self.validate_collisions(&input.team, &seats)?;
+        if actor.is_glados() { actor.revalidate_before_mutation().map_err(TeamError::from_message)?; }
         let _team_lock = try_lock(&self.paths.team_locks, &input.team).map_err(TeamError::from_message)?;
         self.validate_collisions(&input.team, &seats)?;
 
@@ -849,6 +857,7 @@ impl TeamEngine {
         let stage_root = self.paths.staging.join(&staging_uuid);
         let staged_team = stage_root.join("team");
         let result = (|| {
+            if actor.is_glados() { actor.revalidate_before_mutation().map_err(TeamError::from_message)?; }
             ensure_private_dir(&staged_team).map_err(TeamError::from_message)?;
             ensure_private_dir(&stage_root.join("seats")).map_err(TeamError::from_message)?;
             write_private_bytes_atomic(&staged_team.join("team.json"), &snapshot_bytes, false).map_err(TeamError::from_message)?;
@@ -863,6 +872,7 @@ impl TeamEngine {
             }
             sync_tree(&stage_root)?;
             let destination = self.paths.teams.join(&input.team);
+            if actor.is_glados() { actor.revalidate_before_mutation().map_err(TeamError::from_message)?; }
             rename_no_replace(&staged_team, &destination).map_err(TeamError::from_message)?;
             sync_parent(&staged_team).map_err(TeamError::from_message)?;
             sync_parent(&destination).map_err(TeamError::from_message)?;
@@ -2047,6 +2057,14 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or_else(|| TeamError::io("project root unavailable"))?.to_path_buf();
     let engine = TeamEngine::new(home, project);
     match request {
+        TeamControlRequest::Catalog => {
+            authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.catalog().map(TeamControlResponse::Catalog)
+        }
+        TeamControlRequest::Create(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.create_team(&actor, input).map(TeamControlResponse::Create)
+        }
         TeamControlRequest::ListPending => {
             authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.list_teams().map(|teams| TeamControlResponse::ListPending(teams.into_iter().filter(|team| team.state.state == TeamLifecycle::Pending).collect()))
@@ -2354,6 +2372,70 @@ mod tests {
                 match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
             }
         }
+    }
+
+    #[test]
+    fn conversational_create_uses_authenticated_control_and_stays_pending() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("conversation-create");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let json = include_str!("../../mcp-server/test/fixtures/team-create-request.json");
+        // The exact request fixture is also consumed by the MCP tests.
+        let response = team_control_headless(json).unwrap();
+        let TeamControlResponse::Create(created) = response else { panic!("expected pending create response") };
+        assert_eq!(created.team.state.state, TeamLifecycle::Pending);
+        assert_eq!(created.team.state.generation, 0);
+        assert!(created.team.state.epic_id.is_none());
+        assert!(!created.team.capabilities.start);
+        assert_eq!(created.team.snapshot.seats.len(), 2);
+        for seat in &created.team.snapshot.seats {
+            assert!(!home.join(".claude/aperture").join(&seat.name).exists());
+            assert!(!home.join(".aperture/run/owner").join(format!("{}.json",seat.name)).exists());
+            assert!(!home.join(".aperture/run/hub-tokens").join(format!("{}.token",seat.name)).exists());
+        }
+        assert!(matches!(team_control_headless(r#"{"action":"catalog"}"#).unwrap(), TeamControlResponse::Catalog(_)));
+        assert!(team_control_headless(json).is_err(), "duplicate creation cannot silently retry");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn conversational_create_rejects_forgery_and_missing_capability_before_write() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("conversation-denied");
+        let _env = EnvRestore::set(&home);
+        let json = include_str!("../../mcp-server/test/fixtures/team-create-request.json");
+        assert!(team_control_headless(json).is_err());
+        assert!(!home.join(".aperture/teams").exists());
+        prepare_glados(&home);
+        for field in ["actor", "grants", "created_at", "creation_request_id", "source"] {
+            let mut forged: serde_json::Value = serde_json::from_str(json).unwrap();
+            forged["input"][field] = serde_json::json!("glados");
+            assert!(team_control_headless(&forged.to_string()).is_err());
+            assert!(!home.join(".aperture/teams").exists());
+        }
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let TeamControlRequest::Create(input) = serde_json::from_str(json).unwrap() else { unreachable!() };
+        assert!(engine.create_team(&AuthenticatedActor::launcher(), input).is_err());
+        assert!(!home.join(".aperture/teams").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn conversational_create_revalidates_replaced_capability_before_any_write() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("conversation-replaced-capability");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        let actor = authenticate_glados_control().unwrap();
+        let token = home.join(".aperture/run/hub-tokens/glados.token");
+        fs::rename(&token, token.with_extension("old")).unwrap();
+        fs::write(&token, b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        let engine = TeamEngine::new(home.clone(), project_root());
+        assert!(engine.create_team(&actor, fullstack_input("replaced")).is_err());
+        assert!(!home.join(".aperture/teams").exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

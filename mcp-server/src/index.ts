@@ -1,3 +1,4 @@
+import { createTeamSchema, parseCreatedTeam } from "./team-create.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -463,6 +464,40 @@ server.tool(
     try {
       const pending = parsePendingList(await invokeTeamControl({ action: "list_pending" }));
       return { content: [{ type: "text", text: JSON.stringify(pending.result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_get_creation_catalog",
+  "GLaDOS-only read-only native catalog of roles, repository availability and execution tuples. Use this before proposing a team; catalog configuration is not proof of live harness support. Claude managed launches remain unavailable.",
+  {},
+  async () => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const result = await invokeTeamControl({ action: "catalog" });
+      if (result.action !== "catalog" || !result.result || typeof result.result !== "object") throw new Error("E_CONTROL_FAILED: unexpected catalog response");
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_create",
+  "GLaDOS-only: after the operator confirms mission, repository and exact team composition, create a durable PENDING team. This never activates or starts workers. Use the native catalog first; team_approve_activation with the authorized epic remains a separate step. On unknown outcome inspect pending requests before retrying. No actor, grants or generated provenance input.",
+  { input: createTeamSchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = createTeamSchema.parse(input);
+      const result = parseCreatedTeam(await invokeTeamControl({ action: "create", input: request }), request);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
