@@ -102,6 +102,7 @@ export function createAgentList(container: HTMLElement) {
   // when a pending op flips, so the spinner shows even if the backend is
   // blocked inside a multi-second boot and list_agents is queued behind it.
   let lastAgents: AgentDef[] = [];
+  let teamSeatNames = new Set<string>();
   let lastAgentHash = "";
   let isBulkToggling = false;
 
@@ -150,7 +151,7 @@ export function createAgentList(container: HTMLElement) {
    *  next poll. */
   function render() {
     const now = Date.now();
-    const agents: AgentDef[] = lastAgents.map(a => ({
+    const agents: AgentDef[] = lastAgents.filter(a => !teamSeatNames.has(a.name)).map(a => ({
       ...a,
       op_pending: pendingOps.get(a.name) ?? null,
     }));
@@ -183,7 +184,7 @@ export function createAgentList(container: HTMLElement) {
     lastAgentHash = hash;
     wrapper.innerHTML = "";
 
-    const allRunning = agents.every(a => a.status === "running");
+    const allRunning = agents.length > 0 && agents.every(a => a.status === "running");
 
     const header = document.createElement("div");
     header.className = "agent-list__header";
@@ -200,12 +201,22 @@ export function createAgentList(container: HTMLElement) {
       toggleAll.textContent = allRunning ? "■ All" : "▶ All";
       toggleAll.addEventListener("click", () => { void bulkToggle(agents, allRunning); });
     }
+    if (!agents.length) toggleAll.disabled = true;
     header.appendChild(toggleAll);
     wrapper.appendChild(header);
 
-    agents.forEach((agent) => {
-      wrapper.appendChild(createAgentCard(agent, modal, refresh, lifecycle));
-    });
+    const coordination = new Set(["glados", "wheatley", "peppy"]);
+    for (const [title, group] of [
+      ["Coordination", agents.filter(a => coordination.has(a.name))],
+      ["Standing specialists", agents.filter(a => !coordination.has(a.name))],
+    ] as const) {
+      if (!group.length) continue;
+      const label = document.createElement("h3");
+      label.className = "section-title";
+      label.textContent = title;
+      wrapper.appendChild(label);
+      group.forEach(agent => wrapper.appendChild(createAgentCard(agent, modal, refresh, lifecycle)));
+    }
   }
 
   async function refresh() {
@@ -224,5 +235,11 @@ export function createAgentList(container: HTMLElement) {
   }
 
   refresh();
-  return { refresh };
+  return { refresh, setTeamSeats(names: string[]) {
+    const next = new Set(names);
+    if (next.size === teamSeatNames.size && [...next].every(n => teamSeatNames.has(n))) return;
+    teamSeatNames = next;
+    lastAgentHash = "";
+    render();
+  } };
 }

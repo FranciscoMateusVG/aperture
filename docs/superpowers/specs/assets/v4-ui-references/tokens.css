@@ -1,0 +1,37 @@
+/* Design reference only. Existing Aperture navy/amber palette; no runtime import. */
+:root {
+  --v4-canvas: #0f0f1a;
+  --v4-navigation: #0c0c18;
+  --v4-panel: #141428;
+  --v4-card: #1a1a2e;
+  --v4-hover: #222240;
+  --v4-text: #e0e0e0;
+  --v4-muted: #a6a6c0; /* Existing #8888aa raised for small metadata. */
+  --v4-border: #666684; /* Visible controls; decorative dividers use existing #2a2a4a. */
+  --v4-divider: #2a2a4a;
+  --v4-accent: #f39c12;
+  --v4-success: #2ecc71;
+  --v4-danger: #ff8b85;
+  --v4-focus: #8dccff;
+  --v4-font: -apple-system, BlinkMacSystemFont, sans-serif;
+  --v4-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --v4-type-small: 12px;
+  --v4-type-body: 14px;
+  --v4-type-heading: 20px;
+  --v4-type-title: 28px;
+  --v4-leading: 1.5;
+  --v4-space-1: 4px;
+  --v4-space-2: 8px;
+  --v4-space-3: 12px;
+  --v4-space-4: 16px;
+  --v4-space-6: 24px;
+  --v4-space-8: 32px;
+  --v4-radius: 6px;
+  --v4-dialog-radius: 12px;
+  --v4-target: 44px;
+  --v4-shadow: 0 24px 80px #00000066;
+  --v4-ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* No photography. Role initials/labels, not emoji-only status. New UI uses
+   1.5px decorative icon strokes; every icon-only control has a text label.
+   Motion: opacity/transform only, 160ms max; reduced-motion removes it. */

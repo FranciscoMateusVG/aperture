@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import { readFileSync } from "node:fs";
+import { managedHelloFields } from "./managed-identity.js";
 
 /**
  * Best-effort push notification to the comms-layer v2 WS hub (ws-hub.ts).
@@ -85,7 +86,14 @@ export function notifyHub(
         finish("unacked", "hub credential unavailable");
         return;
       }
-      ws!.send(JSON.stringify({ type: "hello", role: "producer", agent: AGENT_NAME, token }));
+      let managed: Record<string, unknown>;
+      try {
+        managed = managedHelloFields(AGENT_NAME, token);
+      } catch {
+        finish("unacked", "managed seat identity is invalid");
+        return;
+      }
+      ws!.send(JSON.stringify({ type: "hello", role: "producer", agent: AGENT_NAME, token, ...managed }));
       ws!.send(JSON.stringify({ type: "notify", ...note }));
     });
 

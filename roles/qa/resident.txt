@@ -1,0 +1,3 @@
+# Exactly two bodies; does not change any standing agent resident list.
+constitution
+qa-core

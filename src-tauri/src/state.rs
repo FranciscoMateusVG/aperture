@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use crate::team_replacement::native::NativePreparedReplacement;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDef {
@@ -87,4 +90,161 @@ pub struct AppState {
     #[allow(dead_code)]
     pub db_path: String,
     pub project_dir: String,
+    /// Opaque, launcher-local human replacement permits. The permit itself is
+    /// deliberately non-serializable and is removed before Start invokes the
+    /// consuming native seam. Keeping this behind its own mutex avoids holding
+    /// the global AppState lock across the bounded lifecycle operation.
+    pub team_preparations: Arc<Mutex<RuntimePermitStore>>,
+}
+
+const MAX_RUNTIME_PERMITS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PermitKey {
+    team: String,
+    seat: String,
+    generation: u64,
+}
+
+/// Process-local storage only. A lost map never reconstructs authority from
+/// disk; callers must run a fresh native Prepare, which revalidates the durable
+/// Ready evidence before issuing a replacement opaque id.
+pub struct RuntimePermitStore {
+    permits: HashMap<String, NativePreparedReplacement>,
+    reservations: HashSet<PermitKey>,
+}
+
+impl RuntimePermitStore {
+    pub fn new() -> Self {
+        Self { permits: HashMap::new(), reservations: HashSet::new() }
+    }
+
+    pub(crate) fn reserve(&mut self, team: &str, seat: &str, generation: u64) -> Result<(), String> {
+        let key = PermitKey { team: team.into(), seat: seat.into(), generation };
+        if self.reservations.contains(&key) {
+            return Err("E_STATE_CONFLICT: replacement preparation is already running".into());
+        }
+        let replacing_existing = self.permits.values().any(|permit| {
+            permit.team() == team && permit.seat() == seat && permit.generation() == generation
+        });
+        if !replacing_existing && self.permits.len() + self.reservations.len() >= MAX_RUNTIME_PERMITS {
+            return Err("E_RUNTIME_UNAVAILABLE: replacement permit capacity is exhausted".into());
+        }
+        self.reservations.insert(key);
+        Ok(())
+    }
+
+    pub(crate) fn cancel_reservation(&mut self, team: &str, seat: &str, generation: u64) {
+        self.reservations.remove(&PermitKey { team: team.into(), seat: seat.into(), generation });
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        id: String,
+        permit: NativePreparedReplacement,
+    ) -> Result<(), String> {
+        let key = PermitKey {
+            team: permit.team().into(),
+            seat: permit.seat().into(),
+            generation: permit.generation(),
+        };
+        if !self.reservations.remove(&key) || self.permits.contains_key(&id) {
+            return Err("E_STATE_CONFLICT: replacement permit reservation changed".into());
+        }
+        self.permits.retain(|_, existing| {
+            existing.team() != key.team
+                || existing.seat() != key.seat
+                || existing.generation() != key.generation
+        });
+        self.permits.insert(id, permit);
+        Ok(())
+    }
+
+    /// Validate all selectors before consuming. A mismatched request cannot
+    /// destroy the legitimate opaque permit.
+    pub(crate) fn take(
+        &mut self,
+        id: &str,
+        team: &str,
+        seat: &str,
+        generation: u64,
+    ) -> Result<NativePreparedReplacement, String> {
+        let Some(permit) = self.permits.get(id) else {
+            return Err("E_PREPARATION_EXPIRED: replacement preparation is unavailable".into());
+        };
+        if permit.team() != team || permit.seat() != seat || permit.generation() != generation {
+            return Err("E_PREPARATION_EXPIRED: replacement preparation selectors changed".into());
+        }
+        self.permits.remove(id).ok_or_else(|| {
+            "E_PREPARATION_EXPIRED: replacement preparation is unavailable".into()
+        })
+    }
+}
+
+// Aperture V4 shared execution/ownership DTOs. These are serialized to the UI,
+// but authoritative owner records (pid/token/thread/nonce) remain private to
+// owner.rs and are projected through OwnerSummary only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Harness {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionTuple {
+    pub harness: Harness,
+    pub model: String,
+    pub reasoning: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerState {
+    Starting,
+    Active,
+    Stale,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerSummary {
+    pub generation: u64,
+    pub state: OwnerState,
+    pub since: String,
+    pub configured: ExecutionTuple,
+    pub actual: Option<ExecutionTuple>,
+    pub process_count: u32,
+    pub thread_bound: bool,
+}
+
+#[cfg(test)]
+mod runtime_permit_store_tests {
+    use super::*;
+
+    #[test]
+    fn reservations_are_bounded_and_same_target_is_single_flight() {
+        let mut store = RuntimePermitStore::new();
+        store.reserve("t1", "t1-backend", 1).unwrap();
+        assert!(store.reserve("t1", "t1-backend", 1).unwrap_err().starts_with("E_STATE_CONFLICT"));
+        store.cancel_reservation("t1", "t1-backend", 1);
+        store.reserve("t1", "t1-backend", 1).unwrap();
+        store.cancel_reservation("t1", "t1-backend", 1);
+
+        for generation in 1..=MAX_RUNTIME_PERMITS as u64 {
+            store.reserve("t2", &format!("t2-seat-{generation}"), generation).unwrap();
+        }
+        assert!(store.reserve("t3", "t3-backend", 1).unwrap_err().starts_with("E_RUNTIME_UNAVAILABLE"));
+    }
 }
