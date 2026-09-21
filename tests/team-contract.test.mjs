@@ -145,3 +145,19 @@ test("repository choice uses served catalog only, never preset or project infere
 test("immutable repository is visible in pending and active approval context", () => {
  for (const state of ["pending", "active"]) assert.match(renderTeamGroup(team(state)), /repository: aperture \(immutable\)/);
 });
+
+// Real Rust conversational creation uses None -> {id:null, sha256:null}.
+test("conversation-created pending and active teams have no preset reference", async () => {
+ for (const state of ["pending", "active"]) {
+  const native = team(state); native.snapshot.preset = { id: null, sha256: null };
+  const api = createTeamCommands(async command => { assert.equal(command, "team_list"); return [native]; });
+  assert.deepEqual(await api.list(), [native]);
+  assert.match(renderTeamGroup(native), /t1/);
+ }
+});
+test("preset reference is an exact nullable pair, never a missing or mixed pair", () => {
+ for (const reference of [null, {}, {id:null}, {sha256:null}, {id:"fullstack",sha256:null}, {id:null,sha256:"a".repeat(64)}, {id:"",sha256:"a".repeat(64)}]) {
+  const native = team("active"); native.snapshot.preset = reference;
+  rejects(() => c.parseTeamView(native));
+ }
+});

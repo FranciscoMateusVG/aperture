@@ -126,7 +126,7 @@ export interface TeamSnapshot {
   repo: string;
   mission: string;
   acceptance: string;
-  preset: { id: string | null; sha256: string };
+  preset: { id: string; sha256: string } | { id: null; sha256: null };
   lead: string;
   seats: TeamSeat[];
   fallbacks: ExecutionTuple[];

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { createServer } from "vite";
 import { preset, catalog, team, clone } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
+const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts");
 const { createTeamsArea } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); const { createRuntimeCommands } = await vite.ssrLoadModule("/src/services/team-runtime.ts"); await vite.close();
 const tick = () => new Promise(r => setImmediate(r));
 async function setup(options, fn) {
@@ -150,5 +151,18 @@ test("stale rendered bootstrap actions cannot bypass current capability or faile
   await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
   f.api.list = async () => { throw new Error("unavailable"); }; await f.instance.refresh();
   t.capabilities.start = true; await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
+ });
+});
+
+test("Refresh renders a presetless native active team through the real command parser", async () => {
+ const native = team("active"); native.snapshot.preset = {id:null,sha256:null};
+ native.capabilities.start = true;
+ native.seats = native.snapshot.seats.map(configured => ({configured, observed_owner:{generation:0,state:"stale",since:"fixture",configured:{harness:configured.harness,model:configured.model,reasoning:configured.reasoning},actual:null,process_count:0,thread_bound:false}}));
+ const api = createTeamCommands(async command => { assert.equal(command,"team_list"); return [native]; });
+ await setup({api}, async f => {
+  assert.match(f.status.textContent,/Team state loaded/);
+  assert.match(f.teams.innerHTML,/t1-backend/);
+  assert.match(f.teams.innerHTML,/Bootstrap worker/);
+  assert.doesNotMatch(f.teams.innerHTML,/No teams registered/);
  });
 });

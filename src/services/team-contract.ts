@@ -47,6 +47,10 @@ export function parseTeamCatalog(v: unknown): TeamCatalog {
   if (new Set(repos.map(r => JSON.stringify([r.project, r.repo]))).size !== repos.length) return invalid();
   return v as unknown as TeamCatalog;
 }
+// Rust PresetSnapshotRef uses None/None for conversation-created teams.
+// Keep named presets hash-bound; a mixed/missing pair is still invalid.
+const presetReference = (v: unknown): boolean => record(v) &&
+  ((v.id === null && v.sha256 === null) || (str(v.id) && v.id.length > 0 && hash(v.sha256)));
 function owner(v: unknown): boolean {
   return v === null || (record(v) && int(v.generation) && oneOf(v.state, ["starting", "active", "stale", "quarantined"]) && str(v.since) &&
     isExecutionTuple(v.configured) && (v.actual === null || isExecutionTuple(v.actual)) && int(v.process_count) && typeof v.thread_bound === "boolean");
@@ -55,7 +59,7 @@ export function parseTeamView(v: unknown): TeamView {
   if (!record(v) || !record(v.snapshot) || !record(v.state) || !record(v.capabilities)) return invalid();
   const s = v.snapshot, state = v.state;
   if (s.schema_version !== 1 || !isRepositoryKey(s.repo) || ![s.team, s.project, s.mission, s.acceptance, s.lead, s.created_at, s.creation_request_id, s.staging_uuid].every(str) ||
-    !record(s.preset) || !(s.preset.id === null || str(s.preset.id)) || !hash(s.preset.sha256) ||
+    !presetReference(s.preset) ||
     !arr(s.seats, teamSeat) || !arr(s.fallbacks, isExecutionTuple) || !Array.isArray(s.grants)) return invalid();
   if (state.schema_version !== 1 || !oneOf(state.state, ["pending", "active", "failed", "archived"]) || !int(state.generation) ||
     !(state.epic_id === null || str(state.epic_id)) || !str(state.updated_at) ||

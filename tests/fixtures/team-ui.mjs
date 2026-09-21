@@ -23,7 +23,7 @@ export function created(input) {
  if (input) {
   const counts = new Map();
   const seats = input.seats.map(s => { const n = (counts.get(s.role) ?? 0) + 1; counts.set(s.role, n); return { ...s, name: `${input.team}-${s.role}${n === 1 ? "" : `-${n}`}` }; });
-  Object.assign(t.snapshot, { team: input.team, project: input.project, repo: input.repo, mission: input.mission, acceptance: input.acceptance, preset: { id: input.preset_id, sha256: preset.sha256 }, seats, lead: seats[input.lead_index]?.name, fallbacks: clone(input.fallbacks) });
+  Object.assign(t.snapshot, { team: input.team, project: input.project, repo: input.repo, mission: input.mission, acceptance: input.acceptance, preset: { id: input.preset_id, sha256: input.preset_id === null ? null : preset.sha256 }, seats, lead: seats[input.lead_index]?.name, fallbacks: clone(input.fallbacks) });
   t.seats = seats.map(configured => ({ configured, observed_owner: null }));
  }
  return { team: t, creation_request: { schema_version: 1, request_id: t.snapshot.creation_request_id, team: t.snapshot.team, project: t.snapshot.project, repo: t.snapshot.repo, snapshot_sha256: "b".repeat(64), expected_generation: 0, created_at: t.snapshot.created_at } }; }
