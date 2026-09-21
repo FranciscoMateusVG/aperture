@@ -80,7 +80,7 @@ export function parseReplacement(v: unknown, team: TeamView, seat: string, prepa
   return v as unknown as ReplacementView | PreparedReplacementView;
 }
 export function canStartReplacement(team: TeamView, seat: string, prepared: PreparedReplacementView | null, selection: ExecutionTuple): boolean {
-  return canInvoke(team, "replace") && (ownerGeneration(team, seat) ?? 0) > 0 && !!prepared && prepared.team === team.snapshot.team && prepared.seat === seat &&
+  return canPrepareReplacement(team, seat) && (ownerGeneration(team, seat) ?? 0) > 0 && !!prepared && prepared.team === team.snapshot.team && prepared.seat === seat &&
     prepared.generation === ownerGeneration(team, seat) && prepared.phase === "ready" && !!prepared.preparation_id &&
     prepared.blockers.length === 0 && Object.values(prepared.checks).every(v => v === "verified") &&
     selection.harness === "codex" && !!prepared.owner && prepared.owner.configured.harness === "codex" &&

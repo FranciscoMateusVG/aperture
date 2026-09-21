@@ -73,6 +73,24 @@ test("prepare permit remains startable after an authoritative same-generation re
  await api.start(refreshed, "t1-backend", permit, tuple());
  assert.equal(calls, 2);
 });
+for (const [label, mutate] of [
+ ["quarantined", t => t.seats[0].observed_owner.state = "quarantined"],
+ ["stale", t => t.seats[0].observed_owner.state = "stale"],
+ ["starting", t => t.seats[0].observed_owner.state = "starting"],
+ ["missing owner", t => t.seats[0].observed_owner = null],
+ ["observed tuple drift", t => t.seats[0].observed_owner.actual = clone(preset.fallbacks[0])],
+ ["missing process evidence", t => t.seats[0].observed_owner.process_count = 0],
+ ["missing thread binding", t => t.seats[0].observed_owner.thread_bound = false],
+]) test(`prepared Start rechecks the current target after refresh: ${label}`, async () => {
+ const initial = current(), permit = prepared(initial), refreshed = clone(initial); mutate(refreshed);
+ // The aggregate team flag deliberately stays true, as it can be supplied by
+ // another eligible seat. It must not authorize this changed target seat.
+ assert.equal(refreshed.capabilities.replace, true);
+ let calls = 0;
+ assert.equal(r.canStartReplacement(refreshed, "t1-backend", permit, tuple()), false);
+ await assert.rejects(r.createRuntimeCommands(async () => { calls++; }).start(refreshed, "t1-backend", permit, tuple()), e => e.code === "E_RUNTIME_UNAVAILABLE");
+ assert.equal(calls, 0);
+});
 test("Claude replacement selection remains zero-invoke even when team replace is available", async () => {
  const t = current(), p = prepared(t), selection = { harness: "claude", model: "sonnet", reasoning: null }; let calls = 0;
  assert.equal(r.canStartReplacement(t, "t1-backend", p, selection), false);
