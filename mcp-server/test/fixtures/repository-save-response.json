@@ -1,0 +1,51 @@
+{
+  "action": "save_repository",
+  "result": {
+    "schema_version": 1,
+    "sha256": "3c8342b2c77ea25679c7d4e86c900d38158f19e31bfc2236a8e0d9a7afb02a7f",
+    "repositories": [
+      {
+        "project": "project:aperture",
+        "repo": "aperture",
+        "display_name": "Aperture",
+        "enabled": true,
+        "available": true
+      },
+      {
+        "project": "project:beads-galaxy",
+        "repo": "beads-galaxy",
+        "display_name": "Beads Galaxy",
+        "enabled": true,
+        "available": false
+      },
+      {
+        "project": "project:frame",
+        "repo": "frame",
+        "display_name": "Frame",
+        "enabled": true,
+        "available": false
+      },
+      {
+        "project": "project:incluir",
+        "repo": "eunenem",
+        "display_name": "EuNeném",
+        "enabled": true,
+        "available": false
+      },
+      {
+        "project": "project:incluir",
+        "repo": "eunenem-engine",
+        "display_name": "EuNeném Engine",
+        "enabled": true,
+        "available": true
+      },
+      {
+        "project": "project:incluir",
+        "repo": "monorepo-incluir",
+        "display_name": "Programa Incluir",
+        "enabled": true,
+        "available": false
+      }
+    ]
+  }
+}

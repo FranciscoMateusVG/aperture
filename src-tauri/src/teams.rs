@@ -58,13 +58,17 @@ const PROJECTS: &[&str] = &[
     "project:frame",
 ];
 
-const REPO_CATALOG: &[(&str, &str, &str)] = &[
+const REPOSITORY_SEEDS: &[(&str, &str, &str)] = &[
     ("project:aperture", "aperture", "Aperture"),
     ("project:beads-galaxy", "beads-galaxy", "Beads Galaxy"),
     ("project:frame", "frame", "Frame"),
     ("project:incluir", "monorepo-incluir", "Programa Incluir"),
     ("project:incluir", "eunenem", "EuNeném"),
 ];
+
+#[path = "team_repository_catalog.rs"]
+mod repository_registry;
+pub use repository_registry::{RepositoryRegistryView, SaveRepositoryInput};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeamError {
@@ -564,6 +568,8 @@ pub struct ResolveRemoteInput {
 #[serde(tag = "action", content = "input", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TeamControlRequest {
     Catalog,
+    ListRepositories,
+    SaveRepository(SaveRepositoryInput),
     Create(CreateTeamInput),
     ListPending,
     Approve(ActivateTeamInput),
@@ -580,6 +586,8 @@ pub enum TeamControlRequest {
 #[serde(tag = "action", content = "result", rename_all = "snake_case")]
 pub enum TeamControlResponse {
     Catalog(TeamCatalog),
+    ListRepositories(RepositoryRegistryView),
+    SaveRepository(RepositoryRegistryView),
     Create(CreateTeamResult),
     ListPending(Vec<TeamView>),
     Approve(TeamView),
@@ -655,7 +663,7 @@ impl TeamEngine {
         let roles = self.role_catalog()?;
         Ok(TeamCatalog {
             roles,
-            repositories: repository_catalog(&self.paths.home),
+            repositories: repository_catalog(&self.paths.home)?,
             execution_tuples: execution_catalog(),
             limits: TeamLimits {
                 max_seats: MAX_SEATS,
@@ -790,7 +798,7 @@ impl TeamEngine {
         self.paths.ensure_runtime_roots()?;
         validate_team_name(&input.team)?;
         if !PROJECTS.contains(&input.project.as_str()) { return Err(TeamError::name("project is not in the canonical taxonomy")); }
-        resolve_repository(&self.paths.home, &input.project, &input.repo)?;
+        repository_registry::resolve_selected(&self.paths.home, &input.project, &input.repo)?;
         validate_text(&input.mission, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "mission")?;
         validate_text(&input.acceptance, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "acceptance")?;
         let role_ids: HashSet<String> = self.role_catalog()?.into_iter().map(|r| r.id).collect();
@@ -813,6 +821,9 @@ impl TeamEngine {
         self.validate_collisions(&input.team, &seats)?;
         if actor.is_glados() { actor.revalidate_before_mutation().map_err(TeamError::from_message)?; }
         let _team_lock = try_lock(&self.paths.team_locks, &input.team).map_err(TeamError::from_message)?;
+        // All admissions take team -> catalog; the catalog writer never takes a team lock.
+        let _catalog_lock = repository_registry::lock(&self.paths.home)?;
+        repository_registry::resolve_selected(&self.paths.home, &input.project, &input.repo)?;
         self.validate_collisions(&input.team, &seats)?;
 
         let staging_uuid = Uuid::new_v4().to_string();
@@ -1148,7 +1159,8 @@ impl TeamEngine {
         // Availability is deliberately checked again under the team lock. A
         // catalog entry disappearing between create and approval must not
         // publish a team whose immutable repository cannot be resolved.
-        resolve_repository(&self.paths.home, &view.snapshot.project, &view.snapshot.repo)?;
+        let _catalog_lock = repository_registry::lock(&self.paths.home)?;
+        repository_registry::resolve_selected(&self.paths.home, &view.snapshot.project, &view.snapshot.repo)?;
 
         let mut seat_names: Vec<_> = view.snapshot.seats.iter().map(|seat| seat.name.clone()).collect();
         seat_names.sort();
@@ -1340,11 +1352,10 @@ fn valid_repo_key(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-pub(crate) fn repository_binding_is_allowed(project: &str, repo: &str) -> bool {
-    valid_repo_key(repo)
-        && REPO_CATALOG.iter().any(|(allowed_project, allowed_repo, _)| {
-            *allowed_project == project && *allowed_repo == repo
-        })
+// A private, previously admitted snapshot keeps its binding independently of
+// mutable offers. Disabling an offer must never hide or strand an active team.
+pub(crate) fn repository_binding_is_wellformed(project: &str, repo: &str) -> bool {
+    PROJECTS.contains(&project) && valid_repo_key(repo)
 }
 
 fn repository_is_available(home: &Path, repo: &str) -> bool {
@@ -1369,21 +1380,18 @@ fn repository_is_available(home: &Path, repo: &str) -> bool {
         && (git_meta.is_dir() || (git_meta.is_file() && git_meta.nlink() == 1))
 }
 
-fn repository_catalog(home: &Path) -> Vec<RepositoryCatalogEntry> {
-    REPO_CATALOG.iter().map(|(project, repo, display_name)| RepositoryCatalogEntry {
-        project: (*project).into(),
-        repo: (*repo).into(),
-        display_name: (*display_name).into(),
-        available: repository_is_available(home, repo),
-    }).collect()
+fn repository_catalog(home: &Path) -> TeamResult<Vec<RepositoryCatalogEntry>> {
+    Ok(repository_registry::read(home)?.repositories.into_iter().filter(|r| r.enabled).map(|r| RepositoryCatalogEntry {
+        available: repository_is_available(home, &r.repo),
+        project: r.project, repo: r.repo, display_name: r.display_name,
+    }).collect())
 }
 
-/// Resolve a caller-selected repository key through the immutable native
-/// catalog. Project labels scope the allowlist but never choose a repository.
+/// Resolve an already-admitted immutable snapshot binding, not a new offer.
 pub(crate) fn resolve_repository(home: &Path, project: &str, repo: &str) -> TeamResult<PathBuf> {
     if repo.is_empty() { return Err(TeamError::new("E_REPO_REQUIRED", "repository selection is required")); }
-    if !repository_binding_is_allowed(project, repo) {
-        return Err(TeamError::new("E_REPO_NOT_IN_CATALOG", "repository is not allowlisted for the selected project"));
+    if !repository_binding_is_wellformed(project, repo) {
+        return Err(TeamError::new("E_REPO_NOT_IN_CATALOG", "stored repository binding is malformed"));
     }
     if !repository_is_available(home, repo) {
         return Err(TeamError::new("E_REPO_UNAVAILABLE", "selected repository is unavailable"));
@@ -1570,7 +1578,7 @@ fn validate_stored_team(team: &str, snapshot: &TeamSnapshot, state: &TeamStateFi
     if snapshot.schema_version != 1 || state.schema_version != 1 || snapshot.team != team || !PROJECTS.contains(&snapshot.project.as_str()) {
         return Err(TeamError::state("team snapshot identity is invalid"));
     }
-    if !repository_binding_is_allowed(&snapshot.project, &snapshot.repo) {
+    if !repository_binding_is_wellformed(&snapshot.project, &snapshot.repo) {
         return Err(TeamError::state("team snapshot repository binding is invalid"));
     }
     validate_team_name(&snapshot.team)?;
@@ -2061,6 +2069,14 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.catalog().map(TeamControlResponse::Catalog)
         }
+        TeamControlRequest::ListRepositories => {
+            authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.list_repositories().map(TeamControlResponse::ListRepositories)
+        }
+        TeamControlRequest::SaveRepository(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.save_repository(&actor, input).map(TeamControlResponse::SaveRepository)
+        }
         TeamControlRequest::Create(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.create_team(&actor, input).map(TeamControlResponse::Create)
@@ -2240,6 +2256,7 @@ fn checkpoint_error(error: CheckpointError) -> TeamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("team_repository_catalog_tests.rs");
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Barrier;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2372,6 +2389,62 @@ mod tests {
                 match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
             }
         }
+    }
+
+    #[test]
+    fn repository_registry_lock_serializes_admission_and_competing_saves() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("registry-lock");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        registry_fixture_repo(&home, "eunenem-engine");
+        let engine = TeamEngine::new(home.clone(), project_root());
+        let actor = authenticate_glados_control().unwrap();
+        let initial = engine.list_repositories().unwrap();
+        let pending = engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("lock-pending")).unwrap();
+        let held = repository_registry::lock(&home).unwrap();
+        assert_eq!(engine.save_repository(&actor, registry_fixture_input(&initial.sha256, true)).unwrap_err().code, "E_LOCK_HELD");
+        assert_eq!(engine.create_team(&AuthenticatedActor::operator_ui(), fullstack_input("lock-denied")).unwrap_err().code, "E_LOCK_HELD");
+        assert_eq!(engine.activate(&actor, ActivateTeamInput {
+            team: "lock-pending".into(), expected_generation: 0,
+            creation_request_id: pending.creation_request.request_id, epic_id: "aperture-fixture".into(),
+        }).unwrap_err().code, "E_LOCK_HELD");
+        assert!(!home.join(".aperture/teams/lock-denied").exists());
+        assert_eq!(engine.read_team_view("lock-pending").unwrap().state.state, TeamLifecycle::Pending);
+        drop(held);
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["Engine A", "Engine B"].into_iter().map(|display| {
+            let home = home.clone(); let barrier = barrier.clone(); let hash = initial.sha256.clone();
+            std::thread::spawn(move || {
+                let engine = TeamEngine::new(home, project_root());
+                let actor = authenticate_glados_control().unwrap();
+                let mut input = registry_fixture_input(&hash, true); input.display_name = display.into();
+                barrier.wait();
+                engine.save_repository(&actor, input)
+            })
+        }).collect();
+        let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results.into_iter().find_map(Result::err).unwrap();
+        assert!(matches!(error.code.as_str(), "E_LOCK_HELD" | "E_REPOSITORY_CONFLICT"));
+        assert_eq!(engine.list_repositories().unwrap().repositories.len(), REPOSITORY_SEEDS.len() + 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repository_control_matches_shared_real_request_and_response() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("registry-wire");
+        let _env = EnvRestore::set(&home);
+        prepare_glados(&home);
+        ensure_private_dir(&home.join("projects/eunenem-engine/.git")).unwrap();
+        let request = include_str!("../../mcp-server/test/fixtures/repository-save-request.json");
+        let expected: serde_json::Value = serde_json::from_str(include_str!("../../mcp-server/test/fixtures/repository-save-response.json")).unwrap();
+        let actual = serde_json::to_value(team_control_headless(request).unwrap()).unwrap();
+        assert_eq!(actual, expected, "real Rust output must match the fixture parsed by MCP");
+        let listed = serde_json::to_value(team_control_headless(r#"{"action":"list_repositories"}"#).unwrap()).unwrap();
+        assert_eq!(listed["result"], expected["result"]);
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

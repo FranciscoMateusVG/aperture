@@ -1,4 +1,5 @@
 import { createTeamSchema, parseCreatedTeam } from "./team-create.js";
+import { parseRepositoryRegistry, parseSavedRepository, saveRepositorySchema } from "./team-repositories.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -497,6 +498,39 @@ server.tool(
     try {
       const request = createTeamSchema.parse(input);
       const result = parseCreatedTeam(await invokeTeamControl({ action: "create", input: request }), request);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_list_repositories",
+  "GLaDOS-only: read the runtime repository registry (project, repo key, display name, enabled, local availability) with its current sha256 for CAS. Keys resolve only under HOME/projects; no paths are accepted or returned. Reloaded on every call.",
+  {},
+  async () => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const result = parseRepositoryRegistry(await invokeTeamControl({ action: "list_repositories" }), "list_repositories");
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_save_repository",
+  "GLaDOS-only: register or edit one repository offer (display_name / enabled) with CAS against expected_sha256 from team_list_repositories. project+repo identify the entry and are never remapped or deleted; disabling only blocks new team create/approve admissions and never touches existing teams. No paths, no actor, no activation.",
+  { input: saveRepositorySchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = saveRepositorySchema.parse(input);
+      const result = parseSavedRepository(await invokeTeamControl({ action: "save_repository", input: request }), request);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };

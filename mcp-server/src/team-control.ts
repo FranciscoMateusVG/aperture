@@ -1,4 +1,5 @@
 import type { CreateTeamSelectors } from "./team-create.js";
+import type { SaveRepositorySelectors } from "./team-repositories.js";
 import { spawn } from "node:child_process";
 import { constants, fstatSync, lstatSync, openSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
@@ -78,6 +79,8 @@ export interface RemoteResolutionSelectors extends RemoteTargetSelectors {
 
 export type TeamControlRequest =
   | { action: "catalog" }
+  | { action: "list_repositories" }
+  | { action: "save_repository"; input: SaveRepositorySelectors }
   | { action: "create"; input: CreateTeamSelectors }
   | { action: "list_pending" }
   | { action: "approve"; input: ActivationSelectors }

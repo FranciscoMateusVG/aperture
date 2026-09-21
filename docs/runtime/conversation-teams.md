@@ -7,6 +7,8 @@ internal implementation detail, not an operator editor.
 ## Creation boundary
 
 1. GLaDOS reads `team_get_creation_catalog` (the existing native catalog;
+   repository offers come from the runtime registry, see
+   [`repository-registry.md`](./repository-registry.md);
    repositories, roles and execution tuples are not inferred from labels).
 2. The operator confirms the mission, acceptance, repository, seats, lead and
    exact execution tuples. This is not permission to file new BEADS tasks
@@ -28,7 +30,8 @@ is introduced.
 ## Compatibility and limits
 
 GUI, MCP and `aperture-team-control` must be built/published from the integrated
-head. An old binary cannot handle the new `catalog` / `create` action. Existing
+head. An old binary cannot handle the new `catalog` / `create` /
+`list_repositories` / `save_repository` actions. Existing
 operator-native creation remains available internally; the preset editor is
 removed from the launcher surface. No standing manifest, history or task is
 removed or reassigned by the UI change.

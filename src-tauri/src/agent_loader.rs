@@ -230,7 +230,7 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     if state.state != "active"
         || snapshot.team != name
         || !is_valid_project_label(&snapshot.project)
-        || !crate::teams::repository_binding_is_allowed(&snapshot.project, &snapshot.repo)
+        || !crate::teams::repository_binding_is_wellformed(&snapshot.project, &snapshot.repo)
         || !is_valid_seat_name(&snapshot.lead)
     {
         return None;
@@ -908,6 +908,34 @@ mod tests {
         .unwrap();
         let unsafe_archive_root = load_agents_from_roots(&agents, &teams);
         assert!(!unsafe_archive_root.contains_key("p1-backend"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loader_keeps_admitted_dynamic_repository_independent_of_mutable_offers() {
+        let root = temp_dir("dynamic-repository");
+        let agents = root.join("agents");
+        let teams = root.join("teams");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&teams).unwrap();
+        write_agent(&agents, "mural-frontend", true, true);
+        write_team(&teams, "mural", "active", &[("mural-frontend", "frontend")]);
+        let path = teams.join("mural/team.json");
+        let mut snapshot: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        snapshot["project"] = serde_json::json!("project:incluir");
+        snapshot["repo"] = serde_json::json!("eunenem-engine");
+        fs::write(&path, snapshot.to_string()).unwrap();
+        assert!(load_agents_from_roots(&agents, &teams).contains_key("mural-frontend"));
+        // The private snapshot was admitted earlier. Corruption of offers is
+        // not permission to strand its workers or erase it from the roster.
+        fs::write(root.join("repositories.json"), b"corrupt").unwrap();
+        assert!(load_agents_from_roots(&agents, &teams).contains_key("mural-frontend"));
+        for (field, value) in [("repo", "../elsewhere"), ("project", "project:unknown")] {
+            let mut invalid = snapshot.clone();
+            invalid[field] = serde_json::json!(value);
+            fs::write(&path, invalid.to_string()).unwrap();
+            assert!(!load_agents_from_roots(&agents, &teams).contains_key("mural-frontend"));
+        }
         let _ = fs::remove_dir_all(root);
     }
 
