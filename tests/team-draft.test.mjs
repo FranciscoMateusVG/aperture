@@ -33,7 +33,7 @@ test("lead must refer to a remaining seat after removal", () => {
   for (const lead_index of [-1, 1, 0.5, NaN]) assert.ok(validateTeamDraft({ ...draft(), lead_index }).some(x => x.field === "lead_index"));
   assert.ok(validateTeamDraft({ ...draft(), seats: [] }).some(x => x.field === "seats"));
 });
-test("required mission, acceptance and canonical project", () => {
+test("required mission, acceptance and well-formed project", () => {
   for (const field of ["mission", "acceptance", "project"]) assert.ok(validateTeamDraft({ ...draft(), [field]: " " }).some(x => x.field === field));
 });
 test("role and duplicate bound at 99, no truncated names", () => {
@@ -65,7 +65,7 @@ test("v2 human-text boundaries count Unicode scalars and reject controls without
   assert.equal(validHumanText(" leading and trailing ", 80, 320), true);
 });
 test("v2 taxonomy and total budgets", () => {
-  assert.ok(validateTeamDraft({ ...draft(), project: "project:new-unapproved" }).some(x => x.field === "project"));
+  assert.ok(validateTeamDraft({ ...draft(), project: "project:../invalid" }).some(x => x.field === "project"));
   assert.ok(validateTeamDraft({ ...draft(), mission: "a".repeat(2001) }).some(x => x.field === "mission"));
   assert.ok(validateTeamDraft({ ...draft(), fallbacks: Array.from({ length: 17 }, () => draft().fallbacks[0]) }).some(x => x.field === "fallbacks"));
   assert.ok(validateTeamDraft({ ...draft(), seats: Array.from({ length: 100 }, () => ({ ...seat })) }).some(x => x.field === "seats"));

@@ -50,14 +50,6 @@ const MAX_DISPLAY_BYTES: usize = 320;
 const MAX_MISSION_SCALARS: usize = 2_000;
 const MAX_MISSION_BYTES: usize = 8_000;
 
-const PROJECTS: &[&str] = &[
-    "project:aperture",
-    "project:incluir",
-    "project:beads-galaxy",
-    "project:mempalace",
-    "project:frame",
-];
-
 const REPOSITORY_SEEDS: &[(&str, &str, &str)] = &[
     ("project:aperture", "aperture", "Aperture"),
     ("project:beads-galaxy", "beads-galaxy", "Beads Galaxy"),
@@ -572,6 +564,8 @@ pub enum TeamControlRequest {
     SaveRepository(SaveRepositoryInput),
     Create(CreateTeamInput),
     ListPending,
+    ListTeams,
+    BootstrapSeat(BootstrapSeatInput),
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
     Checkpoint(WriteCheckpointInput),
@@ -590,6 +584,8 @@ pub enum TeamControlResponse {
     SaveRepository(RepositoryRegistryView),
     Create(CreateTeamResult),
     ListPending(Vec<TeamView>),
+    ListTeams(Vec<TeamView>),
+    BootstrapSeat(BootstrapView),
     Approve(TeamView),
     Cancel(CancelPendingResult),
     Checkpoint(CheckpointReceipt),
@@ -797,7 +793,7 @@ impl TeamEngine {
         if actor.is_glados() { actor.revalidate_before_mutation().map_err(TeamError::from_message)?; }
         self.paths.ensure_runtime_roots()?;
         validate_team_name(&input.team)?;
-        if !PROJECTS.contains(&input.project.as_str()) { return Err(TeamError::name("project is not in the canonical taxonomy")); }
+        if !valid_project_label(&input.project) { return Err(TeamError::name("project label is malformed")); }
         repository_registry::resolve_selected(&self.paths.home, &input.project, &input.repo)?;
         validate_text(&input.mission, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "mission")?;
         validate_text(&input.acceptance, MAX_MISSION_SCALARS, MAX_MISSION_BYTES, "acceptance")?;
@@ -1352,10 +1348,14 @@ fn valid_repo_key(value: &str) -> bool {
         && value.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn valid_project_label(value: &str) -> bool {
+    value.strip_prefix("project:").map(valid_repo_key).unwrap_or(false)
+}
+
 // A private, previously admitted snapshot keeps its binding independently of
 // mutable offers. Disabling an offer must never hide or strand an active team.
 pub(crate) fn repository_binding_is_wellformed(project: &str, repo: &str) -> bool {
-    PROJECTS.contains(&project) && valid_repo_key(repo)
+    valid_project_label(project) && valid_repo_key(repo)
 }
 
 fn repository_is_available(home: &Path, repo: &str) -> bool {
@@ -1575,7 +1575,7 @@ fn remove_private_tree(path: &Path, fixed_root: &Path) -> TeamResult<()> {
 }
 
 fn validate_stored_team(team: &str, snapshot: &TeamSnapshot, state: &TeamStateFile) -> TeamResult<()> {
-    if snapshot.schema_version != 1 || state.schema_version != 1 || snapshot.team != team || !PROJECTS.contains(&snapshot.project.as_str()) {
+    if snapshot.schema_version != 1 || state.schema_version != 1 || snapshot.team != team || !valid_project_label(&snapshot.project) {
         return Err(TeamError::state("team snapshot identity is invalid"));
     }
     if !repository_binding_is_wellformed(&snapshot.project, &snapshot.repo) {
@@ -1919,14 +1919,17 @@ pub fn team_bootstrap_seat(
     input: BootstrapSeatInput,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> TeamResult<BootstrapView> {
+    bootstrap_seat(&engine_from_state(&state)?, &AuthenticatedActor::operator_ui(), input)
+}
+
+fn bootstrap_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: BootstrapSeatInput) -> TeamResult<BootstrapView> {
     validate_team_name(&input.team)?;
     if !is_valid_seat_name(&input.seat) || input.expected_generation != 0 {
         return Err(TeamError::new("E_GENERATION_MISMATCH", "bootstrap selectors are invalid"));
     }
-    let engine = engine_from_state(&state)?;
     let started = bootstrap_authorized(
         &engine.paths.home,
-        &AuthenticatedActor::operator_ui(),
+        actor,
         &input.team,
         &input.seat,
         input.expected_generation,
@@ -2080,6 +2083,14 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
         TeamControlRequest::Create(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.create_team(&actor, input).map(TeamControlResponse::Create)
+        }
+        TeamControlRequest::BootstrapSeat(input) => {
+            let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            bootstrap_seat(&engine, &actor, input).map(TeamControlResponse::BootstrapSeat)
+        }
+        TeamControlRequest::ListTeams => {
+            authenticate_glados_control().map_err(TeamError::from_message)?;
+            engine.list_teams().map(TeamControlResponse::ListTeams)
         }
         TeamControlRequest::ListPending => {
             authenticate_glados_control().map_err(TeamError::from_message)?;
@@ -2389,6 +2400,58 @@ mod tests {
                 match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
             }
         }
+    }
+
+    include!("team_project_runtime_tests.rs");
+
+    #[test]
+    fn glados_bootstrap_receipt_matches_shared_native_wire_fixture() {
+        let tuple = ExecutionTuple { harness: Harness::Codex, model: "gpt-5.6-sol".into(), reasoning: Some(ReasoningEffort::High) };
+        let response = TeamControlResponse::BootstrapSeat(BootstrapView {
+            team: "mural".into(), seat: "mural-frontend".into(), generation: 1,
+            phase: BootstrapPhase::Started, owner: Some(OwnerSummary {
+                generation: 1, state: crate::state::OwnerState::Active, since: "2026-09-21T00:00:00Z".into(),
+                configured: tuple.clone(), actual: Some(tuple), process_count: 1, thread_bound: true,
+            }), blockers: vec![],
+        });
+        let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/team-bootstrap-response.json")).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), expected);
+    }
+
+    #[test]
+    fn glados_bootstrap_control_uses_real_capability_and_strict_selectors() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("glados-bootstrap-control");
+        let _env = EnvRestore::set(&home);
+        let request = r#"{"action":"bootstrap_seat","input":{"team":"t1","seat":"t1-frontend","expected_generation":1}}"#;
+        assert_eq!(team_control_headless(request).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        // The real authenticated child reaches selector validation, not a fake
+        // operator actor. No real launch or state mutation is needed for this test.
+        assert_eq!(team_control_headless(request).unwrap_err().code, "E_GENERATION_MISMATCH");
+        for key in ["actor", "model", "timeout", "generation", "token"] {
+            let mut forged: serde_json::Value = serde_json::from_str(request).unwrap();
+            forged["input"][key] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<TeamControlRequest>(forged).is_err());
+        }
+        let actor = authenticate_glados_control().unwrap();
+        assert_eq!(bootstrap_authorized(&home, &actor, "t1", "t1-frontend", 1).unwrap_err(),
+            crate::team_replacement::ReplacementError::GenerationMismatch);
+        // Capability is valid at preflight; a replacement before final commit
+        // must fail under the same lock activation uses, without owner mutation.
+        drop(crate::team_replacement::native::lock_activation(&home, "t1", Some(&actor)).unwrap());
+        let token = home.join(".aperture/run/hub-tokens/glados.token");
+        let replaced = token.with_extension("replacement");
+        fs::write(&replaced, b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        fs::set_permissions(&replaced, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(replaced, token).unwrap();
+        assert_eq!(bootstrap_authorized(&home, &actor, "t1", "t1-frontend", 0).unwrap_err(),
+            crate::team_replacement::ReplacementError::AuthorizationRequired);
+        assert!(matches!(crate::team_replacement::native::lock_activation(&home, "t1", Some(&actor)),
+            Err(crate::team_replacement::ReplacementError::AuthorizationRequired)));
+        assert!(!home.join(".aperture/run/owner/t1-frontend.json").exists());
+        assert!(!home.join(".aperture/teams/t1").exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

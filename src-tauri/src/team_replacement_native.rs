@@ -16,6 +16,18 @@ struct NativeStarted {
     child: Option<launch_gate::ReleasedChild>,
     candidate: StartedCandidate,
 }
+// Only native UI authority or the current authenticated GLaDOS capability may
+// bootstrap; a launcher/worker or a caller-supplied principal is not authority.
+fn authorize_bootstrap(actor: &AuthenticatedActor) -> Result<(), ReplacementError> {
+    if actor.is_glados() {
+        actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)
+    } else if actor.principal() == "operator" {
+        Ok(())
+    } else {
+        Err(ReplacementError::AuthorizationRequired)
+    }
+}
+
 /// Internal native result; transport must project OwnerSummary and never expose
 /// StartedReplacement.thread_id. No caller tuple in the bootstrap command.
 pub(crate) fn bootstrap_authorized(
@@ -26,9 +38,7 @@ pub(crate) fn bootstrap_authorized(
     expected_generation: u64,
 ) -> Result<StartedReplacement, ReplacementError> {
     let budget = deadline::Deadline::new();
-    if actor.principal() != "operator" {
-        return Err(ReplacementError::AuthorizationRequired);
-    }
+    authorize_bootstrap(actor)?;
     if expected_generation != 0 {
         return Err(ReplacementError::GenerationMismatch);
     }
@@ -50,6 +60,7 @@ pub(crate) fn bootstrap_authorized(
     };
     let plan =
         launch::NativeLaunchBinding::preflight(home, team, seat, &selected, &repo, None, &budget)?;
+    authorize_bootstrap(actor)?;
     let mut attempt = deadline::RuntimeAttempt::begin_bootstrap(
         home,
         &AuthenticatedActor::launcher(),
@@ -58,14 +69,14 @@ pub(crate) fn bootstrap_authorized(
         budget,
     )?;
     attempt.admit_effects()?;
-    let mut started = match start_native(home, team, seat, 0, selected, &plan, &attempt) {
+    let mut started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor)) {
         Ok(v) => v,
         Err(e) => {
             let _ = attempt.finish_unknown();
             return Err(e);
         }
     };
-    if let Err(e) = activate_native(home, team, &started, &attempt) {
+    if let Err(e) = authorize_bootstrap(actor).and_then(|_| activate_native(home, team, &started, &attempt, Some(actor))) {
         let cleaned = cleanup_native(
             home,
             team,
@@ -106,6 +117,7 @@ fn start_native(
     selected: ExecutionTuple,
     plan: &launch::NativeLaunchBinding,
     attempt: &deadline::RuntimeAttempt,
+    bootstrap_actor: Option<&AuthenticatedActor>,
 ) -> Result<NativeStarted, ReplacementError> {
     attempt.budget().forward(Duration::from_secs(90))?;
     plan.revalidate(attempt.budget())?;
@@ -114,6 +126,7 @@ fn start_native(
     let reservation = {
         let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
             .map_err(|_| ReplacementError::NativeFailure)?;
+        if let Some(actor) = bootstrap_actor { authorize_bootstrap(actor)?; }
         store
             .reserve_start(&launcher, seat, generation, selected.clone())
             .map_err(|_| ReplacementError::GenerationMismatch)?
@@ -124,6 +137,7 @@ fn start_native(
             .map_err(|_| ReplacementError::NativeFailure)?;
         let spec = plan.publish(&reservation, &token, attempt.budget())?;
         attempt.budget().forward(Duration::from_secs(85))?;
+        if let Some(actor) = bootstrap_actor { authorize_bootstrap(actor)?; }
         let pending = launch_gate::spawn(spec).map_err(|_| ReplacementError::OutcomeUnknown)?;
         let metadata = match team_process::native::capture_gated_child(&pending) {
             Ok(p) => p,
@@ -231,11 +245,22 @@ fn start_native(
         }
     }
 }
+/// Revalidate at the actual Active commit boundary, not before observation IO.
+pub(crate) fn lock_activation(
+    home: &Path, team: &str, bootstrap_actor: Option<&AuthenticatedActor>,
+) -> Result<crate::owner::AdvisoryLock, ReplacementError> {
+    let lock = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
+        .map_err(|_| ReplacementError::NativeFailure)?;
+    if let Some(actor) = bootstrap_actor { authorize_bootstrap(actor)?; }
+    Ok(lock)
+}
+
 fn activate_native(
     home: &Path,
     team: &str,
     started: &NativeStarted,
     attempt: &deadline::RuntimeAttempt,
+    bootstrap_actor: Option<&AuthenticatedActor>,
 ) -> Result<(), ReplacementError> {
     attempt.budget().forward(Duration::from_secs(1))?;
     let observation = model_observation::read_native(home, team, &started.reservation)
@@ -249,8 +274,7 @@ fn activate_native(
             observation.into_runtime_observation(),
         )
         .map_err(|_| ReplacementError::ModelUnverified)?;
-    let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
-        .map_err(|_| ReplacementError::NativeFailure)?;
+    let _team = lock_activation(home, team, bootstrap_actor)?;
     attempt.budget().forward(Duration::from_secs(1))?;
     let owner = store
         .commit_start(&launcher, &started.reservation)
@@ -1232,6 +1256,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
             selected,
             &plan,
             &self.attempt,
+            None,
         )?;
         let result = started.candidate.clone();
         self.started = Some(started);
@@ -1248,7 +1273,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         {
             return Err(ReplacementError::ModelUnverified);
         }
-        activate_native(self.home, &self.target.team, started, &self.attempt)
+        activate_native(self.home, &self.target.team, started, &self.attempt, None)
     }
     fn abort_started(&mut self, candidate: &StartedCandidate) -> Result<(), ReplacementError> {
         let started = self

@@ -4,7 +4,7 @@ import { isValidSeatName } from "./seat-name";
 export interface DraftIssue { field: string; message: string }
 const TEAM_RE = /^[a-z0-9][a-z0-9_-]{0,15}$/;
 const ROLE_RE = /^[a-z0-9][a-z0-9_-]{0,9}$/;
-const PROJECTS = new Set(["project:aperture", "project:incluir", "project:beads-galaxy", "project:mempalace", "project:frame"]);
+const PROJECT = /^project:[a-z][a-z0-9._-]{0,63}$/;
 const HUMAN_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/;
 
@@ -59,7 +59,7 @@ export function validateTeamDraft(
   const add = (field: string, message: string) => issues.push({ field, message });
   if (!TEAM_RE.test(input.team)) add("team", "Use 1–16 lowercase letters, digits, hyphens or underscores; start with a letter or digit.");
   if (knownTeamNames.includes(input.team) || RESERVED.has(input.team)) add("team", "This team name is reserved or already in use, including archived teams.");
-  if (!PROJECTS.has(input.project)) add("project", "Enter the canonical project label, for example project:aperture.");
+  if (!PROJECT.test(input.project)) add("project", "Enter the registered project label, normally project:<repository-key>.");
   if (!validHumanText(input.mission, 2000, 8000)) add("mission", "Describe a mission of up to 2,000 characters without control characters.");
   if (!validHumanText(input.acceptance, 2000, 8000)) add("acceptance", "Describe acceptance in up to 2,000 characters without control characters.");
   if (!input.seats.length || input.seats.length > 99) add("seats", "Use between 1 and 99 seats.");

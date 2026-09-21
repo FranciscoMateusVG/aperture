@@ -18,7 +18,13 @@ Keys resolve only as `$HOME/projects/<repo>`; no path, URL, actor, source or
 provenance is accepted from the caller. Enabling requires a safe local clone.
 An unavailable clone is never silently substituted with another repository.
 For example `eunenem` and `eunenem-engine` are distinct bindings. Project labels
-remain the existing five-value taxonomy; they do not select a repository.
+normally match the repository name, e.g. `project:eunenem-engine`. Their suffix
+uses the same 1–64 ASCII key syntax as repositories; no compiled project allowlist
+is required. An explicit different project name is allowed only through an
+operator-confirmed registry offer, not inferred from a label. Register the exact
+pair before create/approve. The legacy seeds remain unchanged for compatibility.
+Adding a new pair never relabels existing immutable team snapshots or BEADS
+history. Those transitions require an explicit separate decision.
 
 ## Durable configuration
 

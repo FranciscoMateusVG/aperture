@@ -83,6 +83,8 @@ export type TeamControlRequest =
   | { action: "save_repository"; input: SaveRepositorySelectors }
   | { action: "create"; input: CreateTeamSelectors }
   | { action: "list_pending" }
+  | { action: "list_teams" }
+  | { action: "bootstrap_seat"; input: { team: string; seat: string; expected_generation: number } }
   | { action: "approve"; input: ActivationSelectors }
   | { action: "cancel"; input: CancelSelectors }
   | { action: "checkpoint"; input: CheckpointSelectors }
@@ -150,7 +152,7 @@ function parseObject(text: string): Record<string, unknown> {
 }
 
 export function teamControlWatchdogMs(action: TeamControlRequest["action"]): number {
-  return action === "replace" ? REPLACE_TIMEOUT_MS : action === "archive" || action === "rollback_archive" ? ARCHIVE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
+  return (action === "replace" || action === "bootstrap_seat") ? REPLACE_TIMEOUT_MS : action === "archive" || action === "rollback_archive" ? ARCHIVE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
 }
 
 function killControlProcessGroup(child: ReturnType<typeof spawn>, isolated: boolean): void {
@@ -174,7 +176,7 @@ export async function invokeTeamControl(request: TeamControlRequest): Promise<Re
   const path = binaryPath();
   validateBinary(path);
   return await new Promise((resolve, reject) => {
-    const isolated = request.action === "replace" || request.action === "archive" || request.action === "rollback_archive";
+    const isolated = request.action === "bootstrap_seat" || request.action === "replace" || request.action === "archive" || request.action === "rollback_archive";
     const child = spawn(path, [], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,

@@ -6,13 +6,14 @@ import { z } from "zod";
  * no paths, no actor, no team or activation inference. Disabling an entry only
  * blocks new create/approve admissions; stored team bindings never read this.
  */
-const PROJECTS = ["project:aperture", "project:incluir", "project:beads-galaxy", "project:mempalace", "project:frame"] as const;
+
 const MAX_REPOSITORIES = 128;
 const MAX_DISPLAY_SCALARS = 80;
 const MAX_DISPLAY_BYTES = 320;
 // Same set the native validate_text rejects: control characters (Cc) plus bidi controls.
 const UNSAFE_TEXT = /[\p{Cc}\u{061c}\u{200e}\u{200f}\u{202a}-\u{202e}\u{2066}-\u{2069}]/u;
 
+export const projectLabelSchema = z.string().regex(/^project:[a-z][a-z0-9._-]{0,63}$/);
 export const repositoryKeySchema = z.string().min(1).max(64).regex(/^[a-z][a-z0-9._-]*$/);
 export const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const displayName = z.string().refine(v =>
@@ -20,7 +21,7 @@ const displayName = z.string().refine(v =>
   { message: "display_name must be 1-80 scalars, at most 320 bytes, without control or bidi characters" });
 
 export const saveRepositorySchema = z.object({
-  project: z.enum(PROJECTS),
+  project: projectLabelSchema,
   repo: repositoryKeySchema,
   display_name: displayName,
   enabled: z.boolean(),
@@ -29,7 +30,7 @@ export const saveRepositorySchema = z.object({
 export type SaveRepositorySelectors = z.infer<typeof saveRepositorySchema>;
 
 const entry = z.object({
-  project: z.enum(PROJECTS),
+  project: projectLabelSchema,
   repo: repositoryKeySchema,
   display_name: displayName,
   enabled: z.boolean(),

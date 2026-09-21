@@ -1,3 +1,4 @@
+import { bootstrapSeatSchema, bootstrapSelection, parseBootstrapStarted, parseTeamList } from "./team-bootstrap.js";
 import { createTeamSchema, parseCreatedTeam } from "./team-create.js";
 import { parseRepositoryRegistry, parseSavedRepository, saveRepositorySchema } from "./team-repositories.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -303,7 +304,7 @@ server.tool(
     priority: z.number().min(0).max(4).describe("Priority 0-4 (0 = highest)"),
     description: z.string().optional().describe("Task description. NOTE: avoid literal XML/HTML close-tag patterns like `</reason>`, `</notes>`, `</description>` inside the text — the tool-argument wire format can misinterpret them as parameter terminators, causing argument truncation. If you must reference such tags, use `&lt;/reason&gt;` or paraphrase (e.g. \"the reason field\")."),
     type: z.enum(["task", "bug", "feature", "chore", "epic"]).optional().describe("Task type. Defaults to 'task'."),
-    labels: z.array(z.string()).optional().describe("Labels to apply at creation. If provided, MUST contain exactly one `project:<name>` label (canonical: project:aperture, project:incluir, project:beads-galaxy, project:mempalace, project:frame). If omitted, no labels are set — add the project label separately via update_task add_labels."),
+    labels: z.array(z.string()).optional().describe("Labels to apply at creation. If provided, MUST contain exactly one `project:<name>` label (normally project:<repository-key>; explicit registered project bindings may differ). If omitted, no labels are set — add the project label separately via update_task add_labels."),
     assignee: z.string().optional().describe("Assignee (agent name: glados, wheatley, peppy, izzy, vance, rex, scout, cipher — or any string). Set without a separate update call."),
     acceptance: z.string().optional().describe("Testable acceptance criteria. NOTE: avoid literal XML/HTML close-tag patterns like `</acceptance>` inside the text; they can be misread as parameter terminators. Use `&lt;/...&gt;` or paraphrase."),
     blocked_by: z.array(z.string()).optional().describe("Task IDs that block this one. Each is wired up via `bd dep add <new> <blocker>` after creation."),
@@ -319,7 +320,7 @@ server.tool(
           return {
             content: [{
               type: "text",
-              text: `ERROR: project label required: must include exactly one project:<name> label (got ${projectLabels.length}: ${JSON.stringify(projectLabels)}). Canonical taxonomy: project:aperture, project:incluir, project:beads-galaxy, project:mempalace, project:frame.`,
+              text: `ERROR: project label required: must include exactly one project:<name> label (got ${projectLabels.length}: ${JSON.stringify(projectLabels)}). Use the exact project label registered for the selected repository.`,
             }],
             isError: true,
           };
@@ -481,6 +482,41 @@ server.tool(
     try {
       const result = await invokeTeamControl({ action: "catalog" });
       if (result.action !== "catalog" || !result.result || typeof result.result !== "object") throw new Error("E_CONTROL_FAILED: unexpected catalog response");
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_list",
+  "GLaDOS-only read-only team state, including native owner observations. Use this to orchestrate approved teams and inspect unknown outcomes; never infer that an active team means its workers are running.",
+  {},
+  async () => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const raw = await invokeTeamControl({ action: "list_teams" });
+      parseTeamList(raw);
+      return { content: [{ type: "text", text: JSON.stringify(raw) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_bootstrap_seat",
+  "GLaDOS-only: start one eligible Codex seat of an already approved team through native ownership, fresh session and exact model observation. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
+  { input: bootstrapSeatSchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = bootstrapSeatSchema.parse(input);
+      const expected = bootstrapSelection(await invokeTeamControl({ action: "list_teams" }), request);
+      const result = parseBootstrapStarted(await invokeTeamControl({ action: "bootstrap_seat", input: request }), request, expected);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };

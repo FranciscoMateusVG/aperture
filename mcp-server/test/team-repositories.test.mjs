@@ -45,8 +45,8 @@ test('save input mirrors native SaveRepositoryInput exactly and refuses authorit
   }
   assert.throws(() => saveRepositorySchema.parse({ ...input, enabled: 'true' }), 'string enabled');
 });
-test('project taxonomy, repository key, display text and digest are validated like the native side', () => {
-  for (const project of ['project:unknown', 'incluir', '']) assert.throws(() => saveRepositorySchema.parse({ ...input, project }), project);
+test('project syntax, repository key, display text and digest are validated like the native side', () => {
+  for (const project of ['project:../unknown', 'incluir', '']) assert.throws(() => saveRepositorySchema.parse({ ...input, project }), project);
   for (const repo of ['Eunenem', '-engine', 'a/b', '../x', 'x'.repeat(65), '']) assert.throws(() => saveRepositorySchema.parse({ ...input, repo }), repo);
   for (const repo of ['a', 'eunenem-engine', 'x.y_z-1']) assert.equal(saveRepositorySchema.parse({ ...input, repo }).repo, repo);
   for (const display_name of UNSAFE_DISPLAY) assert.throws(() => saveRepositorySchema.parse({ ...input, display_name }), JSON.stringify(display_name).slice(0, 24));
@@ -68,7 +68,7 @@ test('list response validates exact native envelope shape and refuses duplicates
     ['string available', r => { r.result.repositories[0].available = 'true'; }],
     ['missing enabled', r => { delete r.result.repositories[0].enabled; }],
     ['unsafe display', r => { r.result.repositories[0].display_name = X_BIDI_Y; }],
-    ['project outside taxonomy', r => { r.result.repositories[0].project = 'project:other'; }],
+    ['malformed project', r => { r.result.repositories[0].project = 'project:../other'; }],
     ['empty registry', r => { r.result.repositories = []; }],
     ['too many entries', r => { r.result.repositories = Array.from({ length: 129 }, (_, i) => ({ ...seeds[0], repo: `r${i}` })); }],
   ];

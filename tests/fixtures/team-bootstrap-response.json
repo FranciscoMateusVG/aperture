@@ -1,0 +1,27 @@
+{
+  "action": "bootstrap_seat",
+  "result": {
+    "team": "mural",
+    "seat": "mural-frontend",
+    "generation": 1,
+    "phase": "started",
+    "owner": {
+      "generation": 1,
+      "state": "active",
+      "since": "2026-09-21T00:00:00Z",
+      "configured": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "reasoning": "high"
+      },
+      "actual": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "reasoning": "high"
+      },
+      "process_count": 1,
+      "thread_bound": true
+    },
+    "blockers": []
+  }
+}

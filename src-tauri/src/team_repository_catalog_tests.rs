@@ -239,7 +239,7 @@ fn runtime_registry_invalid_request_or_unavailable_repo_never_publishes() {
         let mut input = registry_fixture_input(&hash, true);
         match field {
             "repo" => input.repo = "../eunenem-engine".into(),
-            "project" => input.project = "project:unknown".into(),
+            "project" => input.project = "project:../unknown".into(),
             "display" => input.display_name = "unsafe\ntext".into(),
             _ => input.expected_sha256 = "not-a-hash".into(),
         }

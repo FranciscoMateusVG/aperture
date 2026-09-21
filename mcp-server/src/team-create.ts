@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { projectLabelSchema } from "./team-repositories.js";
 
 const id = (max: number) => z.string().min(1).max(max).regex(/^[a-z0-9][a-z0-9_-]*$/);
 const text = z.string().min(1).refine(v => [...v].length <= 2000 && Buffer.byteLength(v) <= 8000);
@@ -10,7 +11,7 @@ const tuple = z.object({
 const seat = tuple.extend({ role: id(10) }).strict();
 export const createTeamSchema = z.object({
   team: id(16),
-  project: z.enum(["project:aperture", "project:incluir", "project:beads-galaxy", "project:mempalace", "project:frame"]),
+  project: projectLabelSchema,
   repo: z.string().min(1).max(64).regex(/^[a-z][a-z0-9._-]*$/),
   mission: text,
   acceptance: text,
