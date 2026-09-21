@@ -5,7 +5,7 @@ import { createServer } from "vite";
 import { preset, catalog, team, clone } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
 const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts");
-const { createTeamsArea } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); const { createRuntimeCommands } = await vite.ssrLoadModule("/src/services/team-runtime.ts"); await vite.close();
+const { createTeamsArea } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); await vite.close();
 const tick = () => new Promise(r => setImmediate(r));
 async function setup(options, fn) {
  class El {
@@ -78,79 +78,49 @@ test("tab handler follows arrow/home/end semantics between Coordination and Team
  });
 });
 
-function bootstrapTeam() {
+function startableTeam() {
  const t = team("active"); t.capabilities.start = true;
- const { harness, model, reasoning } = t.snapshot.seats[0];
- t.seats[0].observed_owner = { generation: 0, state: "stale", since: "fixture", configured: { harness, model, reasoning }, actual: null, process_count: 0, thread_bound: false };
- const claude = t.snapshot.seats[1];
- t.seats[1].observed_owner = { generation: 0, state: "stale", since: "fixture", configured: { harness: claude.harness, model: claude.model, reasoning: claude.reasoning }, actual: null, process_count: 0, thread_bound: false };
+ for (const seat of t.seats) seat.observed_owner = { generation: 0, state: "stale", since: "fixture", configured: { harness: seat.configured.harness, model: seat.configured.model, reasoning: seat.configured.reasoning }, actual: null, process_count: 0, thread_bound: false };
  return t;
 }
-test("bootstrap CTA exists only for active/stale g0 enabled seat, not other seats", async () => {
- for (const [enabled, mutate] of [[true, () => {}], [false, t => t.capabilities.start = false], [false, t => t.seats[0].observed_owner.generation = 1], [false, t => t.state.state = "pending"]]) {
-  const t = bootstrapTeam(); mutate(t);
+test("no manual start control exists for any seat state; start is coordinated by GLaDOS", async () => {
+ for (const mutate of [() => {}, t => { t.capabilities.start = false; }, t => { t.seats[0].observed_owner.generation = 1; }, t => { t.state.state = "pending"; }]) {
+  const t = startableTeam(); mutate(t);
   await setup({ api: { list: async () => [t] } }, async f => {
-   assert.equal(f.teams.innerHTML.includes('data-action="bootstrap"'), enabled);
-   if (enabled) assert.equal((f.teams.innerHTML.match(/data-action="bootstrap"/g) ?? []).length, 1);
+   assert.doesNotMatch(f.teams.innerHTML, /data-action="bootstrap"|Bootstrap worker/);
+   assert.match(f.teams.innerHTML, /coordinated by GLaDOS/);
+   assert.doesNotMatch(f.teams.innerHTML, /click .*start|start (the|a) worker|press .*start/i);
   });
  }
 });
-test("bootstrap click handler-contract locks duplicate start, avoids legacy and refreshes authoritative state", async () => {
- const t = bootstrapTeam(); let resolve, calls = 0, reads = 0, legacy = 0;
- await setup({ api: { list: async () => { reads++; return [t]; } }, openAgent: async () => { legacy++; },
-  runtime: { bootstrap: (input, seat) => { calls++; assert.equal(input, t); assert.equal(seat, "t1-backend"); return new Promise(r => { resolve = r; }); } } }, async f => {
-  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
-  const pending = f.root.handlers.click({ target: button }); await f.root.handlers.click({ target: button });
-  assert.equal(calls, 1); assert.equal(reads, 1); assert.equal(legacy, 0); assert.equal(f.refresh.disabled, true);
-  assert.match(f.status.textContent, /pending.*awaiting native evidence/);
-  const next = clone(t); next.seats[0].observed_owner.generation = 3; next.seats[0].observed_owner.state = "active"; next.seats[0].observed_owner.actual = next.seats[0].observed_owner.configured;
-  f.api.list = async () => { reads++; return [next]; };
-  resolve({ phase: "started", blockers: [] }); await pending;
-  assert.equal(reads, 2); assert.match(f.teams.innerHTML, /active · g3/); assert.equal(t.seats[0].observed_owner.generation, 0);
-  assert.doesNotMatch(f.teams.innerHTML, /data-action="bootstrap"/); assert.match(f.status.textContent, /reported started/);
- });
-});
-test("bootstrap unknown outcome requires explicit read refresh, no retry or local generation reset", async () => {
- let calls = 0, reads = 0; const t = bootstrapTeam();
- await setup({ api: { list: async () => { reads++; return [t]; } }, runtime: { bootstrap: async () => { calls++; throw { code: "E_RUNTIME_DEADLINE", message: "SECRET_SENTINEL" }; } } }, async f => {
-  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
+test("a synthetic bootstrap click is inert: no command, no status change, no lock", async () => {
+ let reads = 0; const t = startableTeam();
+ await setup({ api: { list: async () => { reads++; return [t]; } } }, async f => {
+  const before = f.status.textContent; const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
   await f.root.handlers.click({ target: button });
-  assert.equal(calls, 1); assert.equal(reads, 1); assert.match(f.status.textContent, /unknown.*[Rr]efresh/); assert.doesNotMatch(f.status.textContent, /SECRET_SENTINEL/);
-  const syntheticSecond = new f.El(); syntheticSecond.dataset = button.dataset;
-  await f.root.handlers.click({ target: syntheticSecond }); assert.equal(calls, 1);
-  assert.equal(f.refresh.disabled, false); assert.equal(t.seats[0].observed_owner.generation, 0);
-  await f.instance.refresh(); assert.equal(reads, 2); assert.equal(calls, 1);
+  assert.equal(reads, 1); assert.equal(f.status.textContent, before); assert.equal(f.refresh.disabled, false); assert.equal(button.disabled, false);
  });
 });
-test("bootstrap starting and blocked responses refresh but do not claim success", async () => {
- for (const phase of ["starting", "blocked"]) {
-  let reads = 0;
-  await setup({ api: { list: async () => { reads++; return [bootstrapTeam()]; } }, runtime: { bootstrap: async () => ({ phase, blockers: phase === "blocked" ? [{ code: "E_LAUNCH_UNAVAILABLE", reference: "fixture" }] : [] }) } }, async f => {
-   const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
-   await f.root.handlers.click({ target: button });
-   assert.equal(reads, 2); assert.match(f.status.textContent, /successful launch is not confirmed/); assert.doesNotMatch(f.status.textContent, /reported started/);
-  });
- }
-});
-
-
-test("malformed bootstrap response keeps unknown state and cannot trigger success refresh", async () => {
- let calls = 0, reads = 0;
- const runtime = createRuntimeCommands(async () => { calls++; return { phase: "started", owner: null }; });
- await setup({ api: { list: async () => { reads++; return [bootstrapTeam()]; } }, runtime }, async f => {
-  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
-  await f.root.handlers.click({ target: button }); assert.equal(calls, 1); assert.equal(reads, 1);
-  assert.match(f.status.textContent, /could not be confirmed/); assert.doesNotMatch(f.status.textContent, /reported started/);
+test("active card is compact by default: one row per seat, diagnostics and advanced actions only inside closed details", async () => {
+ const t = startableTeam();
+ await setup({ api: { list: async () => [t] } }, async f => {
+  const html = f.teams.innerHTML;
+  assert.equal((html.match(/<details class="v4-details">/g) ?? []).length, t.seats.length + 1, "one details per seat plus one for mission/actions");
+  assert.doesNotMatch(html, /<details[^>]*\sopen/);
+  for (const inside of ["Thread binding", "Checkpoint / context", "Replace worker", "Archive checklist", "Acceptance:"]) {
+   const at = html.indexOf(inside); assert.ok(at > 0, inside);
+   assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
+  }
+  assert.match(html, /2 seats · 0 active/); assert.match(html, /t1-backend · LEAD/); assert.match(html, /data-action="open-seat" data-seat="t1-backend"/);
+  const openAt = html.indexOf('data-action="open-seat"'); assert.ok(html.lastIndexOf("<details", openAt) < html.lastIndexOf("</details>", openAt) || html.lastIndexOf("<details", openAt) === -1, "Open stays on the seat row, outside details");
  });
 });
-test("stale rendered bootstrap actions cannot bypass current capability or failed refresh", async () => {
- let calls = 0;
- const t = bootstrapTeam(); t.capabilities.start = false;
- await setup({ api: { list: async () => [t] }, runtime: { bootstrap: async () => { calls++; } } }, async f => {
-  const button = new f.El(); button.dataset = { action: "bootstrap", team: "t1", seat: "t1-backend" };
-  await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
-  f.api.list = async () => { throw new Error("unavailable"); }; await f.instance.refresh();
-  t.capabilities.start = true; await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
+test("pending card keeps cancel visible and hides worker rows and worker actions", async () => {
+ await setup({}, async f => {
+  const html = f.teams.innerHTML;
+  assert.match(html, /data-action="cancel-pending"/); assert.match(html, /1 seats|2 seats/);
+  assert.doesNotMatch(html, /data-action="open-seat"|data-action="replace"|Bootstrap/);
+  assert.match(html, /start is coordinated by GLaDOS after approval/);
  });
 });
 
@@ -162,7 +132,7 @@ test("Refresh renders a presetless native active team through the real command p
  await setup({api}, async f => {
   assert.match(f.status.textContent,/Team state loaded/);
   assert.match(f.teams.innerHTML,/t1-backend/);
-  assert.match(f.teams.innerHTML,/Bootstrap worker/);
+  assert.match(f.teams.innerHTML,/coordinated by GLaDOS/); assert.doesNotMatch(f.teams.innerHTML,/Bootstrap worker/);
   assert.doesNotMatch(f.teams.innerHTML,/No teams registered/);
  });
 });

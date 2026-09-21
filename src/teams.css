@@ -91,6 +91,19 @@
 .v4-seat-facts dt { color: var(--v4-muted); font-size: 12px; }
 .v4-seat-facts dd { margin: 0; overflow-wrap: anywhere; }
 .v4-status { color: var(--v4-accent); }
+/* Compact team card: one-line header, one-line seat rows, everything else behind native details. */
+.v4-team__head { align-items: flex-start; }
+.v4-team__state { display: grid; justify-items: end; gap: 4px; }
+.v4-seats { list-style: none; display: grid; gap: 8px; margin: 12px 0; padding: 0; }
+.v4-seat { padding: 8px 12px; background: var(--v4-panel); border: 1px solid var(--v4-divider); border-radius: 6px; }
+.v4-seat__row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.v4-seat__name { font-weight: 600; }
+.v4-seat__row .v4-meta { flex: 1; min-width: 0; }
+.v4-button--small { min-height: 32px; padding: 4px 10px; }
+.v4-details { margin: 8px 0; }
+.v4-details > summary { cursor: pointer; color: var(--v4-muted); font: var(--v4-type-small) var(--v4-font); min-height: var(--v4-target); display: flex; align-items: center; }
+.v4-details > summary:focus-visible { outline: 2px solid var(--v4-focus); outline-offset: 2px; }
+.v4-details[open] > summary { color: var(--v4-text); }
 .v4-checklist { list-style: none; display: grid; gap: 12px; margin: 16px 0; padding: 0; }
 .v4-checklist li { padding: 12px; background: var(--v4-panel); border: 1px solid var(--v4-divider); border-radius: 6px; }
 @media (max-width: 700px) {
