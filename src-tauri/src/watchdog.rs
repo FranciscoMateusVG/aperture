@@ -824,6 +824,14 @@ fn execute_rekick(
     tier: RekickTier,
     attempt: u8,
 ) {
+    // A team seat cannot be nudged or torn down through the standing-seat
+    // recovery path. In particular, checking only boot_agent_headless is too
+    // late: Respawn already killed its window/app-server before that call.
+    // Filesystem truth, not AppState or UI filtering, is authoritative.
+    if crate::agents::require_legacy_lifecycle(name).is_err() {
+        eprintln!("[watchdog] re-kick denied: E_TEAM_LIFECYCLE_REQUIRED");
+        return;
+    }
     match tier {
         RekickTier::Nudge => {
             // Claude nudge: run the boot-routine turn in the EXISTING pane so the

@@ -33,6 +33,8 @@ export class FakeAppServer {
     this.threads = opts.threads ?? []; // [{ id: "..." }]
     this.delays = opts.delays ?? {}; // method → ms
     this.failures = opts.failures ?? {}; // method → remaining error count
+    this.threadStartModel = opts.threadStartModel;
+    this.threadStartReasoning = opts.threadStartReasoning;
     /** @type {{method: string, params: unknown, id: number|string|null, ts: number}[]} */
     this.calls = [];
     this.sockets = new Set();
@@ -100,7 +102,11 @@ export class FakeAppServer {
       case "thread/start": {
         const id = `t-fake-${++this.threadCounter}`;
         this.threads.unshift({ id });
-        result = { threadId: id };
+        result = {
+          thread: { id },
+          model: this.threadStartModel ?? msg.params?.model ?? "gpt-test",
+          reasoningEffort: this.threadStartReasoning ?? msg.params?.config?.model_reasoning_effort ?? "high",
+        };
         break;
       }
       // initialize, thread/resume, turn/start, turn/steer → empty result

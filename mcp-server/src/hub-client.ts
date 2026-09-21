@@ -53,6 +53,7 @@
  */
 
 import WebSocket from "ws";
+import { managedHelloFields } from "./managed-identity.js";
 import { readFileSync } from "node:fs";
 
 /** First reconnect delay; doubles on every consecutive failure. */
@@ -69,6 +70,8 @@ const STILL_DISCONNECTED_EVERY_MS = 5 * 60_000;
 const CLOSE_REPLACED = 4000;
 /** Hub close code: hello rejected (bad/missing token, bad agent name). */
 const CLOSE_HELLO_REJECTED = 4001;
+/** Hub close code: managed generation/token identity rejected. */
+const CLOSE_MANAGED_IDENTITY_REJECTED = 4003;
 
 const agent = process.argv[2];
 if (!agent) {
@@ -91,6 +94,7 @@ if (!token) {
   console.log("HUB_CLIENT_ERROR missing agent token");
   process.exit(2);
 }
+const agentToken = token as string;
 
 // ── Outage state ────────────────────────────────────────────────────────────
 // outageStartedAt is null while connected. attempts counts failed connection
@@ -172,8 +176,14 @@ function connect(): void {
   };
 
   ws.on("open", () => {
-    const hello: Record<string, unknown> = { type: "hello", role: "agent", agent };
-    hello.token = token;
+    let managed: Record<string, unknown>;
+    try {
+      managed = managedHelloFields(agent, agentToken);
+    } catch {
+      exitWithLine("HUB_IDENTITY_INVALID managed seat identity is invalid; fix launcher state before reconnecting", 1);
+      return;
+    }
+    const hello: Record<string, unknown> = { type: "hello", role: "agent", agent, token: agentToken, ...managed };
     ws.send(JSON.stringify(hello));
     onConnected();
     armStale();
@@ -199,9 +209,9 @@ function connect(): void {
       );
       return;
     }
-    if (code === CLOSE_HELLO_REJECTED) {
+    if (code === CLOSE_HELLO_REJECTED || code === CLOSE_MANAGED_IDENTITY_REJECTED) {
       exitWithLine(
-        `HUB_SOCKET_CLOSED code=${code} reason=${why} — hello rejected (token or agent name); fix and restart your inbox monitor`,
+        `HUB_SOCKET_CLOSED code=${code} reason=${why} — hello rejected (token, agent name, or managed identity); fix and restart your inbox monitor`,
         1,
       );
       return;

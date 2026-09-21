@@ -24,6 +24,8 @@ libc = "0.2"
 # docs/presence-dots-spec.md.
 tungstenite = "0.24"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 toml = "0.8"

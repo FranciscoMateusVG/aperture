@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { managedHelloFields } from "./managed-identity.js";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
@@ -114,7 +115,14 @@ try {
 }
 
 ws!.on("open", () => {
-  ws!.send(JSON.stringify({ type: "hello", role: "producer", agent, token }));
+  let managed: Record<string, unknown>;
+  try {
+    managed = managedHelloFields(agent, token);
+  } catch {
+    finish("managed seat identity is invalid");
+    return;
+  }
+  ws!.send(JSON.stringify({ type: "hello", role: "producer", agent, token, ...managed }));
   ws!.send(JSON.stringify({ type: "presence_hint", event }));
 });
 

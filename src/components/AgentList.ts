@@ -10,6 +10,9 @@ type PendingOp = NonNullable<AgentDef["op_pending"]>;
 
 const LIFECYCLE_ERROR_TTL_MS = 15_000;
 
+/** The only fixed launcher seats. Everyone else runs as a temporary team seat under Teams. */
+const COORDINATION_SEATS: ReadonlySet<string> = new Set(["glados", "wheatley", "peppy"]);
+
 const OP_VERB: Record<PendingOp, string> = {
   starting: "start",
   stopping: "stop",
@@ -102,6 +105,7 @@ export function createAgentList(container: HTMLElement) {
   // when a pending op flips, so the spinner shows even if the backend is
   // blocked inside a multi-second boot and list_agents is queued behind it.
   let lastAgents: AgentDef[] = [];
+  let teamSeatNames = new Set<string>();
   let lastAgentHash = "";
   let isBulkToggling = false;
 
@@ -136,6 +140,7 @@ export function createAgentList(container: HTMLElement) {
     render();
     // Yield to let the browser paint the spinner before kicking off Tauri calls
     await new Promise(r => requestAnimationFrame(r));
+    // `agents` is already the coordination roster, so bulk ops never reach team seats.
     const targets = allRunning ? agents : agents.filter(a => a.status !== "running");
     // Each op reports its own rejection into the strip (runOp) and carries
     // its own op_pending entry; allSettled just waits for the fleet.
@@ -150,7 +155,9 @@ export function createAgentList(container: HTMLElement) {
    *  next poll. */
   function render() {
     const now = Date.now();
-    const agents: AgentDef[] = lastAgents.map(a => ({
+    // Coordination roster: fixed seats only. Team seats (and any non-trio
+    // standing profile) never render here and never join bulk Start/Stop.
+    const agents: AgentDef[] = lastAgents.filter(a => COORDINATION_SEATS.has(a.name) && !teamSeatNames.has(a.name)).map(a => ({
       ...a,
       op_pending: pendingOps.get(a.name) ?? null,
     }));
@@ -183,11 +190,11 @@ export function createAgentList(container: HTMLElement) {
     lastAgentHash = hash;
     wrapper.innerHTML = "";
 
-    const allRunning = agents.every(a => a.status === "running");
+    const allRunning = agents.length > 0 && agents.every(a => a.status === "running");
 
     const header = document.createElement("div");
     header.className = "agent-list__header";
-    header.innerHTML = `<h3 class="section-title">Agents</h3>`;
+    header.innerHTML = `<h3 class="section-title">Coordination</h3>`;
 
     const toggleAll = document.createElement("button");
     if (isBulkToggling) {
@@ -200,12 +207,11 @@ export function createAgentList(container: HTMLElement) {
       toggleAll.textContent = allRunning ? "■ All" : "▶ All";
       toggleAll.addEventListener("click", () => { void bulkToggle(agents, allRunning); });
     }
+    if (!agents.length) toggleAll.disabled = true;
     header.appendChild(toggleAll);
     wrapper.appendChild(header);
 
-    agents.forEach((agent) => {
-      wrapper.appendChild(createAgentCard(agent, modal, refresh, lifecycle));
-    });
+    agents.forEach(agent => wrapper.appendChild(createAgentCard(agent, modal, refresh, lifecycle)));
   }
 
   async function refresh() {
@@ -224,5 +230,11 @@ export function createAgentList(container: HTMLElement) {
   }
 
   refresh();
-  return { refresh };
+  return { refresh, setTeamSeats(names: string[]) {
+    const next = new Set(names);
+    if (next.size === teamSeatNames.size && [...next].every(n => teamSeatNames.has(n))) return;
+    teamSeatNames = next;
+    lastAgentHash = "";
+    render();
+  } };
 }

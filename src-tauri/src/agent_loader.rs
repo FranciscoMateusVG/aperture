@@ -16,6 +16,7 @@ use crate::state::AgentDef;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// Per-agent metadata loaded from `~/.claude/aperture/<agent>/manifest.json`.
@@ -135,6 +136,7 @@ struct TeamGrant {
 struct TeamSnapshot {
     team: String,
     project: String,
+    repo: String,
     lead: String,
     seats: Vec<TeamSeat>,
     #[serde(default)]
@@ -157,6 +159,29 @@ fn path_entry_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+fn archive_journal_blocks(teams_root: &Path, team: &str) -> bool {
+    let Some(aperture_root) = teams_root.parent() else {
+        return true;
+    };
+    let journal_root = aperture_root.join("run/team-journals");
+    match fs::symlink_metadata(&journal_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0 =>
+        {
+            match fs::symlink_metadata(journal_root.join(format!("{team}.archive.json"))) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            }
+        }
+        _ => true,
+    }
+}
+
 fn path_inside(root: &Path, path: &Path) -> bool {
     match (fs::canonicalize(root), fs::canonicalize(path)) {
         (Ok(root), Ok(path)) => path.starts_with(root),
@@ -175,7 +200,11 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     let state_path = dir.join("state.json");
     let team_path = dir.join("team.json");
     let journal_path = dir.join("journal.json");
-    if !is_real_file(&state_path) || !is_real_file(&team_path) || path_entry_exists(&journal_path) {
+    if !is_real_file(&state_path)
+        || !is_real_file(&team_path)
+        || path_entry_exists(&journal_path)
+        || archive_journal_blocks(root, name)
+    {
         return None;
     }
     if !path_inside(&dir, &state_path) || !path_inside(&dir, &team_path) {
@@ -183,12 +212,16 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     }
     let state_before = fs::read_to_string(&state_path).ok()?;
     let team_before = fs::read_to_string(&team_path).ok()?;
-    if path_entry_exists(&journal_path) {
+    if path_entry_exists(&journal_path) || archive_journal_blocks(root, name) {
         return None;
     }
     let team_after = fs::read_to_string(&team_path).ok()?;
     let state_after = fs::read_to_string(&state_path).ok()?;
-    if path_entry_exists(&journal_path) || state_before != state_after || team_before != team_after {
+    if path_entry_exists(&journal_path)
+        || archive_journal_blocks(root, name)
+        || state_before != state_after
+        || team_before != team_after
+    {
         return None;
     }
     let state: TeamState = serde_json::from_str(&state_before).ok()?;
@@ -197,6 +230,7 @@ fn read_active_team(root: &Path, name: &str) -> Option<TeamSnapshot> {
     if state.state != "active"
         || snapshot.team != name
         || !is_valid_project_label(&snapshot.project)
+        || !crate::teams::repository_binding_is_allowed(&snapshot.project, &snapshot.repo)
         || !is_valid_seat_name(&snapshot.lead)
     {
         return None;
@@ -738,6 +772,7 @@ mod tests {
     use super::{is_valid_seat_name, link_codex_skills, load_agents_from_roots, parse_skill_lines, read_resident_list};
     use serde::Deserialize;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -807,6 +842,7 @@ mod tests {
             serde_json::json!({
                 "team": team,
                 "project": "project:aperture",
+                "repo": "aperture",
                 "lead": seats[0].0,
                 "seats": seats.iter().map(|(name, role)| serde_json::json!({"name": name, "role": role})).collect::<Vec<_>>(),
                 "grants": []
@@ -853,6 +889,25 @@ mod tests {
         fs::write(teams.join("p1/journal.json"), "{}").unwrap();
         let during_transition = load_agents_from_roots(&agents, &teams);
         assert!(!during_transition.contains_key("p1-backend"));
+        fs::remove_file(teams.join("p1/journal.json")).unwrap();
+        fs::create_dir_all(root.join("run/team-journals")).unwrap();
+        fs::set_permissions(
+            root.join("run/team-journals"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(root.join("run/team-journals/p1.archive.json"), "{}").unwrap();
+        let during_archive = load_agents_from_roots(&agents, &teams);
+        assert!(!during_archive.contains_key("p1-backend"));
+        fs::remove_file(root.join("run/team-journals/p1.archive.json")).unwrap();
+        fs::remove_dir(root.join("run/team-journals")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("does-not-exist"),
+            root.join("run/team-journals"),
+        )
+        .unwrap();
+        let unsafe_archive_root = load_agents_from_roots(&agents, &teams);
+        assert!(!unsafe_archive_root.contains_key("p1-backend"));
         let _ = fs::remove_dir_all(root);
     }
 
