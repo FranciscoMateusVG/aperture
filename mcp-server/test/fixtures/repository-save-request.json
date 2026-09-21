@@ -1,0 +1,10 @@
+{
+  "action": "save_repository",
+  "input": {
+    "project": "project:incluir",
+    "repo": "eunenem-engine",
+    "display_name": "EuNeném Engine",
+    "enabled": true,
+    "expected_sha256": "8dec2b20e8d1237a6e8f60b2f6cea4303a638967a7706d27eeef3b66077c3be2"
+  }
+}

@@ -1,4 +1,6 @@
 import "./style.css";
+import "./teams.css";
+import { createTeamsArea } from "./components/TeamsArea";
 import { createNavbar } from "./components/Navbar";
 import { createAgentList } from "./components/AgentList";
 import { createFooter } from "./components/Footer";
@@ -28,6 +30,18 @@ async function init() {
 
   // The agent launcher — the only feature the panel offers.
   const agentList = createAgentList(sidebarAgents);
+  const teamHost = document.createElement("div");
+  teamHost.id = "teams-area";
+  sidebarAgents.before(teamHost);
+  createTeamsArea(teamHost, sidebarAgents, {
+    listAgents: commands.listAgents,
+    onTeamSeats: names => agentList.setTeamSeats(names),
+    openAgent: async name => {
+      const agent = (await commands.listAgents()).find(a => a.name === name);
+      if (!agent?.tmux_window_id) throw new Error("No current window");
+      await commands.tmuxSelectWindow(agent.tmux_window_id);
+    },
+  });
 
   // Bottom-of-sidebar version line (semver · git SHA · build date).
   // Fire-and-forget: if it fails the launcher still works.

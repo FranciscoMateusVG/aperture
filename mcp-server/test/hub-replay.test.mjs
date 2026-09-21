@@ -51,7 +51,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,11 +95,17 @@ async function spawnHub({ bdFail = false } = {}) {
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-replay-agents-"));
   const teamsDir = mkdtempSync(join(tmpdir(), "hub-replay-teams-"));
   const dataDir = mkdtempSync(join(tmpdir(), "hub-replay-bdstub-"));
-  const tokenDir = mkdtempSync(join(tmpdir(), "hub-replay-tokens-"));
+  const homeDir = mkdtempSync(join(tmpdir(), "hub-replay-home-"));
+  chmodSync(homeDir, 0o700);
   // aperture-oeb6q: the hub now writes presence.json under APERTURE_RUN_DIR on
   // boot and on every presence change — isolate it so a test hub never
   // clobbers the developer's real ~/.aperture/run/presence.json.
-  const runDir = mkdtempSync(join(tmpdir(), "hub-replay-run-"));
+  const runDir = join(homeDir, ".aperture", "run");
+  mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  chmodSync(join(homeDir, ".aperture"), 0o700);
+  chmodSync(runDir, 0o700);
+  const tokenDir = join(runDir, "hub-tokens");
+  mkdirSync(tokenDir, { mode: 0o700 });
   for (const [principal, token] of Object.entries(TOKENS)) {
     writeFileSync(join(tokenDir, `${principal}.token`), token, { mode: 0o600 });
     if (principal !== "watchdog") {
@@ -114,6 +120,7 @@ async function spawnHub({ bdFail = false } = {}) {
 
   const env = {
     ...process.env,
+    HOME: homeDir,
     APERTURE_WS_PORT: String(port),
     APERTURE_AGENTS_DIR: emptyAgentsDir,
     APERTURE_TEAMS_DIR: teamsDir,
@@ -194,8 +201,7 @@ async function spawnHub({ bdFail = false } = {}) {
     rmSync(emptyAgentsDir, { recursive: true, force: true });
     rmSync(teamsDir, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
-    rmSync(tokenDir, { recursive: true, force: true });
-    rmSync(runDir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);

@@ -1,0 +1,17 @@
+{
+  "action": "create",
+  "input": {
+    "team": "conversation",
+    "project": "project:aperture",
+    "repo": "aperture",
+    "mission": "Exercise the existing isolated team transaction.",
+    "acceptance": "A pending team exists, without active workers.",
+    "preset_id": null,
+    "seats": [
+      {"role": "backend", "harness": "codex", "model": "gpt-6-astra", "reasoning": "high"},
+      {"role": "qa", "harness": "codex", "model": "gpt-5.6-sol", "reasoning": "high"}
+    ],
+    "lead_index": 0,
+    "fallbacks": []
+  }
+}

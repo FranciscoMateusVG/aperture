@@ -4,6 +4,15 @@ mod codex_appserver;
 mod config;
 mod launcher;
 mod hub_auth;
+mod journal;
+mod owner;
+mod team_auth;
+mod teams;
+mod team_checkpoint;
+mod team_replacement;
+mod team_process;
+mod team_archive;
+mod team_archive_finalize;
 mod poller;
 mod state;
 mod tmux;
@@ -53,6 +62,17 @@ pub fn boot_agent_headless(name: &str) -> Result<String, String> {
         state.mcp_sentry_server_path.clone(),
         state.project_dir.clone(),
     )
+}
+
+/// Authenticated, headless V4 team activation. The request carries selectors
+/// only; teams.rs derives authority from the fixed canonical GLaDOS bearer.
+pub fn team_control_json(input: &str) -> Result<String, String> {
+    teams::team_control_headless(input)
+        .and_then(|response| serde_json::to_string(&response).map_err(|_| teams::TeamError {
+            code: "E_STAGING_IO".into(),
+            message: "team control result serialization failed".into(),
+        }))
+        .map_err(|error| serde_json::to_string(&error).unwrap_or_else(|_| "{\"code\":\"E_STAGING_IO\",\"message\":\"team control failed\"}".into()))
 }
 
 /// aperture-3x136: GUI-launched apps inherit launchd's minimal PATH
@@ -213,6 +233,19 @@ pub fn run() {
             tmux::tmux_select_window,
             // Build metadata for the launcher footer (semver + git SHA + build date)
             get_version,
+            // Aperture V4 P1 team lifecycle. Activation is intentionally not
+            // exposed to Tauri; authenticated GLaDOS control uses the common
+            // headless engine in teams.rs.
+            teams::team_get_catalog,
+            teams::team_list_presets,
+            teams::team_save_preset,
+            teams::team_create,
+            teams::team_list,
+            teams::team_cancel_pending,
+            teams::team_bootstrap_seat,
+            teams::team_prepare_replacement,
+            teams::team_start_replacement,
+            teams::team_archive,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

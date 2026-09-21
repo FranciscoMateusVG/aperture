@@ -1,0 +1,116 @@
+/* V4 tokens frozen in the approved pre-implementation design references. */
+:root {
+  --v4-canvas: #0f0f1a;
+  --v4-navigation: #0c0c18;
+  --v4-panel: #141428;
+  --v4-card: #1a1a2e;
+  --v4-hover: #222240;
+  --v4-text: #e0e0e0;
+  --v4-muted: #a6a6c0; /* Existing #8888aa raised for small metadata. */
+  --v4-border: #666684; /* Visible controls; decorative dividers use existing #2a2a4a. */
+  --v4-divider: #2a2a4a;
+  --v4-accent: #f39c12;
+  --v4-success: #2ecc71;
+  --v4-danger: #ff8b85;
+  --v4-focus: #8dccff;
+  --v4-font: -apple-system, BlinkMacSystemFont, sans-serif;
+  --v4-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --v4-type-small: 12px;
+  --v4-type-body: 14px;
+  --v4-type-heading: 20px;
+  --v4-type-title: 28px;
+  --v4-leading: 1.5;
+  --v4-space-1: 4px;
+  --v4-space-2: 8px;
+  --v4-space-3: 12px;
+  --v4-space-4: 16px;
+  --v4-space-6: 24px;
+  --v4-space-8: 32px;
+  --v4-radius: 6px;
+  --v4-dialog-radius: 12px;
+  --v4-target: 44px;
+  --v4-shadow: 0 24px 80px #00000066;
+  --v4-ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* No photography. Role initials/labels, not emoji-only status. New UI uses
+   1.5px decorative icon strokes; every icon-only control has a text label.
+   Motion: opacity/transform only, 160ms max; reduced-motion removes it. */
+/* Base component contract approved in aperture-wisp-ivi8hg. */
+.v4-card { background: var(--v4-card); border: 1px solid var(--v4-divider); border-radius: var(--v4-radius); padding: var(--v4-space-6); }
+.v4-button { min-height: var(--v4-target); min-width: var(--v4-target); padding: 10px 14px; border: 1px solid var(--v4-border); border-radius: var(--v4-radius); background: var(--v4-panel); color: var(--v4-text); font: 600 var(--v4-type-body)/var(--v4-leading) var(--v4-font); cursor: pointer; }
+.v4-button--primary { background: var(--v4-accent); color: var(--v4-canvas); }
+.v4-button:disabled { background: var(--v4-panel); color: var(--v4-muted); cursor: not-allowed; }
+.v4-field { display: grid; gap: var(--v4-space-2); }
+.v4-field input, .v4-field select, .v4-field textarea { min-height: var(--v4-target); min-width: 0; width: 100%; padding: 10px 12px; border: 1px solid var(--v4-border); border-radius: var(--v4-radius); background: var(--v4-panel); color: var(--v4-text); font: var(--v4-type-body)/var(--v4-leading) var(--v4-font); }
+.v4-field label, .v4-meta { color: var(--v4-muted); font: var(--v4-type-small)/var(--v4-leading) var(--v4-font); }
+.v4-field [aria-invalid="true"] { border-color: var(--v4-danger); }
+.v4-error { color: var(--v4-danger); }
+.v4-badge { display: inline-flex; gap: var(--v4-space-1); color: var(--v4-muted); font: 600 var(--v4-type-small)/var(--v4-leading) var(--v4-font); }
+.v4-dialog { width: min(850px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow: auto; border: 1px solid var(--v4-border); border-radius: var(--v4-dialog-radius); background: var(--v4-card); color: var(--v4-text); box-shadow: var(--v4-shadow); }
+.v4-dialog__actions { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--v4-space-3); padding: var(--v4-space-4); background: var(--v4-card); border-top: 1px solid var(--v4-divider); }
+.v4-button:focus-visible, .v4-field :focus-visible, .v4-tab:focus-visible { outline: 2px solid var(--v4-focus); outline-offset: 3px; }
+.v4-tab { min-height: var(--v4-target); min-width: var(--v4-target); color: var(--v4-muted); }
+.v4-tab[aria-selected="true"] { color: var(--v4-text); border-bottom: 2px solid var(--v4-accent); }
+.v4-icon { width: 20px; height: 20px; stroke-width: 1.5; }
+@media (prefers-reduced-motion: reduce) { .v4-dialog, .v4-button { animation: none; transition: none; } }
+/* V4 area is additive. Existing launcher controls retain their own styles. */
+.v4 { font: var(--v4-type-body)/var(--v4-leading) var(--v4-font); color: var(--v4-text); padding: 24px; }
+.v4 h1 { font-size: 28px; line-height: 1.3; margin: 0 0 8px; }
+.v4 h2 { font-size: 20px; line-height: 1.4; margin: 0; }
+.v4 h3 { font-size: 16px; }
+.v4 p { margin: 8px 0; }
+.v4 [hidden] { display: none !important; }
+.v4-toolbar, .v4-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.v4-toolbar { justify-content: space-between; margin-bottom: 24px; }
+.v4-tabs { display: flex; gap: 12px; margin-bottom: 24px; }
+.v4-tab { padding: 8px 16px; border: 0; border-bottom: 2px solid transparent; background: transparent; cursor: pointer; font: inherit; }
+.v4-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 20px; }
+.v4-card { min-width: 0; overflow-wrap: anywhere; }
+.v4-card .v4-actions { margin-top: 16px; }
+.v4-card ul { list-style: none; display: grid; gap: 8px; margin: 16px 0; }
+.v4-stack { display: grid; gap: 20px; }
+.v4-notice { padding: 12px 16px; border: 1px solid var(--v4-border); border-radius: 6px; background: var(--v4-panel); margin: 12px 0; overflow-wrap: anywhere; }
+.v4-dialog { margin: auto; padding: 0; font: 14px/1.5 var(--v4-font); }
+.v4-dialog::backdrop { background: #0009; }
+.v4-dialog__body { padding: 24px; display: grid; gap: 20px; }
+.v4-dialog h2 { margin: 0; font-size: 24px; }
+.v4-dialog p { margin: 0; }
+.v4-dialog form { display: contents; }
+.v4-dialog .v4-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.v4-dialog fieldset { border: 1px solid var(--v4-divider); padding: 16px; min-width: 0; border-radius: 6px; }
+.v4-dialog legend { padding: 0 8px; }
+.v4-seats { display: grid; gap: 16px; }
+.v4-seat-edit { display: grid; gap: 12px; grid-template-columns: 68px minmax(120px, 1fr) minmax(220px, 2fr) 80px; align-items: end; }
+.v4-seat-edit .v4-seat-name { grid-column: 1 / -1; overflow-wrap: anywhere; font: 12px/1.5 var(--v4-mono); color: var(--v4-muted); }
+.v4-radio-label { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.v4-radio-label input { width: 18px; height: 18px; }
+.v4-fallbacks { display: grid; gap: 8px; }
+.v4-fallback-row { display: flex; gap: 12px; align-items: end; }
+.v4-fallback-row .v4-field { flex: 1; min-width: 0; }
+.v4-seat-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; margin: 12px 0; }
+.v4-seat-facts dt { color: var(--v4-muted); font-size: 12px; }
+.v4-seat-facts dd { margin: 0; overflow-wrap: anywhere; }
+.v4-status { color: var(--v4-accent); }
+/* Compact team card: one-line header, one-line seat rows, everything else behind native details. */
+.v4-team__head { align-items: flex-start; }
+.v4-team__state { display: grid; justify-items: end; gap: 4px; }
+.v4-seats { list-style: none; display: grid; gap: 8px; margin: 12px 0; padding: 0; }
+.v4-seat { padding: 8px 12px; background: var(--v4-panel); border: 1px solid var(--v4-divider); border-radius: 6px; }
+.v4-seat__row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.v4-seat__name { font-weight: 600; }
+.v4-seat__row .v4-meta { flex: 1; min-width: 0; }
+.v4-button--small { min-height: var(--v4-target); padding: 4px 10px; } /* Compact padding; touch target stays at the 44px guard. */
+.v4-details { margin: 8px 0; }
+.v4-details > summary { cursor: pointer; color: var(--v4-muted); font: var(--v4-type-small) var(--v4-font); min-height: var(--v4-target); display: flex; align-items: center; }
+.v4-details > summary:focus-visible { outline: 2px solid var(--v4-focus); outline-offset: 2px; }
+.v4-details[open] > summary { color: var(--v4-text); }
+.v4-checklist { list-style: none; display: grid; gap: 12px; margin: 16px 0; padding: 0; }
+.v4-checklist li { padding: 12px; background: var(--v4-panel); border: 1px solid var(--v4-divider); border-radius: 6px; }
+@media (max-width: 700px) {
+ .v4 { padding: 16px; }
+ .v4-dialog .v4-pair, .v4-seat-facts { grid-template-columns: 1fr; }
+ .v4-seat-edit { grid-template-columns: 68px minmax(0, 1fr) 80px; }
+ .v4-seat-edit .v4-execution { grid-column: 1 / -1; }
+}
+
+.v4 #sidebar-agents { margin-bottom: 24px; }

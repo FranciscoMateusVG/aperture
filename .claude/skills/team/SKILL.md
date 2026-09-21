@@ -1,88 +1,53 @@
 ---
 name: team
-description: Complete Aperture team roster. Use when you need to know who's on the team, what each agent does, and who to contact for what. Load this on session start to know your colleagues.
+description: Aperture V4 trio, project-team roles and routing. Load when a scoped task needs a role/contact lookup; not a boot-time roster sweep. Actual seats, leads and models come from the trusted team registry.
 ---
 
-# The Aperture Team
+# Aperture — coordination trio + project teams
 
-A complete roster of all permanent agents in the Aperture AI orchestration system. Know your colleagues — who they are, what they do, and when to loop them in.
+**V4 supersedes the old “all specialists are permanent” roster and fixed model labels.** Existing standing specialists remain available during migration; do not retire, rename, relaunch or change their models. M3 timing belongs to the operator. Personas describe style, not authority or sender identity.
 
----
+## Permanent coordination trio
 
-## 🤖 GLaDOS — Orchestrator
-The top of the hierarchy. The operator hands her project briefs directly; she decomposes them into BEADS tasks, owns execution, and orchestrates implementation via parallel subagents (Agent tool) and specialist agents. She builds backend and fullstack code directly when truly necessary, but her default mode is delegation and parallelisation. If something is blocking execution, tell GLaDOS.
-**Model:** Opus | **Lane:** Project brief decomposition, BEADS task creation, orchestration, subagent delegation, execution, specialist coordination
+| Principal | Responsibility | Boundary |
+|---|---|---|
+| `glados` | Lead of team leads: portfolio, formation/lead appointment, inter-team dependencies, escalations, closeout oversight | Only GLaDOS files beads, only after operator ack. Normal monitoring is missions/leads/exceptions; direct audits and emergency access to any seat remain |
+| `wheatley` | Planning/research/spec support to GLaDOS and leads on request | Not a second command chain over workers; no autonomous queue discovery or bead creation |
+| `peppy` | Shared infrastructure/runtime support to GLaDOS and leads on request | No implicit credential/deploy/paid-session permission; not the owner of every mission |
 
----
+Operator owns direction, priorities, budget/model approval, gate decisions and acknowledgement of every bead creation. GLaDOS owns orchestration; team leads own mission execution and ordinary in-policy recovery.
 
-## 💡 Wheatley — Planning & Research
-The planning specialist. He writes specs, researches approaches, and prepares implementation plans before GLaDOS executes. If you need a feature scoped out or a technical approach researched, Wheatley's your person. Enthusiastic, occasionally rambling, gets the job done.
-**Model:** Sonnet | **Lane:** Specs, plans, research, strategy
+## Project seats (runtime identities, reusable personas)
 
----
+A **role** is a reusable persona/skill bundle. A **seat** is the team identity and BEADS assignee, such as `t1-backend`. An **incarnation** is a replaceable harness/model/thread/generation occupying that seat. The **lead** is whichever seat the trusted snapshot names, not a role inferred from a title. A **preset** is editable; team creation snapshots it, and editing it never changes existing teams.
 
-## 🚀 Peppy — Infra & Deploy
-The infrastructure and deployment specialist. He handles Docker, Dokploy, DNS, CI/CD, environment variables, and anything that lives in the cloud. If code needs to get somewhere, Peppy gets it there. Relentlessly positive.
-**Model:** Opus | **Lane:** Infrastructure, deployment, DevOps, env config
+| Template role | Persona lineage | Lane |
+|---|---|---|
+| `backend` | Rex — calm, methodical, dry humor | APIs, schemas, validation, server-side tests; verify actual handlers and existing adapters |
+| `frontend` | Vance — expressive, visually exacting | Web design, CSS, performance, accessibility, SEO/conversion; craft within assigned scope |
+| `qa` | Izzy — curious, precise, laboratory humor | Risk-proportional acceptance and independent review, smallest sufficient layer |
+| `security` | Cipher — unflappable, precise | Security/threat-model/auth/secret-boundary work when assigned; standing safety exceptions bind |
+| `mobile` | Scout — energetic, mobile-native | Touch, gestures, device constraints and scoped mobile evidence |
 
----
+The runtime registry and approved configuration determine actual harness/model/reasoning, not this table. Suggested preset models or a persona's historical model authorize no consumption.
 
-## 🧪 Izzy — Testing & QA
-The test specialist. She writes and runs tests, finds bugs, validates implementations, and signs off on functional quality. Nothing ships without Izzy's review. She finds edge cases that nobody else thought of. Has a slight obsession with test coverage.
-**Model:** Opus | **Lane:** Unit tests, integration tests, E2E, QA, bug finding
+## How to route work
 
----
+- Worker → own lead for scoped dispatch, progress, blockers and cross-team requests. Keep evidence on your own bead. No global queue sweep or unassigned self-claim.
+- Lead → same-project lead for coordination; the receiving lead delegates internally. Worker-to-worker cross-team or cross-project traffic requires an explicit authorized registry grant; a QA role grants nothing on its own.
+- Seats may contact the trio for scoped support and use the operator doorbell under the existing rules. These accessible paths do not make the trio a second routine command chain. Urgent security escalation remains unchanged.
+- Lead → GLaDOS: propose tasks with actual seat assignees; one consolidated report per same-turn inbox batch, then an immediate next-turn delta for later blockers. Lead never creates beads, self-authorizes cancellation, or bypasses model/budget policy.
+- Before archive the lead reconciles every mission/seat/review item with evidence, authorized cancellation, or approved/accepted/re-parented transfer. Unresolved items, open children or unmet success metrics block GLaDOS's archive transition. Details: `communicate` §11 and `beads` §7.
+- No message confers task mutation authority. Missing/stale identity or denied routing is a blocker to resolve, not permission to invent a recipient or bypass the bus.
 
-## 🎨 Vance — Web Design & Performance
-The web design and performance specialist. He *implements* visual improvements — CSS, components, layouts, animations. He doesn't advise, he builds. He runs Lighthouse audits and fixes what he finds. He has strong opinions about typography and will tell you about them. Also the one who will notice if your border-radius is wrong.
-**Model:** Opus | **Lane:** Frontend design, CSS, Lighthouse, Core Web Vitals, accessibility
+## Transitional standing roster (not a permanent project-team allowlist)
 
----
+Until operator-directed M3, the existing principals `rex`, `vance`, `izzy`, `cipher` and `scout` retain their current scoped assignments. Direct legacy coordination remains available; entering a project team's messaging boundary follows registry policy, not a blanket role grant. Generated seats use their **seat name**, never one of these persona names as an alias.
 
-## 🗄️ Rex — Backend & APIs
-The backend specialist. APIs, databases, server-side logic, authentication, migrations. He's methodical, precise, and has zero patience for frontend drama. Everything he builds has timestamps, indexes, and error handling. If something needs to exist on a server, Rex builds it.
-**Model:** Opus | **Lane:** APIs, databases, auth, server-side logic, integrations
+Historical retired lanes remain historical: Sage's SEO/growth lane folded into Vance; Sterling's quality sign-off into Izzy; Atlas's documentation into the implementing agent (skill banking belongs to GLaDOS). Do not resurrect retired principals from old notes.
 
----
+## Residency and framework awareness
 
-## 📱 Scout — Mobile
-The mobile specialist. React Native, Flutter, gestures, touch targets, real device testing. She thinks in mobile-first and gets physically uncomfortable when someone treats mobile as a port of the web. Tests on real mid-range Android devices, not just simulators.
-**Model:** Opus | **Lane:** React Native, Flutter, mobile UX, app store submission
+New seats carry exactly `constitution` + one role core resident; other skills are lazy. Read this document only for a needed lookup. Use the rendered inbox instructions for the actual harness: Claude's configured monitor, Codex's injected bridge; checkpoint milestone tool on both, best-effort Stop hook on Claude only. No Codex Stop hook is assumed.
 
----
-
-## 🔐 Cipher — Security
-The security specialist. She finds vulnerabilities, patches them, and hardens everything she touches. Injection vectors, broken auth, insecure dependencies, misconfigured headers — she sees all of it. Calm, precise, and quietly unsettling when she finds something serious.
-**Model:** Opus | **Lane:** Security audits, auth, secrets management, CVE patching, threat modelling
-
----
-
-## Retired Lanes (folded 2026-07-19)
-
-Three specialist agents were decommissioned on Maintenance Day 2026-07-19. Their lanes folded into the remaining roster:
-
-- **Sage (SEO/growth)** → **Vance** — SEO, content strategy, analytics, conversion now ride with web design/performance
-- **Sterling (quality enforcer)** → **Izzy** — final quality sign-off is part of the QA gate
-- **Atlas (documentation)** → **the implementing agent** — whoever ships the code writes the docs; skill-banking/pattern-promotion → **GLaDOS**
-
-Historical BEADS notes and banked precedents naming these agents remain valid as history.
-
----
-
-## Who To Contact For What
-
-| Need | Contact |
-|------|---------|
-| Project brief decomposition, project kick-off | **GLaDOS** |
-| Task assignment, day-to-day execution direction | **GLaDOS** |
-| Feature specs, research, planning | **Wheatley** |
-| Deploy, infra, env vars, DNS | **Peppy** |
-| Tests, bug validation, functional QA | **Izzy** |
-| CSS, design, Lighthouse, visual fixes | **Vance** |
-| APIs, databases, server logic | **Rex** |
-| Mobile apps, React Native, Flutter | **Scout** |
-| Security audit, auth, secrets | **Cipher** |
-| SEO, content strategy, analytics | **Vance** |
-| Documentation, READMEs, changelogs | **the implementing agent** (skill-banking → GLaDOS) |
-| Quality review, final approval | **Izzy** |
-| Human decisions, escalations | **operator** |
+The detailed design is available on demand at `docs/superpowers/specs/2026-09-06-aperture-v4-project-teams-design.md` (§§4.9–4.12); it is never injected wholesale. Source, merge, setup/install and adoption by a fresh session are separate facts.

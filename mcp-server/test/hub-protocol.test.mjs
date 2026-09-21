@@ -43,7 +43,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -89,14 +90,26 @@ const TOKENS = {
  * Returns { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, stop }.
  * stderrEvents is the live array of parsed JSON log lines from hub stderr.
  */
-async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry = false } = {}) {
+async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry = false, runtimeHome = null } = {}) {
   const port = 20000 + Math.floor(Math.random() * 20000);
   const emptyAgentsDir = mkdtempSync(join(tmpdir(), "hub-test-agents-"));
   const teamsDir = mkdtempSync(join(tmpdir(), "hub-test-teams-"));
-  const tokenDir = mkdtempSync(join(tmpdir(), "hub-test-tokens-"));
-  // Short prefix: the codex app-server unix socket lives here and sun_path is
-  // ~104 bytes on macOS.
-  const runDir = mkdtempSync(join(tmpdir(), "hr-"));
+  const homeDir = runtimeHome ?? mkdtempSync(join(tmpdir(), "hub-home-"));
+  chmodSync(homeDir, 0o700);
+  mkdirSync(join(homeDir, ".aperture"), { recursive: true, mode: 0o700 });
+  chmodSync(join(homeDir, ".aperture"), 0o700);
+  // Short private root: the codex app-server unix socket lives here and
+  // sun_path is ~104 bytes on macOS.
+  const runDir = join(homeDir, ".aperture", "run");
+  mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  chmodSync(runDir, 0o700);
+  const tokenDir = join(runDir, "hub-tokens");
+  const ownerDir = join(runDir, "owner");
+  const revocationDir = join(runDir, "revocations");
+  for (const dir of [tokenDir, ownerDir, revocationDir]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+  }
   const presenceFile = join(runDir, "presence.json");
   const bdMessageFile = join(runDir, "bd-message.json");
   const bdCallsFile = join(runDir, "bd-calls.log");
@@ -161,17 +174,23 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
         grants: [],
       }));
     }
+    for (const name of ["p1-a-lead", "p1-a-worker", "p1-b-lead"]) {
+      writeOwner(name, 1, TOKENS[name]);
+    }
   }
   if (staleSnapshot) writeFileSync(presenceFile, JSON.stringify(staleSnapshot));
   const proc = spawn(process.execPath, [hubPath], {
     env: {
       ...process.env,
+      HOME: homeDir,
       APERTURE_WS_PORT: String(port),
       APERTURE_HUB_SKIP_REPLAY: "1",
       APERTURE_AGENTS_DIR: emptyAgentsDir,
       APERTURE_TEAMS_DIR: teamsDir,
       APERTURE_HUB_TOKEN_DIR: tokenDir,
       APERTURE_RUN_DIR: runDir,
+      APERTURE_OWNER_DIR: ownerDir,
+      APERTURE_REVOCATION_DIR: revocationDir,
       // Never let the developer's real ~/.aperture/agent-config.json model
       // overrides leak into discovery.
       APERTURE_AGENT_CONFIG_PATH: join(runDir, "no-such-agent-config.json"),
@@ -238,8 +257,31 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
     proc.kill("SIGKILL");
     rmSync(emptyAgentsDir, { recursive: true, force: true });
     rmSync(teamsDir, { recursive: true, force: true });
-    rmSync(tokenDir, { recursive: true, force: true });
-    rmSync(runDir, { recursive: true, force: true });
+    if (runtimeHome === null) rmSync(homeDir, { recursive: true, force: true });
+  }
+
+  function writeOwner(seat, generation, token, state = "active") {
+    const tokenId = createHash("sha256").update(token).digest("hex");
+    writeFileSync(join(ownerDir, `${seat}.json`), JSON.stringify({
+      schema_version: 1,
+      seat,
+      generation,
+      state,
+      reservation_nonce_sha256: null,
+      requested: { harness: "claude", model: "claude/test", reasoning: null },
+      incarnation: {
+        pid: 123,
+        start_time: 456,
+        thread_id: `thread-${seat}-${generation}`,
+        token_id: tokenId,
+        harness: "claude",
+        model: "claude/test",
+        reasoning: null,
+        processes: [{ pid: 123, start_time: 456, ppid: 1, pgid: 123, cmdline_sha256: "a".repeat(64), cwd: "/tmp/work" }],
+      },
+      since: "2026-09-20T00:00:00Z",
+      writer: "launcher",
+    }), { mode: 0o600 });
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
@@ -247,7 +289,7 @@ async function spawnHub({ codexAgent = null, staleSnapshot = null, teamRegistry 
   const bdCalls = () => existsSync(bdCallsFile)
     ? readFileSync(bdCallsFile, "utf8").split("\n").filter(Boolean)
     : [];
-  return { port, proc, runDir, presenceFile, readPresence, stderrEvents, waitForEvent, setBdMessage, bdCalls, stop };
+  return { port, proc, homeDir, runDir, tokenDir, ownerDir, revocationDir, presenceFile, readPresence, stderrEvents, waitForEvent, setBdMessage, bdCalls, writeOwner, stop };
 }
 
 function connect(port) {
@@ -258,9 +300,13 @@ function connect(port) {
   });
 }
 
-const hello = (ws, role, agent) => {
+const hello = (ws, role, agent, options = {}) => {
   const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
-  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token: TOKENS[principal] }));
+  const token = options.token ?? TOKENS[principal];
+  const managed = principal.startsWith("p1-")
+    ? { generation: options.generation ?? 1, token_id: createHash("sha256").update(token).digest("hex") }
+    : {};
+  ws.send(JSON.stringify({ type: "hello", role, agent: principal, token, ...managed }));
 };
 
 async function authenticate(hub, ws, role, agent) {
@@ -635,6 +681,222 @@ test("team registry is enforced at the hub: dynamic hello, lead route, and non-l
   }
 });
 
+test("managed identity revocation is durable, exact-generation, and fail-closed", async () => {
+  const runtimeHome = mkdtempSync(join(tmpdir(), "hub-revocation-restart-"));
+  const hub = await spawnHub({ teamRegistry: true, runtimeHome });
+  let restarted = null;
+  try {
+    const missingIdentity = await connect(hub.port);
+    const missingClose = waitForClose(missingIdentity, "managed hello without generation");
+    missingIdentity.send(JSON.stringify({
+      type: "hello",
+      role: "agent",
+      agent: "p1-a-worker",
+      token: TOKENS["p1-a-worker"],
+    }));
+    assert.equal((await missingClose).code, 4003);
+
+    const launcher = await connect(hub.port);
+    await authenticate(hub, launcher, "subscriber", "watchdog");
+    const forgedFuture = await connect(hub.port);
+    const forgedFutureClose = waitForClose(forgedFuture, "owner-bound future generation rejection");
+    hello(forgedFuture, "producer", "p1-a-worker", { generation: 2 });
+    assert.equal((await forgedFutureClose).code, 4003, "caller generation cannot outrun the authoritative owner record");
+
+    const generationOne = await connect(hub.port);
+    await authenticate(hub, generationOne, "producer", "p1-a-worker");
+    const generationOneClose = waitForClose(generationOne, "revoked generation one socket");
+    const generationOneTokenId = createHash("sha256").update(TOKENS["p1-a-worker"]).digest("hex");
+    const ordinaryProducer = await connect(hub.port);
+    await authenticate(hub, ordinaryProducer, "producer", "glados");
+    const unauthorized = waitFor(
+      ordinaryProducer,
+      (m) => m.type === "error" && m.code === "E_CONTROL_UNAUTHORIZED",
+      "non-launcher control rejection",
+    );
+    ordinaryProducer.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_id: generationOneTokenId,
+    }));
+    await unauthorized;
+    assert.equal(generationOne.readyState, WebSocket.OPEN, "ordinary producer cannot revoke a managed identity");
+    const generationOneAck = waitFor(
+      launcher,
+      (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 1,
+      "generation one revocation ack",
+    );
+    const revokeStartedAt = Date.now();
+    generationOne._socket.pause();
+    launcher.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_id: generationOneTokenId,
+    }));
+    await hub.waitForEvent(
+      (e) => e.event === "generation_revocation_fenced" && e.agent !== "unused" && e.seat === "p1-a-worker",
+      "generation one authority fence",
+    );
+    generationOne.send(JSON.stringify({
+      type: { toString: null },
+      to: "p1-a-lead",
+      id: "revoked-hostile-frame",
+      from: "p1-a-worker",
+      preview: "must be rejected",
+    }));
+    await hub.waitForEvent(
+      (e) => e.event === "revoked_frame_rejected" && e.agent === "p1-a-worker" && e.frame_type_kind === "object",
+      "hostile post-revocation frame rejection",
+    );
+    assert.equal(
+      hub.stderrEvents.some((e) => e.event === "notify_offline" && e.id === "revoked-hostile-frame"),
+      false,
+      "revoked connection cannot perform application effects while close is pending",
+    );
+    generationOne._socket.resume();
+    assert.deepEqual(await generationOneAck, {
+      type: "ok",
+      control: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_deleted: true,
+      token_absent_verified: true,
+      token_directory_synced: true,
+      sockets_close_requested: 1,
+      sockets_closed_verified: 1,
+    });
+    assert.equal((await generationOneClose).code, 4001);
+    assert.ok(Date.now() - revokeStartedAt <= 1_000, "exact socket close is observed within one second");
+    assert.equal(existsSync(join(hub.tokenDir, "p1-a-worker.token")), false, "exact token file deleted durably");
+    const repeatedGenerationOneAck = waitFor(
+      launcher,
+      (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 1,
+      "idempotent generation one revocation ack",
+    );
+    launcher.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_id: generationOneTokenId,
+    }));
+    assert.deepEqual(await repeatedGenerationOneAck, {
+      type: "ok",
+      control: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 1,
+      token_deleted: false,
+      token_absent_verified: true,
+      token_directory_synced: true,
+      sockets_close_requested: 0,
+      sockets_closed_verified: 0,
+    });
+
+    const replayedGenerationOne = await connect(hub.port);
+    const replayedClose = waitForClose(replayedGenerationOne, "revoked generation rejected after token deletion");
+    hello(replayedGenerationOne, "agent", "p1-a-worker");
+    assert.equal((await replayedClose).code, 4003, "durable revocation, not missing token fallback, rejects generation one");
+
+    const generationTwoToken = "0b".repeat(32);
+    const generationTwoTokenId = createHash("sha256").update(generationTwoToken).digest("hex");
+    writeFileSync(join(hub.tokenDir, "p1-a-worker.token"), generationTwoToken, { mode: 0o600 });
+    hub.writeOwner("p1-a-worker", 2, generationTwoToken);
+    const generationTwo = await connect(hub.port);
+    hello(generationTwo, "agent", "p1-a-worker", { token: generationTwoToken, generation: 2 });
+    await hub.waitForEvent(
+      (e) => e.event === "hello" && e.agent === "p1-a-worker" && e.generation === 2,
+      "generation two managed hello",
+    );
+    await sleep(50);
+    assert.equal(generationTwo.readyState, WebSocket.OPEN, "next fresh generation is accepted");
+    const generationTwoClose = waitForClose(generationTwo, "revoked generation two socket");
+    const generationTwoAck = waitFor(
+      launcher,
+      (m) => m.type === "ok" && m.control === "revoke_generation" && m.generation === 2,
+      "generation two revocation ack",
+    );
+    launcher.send(JSON.stringify({
+      type: "revoke_generation",
+      seat: "p1-a-worker",
+      generation: 2,
+      token_id: generationTwoTokenId,
+    }));
+    await generationTwoAck;
+    assert.equal((await generationTwoClose).code, 4001);
+    const persisted = JSON.parse(readFileSync(join(hub.revocationDir, "p1-a-worker.json"), "utf8"));
+    assert.equal(persisted.revoked_through_generation, 2);
+    assert.deepEqual(persisted.revoked_token_ids, [generationOneTokenId, generationTwoTokenId].sort());
+
+    closeAll(launcher, ordinaryProducer);
+    hub.stop();
+
+    restarted = await spawnHub({ teamRegistry: true, runtimeHome });
+    const oldAfterRestart = await connect(restarted.port);
+    const oldAfterRestartClose = waitForClose(oldAfterRestart, "old identity rejected after hub restart");
+    hello(oldAfterRestart, "agent", "p1-a-worker");
+    assert.equal((await oldAfterRestartClose).code, 4003, "hub reloads the durable generation floor");
+
+    const generationThreeToken = "0c".repeat(32);
+    writeFileSync(join(restarted.tokenDir, "p1-a-worker.token"), generationThreeToken, { mode: 0o600 });
+    restarted.writeOwner("p1-a-worker", 3, generationThreeToken);
+    const generationThree = await connect(restarted.port);
+    hello(generationThree, "agent", "p1-a-worker", { token: generationThreeToken, generation: 3 });
+    await restarted.waitForEvent(
+      (e) => e.event === "hello" && e.agent === "p1-a-worker" && e.generation === 3,
+      "generation three after hub restart",
+    );
+    await sleep(100);
+    assert.equal(generationThree.readyState, WebSocket.OPEN, "generation three is the only accepted fresh identity");
+    closeAll(generationThree);
+  } finally {
+    restarted?.stop();
+    hub.stop();
+    rmSync(runtimeHome, { recursive: true, force: true });
+  }
+});
+
+test("durable revoke fences and closes the exact socket even when token cleanup fails", async () => {
+  const hub = await spawnHub({ teamRegistry: true });
+  try {
+    const launcher = await connect(hub.port);
+    await authenticate(hub, launcher, "subscriber", "watchdog");
+    const worker = await connect(hub.port);
+    await authenticate(hub, worker, "producer", "p1-a-worker");
+    const workerClose = waitForClose(worker, "cleanup-failure revoked socket close");
+    const token = createHash("sha256").update(TOKENS["p1-a-worker"]).digest("hex");
+    worker._socket.pause();
+    chmodSync(hub.tokenDir, 0o500);
+    const failed = waitFor(
+      launcher,
+      (m) => m.type === "error" && m.code === "E_REVOCATION_FAILED",
+      "cleanup failure acknowledgement",
+    );
+    launcher.send(JSON.stringify({ type: "revoke_generation", seat: "p1-a-worker", generation: 1, token_id: token }));
+    await hub.waitForEvent(
+      (e) => e.event === "generation_revocation_fenced" && e.seat === "p1-a-worker",
+      "cleanup-failure authority fence",
+    );
+    worker.send(JSON.stringify({ type: "notify", to: "p1-a-lead", id: "cleanup-fault-frame", from: "p1-a-worker" }));
+    await hub.waitForEvent(
+      (e) => e.event === "revoked_frame_rejected" && e.agent === "p1-a-worker",
+      "cleanup-failure hostile frame rejection",
+    );
+    worker._socket.resume();
+    await failed;
+    assert.equal((await workerClose).code, 4001, "cleanup failure never leaves the revoked socket live");
+    assert.equal(existsSync(join(hub.tokenDir, "p1-a-worker.token")), true, "failed cleanup is reported, not misrepresented as deletion");
+    const persisted = JSON.parse(readFileSync(join(hub.revocationDir, "p1-a-worker.json"), "utf8"));
+    assert.equal(persisted.revoked_through_generation, 1, "durable floor remains authoritative after cleanup failure");
+    assert.equal(hub.stderrEvents.some((e) => e.event === "notify_offline" && e.id === "cleanup-fault-frame"), false);
+    chmodSync(hub.tokenDir, 0o700);
+    closeAll(launcher);
+  } finally {
+    try { chmodSync(hub.tokenDir, 0o700); } catch { /* fixture cleanup */ }
+    hub.stop();
+  }
+});
+
 // ── e. agent_replaced, ordering 1: old socket still alive ───────────────────
 
 test("agent_replaced (old alive): old closed 4000, two joins / zero leaves, delivery to new only", async () => {
@@ -782,10 +1044,10 @@ test("post-hello junk from an agent is ignored; connection stays open and still 
     // Give the hello a beat so the junk below is unambiguously post-hello.
     await sleep(100);
 
-    // Valid JSON, unknown type → ignored_message (logged, socket kept).
-    agent.send(JSON.stringify({ type: "weird-frame", payload: 42 }));
+    // Hostile-but-valid object type cannot trigger attacker-controlled coercion.
+    agent.send(JSON.stringify({ type: { toString: null }, payload: 42 }));
     await hub.waitForEvent(
-      (e) => e.event === "ignored_message" && e.agent === "izzy-test" && e.type === "weird-frame",
+      (e) => e.event === "ignored_message" && e.agent === "izzy-test" && e.frame_type_kind === "object",
       "ignored_message log",
     );
 

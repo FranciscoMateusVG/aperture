@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "fullstack",
+  "display_name": "Full-stack project team",
+  "mission_placeholder": "Describe the approved project mission and repository.",
+  "acceptance_placeholder": "Define evidence/review. Editable models do not authorize paid sessions.",
+  "seats": [
+    {
+      "role": "backend",
+      "harness": "codex",
+      "model": "gpt-6-astra",
+      "reasoning": "high"
+    },
+    {
+      "role": "frontend",
+      "harness": "claude",
+      "model": "opus",
+      "reasoning": null
+    },
+    {
+      "role": "qa",
+      "harness": "claude",
+      "model": "sonnet",
+      "reasoning": null
+    }
+  ],
+  "lead_index": 0,
+  "fallbacks": [
+    {
+      "harness": "codex",
+      "model": "gpt-5.6-sol",
+      "reasoning": "high"
+    },
+    {
+      "harness": "codex",
+      "model": "gpt-5.6-terra",
+      "reasoning": "high"
+    }
+  ],
+  "source": "shipped"
+}

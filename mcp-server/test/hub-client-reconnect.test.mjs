@@ -236,7 +236,7 @@ test("hub close 4001 (hello rejected): HUB_SOCKET_CLOSED code=4001, exit 1, no r
     const closed = await client.waitForLine(startsWith("HUB_SOCKET_CLOSED"), "HUB_SOCKET_CLOSED");
     assert.equal(
       closed,
-      "HUB_SOCKET_CLOSED code=4001 reason=expected hello — hello rejected (token or agent name); fix and restart your inbox monitor",
+      "HUB_SOCKET_CLOSED code=4001 reason=expected hello — hello rejected (token, agent name, or managed identity); fix and restart your inbox monitor",
     );
     const code = await client.waitForExit();
     assert.equal(code, 1, "exit code 1 on 4001");

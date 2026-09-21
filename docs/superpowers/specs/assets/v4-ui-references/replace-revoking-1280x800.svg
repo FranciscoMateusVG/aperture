@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800" role="img" aria-label="Aperture V4 replace revoking design reference">
+<rect width="1280" height="800" fill="#0f0f1a"/>
+<rect x="0" y="0" width="1280" height="64" rx="0" fill="#0c0c18" stroke="#2a2a4a"/>
+<text x="24" y="39" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="700">APERTURE</text>
+<text x="205" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Sessions</text>
+<text x="308" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Presets</text>
+<text x="1036" y="39" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">DESIGN • synthetic fixture</text>
+<rect x="215.0" y="100" width="850" height="646" rx="12" fill="#1a1a2e" stroke="#666684"/>
+<text x="243.0" y="143" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="24" font-weight="600">Replace worker</text>
+<text x="243.0" y="173" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">fitt-relaunch-backend · expected generation 2</text>
+<text x="243.0" y="215" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Harness</text>
+<rect x="243.0" y="225" width="150" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="255.0" y="253" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Codex</text>
+<text x="409.0" y="215" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Replacement model</text>
+<rect x="409.0" y="225" width="240" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="421.0" y="253" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">gpt-5.6-sol</text>
+<text x="665.0" y="215" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Reasoning</text>
+<rect x="665.0" y="225" width="140" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="677.0" y="253" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">high</text>
+<text x="243.0" y="307" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">Checkpoint: stale    •    Observed model: unverified</text>
+<text x="243.0" y="348" fill="#f39c12" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="18" font-weight="600">Revoking hub/message authority…</text>
+<text x="243.0" y="389" fill="#2ecc71" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">✓ Checkpoint result recorded</text>
+<text x="243.0" y="421" fill="#2ecc71" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">✓ Owned processes stopped</text>
+<text x="243.0" y="453" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">○ Hub/message authority revoked</text>
+<text x="243.0" y="485" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">○ Remote effects reconciled</text>
+<text x="243.0" y="517" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="400">○ Worktree inventoried without modification</text>
+<text x="243.0" y="602" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Checks are backend evidence, not operator-ticked checkboxes.</text>
+<text x="243.0" y="626" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="400">Closing this dialog does not undo a stop or revoke already requested.</text>
+<rect x="243.0" y="670" width="205" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="257.0" y="698" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Prepare / stop / verify</text>
+<rect x="762.0" y="670" width="100" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="776.0" y="698" fill="#e0e0e0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Close</text>
+<rect x="874.0" y="670" width="163" height="44" rx="6" fill="#141428" stroke="#666684"/>
+<text x="888.0" y="698" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="14" font-weight="600">Start replacement</text>
+<text x="24" y="784" fill="#a6a6c0" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="11" font-weight="400">Design reference only · no command invoked · not an installed-app capture</text>
+</svg>

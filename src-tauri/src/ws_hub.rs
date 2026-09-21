@@ -252,3 +252,7 @@ mod tests {
         }
     }
 }
+
+// Native replacement consumes the existing watchdog control seam only.
+#[path = "team_revoke_native.rs"]
+pub(crate) mod managed_control;
