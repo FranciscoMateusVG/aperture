@@ -1,3 +1,5 @@
+mod team_claude_launch;
+mod team_claude_observation;
 mod agent_loader;
 mod agents;
 mod codex_appserver;
@@ -20,6 +22,22 @@ mod watchdog;
 mod ws_hub;
 
 use std::sync::{Arc, Mutex};
+
+/// Private helper entrypoints: identity and authority are derived by the native
+/// gate/writer from the current owner, never from argv or environment claims.
+pub fn managed_claude_gate(team: &str, seat: &str, generation: u64) -> Result<(), String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)
+        .ok_or_else(|| "E_CLAUDE_RUNTIME_IO".to_string())?;
+    team_claude_launch::gate_native(&home, team, seat, generation)
+        .map_err(|error| error.code().to_string())
+}
+
+pub fn managed_claude_observe(team: &str, seat: &str) -> Result<(), String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)
+        .ok_or_else(|| "E_CLAUDE_RUNTIME_IO".to_string())?;
+    team_claude_observation::write_startup_observation(&home, team, seat, std::io::stdin().lock())
+        .map_err(|error| error.code().to_string())
+}
 
 /// Returns the version metadata baked into this binary at build time.
 /// Three fields: semver from Cargo.toml, short git SHA, and the UTC build
