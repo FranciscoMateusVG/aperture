@@ -89,9 +89,38 @@ test('lead guidance carries creation gate, batching, scoped routing and archive 
       'immediate delta in the next turn', 'same project', 'explicit trusted-registry grant',
       'written acceptance and re-parenting', 'Preserve history', 'open epic child',
       'unmet success metric blocks archive', 'No ready/list/search sweeps',
-      'Models/fallbacks in presets are editable suggestions',
+      'Models/fallbacks in presets are editable suggestions', 'Handoff wakes QA', 'PR-open ends nothing', 'Publication is explicit',
     ]) assert.ok(prompt.includes(text), `${role}: missing ${text}`);
     assert.doesNotMatch(prompt, /\b(?:create_task|bd create)\b/u, 'no actionable bead-creation recipe in worker prompt');
+  }
+});
+
+test('handoff wakes QA, verdict wakes lead/root, PR-open ends nothing, publication explicit, no tools is a blocker', () => {
+  for (const role of roles) {
+    const prompt = fixturePrompt(role, `t1-${role}`);
+    const worker = prompt.slice(prompt.indexOf('**Worker (seat is not lead):**'), prompt.indexOf('**Lead (seat equals lead):**'));
+    const lead = prompt.slice(prompt.indexOf('**Lead (seat equals lead):**'), prompt.indexOf('For both: sender/assignee'));
+    assert.ok(worker.length > 0 && lead.length > 0, `${role}: both sections present`);
+    for (const text of ['immutable head SHA', 'never notes-only', "reviewer's receipt", 'BLOCKER: messaging tools unavailable', 'no handoff counts as delivered']) {
+      assert.ok(worker.includes(text), `${role}: worker section missing ${text}`);
+    }
+    for (const text of [
+      'Handoff wakes QA', 'immutable head SHA, files, PR URL and base', 'A note on a bead is evidence, not a handoff',
+      "stays OPEN until the reviewer's receipt message names that SHA", 'never assume delivery',
+      'Verdict wakes lead and root', 'PASS or HOLD', 'to the lead and to GLaDOS', 'A verdict left only in notes is not a verdict',
+      'PR-open ends nothing', "closes neither the task's responsibility nor the mission", 'never on PR-open',
+      'Publication is explicit', 'release target (branch/environment), actor and authority', 'Never infer permission to merge or promote to main/prod', 'a blocker for GLaDOS, not a default',
+      'No tools means BLOCKER', 'never a completed handoff',
+    ]) assert.ok(lead.includes(text), `${role}: lead section missing ${text}`);
+    // Handoff and verdict are messages; notes are never presented as the delivery mechanism.
+    assert.doesNotMatch(lead, /notes? (?:is|are|counts? as) (?:a |the )?(?:handoff|delivery|verdict)/iu);
+    // No inferred publication authority anywhere in the rendered prompt.
+    assert.doesNotMatch(prompt, /(?:may|can) (?:merge|promote) (?:to )?(?:main|prod)/iu);
+  }
+  // The specific runtime doc states the same completion contract for GLaDOS and the operator.
+  const doc = read('docs/runtime/conversation-teams.md');
+  for (const text of ['Mission completion', 'PR-open ends nothing', 'receipt', 'PASS or HOLD', 'frozen', 'BLOCKER: messaging tools unavailable']) {
+    assert.ok(doc.includes(text), `conversation-teams.md missing ${text}`);
   }
 });
 

@@ -38,6 +38,30 @@ On an unknown create outcome, list pending requests before retrying. A name
 collision is not a successful retry. No automatic replay, activation or launch
 is introduced.
 
+## Mission completion and publication
+
+Started is not ready, and PR-open ends nothing. A team mission is concluded by
+GLaDOS only on agreed evidence; the lead template (`roles/*/prompt.md.tmpl`)
+binds every seat to the same contract:
+
+1. **Handoff wakes QA.** A reviewable state is handed to the reviewer seat by
+   BEADS message with the immutable head SHA, files, PR URL/base and exact
+   commands. A note on a bead is evidence, not a handoff. The handoff stays open
+   until the reviewer's receipt message names that SHA.
+2. **Verdict wakes lead and root.** The reviewer sends PASS or HOLD (SHA and
+   repro) by message to the lead and to GLaDOS; a verdict only in notes is not
+   a verdict.
+3. **PR-open ends nothing.** A seat's bead closes only after handoff receipt and
+   verdict are recorded; the epic closes only on verdict plus publication
+   readback under the policy frozen at creation.
+4. **Publication is explicit.** Release target, actor and authority are frozen
+   in the mission acceptance at `team_create`. Nobody infers permission to merge
+   or promote to main/prod; an unnamed step is a blocker for GLaDOS, not a default.
+5. **No tools is a blocker.** If aperture-bus messaging tools are not callable in
+   a seat, that seat records `BLOCKER: messaging tools unavailable`; a notes-only
+   handoff is a capability gap, never a completed handoff. Functional readiness
+   before business dispatch is tracked separately (aperture-g4nyg).
+
 ## Compatibility and limits
 
 GUI, MCP and `aperture-team-control` must be built/published from the integrated
