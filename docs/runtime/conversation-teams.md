@@ -51,16 +51,20 @@ binds every seat to the same contract:
 2. **Verdict wakes lead and root.** The reviewer sends PASS or HOLD (SHA and
    repro) by message to the lead and to GLaDOS; a verdict only in notes is not
    a verdict.
-3. **PR-open ends nothing.** A seat's bead closes only after handoff receipt and
-   verdict are recorded; the epic closes only on verdict plus publication
-   readback under the policy frozen at creation.
+3. **PR-open ends nothing.** An implementation bead subject to review closes only
+   after handoff receipt and verdict are recorded; a review bead closes on its
+   own verdict and evidence. Lead and epic responsibility continue: the epic
+   closes only on verdict plus publication readback under the policy frozen at
+   creation.
 4. **Publication is explicit.** Release target, actor and authority are frozen
    in the mission acceptance at `team_create`. Nobody infers permission to merge
    or promote to main/prod; an unnamed step is a blocker for GLaDOS, not a default.
 5. **No tools is a blocker.** If aperture-bus messaging tools are not callable in
-   a seat, that seat records `BLOCKER: messaging tools unavailable`; a notes-only
+   a seat, that seat records `BLOCKER: messaging tools unavailable` when bead
+   tools exist and reports only through an authorized BEADS surface; it never
+   invents a channel or claims a report was sent without one. A notes-only
    handoff is a capability gap, never a completed handoff. Functional readiness
-   before business dispatch is tracked separately (aperture-g4nyg).
+   before business dispatch collects that error (aperture-g4nyg).
 
 ## Compatibility and limits
 
