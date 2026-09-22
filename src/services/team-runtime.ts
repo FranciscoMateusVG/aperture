@@ -130,6 +130,10 @@ export const runtimeCommands = createRuntimeCommands(invoke);
 export type RuntimeCommands = ReturnType<typeof createRuntimeCommands>;
 
 const errorMessages: Record<string, string> = {
+ E_RECONCILIATION_RECORD_MISSING: "Falta o registro de encerramento. GLaDOS precisa registrar o destino das tarefas, a revisão e as evidências antes de arquivar. O time não foi arquivado.",
+ E_RECONCILIATION_INVALID: "O registro de encerramento é inválido. GLaDOS precisa corrigir a reconciliação deste time; nenhuma conclusão foi presumida.",
+ E_RECONCILIATION_UNAVAILABLE: "Não foi possível consultar o BEADS. O time não foi arquivado; verifique a conexão antes de tentar novamente.",
+ E_RECONCILIATION_DRIFT: "As evidências mudaram. Atualize o encerramento antes de aprovar o arquivamento.",
  E_PREPARATION_EXPIRED: "Start blocked: the preparation permit expired or is no longer valid. The previous worker remains stopped and revoked. Refresh state and prepare again; no rollback or automatic retry.",
  E_LAUNCH_UNAVAILABLE: "The native launch capability is unavailable. No start is confirmed.",
  E_RUNTIME_DEADLINE: "The runtime deadline elapsed. Outcome is unknown; refresh state, do not assume rollback.",

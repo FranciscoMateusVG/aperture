@@ -246,3 +246,13 @@ test("bootstrap transport/deadline errors never retry or change generation", asy
   assert.doesNotMatch(r.runtimeErrorCopy({ code, message: "SECRET_SENTINEL" }), /SECRET_SENTINEL/);
  }
 });
+
+test("archive errors distinguish missing record from BEADS availability without echoing payload", () => {
+  const missing = r.runtimeErrorCopy({code:"E_RECONCILIATION_RECORD_MISSING",message:"SECRET_SENTINEL"});
+  assert.match(missing, /GLaDOS/);
+  assert.match(missing, /tarefas/);
+  assert.doesNotMatch(missing, /SECRET_SENTINEL|consultar o BEADS/);
+  assert.match(r.runtimeErrorCopy({code:"E_RECONCILIATION_UNAVAILABLE"}), /consultar o BEADS/);
+  assert.match(r.runtimeErrorCopy({code:"E_RECONCILIATION_INVALID"}), /inválido/);
+  assert.match(r.runtimeErrorCopy({code:"E_RECONCILIATION_DRIFT"}), /mudaram/);
+});

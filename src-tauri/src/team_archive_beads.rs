@@ -13,15 +13,28 @@ pub(crate) enum InventoryError {
     Unavailable,
     Drift,
     Record,
+    RecordMissing,
 }
 impl InventoryError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
+            Self::RecordMissing => "E_RECONCILIATION_RECORD_MISSING",
             Self::Binding => "E_ARCHIVE_BINDING",
             Self::Shape | Self::Record => "E_RECONCILIATION_INVALID",
             Self::Limit => "E_RECONCILIATION_LIMIT",
             Self::Unavailable => "E_RECONCILIATION_UNAVAILABLE",
             Self::Drift => "E_RECONCILIATION_DRIFT",
+        }
+    }
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            Self::RecordMissing => "Archive record is missing. GLaDOS must reconcile task dispositions, reviews and metric evidence before archival.",
+            Self::Record => "Archive record is invalid. GLaDOS must correct the epic-bound reconciliation record.",
+            Self::Unavailable => "BEADS inventory could not be read. No archival was performed.",
+            Self::Drift => "Archive evidence changed. Refresh the reconciliation before approval.",
+            Self::Binding => "Archive evidence does not match the team and epic.",
+            Self::Limit => "Archive evidence exceeds the bounded inventory limits.",
+            Self::Shape => "BEADS inventory has an unsupported structure.",
         }
     }
 }
@@ -326,7 +339,10 @@ fn collect<C: ReadBeads>(
     }
     let mut raw = c.query(&args(&["show", epic]))?;
     let record = super::record::parse_epic_record(&raw, team, g, epic, now, sentinels)
-        .map_err(|_| InventoryError::Record);
+        .map_err(|e| match e {
+            super::record::RecordError::Missing => InventoryError::RecordMissing,
+            _ => InventoryError::Record,
+        });
     let root = issues(&raw);
     raw.fill(0);
     let record = record?;
@@ -685,10 +701,24 @@ mod tests {
         let mut f = Fake::new();
         f.data.get_mut(EPIC).unwrap()["metadata"] = json!({});
         f.data.get_mut(EPIC).unwrap()["notes"] = record().to_string().into();
-        assert!(matches!(run(&mut f), Err(InventoryError::Record)));
+        let error = run(&mut f).err().unwrap();
+        assert_eq!(error, InventoryError::RecordMissing);
+        assert_eq!(error.code(), "E_RECONCILIATION_RECORD_MISSING");
+        assert!(error.message().contains("GLaDOS"));
+        assert_ne!(error.code(), InventoryError::Unavailable.code());
         let mut f = Fake::new();
         f.data.get_mut(WORK).unwrap()["status"] = "unknown".into();
         assert!(matches!(run(&mut f), Err(InventoryError::Shape)));
+    }
+    #[test]
+    fn malformed_record_is_not_missing_or_inventory_unavailable() {
+        let mut f = Fake::new();
+        f.data.get_mut(EPIC).unwrap()["metadata"]["aperture_archive_v1"] = json!({"schema_version":99});
+        let error = run(&mut f).err().unwrap();
+        assert_eq!(error, InventoryError::Record);
+        assert_eq!(error.code(), "E_RECONCILIATION_INVALID");
+        assert!(error.message().contains("invalid"));
+        assert!(InventoryError::Unavailable.message().contains("BEADS"));
     }
     #[test]
     fn caller_selector_injection_fails_before_any_read() {

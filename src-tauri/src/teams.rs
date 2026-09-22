@@ -1850,7 +1850,7 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
     let epic = view.state.epic_id.as_deref().ok_or_else(|| TeamError::new("E_RECONCILIATION_INCOMPLETE", "active team epic is unavailable"))?;
     let seats: Vec<_> = view.snapshot.seats.iter().map(|s| s.name.clone()).collect();
     let beads = crate::team_archive::beads::collect_native(&engine.paths.home, &input.team, input.expected_generation, epic, &[])
-        .map_err(|e| TeamError::new(e.code(), "archive reconciliation inventory is unavailable"))?;
+        .map_err(|e| TeamError::new(e.code(), e.message()))?;
     let native = crate::team_archive::native::inspect_native(&engine.paths.home, &input.team, input.expected_generation, &[])
         .map_err(|e| TeamError::new(&e.code, "archive runtime inventory is unavailable"))?;
     let mut blockers: Vec<RuntimeBlocker> = beads.structural_blockers(&seats).into_iter()
