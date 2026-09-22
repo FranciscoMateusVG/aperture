@@ -657,3 +657,154 @@ fn archival_authority_cannot_enter_replacement_or_impersonate_operator() {
     }
     assert_eq!(std::fs::read_dir(&f.0).unwrap().count(), 0);
 }
+
+// Startup-smoke tests use a fake private HOME, real capability validation and
+// synthetic owner/floor records. No harness, hub, signal, prompt or provider.
+struct SmokeEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl SmokeEnv {
+    fn set(f: &Fixture) -> Self {
+        let values = [("HOME", f.0.clone()), ("APERTURE_AGENTS_DIR", f.0.join(".claude/aperture")),
+            ("APERTURE_TEAMS_DIR", f.0.join(".aperture/teams"))];
+        let mut old = vec![];
+        for (key, value) in values { old.push((key, std::env::var_os(key))); std::env::set_var(key, value); }
+        Self(old)
+    }
+}
+impl Drop for SmokeEnv {
+    fn drop(&mut self) { for (k,v) in self.0.drain(..) { match v { Some(v) => std::env::set_var(k,v), None => std::env::remove_var(k) } } }
+}
+fn smoke_fixture(f: &Fixture) -> AuthenticatedActor {
+    let mut snapshot = team(); snapshot.lead = "t1-worker".into();
+    snapshot.seats[0].role = "lead".into(); snapshot.seats[0].harness = Harness::Claude;
+    snapshot.seats[0].model = "claude-sonnet-5".into(); snapshot.seats[0].reasoning = None;
+    snapshot.fallbacks.clear();
+    snapshot.creation_request_id=uuid::Uuid::new_v4().to_string();
+    snapshot.staging_uuid=uuid::Uuid::new_v4().to_string();
+    f.write(".aperture/teams/t1/team.json", &serde_json::to_value(snapshot).unwrap());
+    f.write(".aperture/teams/t1/state.json", &serde_json::json!({"schema_version":1,"state":"active","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-22T00:00:00Z"}));
+    f.write(".claude/aperture/glados/manifest.json", &serde_json::json!({"name":"GLaDOS","model":"sonnet","window":"glados","role":"orchestrator","enabled":true}));
+    for (rel, bytes) in [(".claude/aperture/glados/prompt.md", b"fixture".as_slice()),
+        (".claude/aperture/t1-worker/TEAM", b"".as_slice()), (".claude/aperture/t1-worker/.complete", b"".as_slice()),
+        (".aperture/run/hub-tokens/glados.token", b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".as_slice())] {
+        let p=f.0.join(rel);ensure_private_dir(p.parent().unwrap()).unwrap();write_private_bytes_atomic(&p,bytes,false).unwrap();
+    }
+    OwnerStore::new(f.0.join(".aperture/run/owner")).initialize_owner(&AuthenticatedActor::launcher(),"t1-worker",
+        ExecutionTuple { harness:Harness::Claude, model:"claude-sonnet-5".into(), reasoning:None }).unwrap();
+    crate::team_auth::authenticate_glados_control().unwrap()
+}
+fn synthetic_cleaned_smoke(f: &Fixture, actor: &AuthenticatedActor) -> (SmokeAdmission, NativeStarted, deadline::RuntimeAttempt) {
+    let admission=SmokeAdmission::issue(&f.0,actor,"t1","t1-worker",0).unwrap();
+    let mut attempt=deadline::RuntimeAttempt::begin_bootstrap(&f.0,&AuthenticatedActor::launcher(),"t1","t1-worker",deadline::Deadline::new()).unwrap();
+    attempt.admit_effects().unwrap();
+    let store=OwnerStore::new(f.0.join(".aperture/run/owner"));let launcher=AuthenticatedActor::launcher();
+    let selected=ExecutionTuple { harness:Harness::Claude,model:"claude-sonnet-5".into(),reasoning:None };
+    let res=store.reserve_start(&launcher,"t1-worker",0,selected.clone()).unwrap();
+    store.bind_and_publish_token(&launcher,&res,"a".repeat(64),||Ok(())).unwrap();
+    let pid=900001;let birth=42;let thread=uuid::Uuid::new_v4().to_string();
+    store.record_start_candidate(&launcher,&res,Incarnation { pid,start_time:birth,thread_id:String::new(),token_id:"a".repeat(64),
+        harness:Harness::Claude,model:selected.model.clone(),reasoning:None,observed:false,
+        processes:vec![crate::owner::ProcessIdentity {pid,start_time:birth,ppid:1,pgid:pid,cmdline_sha256:"b".repeat(64),cwd:"/fixture".into()}] }).unwrap();
+    store.record_runtime_observation(&launcher,&res,crate::owner::RuntimeObservation {pid,start_time:birth,token_id:"a".repeat(64),thread_id:thread.clone(),actual:selected}).unwrap();
+    store.commit_start(&launcher,&res).unwrap();
+    store.quarantine_failed_start(&launcher,&res,&crate::owner::FailedStartIdentity {pid,start_time:birth,token_id:"a".repeat(64),thread_id:thread.clone()}).unwrap();
+    f.write(".aperture/run/revocations/t1-worker.json", &revoked_value());
+    let started=NativeStarted { reservation:res,harness:Harness::Claude,child:None,candidate:StartedCandidate {
+        observed:StartedReplacement {generation:1,thread_id:thread,requested_model:"claude-sonnet-5".into(),actual_model:Some("claude-sonnet-5".into()),model_verified:true},
+        actual_harness:Some("claude".into()),actual_reasoning:None,process:team_process::identity_from_owner(pid,birth).unwrap(),token_id:"a".repeat(64) } };
+    (admission,started,attempt)
+}
+#[test]
+fn smoke_authority_is_glados_only_before_any_runtime_io() {
+    let f=Fixture::new();
+    for actor in [AuthenticatedActor::operator_ui(),AuthenticatedActor::launcher()] {
+        assert!(matches!(bootstrap_claude_smoke_authorized(&f.0,&actor,"t1","t1-worker",0,&[]),Err(ReplacementError::AuthorizationRequired)));
+    }
+    assert!(!f.0.join(".aperture").exists());
+    assert!(!crate::teams::managed_launch_enabled(&Harness::Claude));
+}
+#[test]
+fn smoke_admission_pins_g0_exact_tuple_snapshot_and_current_capability() {
+    let _guard=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);let actor=smoke_fixture(&f);
+    assert!(SmokeAdmission::issue(&f.0,&actor,"t1","t1-worker",1).is_err());
+    let a=SmokeAdmission::issue(&f.0,&actor,"t1","t1-worker",0).unwrap();
+    assert!(a.matches_target(&f.0,"t2","t1-worker",0).is_err());
+    assert!(a.matches_target(&f.0,"t1","t1-worker",1).is_err());
+    let path=f.0.join(".aperture/teams/t1/team.json");let mut snapshot:TeamSnapshot=read_private_json(&path).unwrap();
+    snapshot.mission="changed".into();f.write(".aperture/teams/t1/team.json",&serde_json::to_value(snapshot.clone()).unwrap());
+    assert!(a.revalidate().is_err());
+    for (model,reasoning) in [("sonnet",None),("claude-sonnet-5",Some(ReasoningEffort::High))] {
+        snapshot.seats[0].model=model.into();snapshot.seats[0].reasoning=reasoning;
+        f.write(".aperture/teams/t1/team.json",&serde_json::to_value(&snapshot).unwrap());
+        assert!(SmokeAdmission::issue(&f.0,&actor,"t1","t1-worker",0).is_err());
+    }
+    write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/glados.token"),b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",true).unwrap();
+    assert!(matches!(SmokeAdmission::issue(&f.0,&actor,"t1","t1-worker",0),Err(ReplacementError::AuthorizationRequired)));
+    assert!(!f.0.join(".aperture/teams/t1/runtime-attempts").exists());
+}
+#[test]
+fn smoke_terminal_is_cleaned_not_active_and_never_allows_retry() {
+    let _guard=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);let actor=smoke_fixture(&f);
+    let (a,started,mut attempt)=synthetic_cleaned_smoke(&f,&actor);
+    let proof=SmokeCleanupProof::capture(&a,&started,attempt.id(),attempt.budget(),&actor).unwrap();
+    assert_eq!(proof.actual.reasoning,None);
+    attempt.finish_smoke_cleaned(proof,&actor).unwrap();
+    let dir=f.0.join(".aperture/teams/t1/runtime-attempts/t1-worker/g0");
+    let fact:serde_json::Value=read_private_json(&dir.join("terminal.json")).unwrap();
+    assert_eq!(fact["kind"],"smoke_cleaned");
+    assert_eq!(OwnerStore::new(f.0.join(".aperture/run/owner")).read_owner("t1-worker").unwrap().state,OwnerState::Quarantined);
+    assert!(SmokeAdmission::issue(&f.0,&actor,"t1","t1-worker",0).is_err());
+    assert!(deadline::RuntimeAttempt::begin_bootstrap(&f.0,&AuthenticatedActor::launcher(),"t1","t1-worker",deadline::Deadline::new()).is_err());
+}
+#[test]
+fn smoke_terminal_rechecks_every_bound_fact_before_publication() {
+    let _guard=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for drift in ["owner", "snapshot", "floor", "token", "actor", "admission", "effects", "process", "terminal", "state"] {
+        let f=Fixture::new();let _env=SmokeEnv::set(&f);let actor=smoke_fixture(&f);
+        let (a,started,mut attempt)=synthetic_cleaned_smoke(&f,&actor);
+        let proof=SmokeCleanupProof::capture(&a,&started,attempt.id(),attempt.budget(),&actor).unwrap();
+        let dir=".aperture/teams/t1/runtime-attempts/t1-worker/g0";
+        match drift {
+            "owner"=>{let mut owner=OwnerStore::new(f.0.join(".aperture/run/owner")).read_owner("t1-worker").unwrap();owner.generation=2;f.write(".aperture/run/owner/t1-worker.json",&serde_json::to_value(owner).unwrap());},
+            "snapshot"=>{let mut snapshot:TeamSnapshot=read_private_json(&f.0.join(".aperture/teams/t1/team.json")).unwrap();snapshot.mission="drift".into();f.write(".aperture/teams/t1/team.json",&serde_json::to_value(snapshot).unwrap());},
+            "state"=>f.write(".aperture/teams/t1/state.json",&serde_json::json!({"schema_version":1,"state":"archived","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-22T00:00:00Z"})),
+            "floor"=>f.write(".aperture/run/revocations/t1-worker.json",&serde_json::json!({"broken":true})),
+            "token"=>write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/t1-worker.token"),b"unexpected",false).unwrap(),
+            "actor"=>write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/glados.token"),b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",true).unwrap(),
+            "admission"=>f.write(&format!("{dir}/admitted.json"),&serde_json::json!({"broken":true})),
+            "effects"=>f.write(&format!("{dir}/effects.json"),&serde_json::json!({"broken":true})),
+            "terminal"=>f.write(&format!("{dir}/terminal.json"),&serde_json::json!({"existing":"retained"})),
+            "process"=>{let mut owner=OwnerStore::new(f.0.join(".aperture/run/owner")).read_owner("t1-worker").unwrap();owner.incarnation.as_mut().unwrap().processes[0].pid=std::process::id();f.write(".aperture/run/owner/t1-worker.json",&serde_json::to_value(owner).unwrap());},
+            _=>unreachable!(),
+        }
+        assert!(attempt.finish_smoke_cleaned(proof,&actor).is_err(),"{drift}");
+        if drift!="terminal" {assert!(!f.0.join(format!("{dir}/terminal.json")).exists(),"{drift}");}
+        else {assert_eq!(read_private_json::<serde_json::Value>(&f.0.join(format!("{dir}/terminal.json"))).unwrap()["existing"],"retained");}
+    }
+}
+#[test]
+fn smoke_cleanup_proof_does_not_renew_cleanup_deadline_or_cross_attempt() {
+    let _guard=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);let actor=smoke_fixture(&f);
+    let (a,started,attempt)=synthetic_cleaned_smoke(&f,&actor);
+    let proof=SmokeCleanupProof::capture(&a,&started,attempt.id(),attempt.budget(),&actor).unwrap();
+    let published=std::cell::Cell::new(false);
+    assert_eq!(proof.with_revalidated(&f.0,"t1","t1-worker",0,attempt.id(),
+        &deadline::Deadline::fixture_elapsed(Duration::from_secs(171)),&actor,||{published.set(true);Ok(())}),Err(ReplacementError::Deadline));
+    assert!(!published.get());
+    let proof=SmokeCleanupProof::capture(&a,&started,attempt.id(),attempt.budget(),&actor).unwrap();
+    assert!(proof.with_revalidated(&f.0,"t1","t1-worker",0,"different-attempt",attempt.budget(),&actor,||{published.set(true);Ok(())}).is_err());
+    assert!(!published.get());
+    let held=crate::owner::try_lock(&f.0.join(".aperture/run/team-locks"),"t1").unwrap();
+    assert!(SmokeCleanupProof::capture(&a,&started,attempt.id(),attempt.budget(),&actor).is_err());
+    drop(held);
+}
+#[test]
+fn smoke_finally_runs_once_on_success_auth_drift_and_observation_failure() {
+    for observation in [Ok(()),Err(ReplacementError::AuthorizationRequired),Err(ReplacementError::ModelUnverified),Err(ReplacementError::Deadline)] {
+        for cleanup in [Ok(()),Err(ReplacementError::StartCleanupUnverified)] {
+            let count=std::cell::Cell::new(0);
+            let result=smoke_finally(observation.clone(),||{count.set(count.get()+1);cleanup.clone()});
+            assert_eq!(count.get(),1);
+            assert_eq!(result,if cleanup.is_err(){cleanup}else{observation.clone()});
+        }
+    }
+}

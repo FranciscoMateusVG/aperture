@@ -511,3 +511,23 @@ fn failed_start_without_effects_can_reprepare_and_preserves_all_old_facts() {
     let third = RuntimeAttempt::begin(&f.0, &actor, "t1", "t1-worker", 1, Deadline::new()).unwrap();
     assert!(third.dir.ends_with("g1/reprepare/reprepare"));
 }
+
+#[test]
+fn smoke_terminal_is_distinct_and_not_a_reprepare_grant() {
+    let f = Fixture::new(); f.managed();
+    let actor = AuthenticatedActor::launcher();
+    let mut a = RuntimeAttempt::begin(&f.0,&actor,"t1","t1-worker",1,Deadline::new()).unwrap();
+    a.admit_effects().unwrap();
+    let ready = a.finish_ready(&proof()).unwrap();
+    let mut fact: Fact = read_private_json(&ready.dir.join("terminal.json")).unwrap();
+    fact.kind = FactKind::SmokeCleaned;
+    write_private_json_atomic(&ready.dir.join("terminal.json"), &fact, true).unwrap();
+    let before = std::fs::read(ready.dir.join("terminal.json")).unwrap();
+    assert!(matches!(RuntimeAttempt::begin(&f.0,&actor,"t1","t1-worker",1,Deadline::new()),Err(ReplacementError::OutcomeUnknown)));
+    assert!(!ready.dir.join("reprepare").exists());
+    assert_eq!(before,std::fs::read(ready.dir.join("terminal.json")).unwrap());
+    assert_eq!(serde_json::to_value(FactKind::SmokeCleaned).unwrap(),"smoke_cleaned");
+    assert_ne!(FactKind::SmokeCleaned,FactKind::Active);
+    assert_ne!(FactKind::SmokeCleaned,FactKind::Ready);
+    assert_ne!(FactKind::SmokeCleaned,FactKind::Failed);
+}
