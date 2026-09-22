@@ -59,7 +59,8 @@ struct Issue {
     acceptance_sha256: String,
 }
 #[derive(Deserialize)]
-struct RawIssue {
+#[serde(bound(deserialize = "D: Deserialize<'de>"))]
+struct RawIssue<D = Dependency> {
     id: String,
     status: Status,
     assignee: Option<String>,
@@ -67,13 +68,22 @@ struct RawIssue {
     issue_type: String,
     updated_at: String,
     #[serde(default)]
-    dependencies: Vec<Dependency>,
+    dependencies: Vec<D>,
     #[serde(default)]
     acceptance_criteria: String,
 }
 #[derive(Deserialize)]
 struct Dependency {
     id: String,
+    dependency_type: String,
+}
+// bd list embeds edge rows; bd show embeds the referenced issue instead.
+// Keep the wire formats distinct. Only hydrated show rows become evidence.
+#[derive(Deserialize)]
+struct ListedDependency {
+    issue_id: String,
+    depends_on_id: String,
+    #[serde(rename = "type")]
     dependency_type: String,
 }
 fn id(s: &str) -> bool {
@@ -95,6 +105,46 @@ fn issues(raw: &[u8]) -> Result<Vec<Issue>, InventoryError> {
         return Err(InventoryError::Limit);
     }
     let rows: Vec<RawIssue> = serde_json::from_slice(raw).map_err(|_| InventoryError::Shape)?;
+    project_issues(rows)
+}
+fn listed_issues(raw: &[u8]) -> Result<Vec<Issue>, InventoryError> {
+    if raw.len() > 8 * 1024 * 1024 {
+        return Err(InventoryError::Limit);
+    }
+    let rows: Vec<RawIssue<ListedDependency>> =
+        serde_json::from_slice(raw).map_err(|_| InventoryError::Shape)?;
+    if rows.len() > TASK_CAP {
+        return Err(InventoryError::Limit);
+    }
+    let mut normalized = Vec::with_capacity(rows.len());
+    for r in rows {
+        if r.dependencies.len() > TASK_CAP {
+            return Err(InventoryError::Limit);
+        }
+        let mut dependencies = vec![];
+        for d in r.dependencies {
+            if d.issue_id != r.id || !id(&d.depends_on_id) {
+                return Err(InventoryError::Shape);
+            }
+            dependencies.push(Dependency {
+                id: d.depends_on_id,
+                dependency_type: d.dependency_type,
+            });
+        }
+        normalized.push(RawIssue {
+            id: r.id,
+            status: r.status,
+            assignee: r.assignee,
+            created_by: r.created_by,
+            issue_type: r.issue_type,
+            updated_at: r.updated_at,
+            acceptance_criteria: r.acceptance_criteria,
+            dependencies,
+        });
+    }
+    project_issues(normalized)
+}
+fn project_issues(rows: Vec<RawIssue>) -> Result<Vec<Issue>, InventoryError> {
     if rows.len() > TASK_CAP {
         return Err(InventoryError::Limit);
     }
@@ -281,7 +331,10 @@ fn read<C: ReadBeads>(c: &mut C, a: Vec<String>) -> Result<Vec<Issue>, Inventory
 /// List is discovery only: bd show embeds the dependency records needed to
 /// verify parent links. Do not infer a parent solely from the list selector.
 fn discover<C: ReadBeads>(c: &mut C, a: Vec<String>) -> Result<Vec<Issue>, InventoryError> {
-    let listed = read(c, a)?;
+    let mut bytes = c.query(&a)?;
+    let listed = listed_issues(&bytes);
+    bytes.fill(0);
+    let listed = listed?;
     if listed.is_empty() {
         return Ok(vec![]);
     }
@@ -338,11 +391,12 @@ fn collect<C: ReadBeads>(
         return Err(InventoryError::Binding);
     }
     let mut raw = c.query(&args(&["show", epic]))?;
-    let record = super::record::parse_epic_record(&raw, team, g, epic, now, sentinels)
-        .map_err(|e| match e {
+    let record = super::record::parse_epic_record(&raw, team, g, epic, now, sentinels).map_err(
+        |e| match e {
             super::record::RecordError::Missing => InventoryError::RecordMissing,
             _ => InventoryError::Record,
-        });
+        },
+    );
     let root = issues(&raw);
     raw.fill(0);
     let record = record?;
@@ -586,7 +640,8 @@ mod tests {
                     || (args[4] == "--assignee" && args[5] == SEAT)
                 {
                     let mut r = self.data[WORK].clone();
-                    r.as_object_mut().unwrap().remove("dependencies"); // Native list is NOT show.
+                    r["dependencies"] =
+                        json!([{"issue_id":WORK,"depends_on_id":EPIC,"type":"parent-child"}]);
                     result.push(r);
                     if self.extra {
                         result.push(row("aperture-extra", SEAT, None));
@@ -657,6 +712,40 @@ mod tests {
         assert_eq!(f.epic_reads, 1);
     }
     #[test]
+    fn discovery_edges_use_list_wire_format_not_show_issue_format() {
+        let mut r = row(WORK, SEAT, None);
+        r["dependencies"] = json!([{"issue_id":WORK,"depends_on_id":EPIC,"type":"parent-child",
+            "created_by":"glados","created_at":"2026-09-20T12:00:00Z","metadata":{}}]);
+        let bytes = serde_json::to_vec(&vec![r.clone()]).unwrap();
+        assert!(
+            matches!(issues(&bytes), Err(InventoryError::Shape)),
+            "old show parser reproduces installed failure"
+        );
+        let listed = listed_issues(&bytes).unwrap();
+        assert_eq!(listed[0].parents, vec![EPIC]);
+        assert!(listed_issues(b"[]").unwrap().is_empty());
+        assert!(matches!(listed_issues(b"null"), Err(InventoryError::Shape)));
+        for field in ["issue_id", "depends_on_id", "type"] {
+            let mut bad = r.clone();
+            bad["dependencies"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(matches!(
+                listed_issues(&serde_json::to_vec(&vec![bad]).unwrap()),
+                Err(InventoryError::Shape)
+            ));
+        }
+        r["dependencies"][0]["issue_id"] = "aperture-foreign".into();
+        assert!(matches!(
+            listed_issues(&serde_json::to_vec(&vec![r]).unwrap()),
+            Err(InventoryError::Shape)
+        ));
+        let show = serde_json::to_vec(&vec![row(WORK, SEAT, Some(EPIC))]).unwrap();
+        assert!(issues(&show).is_ok());
+        assert!(matches!(listed_issues(&show), Err(InventoryError::Shape)));
+    }
+    #[test]
     fn list_show_or_second_projection_drift_fail_closed() {
         let mut f = Fake::new();
         f.show_drift = true;
@@ -713,7 +802,8 @@ mod tests {
     #[test]
     fn malformed_record_is_not_missing_or_inventory_unavailable() {
         let mut f = Fake::new();
-        f.data.get_mut(EPIC).unwrap()["metadata"]["aperture_archive_v1"] = json!({"schema_version":99});
+        f.data.get_mut(EPIC).unwrap()["metadata"]["aperture_archive_v1"] =
+            json!({"schema_version":99});
         let error = run(&mut f).err().unwrap();
         assert_eq!(error, InventoryError::Record);
         assert_eq!(error.code(), "E_RECONCILIATION_INVALID");
