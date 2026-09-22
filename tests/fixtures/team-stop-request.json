@@ -1,0 +1,8 @@
+{
+  "action": "stop_seat",
+  "input": {
+    "team": "mural",
+    "seat": "mural-frontend",
+    "expected_generation": 1
+  }
+}

@@ -66,11 +66,35 @@ binds every seat to the same contract:
    handoff is a capability gap, never a completed handoff. Functional readiness
    before business dispatch collects that error (aperture-g4nyg).
 
+## Stop a seat without replacement
+
+GLaDOS uses `team_stop_seat({input:{team,seat,expected_generation}})` to stop and
+revoke one exact current seat only when the native collector proves a current,
+validated checkpoint. The input contains selectors only: no caller-supplied
+checkpoint proof, discard/force option, actor or timeout. The native child
+revalidates identity, process ownership and checkpoint evidence before signals;
+MCP authorization alone is not that proof.
+
+A verified receipt echoes the exact team, seat and unchanged owner generation,
+with `phase: "ready"`, `checkpoint_recovery: "valid"`, `owner_state: "active"`
+and no blockers. The persisted owner stays Active until archive; its stored
+process count is not rewritten to zero and is not a live-process claim. No
+replacement, new generation, bootstrap or archive is implied. `team_archive`
+remains a separate explicit action with its reconciliation gates.
+
+Stop uses the existing isolated control process group and fixed 180-second
+parent watchdog. Timeout or an invalid/mismatched receipt means UNKNOWN, not
+success, rollback or permission to retry. Preserve native attempts/evidence,
+inspect and reconcile explicitly; do not replay the stop automatically. Missing
+or stale checkpoint evidence blocks the native action rather than discarding
+context. Source tests do not establish a live stop/archive journey.
+
 ## Compatibility and limits
 
 GUI, MCP and `aperture-team-control` must be built/published from the integrated
 head. An old binary cannot handle the new `catalog` / `create` /
-`list_repositories` / `save_repository` / `list_teams` / `bootstrap_seat` actions. Existing
+`list_repositories` / `save_repository` / `list_teams` / `bootstrap_seat` /
+`stop_seat` actions. Existing
 operator-native creation remains available internally; the preset editor is
 removed from the launcher surface. No standing manifest, history or task is
 removed or reassigned by the UI change.
