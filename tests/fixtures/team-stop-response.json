@@ -1,0 +1,12 @@
+{
+  "action": "stop_seat",
+  "result": {
+    "team": "mural",
+    "seat": "mural-frontend",
+    "generation": 1,
+    "phase": "ready",
+    "checkpoint_recovery": "valid",
+    "owner_state": "active",
+    "blockers": []
+  }
+}

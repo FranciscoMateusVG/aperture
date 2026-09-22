@@ -20,7 +20,7 @@ use crate::team_replacement::{
     CheckpointRecovery, ReplacementError, ReplacementPhase, StartSelection,
 };
 use crate::team_replacement::native::{
-    bootstrap_authorized, prepare_operator, replace_authorized, start_operator,
+    bootstrap_authorized, prepare_operator, replace_authorized, start_operator, stop_for_archive,
     ReplacementAuthority,
 };
 use crate::team_replacement::remote::{
@@ -547,6 +547,26 @@ pub struct ArchiveView {
     pub blockers: Vec<RuntimeBlocker>,
 }
 
+/// GLaDOS-only archival stop selectors; no actor, loss policy or new tuple.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StopSeatInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StopSeatView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub phase: ReplacementPhase,
+    pub checkpoint_recovery: CheckpointRecovery,
+    pub owner_state: OwnerState,
+    pub blockers: Vec<RuntimeBlocker>,
+}
+
 /// Target selectors only. The authenticated lead's team, seat and generation
 /// are derived from the current canonical capability and never accepted here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -574,6 +594,7 @@ pub enum TeamControlRequest {
     ListPending,
     ListTeams,
     BootstrapSeat(BootstrapSeatInput),
+    StopSeat(StopSeatInput),
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
     Checkpoint(WriteCheckpointInput),
@@ -594,6 +615,7 @@ pub enum TeamControlResponse {
     ListPending(Vec<TeamView>),
     ListTeams(Vec<TeamView>),
     BootstrapSeat(BootstrapView),
+    StopSeat(StopSeatView),
     Approve(TeamView),
     Cancel(CancelPendingResult),
     Checkpoint(CheckpointReceipt),
@@ -1931,6 +1953,30 @@ pub fn team_bootstrap_seat(
     bootstrap_seat(&engine_from_state(&state)?, &AuthenticatedActor::operator_ui(), input)
 }
 
+fn stop_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: StopSeatInput) -> TeamResult<StopSeatView> {
+    if !actor.is_glados() {
+        return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"));
+    }
+    actor.revalidate_before_mutation().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability changed"))?;
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation == 0 {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "stop selectors are invalid"));
+    }
+    let view = engine.read_team_view(&input.team)?;
+    if view.state.state != TeamLifecycle::Active
+        || view.snapshot.seats.iter().filter(|s| s.name == input.seat).count() != 1
+    { return Err(TeamError::state("active team seat required")); }
+    let recovery = stop_for_archive(&engine.paths.home, actor, &input.team, &input.seat,
+        input.expected_generation, &[]).map_err(replacement_error)?;
+    let owner = owner_summary(&engine.paths.home, &input.seat)?;
+    if recovery != CheckpointRecovery::Valid || owner.generation != input.expected_generation
+        || owner.state != OwnerState::Active
+    { return Err(TeamError::new("E_CONTROL_UNKNOWN", "stop readback is inconsistent; inspect before retry")); }
+    Ok(StopSeatView { team: input.team, seat: input.seat, generation: owner.generation,
+        phase: ReplacementPhase::Ready, checkpoint_recovery: recovery,
+        owner_state: owner.state, blockers: vec![] })
+}
+
 fn bootstrap_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: BootstrapSeatInput) -> TeamResult<BootstrapView> {
     validate_team_name(&input.team)?;
     if !is_valid_seat_name(&input.seat) || input.expected_generation != 0 {
@@ -2092,6 +2138,10 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
         TeamControlRequest::Create(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.create_team(&actor, input).map(TeamControlResponse::Create)
+        }
+        TeamControlRequest::StopSeat(input) => {
+            let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
+            stop_seat(&engine, &actor, input).map(TeamControlResponse::StopSeat)
         }
         TeamControlRequest::BootstrapSeat(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
@@ -2412,6 +2462,52 @@ mod tests {
     }
 
     include!("team_project_runtime_tests.rs");
+
+    #[test]
+    fn glados_stop_shared_wire_is_ready_not_started_or_archived() {
+        let input: TeamControlRequest = serde_json::from_str(include_str!("../../tests/fixtures/team-stop-request.json")).unwrap();
+        assert!(matches!(input, TeamControlRequest::StopSeat(StopSeatInput { expected_generation: 1, .. })));
+        let response = TeamControlResponse::StopSeat(StopSeatView {
+            team: "mural".into(), seat: "mural-frontend".into(), generation: 1,
+            phase: ReplacementPhase::Ready, checkpoint_recovery: CheckpointRecovery::Valid,
+            owner_state: OwnerState::Active, blockers: vec![],
+        });
+        let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/team-stop-response.json")).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), expected);
+    }
+
+    #[test]
+    fn glados_stop_control_requires_real_capability_and_rejects_loss_overrides() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("glados-stop-control");
+        let _env = EnvRestore::set(&home);
+        let request = r#"{"action":"stop_seat","input":{"team":"t1","seat":"t1-frontend","expected_generation":0}}"#;
+        assert_eq!(team_control_headless(request).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        assert_eq!(team_control_headless(request).unwrap_err().code, "E_GENERATION_MISMATCH");
+        for key in ["actor", "model", "timeout", "force", "discard_context", "token"] {
+            let mut forged: serde_json::Value = serde_json::from_str(request).unwrap();
+            forged["input"][key] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<TeamControlRequest>(forged).is_err());
+        }
+        for actor in [AuthenticatedActor::operator_ui(), AuthenticatedActor::launcher()] {
+            assert_eq!(stop_for_archive(&home, &actor, "t1", "t1-frontend", 1, &[]).unwrap_err(), ReplacementError::AuthorizationRequired);
+        }
+        let actor = authenticate_glados_control().unwrap();
+        assert_eq!(stop_for_archive(&home, &actor, "t1", "t1-frontend", 0, &[]).unwrap_err(), ReplacementError::GenerationMismatch);
+        // Even a real GLaDOS archive principal cannot reuse the replacement
+        // entrypoint to gain start authority or degraded checkpoint recovery.
+        let target = RemoteTarget { team: "t1".into(), seat: "t1-frontend".into(), expected_generation: 1 };
+        assert_eq!(replace_authorized(&home, ReplacementAuthority::GladosArchive(&actor), target,
+            &StartSelection { harness: "codex".into(), model: "gpt-6-astra".into(), reasoning: Some("high".into()) }, &[]).unwrap_err(),
+            ReplacementError::AuthorizationRequired);
+        let token = home.join(".aperture/run/hub-tokens/glados.token");
+        write_private_bytes_atomic(&token, b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true).unwrap();
+        assert_eq!(stop_for_archive(&home, &actor, "t1", "t1-frontend", 1, &[]).unwrap_err(), ReplacementError::AuthorizationRequired);
+        assert!(!home.join(".aperture/run/owner/t1-frontend.json").exists());
+        assert!(!home.join(".aperture/teams/t1").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn glados_bootstrap_receipt_matches_shared_native_wire_fixture() {

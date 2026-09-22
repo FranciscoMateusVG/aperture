@@ -612,11 +612,15 @@ fn cleanup_native(
 pub(crate) enum ReplacementAuthority<'a> {
     Operator(&'a AuthenticatedActor),
     Lead(&'a AuthenticatedSeat),
+    GladosArchive(&'a AuthenticatedActor),
 }
 impl ReplacementAuthority<'_> {
     fn revalidate(&self, target: &remote::RemoteTarget) -> Result<(), ReplacementError> {
         match self {
             Self::Operator(actor) if actor.principal() == "operator" => Ok(()),
+            Self::GladosArchive(actor) if actor.is_glados() => actor
+                .revalidate_before_mutation()
+                .map_err(|_| ReplacementError::AuthorizationRequired),
             Self::Lead(actor) if actor.team() == target.team && actor.seat() != target.seat => {
                 actor
                     .revalidate_before_effect()
@@ -625,11 +629,19 @@ impl ReplacementAuthority<'_> {
             _ => Err(ReplacementError::AuthorizationRequired),
         }
     }
-    fn remote(&self) -> remote::ResolutionAuthority<'_> {
-        match self {
-            Self::Operator(actor) => remote::ResolutionAuthority::Operator(actor),
-            Self::Lead(actor) => remote::ResolutionAuthority::Lead(actor),
-        }
+    fn inspect(&self, home: &Path, target: &remote::RemoteTarget, sentinels: &[String])
+        -> Result<remote::RemoteInventoryView, remote::RemoteError>
+    {
+        self.revalidate(target).map_err(|_| remote::RemoteError::Authority)?;
+        let result = match self {
+            Self::Operator(actor) => remote::inspect_authorized(home, remote::ResolutionAuthority::Operator(actor), target, sentinels),
+            Self::Lead(actor) => remote::inspect_authorized(home, remote::ResolutionAuthority::Lead(actor), target, sentinels),
+            // Read only: GLaDOS archival authority does not become an operator
+            // principal and cannot manufacture a remote-resolution decision.
+            Self::GladosArchive(_) => remote::inspect_native(home, target, sentinels),
+        }?;
+        self.revalidate(target).map_err(|_| remote::RemoteError::Authority)?;
+        Ok(result)
     }
 }
 
@@ -834,6 +846,9 @@ pub(crate) fn replace_authorized(
     selection: &StartSelection,
     sentinels: &[String],
 ) -> Result<NativeReplacementResult, ReplacementError> {
+    if matches!(authority, ReplacementAuthority::GladosArchive(_)) {
+        return Err(ReplacementError::AuthorizationRequired);
+    }
     let budget = deadline::Deadline::new();
     selectors(&target)?;
     let binding = require_repository_binding(home, &target, &budget)?;
@@ -933,6 +948,34 @@ pub(crate) fn prepare_operator(
     if actor.principal() != "operator" {
         return Err(ReplacementError::AuthorizationRequired);
     }
+    prepare_authenticated(home, actor, team, seat, expected_generation, sentinels, false)
+}
+
+/// GLaDOS-only stop/revoke, no replacement permit leaves this function.
+/// The archived owner transition belongs to the existing archive journal.
+pub(crate) fn stop_for_archive(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    expected_generation: u64, sentinels: &[String],
+) -> Result<CheckpointRecovery, ReplacementError> {
+    if !actor.is_glados() {
+        return Err(ReplacementError::AuthorizationRequired);
+    }
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)?;
+    let stopped = prepare_authenticated(home, actor, team, seat, expected_generation, sentinels, true)?;
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::OutcomeUnknown)?;
+    if stopped.prepared.checkpoint_recovery() != CheckpointRecovery::Valid
+        || !stopped.revoked.durable || !stopped.revoked.token_deleted
+        || stopped.revoked.generation != expected_generation
+    { return Err(ReplacementError::OutcomeUnknown); }
+    // Ready evidence is durable. Drop the in-memory replacement permit: there
+    // is no Start call and no automatic generation/model change.
+    Ok(CheckpointRecovery::Valid)
+}
+
+fn prepare_authenticated(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    expected_generation: u64, sentinels: &[String], archive: bool,
+) -> Result<NativePreparedReplacement, ReplacementError> {
     let target = remote::RemoteTarget {
         team: team.into(),
         seat: seat.into(),
@@ -940,7 +983,8 @@ pub(crate) fn prepare_operator(
     };
     selectors(&target)?;
     let budget = deadline::Deadline::new();
-    let authority = ReplacementAuthority::Operator(actor);
+    let authority = if archive { ReplacementAuthority::GladosArchive(actor) }
+        else { ReplacementAuthority::Operator(actor) };
     let binding = require_repository_binding(home, &target, &budget)?;
     authority.revalidate(&target)?;
     let owner = OwnerStore::new(home.join(".aperture/run/owner"))
@@ -967,12 +1011,13 @@ pub(crate) fn prepare_operator(
     let mut runtime = NativeRuntime::new(
         home, authority, target, sentinels, binding, budget, plan, checkpoint,
     )?;
-    let prepared = match prepare(
-        &mut runtime,
-        seat,
-        expected_generation,
-        &ReplacementPolicy::default(),
-    ) {
+    let policy = ReplacementPolicy::default();
+    let result = if archive {
+        prepare_for_archive(&mut runtime, seat, expected_generation, &policy)
+    } else {
+        prepare(&mut runtime, seat, expected_generation, &policy)
+    };
+    let prepared = match result {
         Ok(v) => v,
         Err(e) => {
             let _ = runtime.attempt.finish_failed();
@@ -1042,6 +1087,7 @@ pub(crate) fn start_operator(
         plan,
         checkpoint,
         started: None,
+        archival_signal_admitted: false,
     };
     let result = start(&mut runtime, prepared, selection);
     match result {
@@ -1081,6 +1127,7 @@ struct NativeRuntime<'a> {
     plan: NativePlan,
     checkpoint: RecoveryContext,
     started: Option<NativeStarted>,
+    archival_signal_admitted: bool,
 }
 impl<'a> NativeRuntime<'a> {
     fn new(
@@ -1094,7 +1141,7 @@ impl<'a> NativeRuntime<'a> {
         checkpoint: RecoveryContext,
     ) -> Result<Self, ReplacementError> {
         authority.revalidate(&target)?;
-        remote::inspect_authorized(home, authority.remote(), &target, sentinels)
+        authority.inspect(home, &target, sentinels)
             .map_err(|_| ReplacementError::AuthorizationRequired)?;
         let attempt = deadline::RuntimeAttempt::begin(
             home,
@@ -1118,6 +1165,7 @@ impl<'a> NativeRuntime<'a> {
             plan,
             checkpoint,
             started: None,
+            archival_signal_admitted: false,
         };
         runtime.admission()?;
         Ok(runtime)
@@ -1127,12 +1175,7 @@ impl<'a> NativeRuntime<'a> {
         self.authority.revalidate(&self.target)?;
         // Uses the SAME team -> lexical seat locks and immutable lead identity
         // as resolution. This does not accept or synthesize remote authorization.
-        remote::inspect_authorized(
-            self.home,
-            self.authority.remote(),
-            &self.target,
-            self.sentinels,
-        )
+        self.authority.inspect(self.home, &self.target, self.sentinels)
         .map_err(|e| match e {
             remote::RemoteError::Authority => ReplacementError::AuthorizationRequired,
             _ => ReplacementError::RemoteUncertain,
@@ -1262,6 +1305,12 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         Err(ReplacementError::CheckpointUnavailable)
     }
     fn checkpoint_recovery(&mut self) -> CheckpointRecovery {
+        if matches!(self.authority, ReplacementAuthority::GladosArchive(_)) {
+            return checkpoint_for_target(self.home, &self.authority, &self.target,
+                &self._binding.0, self.sentinels, self.attempt.budget())
+                .ok().filter(|fresh| fresh.worktree == self.checkpoint.worktree)
+                .map(|fresh| fresh.recovery).unwrap_or(CheckpointRecovery::None);
+        }
         self.checkpoint.recovery
     }
     fn process_state(&mut self, process: &ProcessIdentity) -> ProcessState {
@@ -1272,6 +1321,10 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         process: &ProcessIdentity,
         signal: Signal,
     ) -> Result<(), ReplacementError> {
+        if matches!(self.authority, ReplacementAuthority::GladosArchive(_))
+            && !self.archival_signal_admitted
+            && self.checkpoint_recovery() != CheckpointRecovery::Valid
+        { return Err(ReplacementError::CheckpointUnavailable); }
         self.attempt.admit_effects()?;
         let snapshot = self
             .snapshot
@@ -1282,7 +1335,9 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         }
         self.with_stop_guard(snapshot, |guard| {
             team_process::signal_recorded(guard, process, signal)
-        })
+        })?;
+        self.archival_signal_admitted = true;
+        Ok(())
     }
     fn unowned_matches(&mut self, snapshot: &OwnershipSnapshot) -> Result<bool, ReplacementError> {
         self.matches_target(snapshot)?;
@@ -1360,6 +1415,9 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         snapshot: &OwnershipSnapshot,
         selection: &StartSelection,
     ) -> Result<(), ReplacementError> {
+        if matches!(self.authority, ReplacementAuthority::GladosArchive(_)) {
+            return Err(ReplacementError::AuthorizationRequired);
+        }
         self.matches_target(snapshot)?;
         self.admission()?;
         let _lock = crate::owner::try_lock(

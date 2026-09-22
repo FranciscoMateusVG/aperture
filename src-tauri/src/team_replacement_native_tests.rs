@@ -642,3 +642,18 @@ fn disabled_claude_native_plan_denies_before_runtime_io_without_affecting_codex_
         std::fs::read(home.join(".aperture/teams/t1/team.json")).unwrap()
     );
 }
+
+#[test]
+fn archival_authority_cannot_enter_replacement_or_impersonate_operator() {
+    let f = Fixture::new();
+    for actor in [AuthenticatedActor::operator_ui(), AuthenticatedActor::launcher()] {
+        let authority = ReplacementAuthority::GladosArchive(&actor);
+        assert_eq!(authority.revalidate(&target()), Err(ReplacementError::AuthorizationRequired));
+        assert!(matches!(authority.inspect(&f.0, &target(), &[]), Err(remote::RemoteError::Authority)));
+        assert_eq!(replace_authorized(&f.0, authority, target(), &selection(), &[]).unwrap_err(),
+            ReplacementError::AuthorizationRequired);
+        assert_eq!(stop_for_archive(&f.0, &actor, "t1", "t1-worker", 1, &[]).unwrap_err(),
+            ReplacementError::AuthorizationRequired);
+    }
+    assert_eq!(std::fs::read_dir(&f.0).unwrap().count(), 0);
+}
