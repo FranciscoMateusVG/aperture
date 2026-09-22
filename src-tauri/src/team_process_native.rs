@@ -169,6 +169,27 @@ pub(crate) fn capture_gated_child(
     })
 }
 
+/// Capture a natively obtained tmux gate identity without assuming its parent
+/// is the GUI (tmux owns it). This grants no stop authority; the caller must
+/// persist it in OwnerStore before release and never accept a caller PID.
+pub(crate) fn capture_gated_identity(id: &ProcessIdentity) -> Result<crate::owner::ProcessIdentity, ReplacementError> {
+    let before=observe(id.pid)?.ok_or(ReplacementError::StopUnverified)?;
+    if before.identity!=*id || before.uid!=unsafe{libc::geteuid()} {return Err(ReplacementError::StopUnverified);}
+    let (cmdline_sha256,cwd)=native_details(id)?;
+    let after=observe(id.pid)?.ok_or(ReplacementError::StopUnverified)?;
+    if after.identity!=before.identity||after.ppid!=before.ppid||after.pgid!=before.pgid||after.uid!=before.uid {return Err(ReplacementError::StopUnverified);}
+    Ok(crate::owner::ProcessIdentity{pid:id.pid,start_time:birth_micros(id)?,ppid:before.ppid,pgid:before.pgid,cmdline_sha256,cwd})
+}
+#[cfg(all(test,target_os="macos"))]
+#[test]
+fn gated_identity_fixture_uses_native_details_and_rejects_wrong_birth() {
+    let id=observe(std::process::id()).unwrap().unwrap().identity;
+    let captured=capture_gated_identity(&id).unwrap();
+    assert_eq!(captured.pid,id.pid);assert_eq!(captured.start_time,birth_micros(&id).unwrap());
+    assert_eq!(captured.cmdline_sha256.len(),64);assert!(std::path::Path::new(&captured.cwd).is_absolute());
+    let mut wrong=id;wrong.start_time="1.000001".into();assert!(capture_gated_identity(&wrong).is_err());
+}
+
 fn seeded(record: &OwnerRecord) -> Result<(ProcessIdentity, Vec<OwnedProcess>), ReplacementError> {
     let inc = record
         .incarnation

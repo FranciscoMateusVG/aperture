@@ -1244,6 +1244,7 @@ fn execution_catalog() -> Vec<ExecutionTuple> {
     let mut out = vec![
         ExecutionTuple { harness: Harness::Claude, model: "opus".into(), reasoning: None },
         ExecutionTuple { harness: Harness::Claude, model: "sonnet".into(), reasoning: None },
+        ExecutionTuple { harness: Harness::Claude, model: "claude-sonnet-5".into(), reasoning: None },
     ];
     let efforts = [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Xhigh, ReasoningEffort::Max, ReasoningEffort::Ultra];
     for model in ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"] {
@@ -2630,6 +2631,24 @@ mod tests {
         assert_eq!(classify_managed_seat(&home, "standing").unwrap(), None);
         assert_eq!(crate::agent_loader::load_agents_from_disk().keys().filter(|name| name.starts_with("t1-")).count(), 0);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn sonnet_full_id_is_literal_and_does_not_enable_managed_launch() {
+        let tuple = ExecutionTuple { harness: Harness::Claude, model: "claude-sonnet-5".into(), reasoning: None };
+        assert!(validate_execution_tuple(&tuple).is_ok());
+        for model in ["opus", "sonnet"] {
+            assert!(validate_execution_tuple(&ExecutionTuple { model: model.into(), ..tuple.clone() }).is_ok(), "legacy snapshots remain readable");
+        }
+        assert!(validate_execution_tuple(&ExecutionTuple { reasoning: Some(ReasoningEffort::High), ..tuple.clone() }).is_err());
+        assert!(validate_execution_tuple(&ExecutionTuple { harness: Harness::Codex, ..tuple.clone() }).is_err());
+        assert!(validate_execution_tuple(&ExecutionTuple { model: "claude-sonnet-guessed".into(), ..tuple.clone() }).is_err());
+        let mut seat = capability_seat("t1-qa", Harness::Claude, None);
+        seat.configured.model = tuple.model;
+        seat.configured.reasoning = None;
+        seat.observed_owner = Some(capability_owner(&seat.configured, 0, OwnerState::Stale));
+        let caps = team_capabilities(&TeamLifecycle::Active, &[seat]);
+        assert!(!caps.start && !caps.replace, "adapter and installed smoke are separate gates");
     }
 
     #[test]

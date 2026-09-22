@@ -54,7 +54,7 @@ fn private_dir(path: &Path) -> Result<(), ReplacementError> {
     }
     Ok(())
 }
-fn installed_file(path: &Path) -> Result<String, ReplacementError> {
+pub(crate) fn installed_file(path: &Path) -> Result<String, ReplacementError> {
     installed_file_with_cap(path, INSTALLED_FILE_CAP)
 }
 fn installed_pin(path: &Path, executable: &Path) -> Result<String, ReplacementError> {
@@ -64,7 +64,7 @@ fn installed_pin(path: &Path, executable: &Path) -> Result<String, ReplacementEr
         installed_file(path)
     }
 }
-fn installed_file_with_cap(path: &Path, cap: u64) -> Result<String, ReplacementError> {
+pub(crate) fn installed_file_with_cap(path: &Path, cap: u64) -> Result<String, ReplacementError> {
     let m = std::fs::symlink_metadata(path).map_err(|_| error())?;
     if !m.is_file()
         || m.file_type().is_symlink()
@@ -122,7 +122,7 @@ fn binary(home: &Path) -> Result<PathBuf, ReplacementError> {
 // Resolve the actual Node executable, not the Volta shim. No shell rc, caller
 // path/env override or project-selected runtime. The existing bounded native
 // subprocess primitive bounds output/time and reaps its process group.
-fn node_binary(home: &Path, budget: &Deadline) -> Result<PathBuf, ReplacementError> {
+pub(crate) fn node_binary(home: &Path, budget: &Deadline) -> Result<PathBuf, ReplacementError> {
     node_from_candidates(
         home,
         &[
@@ -190,7 +190,7 @@ fn node_from_candidates(
     }
     Err(error())
 }
-fn inventory(root: &Path, budget: &Deadline) -> Result<BTreeMap<String, String>, ReplacementError> {
+pub(crate) fn inventory(root: &Path, budget: &Deadline) -> Result<BTreeMap<String, String>, ReplacementError> {
     let mut out = BTreeMap::new();
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     let mut count = 0;

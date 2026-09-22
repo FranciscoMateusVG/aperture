@@ -87,7 +87,7 @@ fn json<T: DeserializeOwned>(path: &Path) -> Result<T, ObservationError> {
     }
     serde_json::from_slice(&bytes).map_err(|_| ObservationError::Invalid)
 }
-fn token_current(
+pub(crate) fn token_current(
     home: &Path,
     seat: &str,
     generation: u64,
