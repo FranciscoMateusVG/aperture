@@ -5,7 +5,7 @@ import { createServer } from "vite";
 import { preset, catalog, team, clone } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
 const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts");
-const { createTeamsArea } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); await vite.close();
+const { createTeamsArea, seatStatus, renderTeamGroup } = await vite.ssrLoadModule("/src/components/TeamsArea.ts"); await vite.close();
 const tick = () => new Promise(r => setImmediate(r));
 async function setup(options, fn) {
  class El {
@@ -13,25 +13,31 @@ async function setup(options, fn) {
   setAttribute(k, v) { this.attrs[k] = v; } hasAttribute(k) { return k in this.attrs; }
   addEventListener(k, fn) { this.handlers[k] = fn; } closest() { return this; }
   appendChild(el) { this.child = el; } focus() { doc.activeElement = this; }
-  querySelectorAll(s) { return s === "button" ? this.childButtons : []; }
+  classes = new Set(); classList = { add: c => this.classes.add(c), remove: c => this.classes.delete(c), contains: c => this.classes.has(c) };
+  detailsEls = []; contains(el) { return el === this || this.childButtons.includes(el) || this.detailsEls.includes(el); }
+  querySelectorAll(s) { return s === "button" ? this.childButtons : s === "details[open]" ? this.detailsEls.filter(d => d.open) : s === "details" ? this.detailsEls : []; }
  }
  const root = new El(), status = new El(), teams = new El(), coordination = new El(), refresh = new El(), coordPanel = new El(), teamsPanel = new El(), tabs = new El(), legacy = new El();
  const coordinationTab = new El(), teamsTab = new El(); coordinationTab.dataset.tab = "coordination"; teamsTab.dataset.tab = "teams"; coordinationTab.attrs["aria-selected"] = "true"; teamsTab.attrs["aria-selected"] = "false";
  root.querySelector = s => ({ "[data-global-status]": status, "[data-teams]": teams, "[data-coordination]": coordination, "[data-refresh]": refresh, "#v4-coordination": coordPanel, "#v4-teams": teamsPanel, '[role="tablist"]': tabs })[s] ?? [coordinationTab, teamsTab].find(t => t.attrs["aria-selected"] === "true");
  root.querySelectorAll = () => [coordinationTab, teamsTab];
  teams.childButtons.push(new El());
- const prior = globalThis.document; const doc = { createElement: () => root }; globalThis.document = doc;
+ const prior = globalThis.document; const doc = { createElement: () => root, hidden: false, activeElement: null }; globalThis.document = doc;
+ const priorInterval = globalThis.setInterval, priorClear = globalThis.clearInterval; const timers = [];
+ globalThis.setInterval = (fn, ms) => { timers.push({ fn, ms, cleared: false }); return timers.length; };
+ globalThis.clearInterval = id => { if (timers[id - 1]) timers[id - 1].cleared = true; };
  const known = []; const forbidden = name => async () => { throw new Error(`${name} must not be read by the launcher`); };
  // presets/catalog are deliberately present and throwing: a refresh that touches them fails the test.
  const api = { list: async () => [team()], presets: forbidden("presets"), catalog: forbidden("catalog"), ...options.api };
  const instance = createTeamsArea(new El(), legacy, { api, listAgents: async () => [{ name: "glados" }], openAgent: async () => {}, onTeamSeats: n => known.push(n), ...options, api });
- try { await tick(); await fn({ root, status, teams, coordination, refresh, coordPanel, teamsPanel, legacy, tabs, doc, known, api, instance, El }); }
- finally { if (prior === undefined) delete globalThis.document; else globalThis.document = prior; }
+ const auto = async () => { for (const t of timers) if (!t.cleared) t.fn(); await tick(); await tick(); };
+ try { await tick(); await fn({ root, status, teams, coordination, refresh, coordPanel, teamsPanel, legacy, tabs, doc, known, api, instance, El, timers, auto }); }
+ finally { globalThis.setInterval = priorInterval; globalThis.clearInterval = priorClear; if (prior === undefined) delete globalThis.document; else globalThis.document = prior; }
 }
 test("loads authoritative teams only and mounts the standing roster inside Coordination", async () => {
  await setup({}, async f => {
   assert.equal(f.coordination.child, f.legacy); assert.deepEqual(f.known[0], ["t1-backend", "t1-qa"]);
-  assert.match(f.teams.innerHTML, /Awaiting registration and approval/); assert.match(f.status.textContent, /Team state loaded/);
+  assert.match(f.teams.innerHTML, /Awaiting registration and approval/); assert.match(f.status.textContent, /Atualizado \d\d:\d\d:\d\d/);
   // Initial visibility is declared in the component markup (the fake DOM does not parse innerHTML into element state).
   assert.match(f.root.innerHTML, /<section id="v4-teams"[^>]*\bhidden>/); assert.doesNotMatch(f.root.innerHTML, /<section id="v4-coordination"[^>]*\bhidden/);
  });
@@ -42,9 +48,9 @@ test("no preset or creation controls are reachable from the launcher", async () 
   assert.match(f.root.innerHTML, /data-tab="coordination"/); assert.match(f.root.innerHTML, /data-tab="teams"/);
   assert.doesNotMatch(f.teams.innerHTML, /data-action="(blank|create|edit|duplicate)"/);
   for (const button of [new f.El(), new f.El(), new f.El(), new f.El()].map((b, i) => { b.dataset = { action: ["blank", "create", "edit", "duplicate"][i], preset: "fullstack" }; return b; })) {
-   await f.root.handlers.click({ target: button }); assert.equal(f.doc.activeElement, undefined);
+   await f.root.handlers.click({ target: button }); assert.equal(f.doc.activeElement == null, true);
   }
-  assert.match(f.status.textContent, /Team state loaded/);
+  assert.match(f.status.textContent, /Atualizado \d\d:\d\d:\d\d/);
  });
 });
 test("backend unavailable is not empty success; last-known markup remains, actions disabled, roster untouched", async () => {
@@ -105,13 +111,13 @@ test("active card is compact by default: one row per seat, diagnostics and advan
  const t = startableTeam();
  await setup({ api: { list: async () => [t] } }, async f => {
   const html = f.teams.innerHTML;
-  assert.equal((html.match(/<details class="v4-details">/g) ?? []).length, t.seats.length + 1, "one details per seat plus one for mission/actions");
+  assert.equal((html.match(/<details class="v4-details" data-details="/g) ?? []).length, t.seats.length + 1, "one details per seat plus one for mission/actions");
   assert.doesNotMatch(html, /<details[^>]*\sopen/);
   for (const inside of ["Thread binding", "Checkpoint / context", "Replace worker", "Archive checklist", "Acceptance:"]) {
    const at = html.indexOf(inside); assert.ok(at > 0, inside);
    assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
   }
-  assert.match(html, /2 seats · 0 active/); assert.match(html, /t1-backend · LEAD/); assert.match(html, /data-action="open-seat" data-seat="t1-backend"/);
+  assert.match(html, /2 seats · 0 trabalhando · 0 aguardando/); assert.match(html, /t1-backend · LEAD/); assert.match(html, /data-action="open-seat" data-seat="t1-backend"/);
   const openAt = html.indexOf('data-action="open-seat"'); assert.ok(html.lastIndexOf("<details", openAt) < html.lastIndexOf("</details>", openAt) || html.lastIndexOf("<details", openAt) === -1, "Open stays on the seat row, outside details");
  });
 });
@@ -130,9 +136,89 @@ test("Refresh renders a presetless native active team through the real command p
  native.seats = native.snapshot.seats.map(configured => ({configured, observed_owner:{generation:0,state:"stale",since:"fixture",configured:{harness:configured.harness,model:configured.model,reasoning:configured.reasoning},actual:null,process_count:0,thread_bound:false}}));
  const api = createTeamCommands(async command => { assert.equal(command,"team_list"); return [native]; });
  await setup({api}, async f => {
-  assert.match(f.status.textContent,/Team state loaded/);
+  assert.match(f.status.textContent,/Atualizado \d\d:\d\d:\d\d/);
   assert.match(f.teams.innerHTML,/t1-backend/);
   assert.match(f.teams.innerHTML,/coordinated by GLaDOS/); assert.doesNotMatch(f.teams.innerHTML,/Bootstrap worker/);
   assert.doesNotMatch(f.teams.innerHTML,/No teams registered/);
+ });
+});
+
+function ownerIn(state, generation = 0) { return { generation, state, since: "fixture", configured: { harness: "codex", model: "gpt-6-astra", reasoning: "high" }, actual: null, process_count: 0, thread_bound: false }; }
+test("seat status is derived only from exact owner and turn observations; active is never inferred as working", () => {
+ assert.deepEqual(seatStatus(null, "busy"), { kind: "unknown", label: "Sem informação" });
+ assert.deepEqual(seatStatus(ownerIn("stale", 0), "busy"), { kind: "unstarted", label: "Não iniciado" });
+ assert.deepEqual(seatStatus(ownerIn("stale", 2), "busy"), { kind: "stopped", label: "Parado" });
+ assert.deepEqual(seatStatus(ownerIn("starting"), "busy"), { kind: "starting", label: "Inicializando" });
+ assert.deepEqual(seatStatus(ownerIn("quarantined"), "idle"), { kind: "quarantined", label: "Quarentena" });
+ assert.deepEqual(seatStatus(ownerIn("active", 1), "busy"), { kind: "working", label: "Trabalhando" });
+ assert.deepEqual(seatStatus(ownerIn("active", 1), "idle"), { kind: "waiting", label: "Aguardando" });
+ for (const turn of [undefined, null, "stopped", "running"]) assert.deepEqual(seatStatus(ownerIn("active", 1), turn), { kind: "unknown", label: "Sem informação" }, String(turn));
+});
+test("rendered badges carry text labels, and the seat count follows human status not owner state", () => {
+ const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); t.seats[1].observed_owner = ownerIn("active", 1);
+ const html = renderTeamGroup(t, [{ name: "t1-backend", turn_state: "busy" }, { name: "t1-qa", status: "running" }]);
+ assert.match(html, /data-status="working">Trabalhando</); assert.match(html, /data-status="unknown">Sem informação</);
+ assert.match(html, /2 seats · 1 trabalhando · 0 aguardando/); assert.doesNotMatch(html, /2 active/);
+ const idle = renderTeamGroup(t, [{ name: "t1-backend", turn_state: "idle" }]); assert.match(idle, /data-status="waiting">Aguardando</);
+ assert.match(renderTeamGroup(team("active")), /data-status="unknown">Sem informação</);
+});
+test("auto refresh is bounded, never overlaps an in-flight read, and pauses while the Teams tab or page is hidden", async () => {
+ let reads = 0, release; const t = team("active");
+ await setup({ api: { list: () => { reads++; return new Promise(r => { release = () => r([t]); }); } } }, async f => {
+  release(); await tick(); await tick(); assert.equal(reads, 1);
+  assert.equal(f.timers.length, 1); assert.ok(f.timers[0].ms >= 3000 && f.timers[0].ms <= 5000, `bounded interval ${f.timers[0].ms}`);
+  f.teamsPanel.hidden = true; await f.auto(); assert.equal(reads, 1, "hidden tab: no read");
+  f.teamsPanel.hidden = false; f.doc.hidden = true; await f.auto(); assert.equal(reads, 1, "hidden page: no read");
+  f.doc.hidden = false; await f.auto(); assert.equal(reads, 2, "visible: one read, now in flight");
+  await f.auto(); assert.equal(reads, 2, "no overlap while that read is still pending");
+  release(); await tick(); await tick(); await f.auto(); assert.equal(reads, 3, "settled: next tick reads again");
+  release(); await tick(); await tick();
+  f.instance.dispose(); assert.equal(f.timers[0].cleared, true); await f.auto(); assert.equal(reads, 3, "disposed: no read");
+ });
+});
+test("auto refresh does not repaint unchanged data and preserves open details and focus across a changed repaint", async () => {
+ const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); let agents = [{ name: "t1-backend", turn_state: "idle" }];
+ await setup({ api: { list: async () => [structuredClone(t)] }, listAgents: async () => agents }, async f => {
+  let paints = 0; const inner = { v: f.teams.innerHTML }; Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; paints++; } });
+  await f.auto(); assert.equal(paints, 0, "identical markup is not reassigned");
+  const d = new f.El(); d.dataset.details = "seat:t1:t1-backend"; d.open = true; f.teams.detailsEls = [d];
+  const btn = new f.El(); btn.dataset = { action: "open-seat", seat: "t1-backend" }; f.teams.childButtons = [btn]; f.doc.activeElement = btn;
+  let focused = 0; btn.focus = () => { focused++; }; f.teams.querySelector = sel => sel.includes('data-seat="t1-backend"') ? btn : null;
+  const fresh = new f.El(); fresh.dataset.details = "seat:t1:t1-backend"; fresh.open = false;
+  Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; paints++; f.teams.detailsEls = [fresh]; } });
+  agents = [{ name: "t1-backend", turn_state: "busy" }]; await f.auto();
+  assert.equal(paints, 1, "changed status repaints once"); assert.match(inner.v, /Trabalhando/);
+  assert.equal(fresh.open, true, "previously open details reopened by key"); assert.equal(focused, 1, "focused control refocused by key");
+ });
+});
+test("auto refresh error marks the last-known data stale with a timestamp and disables actions; a later success clears it", async () => {
+ let fail = false; const t = team("active");
+ await setup({ api: { list: async () => { if (fail) throw new Error("SENTINEL_SECRET"); return [t]; } } }, async f => {
+  const before = f.teams.innerHTML; fail = true; await f.auto();
+  assert.equal(f.teams.innerHTML, before); assert.ok(f.teams.classList.contains("v4-stale"));
+  assert.match(f.status.textContent, /Sem atualização desde \d\d:\d\d:\d\d/); assert.doesNotMatch(f.status.textContent, /SENTINEL_SECRET/);
+  assert.equal(f.teams.childButtons[0].disabled, true);
+  fail = false; await f.auto(); assert.equal(f.teams.classList.contains("v4-stale"), false); assert.match(f.status.textContent, /Atualizado/);
+ });
+});
+
+test("Open is offered only for seats with a tmux window; otherwise it is disabled with explicit text and never attaches", async () => {
+ const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); t.seats[1].observed_owner = ownerIn("active", 1);
+ let opened = 0;
+ await setup({ api: { list: async () => [t] }, openAgent: async () => { opened++; }, listAgents: async () => [{ name: "t1-backend", turn_state: "busy", tmux_window_id: "@7" }, { name: "t1-qa", turn_state: "idle", tmux_window_id: null }] }, async f => {
+  const html = f.teams.innerHTML;
+  assert.match(html, /data-action="open-seat" data-seat="t1-backend">Open</, "window present: live Open");
+  assert.match(html, /data-action="open-seat" data-seat="t1-qa" disabled title="Terminal não conectado">Open<\/button><span class="v4-meta v4-seat__noterm">Terminal não conectado<\/span>/, "no window: disabled Open with explicit text");
+  assert.match(html, /data-status="working">Trabalhando</); assert.match(html, /data-status="waiting">Aguardando</, "status stays separate from terminal availability");
+  assert.match(html, /Thread binding/, "diagnostics not removed");
+  const disabled = new f.El(); disabled.dataset = { action: "open-seat", seat: "t1-qa" }; disabled.disabled = true;
+  await f.root.handlers.click({ target: disabled }); assert.equal(opened, 0, "disabled Open never attaches");
+  const live = new f.El(); live.dataset = { action: "open-seat", seat: "t1-backend" };
+  await f.root.handlers.click({ target: live }); assert.equal(opened, 1, "live Open attaches");
+ });
+});
+test("with no agent observation at all, every seat shows 'Terminal não conectado' and no live Open", async () => {
+ await setup({ api: { list: async () => { const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); return [t]; } }, listAgents: async () => [] }, async f => {
+  assert.doesNotMatch(f.teams.innerHTML, /data-seat="t1-[a-z]+">Open</); assert.match(f.teams.innerHTML, /Terminal não conectado/);
  });
 });
