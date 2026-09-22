@@ -75,7 +75,7 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
   coordinationEl.appendChild(legacyRoster);
   const refreshButton = root.querySelector<HTMLButtonElement>("[data-refresh]")!;
   let teams: TeamView[] = [];
-  let busy = false, loaded = false, mutation = false, lastMarkup = "";
+  let busy = false, loaded = false, mutation = false, lastMarkup = "", lastSuccessAt: string | null = null;
   const clock = () => new Date().toTimeString().slice(0, 8);
   const teamsPanel = root.querySelector<HTMLElement>("#v4-teams")!;
   /** Repaint only when the rendered markup changed; keep open details and the focused control across the swap. */
@@ -84,13 +84,17 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
     const open = new Set(Array.from(teamsEl.querySelectorAll<HTMLElement>("details[open]")).map(el => el.dataset.details ?? ""));
     // Duck-typed: the launcher runs in WebKit, the tests in Node without an HTMLElement global.
     const activeEl = (document.activeElement ?? null) as HTMLElement | null;
-    const focused = activeEl && activeEl.dataset && typeof teamsEl.contains === "function" && teamsEl.contains(activeEl)
-      ? { action: activeEl.dataset.action, seat: activeEl.dataset.seat, team: activeEl.dataset.team } : null;
+    const inside = activeEl && activeEl.dataset && typeof teamsEl.contains === "function" && teamsEl.contains(activeEl);
+    const focused = inside ? { action: activeEl.dataset.action, seat: activeEl.dataset.seat, team: activeEl.dataset.team } : null;
+    // A focused <summary> (or anything inside a keyed details) is restored by its details key.
+    const focusedDetails = inside && !focused?.action && typeof activeEl.closest === "function" ? (activeEl.closest("details") as HTMLElement | null)?.dataset?.details ?? null : null;
     teamsEl.innerHTML = markup; lastMarkup = markup;
     if (open.size) teamsEl.querySelectorAll<HTMLDetailsElement>("details").forEach(el => { if (open.has(el.dataset.details ?? "")) el.open = true; });
     if (focused?.action) {
       const selector = `[data-action="${focused.action}"]${focused.seat ? `[data-seat="${focused.seat}"]` : ""}${focused.team ? `[data-team="${focused.team}"]` : ""}`;
       teamsEl.querySelector<HTMLElement>(selector)?.focus();
+    } else if (focusedDetails) {
+      teamsEl.querySelector<HTMLElement>(`details[data-details="${focusedDetails}"] > summary`)?.focus();
     }
   }
   function switchTab(tab: string, focus = false) {
@@ -117,13 +121,14 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
       teams = nextTeams;
       options.onTeamSeats(teams.flatMap(t => t.snapshot.seats.map(s => s.name)));
       paint(teams.length ? teams.map(t => renderTeamGroup(t, agents)).join("") : '<p class="v4-notice">No teams registered. Coordination seats are unchanged.</p>');
-      loaded = true; teamsEl.classList.remove("v4-stale");
-      status.textContent = `Atualizado ${clock()} · status por seat vem de observações nativas atuais, nunca inferido.`;
+      loaded = true; lastSuccessAt = clock(); teamsEl.classList.remove("v4-stale");
+      status.textContent = `Atualizado ${lastSuccessAt} · status por seat vem de observações nativas atuais, nunca inferido.`;
     } catch (error) {
       // Last-known state remains readable but cannot initiate any action.
       loaded = false; teamsEl.classList.add("v4-stale");
-      status.textContent = `${auto ? `Sem atualização desde ${clock()} — dados exibidos podem estar desatualizados.` : "Team controls unavailable; any displayed data is last known."} ${teamErrorCopy(error)} Coordination seats remain independent.`;
-      disableTeamActions();
+      status.textContent = `${auto ? `Sem atualização desde ${lastSuccessAt ?? "nunca"} — dados exibidos podem estar desatualizados.` : "Team controls unavailable; any displayed data is last known."} ${teamErrorCopy(error)} Coordination seats remain independent.`;
+      // Disabling mutates the DOM behind the paint cache: invalidate so an identical next success repaints and re-enables.
+      disableTeamActions(); lastMarkup = "";
     } finally { busy = false; refreshButton.disabled = false; }
   }
   // Bounded auto refresh while the Teams panel is visible: never overlaps an in-flight read or mutation.

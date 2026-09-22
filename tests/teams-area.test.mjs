@@ -222,3 +222,44 @@ test("with no agent observation at all, every seat shows 'Terminal não conectad
   assert.doesNotMatch(f.teams.innerHTML, /data-seat="t1-[a-z]+">Open</); assert.match(f.teams.innerHTML, /Terminal não conectado/);
  });
 });
+
+test("error then identical success re-enables valid Open and keeps no-window Open disabled", async () => {
+ let fail = false; const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); t.seats[1].observed_owner = ownerIn("active", 1);
+ await setup({ api: { list: async () => { if (fail) throw new Error("boom"); return [structuredClone(t)]; } }, listAgents: async () => [{ name: "t1-backend", turn_state: "idle", tmux_window_id: "@7" }, { name: "t1-qa", turn_state: "idle", tmux_window_id: null }] }, async f => {
+  let paints = 0; const inner = { v: f.teams.innerHTML }; Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; paints++; } });
+  const live = new f.El(); live.dataset = { action: "open-seat", seat: "t1-backend" }; f.teams.childButtons = [live];
+  fail = true; await f.auto(); assert.equal(live.disabled, true, "error disables actions"); assert.equal(paints, 0);
+  fail = false; await f.auto();
+  assert.equal(paints, 1, "identical data after an error still repaints"); assert.equal(f.teams.classList.contains("v4-stale"), false);
+  assert.match(inner.v, /data-seat="t1-backend">Open</, "Open with a window is live again");
+  assert.match(inner.v, /data-seat="t1-qa" disabled title="Terminal não conectado"/, "Open without a window stays disabled");
+  await f.auto(); assert.equal(paints, 1, "steady state: no further repaint");
+ });
+});
+test("stale copy names the last successful read and does not drift across consecutive failures", async () => {
+ let fail = false; const t = team("active");
+ await setup({ api: { list: async () => { if (fail) throw new Error("boom"); return [t]; } } }, async f => {
+  const good = /Atualizado (\d\d:\d\d:\d\d)/.exec(f.status.textContent)[1];
+  fail = true; await f.auto(); const first = /desde (\S+)/.exec(f.status.textContent)[1]; assert.equal(first, good, "uses the last good read, not the error time");
+  await new Promise(r => setTimeout(r, 1100)); await f.auto(); const second = /desde (\S+)/.exec(f.status.textContent)[1];
+  assert.equal(second, first, "a second failure keeps the same timestamp");
+ });
+});
+test("stale copy before any successful read says 'nunca'", async () => {
+ await setup({ api: { list: async () => { throw new Error("boom"); } } }, async f => {
+  await f.auto(); assert.match(f.status.textContent, /Sem atualização desde nunca/);
+ });
+});
+test("focus on an open details summary is restored by details key across a changed repaint", async () => {
+ const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); let agents = [{ name: "t1-backend", turn_state: "idle" }];
+ await setup({ api: { list: async () => [structuredClone(t)] }, listAgents: async () => agents }, async f => {
+  const details = new f.El(); details.dataset.details = "seat:t1:t1-backend"; details.open = true;
+  const summary = new f.El(); summary.dataset = {}; summary.closest = sel => sel === "details" ? details : null;
+  f.teams.detailsEls = [details]; f.teams.contains = el => el === summary || el === details; f.doc.activeElement = summary;
+  const fresh = new f.El(); fresh.dataset.details = "seat:t1:t1-backend"; fresh.open = false; const freshSummary = new f.El(); let focused = 0; freshSummary.focus = () => { focused++; };
+  const inner = { v: f.teams.innerHTML }; Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; f.teams.detailsEls = [fresh]; } });
+  f.teams.querySelector = sel => sel === 'details[data-details="seat:t1:t1-backend"] > summary' ? freshSummary : null;
+  agents = [{ name: "t1-backend", turn_state: "busy" }]; await f.auto();
+  assert.match(inner.v, /Trabalhando/); assert.equal(fresh.open, true, "details reopened"); assert.equal(focused, 1, "summary refocused by details key");
+ });
+});
