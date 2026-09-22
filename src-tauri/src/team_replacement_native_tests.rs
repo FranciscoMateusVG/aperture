@@ -325,3 +325,320 @@ fn bootstrap_is_operator_g0_only_and_never_creates_state_for_bad_selector() {
     );
     assert!(!home.exists());
 }
+
+fn claude_candidate_fixture(f: &Fixture) -> (OwnerStore, StartReservation, Incarnation) {
+    let store = OwnerStore::new(f.0.join(".aperture/run/owner"));
+    let actor = AuthenticatedActor::launcher();
+    let requested = ExecutionTuple {
+        harness: Harness::Claude,
+        model: crate::team_claude_launch::MODEL.into(),
+        reasoning: None,
+    };
+    store
+        .initialize_owner(&actor, "t1-worker", requested.clone())
+        .unwrap();
+    let res = store
+        .reserve_start(&actor, "t1-worker", 0, requested)
+        .unwrap();
+    store
+        .bind_and_publish_token(&actor, &res, "a".repeat(64), || Ok(()))
+        .unwrap();
+    let candidate = Incarnation {
+        pid: 900001,
+        start_time: 42,
+        thread_id: String::new(),
+        token_id: "a".repeat(64),
+        harness: Harness::Claude,
+        model: crate::team_claude_launch::MODEL.into(),
+        reasoning: None,
+        observed: false,
+        processes: vec![crate::owner::ProcessIdentity {
+            pid: 900001,
+            start_time: 42,
+            ppid: 1,
+            pgid: 900001,
+            cmdline_sha256: "b".repeat(64),
+            cwd: "/fixture".into(),
+        }],
+    };
+    (store, res, candidate)
+}
+#[test]
+fn claude_candidate_attempt_release_order_has_real_durable_owner_at_each_boundary() {
+    let f = Fixture::new();
+    let (store, res, candidate) = claude_candidate_fixture(&f);
+    let phase = std::cell::Cell::new(0);
+    candidate_then_claude_release(
+        &store,
+        &AuthenticatedActor::launcher(),
+        &res,
+        candidate.clone(),
+        || {
+            let current = store.read_owner("t1-worker").unwrap();
+            assert_eq!(current.incarnation.as_ref(), Some(&candidate));
+            assert_eq!(current.state, OwnerState::Starting);
+            assert!(store
+                .commit_start(&AuthenticatedActor::launcher(), &res)
+                .is_err());
+            phase.set(1);
+            Ok(())
+        },
+        || {
+            assert_eq!(phase.get(), 1);
+            assert_eq!(
+                store.read_owner("t1-worker").unwrap().incarnation.as_ref(),
+                Some(&candidate)
+            );
+            phase.set(2);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(phase.get(), 2);
+    assert_eq!(
+        store.read_owner("t1-worker").unwrap().state,
+        OwnerState::Starting
+    );
+    // Releasing the gate is never model observation or an Active commit.
+    assert!(store
+        .commit_start(&AuthenticatedActor::launcher(), &res)
+        .is_err());
+}
+#[test]
+fn claude_candidate_attempt_release_failures_never_advance_past_failed_boundary() {
+    for boundary in 0..3 {
+        let f = Fixture::new();
+        let (store, res, mut candidate) = claude_candidate_fixture(&f);
+        let before = std::fs::read(f.0.join(".aperture/run/owner/t1-worker.json")).unwrap();
+        if boundary == 0 {
+            candidate.token_id = "c".repeat(64);
+        }
+        let phase = std::cell::Cell::new(0);
+        let result = candidate_then_claude_release(
+            &store,
+            &AuthenticatedActor::launcher(),
+            &res,
+            candidate.clone(),
+            || {
+                phase.set(1);
+                if boundary == 1 {
+                    Err(ReplacementError::ModelUnverified)
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                phase.set(2);
+                Err(ReplacementError::OutcomeUnknown)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(phase.get(), boundary);
+        let owner = store.read_owner("t1-worker").unwrap();
+        assert_eq!(owner.state, OwnerState::Starting);
+        if boundary == 0 {
+            assert_eq!(
+                before,
+                std::fs::read(f.0.join(".aperture/run/owner/t1-worker.json")).unwrap()
+            );
+            assert!(owner.incarnation.is_none());
+        } else {
+            assert_eq!(owner.incarnation.as_ref(), Some(&candidate));
+            assert!(!owner.incarnation.unwrap().observed);
+        }
+        assert!(store
+            .commit_start(&AuthenticatedActor::launcher(), &res)
+            .is_err());
+    }
+}
+#[test]
+fn claude_observation_exact_none_is_not_reasoning_wildcard_and_cleanup_identity_is_preserved() {
+    for drift in ["none", "model", "reasoning", "birth"] {
+        let f = Fixture::new();
+        let (store, res, candidate) = claude_candidate_fixture(&f);
+        let actor = AuthenticatedActor::launcher();
+        candidate_then_claude_release(
+            &store,
+            &actor,
+            &res,
+            candidate.clone(),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        let mut actual = ExecutionTuple {
+            harness: Harness::Claude,
+            model: candidate.model.clone(),
+            reasoning: None,
+        };
+        if drift == "model" {
+            actual.model = "sonnet".into();
+        }
+        if drift == "reasoning" {
+            actual.reasoning = Some(ReasoningEffort::High);
+        }
+        let observation = crate::owner::RuntimeObservation {
+            pid: candidate.pid,
+            start_time: if drift == "birth" { 43 } else { 42 },
+            token_id: candidate.token_id.clone(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
+            actual,
+        };
+        let observed = store.record_runtime_observation(&actor, &res, observation);
+        if drift == "none" {
+            observed.unwrap();
+            let owner = store.commit_start(&actor, &res).unwrap();
+            assert_eq!(owner.state, OwnerState::Active);
+            assert_eq!(owner.incarnation.unwrap().reasoning, None);
+        } else {
+            assert!(observed.is_err() || store.commit_start(&actor, &res).is_err());
+            let owner = store.read_owner("t1-worker").unwrap();
+            assert_eq!(owner.state, OwnerState::Starting);
+            let inc = owner.incarnation.unwrap();
+            assert_eq!(inc.processes, candidate.processes);
+            assert_eq!(
+                (inc.pid, inc.start_time, inc.token_id.as_str()),
+                (
+                    candidate.pid,
+                    candidate.start_time,
+                    candidate.token_id.as_str()
+                )
+            );
+        }
+    }
+}
+#[test]
+fn claude_no_socket_or_receipt_does_not_prove_observation_or_cleanup() {
+    let f = Fixture::new();
+    let (store, res, candidate) = claude_candidate_fixture(&f);
+    candidate_then_claude_release(
+        &store,
+        &AuthenticatedActor::launcher(),
+        &res,
+        candidate,
+        || Ok(()),
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(!f.0.join(".aperture/run/t1-worker.sock").exists());
+    assert!(!matches!(
+        runtime_observation(&f.0, "t1", &res, &Harness::Claude),
+        Ok(Some(_))
+    ));
+    let before = std::fs::read(f.0.join(".aperture/run/owner/t1-worker.json")).unwrap();
+    assert_eq!(
+        cleanup_native(&f.0, "t1", &res, None, Instant::now()).unwrap_err(),
+        ReplacementError::StartCleanupUnverified
+    );
+    assert_eq!(
+        before,
+        std::fs::read(f.0.join(".aperture/run/owner/t1-worker.json")).unwrap()
+    );
+}
+
+#[test]
+fn claude_stopped_requires_all_exact_identities_gone_not_socket_absence() {
+    let original = snapshot();
+    claude_stopped(&original, |_| ProcessState::Gone).unwrap();
+    for state in [
+        ProcessState::Same,
+        ProcessState::Recycled,
+        ProcessState::Unreadable,
+    ] {
+        assert_eq!(
+            claude_stopped(&original, |_| state),
+            Err(ReplacementError::StopUnverified)
+        );
+    }
+    let mut bad = original.clone();
+    bad.processes.clear();
+    assert!(claude_stopped(&bad, |_| ProcessState::Gone).is_err());
+    bad = original.clone();
+    bad.complete = false;
+    assert!(claude_stopped(&bad, |_| ProcessState::Gone).is_err());
+    bad = original;
+    bad.unowned_matches.push(bad.processes[0].identity.clone());
+    assert!(claude_stopped(&bad, |_| ProcessState::Gone).is_err());
+}
+
+#[test]
+fn disabled_claude_native_plan_denies_before_runtime_io_without_affecting_codex_policy() {
+    let f = Fixture::new();
+    let home = f.0.canonicalize().unwrap();
+    let root = home.join("projects/aperture");
+    ensure_private_dir(&root).unwrap();
+    assert!(std::process::Command::new("/usr/bin/git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    f.write(
+        ".aperture/teams/t1/team.json",
+        &serde_json::to_value(team()).unwrap(),
+    );
+    let repo =
+        repository::resolve_native(&home, "t1", Instant::now() + Duration::from_secs(3)).unwrap();
+    let before = std::fs::read(home.join(".aperture/teams/t1/team.json")).unwrap();
+    let requested = ExecutionTuple {
+        harness: Harness::Claude,
+        model: crate::team_claude_launch::MODEL.into(),
+        reasoning: None,
+    };
+    // Deliberately missing HOME: policy must reject before examining any native
+    // runtime, executable, token, attempt or process, even with a bound repo.
+    assert!(matches!(
+        NativePlan::preflight_selected(
+            &home.join("missing-home"),
+            "t1",
+            "t1-worker",
+            &requested,
+            &repo,
+            None,
+            &deadline::Deadline::new()
+        ),
+        Err(ReplacementError::LaunchUnavailable)
+    ));
+    let mut claude_team = team();
+    claude_team.seats[0].harness = Harness::Claude;
+    claude_team.seats[0].model = requested.model.clone();
+    claude_team.seats[0].reasoning = None;
+    f.write(
+        ".aperture/teams/t1/team.json",
+        &serde_json::to_value(claude_team).unwrap(),
+    );
+    let actor = AuthenticatedActor::operator_ui();
+    assert_eq!(
+        bootstrap_authorized(&home, &actor, "t1", "t1-worker", 0).unwrap_err(),
+        ReplacementError::LaunchUnavailable
+    );
+    let selected = StartSelection {
+        harness: "claude".into(),
+        model: requested.model.clone(),
+        reasoning: None,
+    };
+    assert_eq!(
+        replace_authorized(
+            &home,
+            ReplacementAuthority::Operator(&actor),
+            target(),
+            &selected,
+            &[]
+        )
+        .unwrap_err(),
+        ReplacementError::LaunchUnavailable
+    );
+    // Restore fixture snapshot only, to assert no incidental state mutation.
+    f.write(
+        ".aperture/teams/t1/team.json",
+        &serde_json::from_slice(&before).unwrap(),
+    );
+    assert!(!crate::teams::managed_launch_enabled(&Harness::Claude));
+    assert!(crate::teams::managed_launch_enabled(&Harness::Codex));
+    assert!(!home.join("missing-home").exists());
+    assert!(!home.join(".aperture/run").exists());
+    assert_eq!(
+        before,
+        std::fs::read(home.join(".aperture/teams/t1/team.json")).unwrap()
+    );
+}

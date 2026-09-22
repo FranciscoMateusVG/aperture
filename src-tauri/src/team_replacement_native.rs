@@ -4,15 +4,123 @@
 use super::*;
 use crate::journal::{read_private_json, validate_component_path};
 use crate::owner::{Incarnation, OwnerRecord, OwnerStore, StartReservation};
-use crate::state::{ExecutionTuple, OwnerState};
+use crate::state::{ExecutionTuple, Harness, OwnerState};
 use crate::team_auth::{AuthenticatedActor, AuthenticatedSeat};
 use crate::team_process;
 use crate::teams::TeamSnapshot;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+enum NativePlan {
+    Codex(launch::NativeLaunchBinding),
+    Claude(crate::team_claude_launch::ClaudeBinding),
+}
+impl NativePlan {
+    fn preflight(
+        home: &Path,
+        team: &str,
+        seat: &str,
+        tuple: &ExecutionTuple,
+        repo: &repository::BoundRepository,
+        checkpoint: Option<&crate::team_checkpoint::CheckpointEntry>,
+        budget: &deadline::Deadline,
+    ) -> Result<Self, ReplacementError> {
+        Self::preflight_selected(
+            home,
+            team,
+            seat,
+            tuple,
+            repo,
+            checkpoint.map(|e| e.payload.worktree.as_str()),
+            budget,
+        )
+    }
+    fn preflight_selected(
+        home: &Path,
+        team: &str,
+        seat: &str,
+        tuple: &ExecutionTuple,
+        repo: &repository::BoundRepository,
+        worktree: Option<&str>,
+        budget: &deadline::Deadline,
+    ) -> Result<Self, ReplacementError> {
+        if !crate::teams::managed_launch_enabled(&tuple.harness) {
+            return Err(ReplacementError::LaunchUnavailable);
+        }
+        match tuple.harness {
+            Harness::Codex => launch::NativeLaunchBinding::preflight_selected(
+                home, team, seat, tuple, repo, worktree, budget,
+            )
+            .map(Self::Codex),
+            Harness::Claude => crate::team_claude_launch::ClaudeBinding::preflight(
+                home, team, seat, tuple, repo, worktree, budget,
+            )
+            .map(Self::Claude)
+            .map_err(|_| ReplacementError::LaunchUnavailable),
+        }
+    }
+    fn revalidate(&self, budget: &deadline::Deadline) -> Result<(), ReplacementError> {
+        let harness = match self { Self::Codex(_) => Harness::Codex, Self::Claude(_) => Harness::Claude };
+        if !crate::teams::managed_launch_enabled(&harness) {
+            return Err(ReplacementError::LaunchUnavailable);
+        }
+        match self {
+            Self::Codex(p) => p.revalidate(budget),
+            Self::Claude(p) => p
+                .revalidate(budget)
+                .map_err(|_| ReplacementError::LaunchUnavailable),
+        }
+    }
+    fn bind_recovery(
+        &mut self,
+        e: Option<&crate::team_checkpoint::CheckpointEntry>,
+    ) -> Result<(), ReplacementError> {
+        match self {
+            Self::Codex(p) => p.bind_recovery(e),
+            Self::Claude(p) => p
+                .bind_recovery(e)
+                .map_err(|_| ReplacementError::CheckpointUnavailable),
+        }
+    }
+}
+fn runtime_observation(
+    home: &Path,
+    team: &str,
+    res: &StartReservation,
+    harness: &Harness,
+) -> Result<Option<crate::owner::RuntimeObservation>, ReplacementError> {
+    match harness {
+        Harness::Codex => match model_observation::read_native(home, team, res) {
+            Ok(v) => Ok(Some(v.into_runtime_observation())),
+            Err(model_observation::ObservationError::Missing) => Ok(None),
+            Err(_) => Err(ReplacementError::ModelUnverified),
+        },
+        Harness::Claude => match crate::team_claude_observation::read_native(home, team, res) {
+            Ok(v) => Ok(Some(v.into_runtime_observation())),
+            Err(crate::team_claude_launch::ClaudeError::Missing) => Ok(None),
+            Err(_) => Err(ReplacementError::ModelUnverified),
+        },
+    }
+}
+/// Native ordering seam used by the Claude branch. No public DTO or proof.
+/// Any failure retains candidate identity for the same exact cleanup path.
+fn candidate_then_claude_release(
+    store: &OwnerStore,
+    actor: &AuthenticatedActor,
+    res: &StartReservation,
+    candidate: Incarnation,
+    attempt: impl FnOnce() -> Result<(), ReplacementError>,
+    release: impl FnOnce() -> Result<(), ReplacementError>,
+) -> Result<(), ReplacementError> {
+    store
+        .record_start_candidate(actor, res, candidate)
+        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+    attempt()?;
+    release()
+}
 struct NativeStarted {
     reservation: StartReservation,
+    harness: Harness,
     child: Option<launch_gate::ReleasedChild>,
     candidate: StartedCandidate,
 }
@@ -59,7 +167,7 @@ pub(crate) fn bootstrap_authorized(
         reasoning: s.reasoning.clone(),
     };
     let plan =
-        launch::NativeLaunchBinding::preflight(home, team, seat, &selected, &repo, None, &budget)?;
+        NativePlan::preflight(home, team, seat, &selected, &repo, None, &budget)?;
     authorize_bootstrap(actor)?;
     let mut attempt = deadline::RuntimeAttempt::begin_bootstrap(
         home,
@@ -115,7 +223,7 @@ fn start_native(
     seat: &str,
     generation: u64,
     selected: ExecutionTuple,
-    plan: &launch::NativeLaunchBinding,
+    plan: &NativePlan,
     attempt: &deadline::RuntimeAttempt,
     bootstrap_actor: Option<&AuthenticatedActor>,
 ) -> Result<NativeStarted, ReplacementError> {
@@ -126,7 +234,9 @@ fn start_native(
     let reservation = {
         let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
             .map_err(|_| ReplacementError::NativeFailure)?;
-        if let Some(actor) = bootstrap_actor { authorize_bootstrap(actor)?; }
+        if let Some(actor) = bootstrap_actor {
+            authorize_bootstrap(actor)?;
+        }
         store
             .reserve_start(&launcher, seat, generation, selected.clone())
             .map_err(|_| ReplacementError::GenerationMismatch)?
@@ -135,44 +245,111 @@ fn start_native(
     let result = (|| {
         let token = crate::hub_auth::managed::provision(home, team, &launcher, &reservation)
             .map_err(|_| ReplacementError::NativeFailure)?;
-        let spec = plan.publish(&reservation, &token, attempt.budget())?;
-        attempt.budget().forward(Duration::from_secs(85))?;
-        if let Some(actor) = bootstrap_actor { authorize_bootstrap(actor)?; }
-        let pending = launch_gate::spawn(spec).map_err(|_| ReplacementError::OutcomeUnknown)?;
-        let metadata = match team_process::native::capture_gated_child(&pending) {
-            Ok(p) => p,
-            Err(e) => {
-                pending
-                    .cancel()
-                    .map_err(|_| ReplacementError::StartCleanupUnverified)?;
-                return Err(e);
+        match plan {
+            NativePlan::Codex(plan) => {
+                let spec = plan.publish(&reservation, &token, attempt.budget())?;
+                attempt.budget().forward(Duration::from_secs(85))?;
+                if let Some(actor) = bootstrap_actor {
+                    authorize_bootstrap(actor)?;
+                }
+                let pending =
+                    launch_gate::spawn(spec).map_err(|_| ReplacementError::OutcomeUnknown)?;
+                let metadata = match team_process::native::capture_gated_child(&pending) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        pending
+                            .cancel()
+                            .map_err(|_| ReplacementError::StartCleanupUnverified)?;
+                        return Err(e);
+                    }
+                };
+                let incarnation = Incarnation {
+                    pid: metadata.pid,
+                    start_time: metadata.start_time,
+                    thread_id: String::new(),
+                    token_id: token.token_id().into(),
+                    harness: selected.harness.clone(),
+                    model: selected.model.clone(),
+                    reasoning: selected.reasoning.clone(),
+                    observed: false,
+                    processes: vec![metadata],
+                };
+                if store
+                    .record_start_candidate(&launcher, &reservation, incarnation)
+                    .is_err()
+                {
+                    pending
+                        .cancel()
+                        .map_err(|_| ReplacementError::StartCleanupUnverified)?;
+                    return Err(ReplacementError::OutcomeUnknown);
+                }
+                match pending.release_retaining(&store, &reservation) {
+                    Ok(released) => child = Some(released),
+                    Err(failure) => {
+                        child = failure.child;
+                        return Err(ReplacementError::OutcomeUnknown);
+                    }
+                }
             }
-        };
-        let incarnation = Incarnation {
-            pid: metadata.pid,
-            start_time: metadata.start_time,
-            thread_id: String::new(),
-            token_id: token.token_id().into(),
-            harness: selected.harness.clone(),
-            model: selected.model.clone(),
-            reasoning: selected.reasoning.clone(),
-            observed: false,
-            processes: vec![metadata],
-        };
-        if store
-            .record_start_candidate(&launcher, &reservation, incarnation)
-            .is_err()
-        {
-            pending
-                .cancel()
-                .map_err(|_| ReplacementError::StartCleanupUnverified)?;
-            return Err(ReplacementError::OutcomeUnknown);
-        }
-        match pending.release_retaining(&store, &reservation) {
-            Ok(released) => child = Some(released),
-            Err(failure) => {
-                child = failure.child;
-                return Err(ReplacementError::OutcomeUnknown);
+            NativePlan::Claude(plan) => {
+                let published = plan
+                    .publish(&reservation, &token, attempt.budget())
+                    .map_err(|_| ReplacementError::LaunchUnavailable)?;
+                attempt.budget().forward(Duration::from_secs(85))?;
+                if let Some(actor) = bootstrap_actor {
+                    authorize_bootstrap(actor)?;
+                }
+                let pending = published
+                    .spawn(attempt.budget())
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                let metadata = pending.process.clone();
+                let candidate = Incarnation {
+                    pid: metadata.pid,
+                    start_time: metadata.start_time,
+                    thread_id: String::new(),
+                    token_id: token.token_id().into(),
+                    harness: selected.harness.clone(),
+                    model: selected.model.clone(),
+                    reasoning: selected.reasoning.clone(),
+                    observed: false,
+                    processes: vec![metadata],
+                };
+                let result = candidate_then_claude_release(
+                    &store,
+                    &launcher,
+                    &reservation,
+                    candidate,
+                    || {
+                        crate::team_claude_observation::record_attempt(
+                            home,
+                            team,
+                            &reservation,
+                            pending.session_id(),
+                        )
+                        .map_err(|_| ReplacementError::ModelUnverified)
+                    },
+                    || {
+                        pending
+                            .release(&reservation, attempt.budget())
+                            .map_err(|_| ReplacementError::OutcomeUnknown)
+                    },
+                );
+                if let Err(error) = result {
+                    // Before candidate publication there is no durable signal
+                    // authority. Never kill a guessed tmux PID: await the bounded
+                    // unreleased gate's exact exit, otherwise report uncertainty.
+                    if store
+                        .read_owner(seat)
+                        .map_err(|_| ReplacementError::StartCleanupUnverified)?
+                        .incarnation
+                        .is_none()
+                    {
+                        pending
+                            .cancel_unreleased(attempt.budget().cleanup_until())
+                            .map_err(|_| ReplacementError::StartCleanupUnverified)?;
+                    }
+                    return Err(error);
+                }
             }
         }
         let until = attempt.budget().forward_until(Duration::from_secs(85))?;
@@ -181,21 +358,18 @@ fn start_native(
             if Instant::now() >= until {
                 return Err(ReplacementError::ModelUnverified);
             }
-            if child
-                .as_mut()
-                .unwrap()
-                .try_wait()
-                .map_err(|_| ReplacementError::StartCleanupUnverified)?
-                .is_some()
-            {
-                return Err(ReplacementError::ModelUnverified);
-            }
-            match model_observation::read_native(home, team, &reservation) {
-                Ok(v) => break v.into_runtime_observation(),
-                Err(model_observation::ObservationError::Missing) => {
-                    std::thread::sleep(Duration::from_millis(25))
+            if let Some(child) = child.as_mut() {
+                if child
+                    .try_wait()
+                    .map_err(|_| ReplacementError::StartCleanupUnverified)?
+                    .is_some()
+                {
+                    return Err(ReplacementError::ModelUnverified);
                 }
-                Err(_) => return Err(ReplacementError::ModelUnverified),
+            }
+            match runtime_observation(home, team, &reservation, &selected.harness)? {
+                Some(v) => break v,
+                None => std::thread::sleep(Duration::from_millis(25)),
             }
         };
         let record = store
@@ -212,7 +386,13 @@ fn start_native(
                 actual_model: Some(inc.model),
                 model_verified: true,
             },
-            actual_harness: Some("codex".into()),
+            actual_harness: Some(
+                match inc.harness {
+                    Harness::Codex => "codex",
+                    Harness::Claude => "claude",
+                }
+                .into(),
+            ),
             actual_reasoning: inc
                 .reasoning
                 .as_ref()
@@ -226,6 +406,7 @@ fn start_native(
     match result {
         Ok(candidate) => Ok(NativeStarted {
             reservation,
+            harness: selected.harness,
             child,
             candidate,
         }),
@@ -263,16 +444,12 @@ fn activate_native(
     bootstrap_actor: Option<&AuthenticatedActor>,
 ) -> Result<(), ReplacementError> {
     attempt.budget().forward(Duration::from_secs(1))?;
-    let observation = model_observation::read_native(home, team, &started.reservation)
-        .map_err(|_| ReplacementError::ModelUnverified)?;
+    let observation = runtime_observation(home, team, &started.reservation, &started.harness)?
+        .ok_or(ReplacementError::ModelUnverified)?;
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
     let launcher = AuthenticatedActor::launcher();
     store
-        .record_runtime_observation(
-            &launcher,
-            &started.reservation,
-            observation.into_runtime_observation(),
-        )
+        .record_runtime_observation(&launcher, &started.reservation, observation)
         .map_err(|_| ReplacementError::ModelUnverified)?;
     let _team = lock_activation(home, team, bootstrap_actor)?;
     attempt.budget().forward(Duration::from_secs(1))?;
@@ -661,9 +838,12 @@ pub(crate) fn replace_authorized(
     selectors(&target)?;
     let binding = require_repository_binding(home, &target, &budget)?;
     authority.revalidate(&target)?;
+    if !crate::teams::managed_launch_enabled(&tuple(selection)?.harness) {
+        return Err(ReplacementError::LaunchUnavailable);
+    }
     let checkpoint =
         checkpoint_for_target(home, &authority, &target, &binding.0, sentinels, &budget)?;
-    let mut plan = launch::NativeLaunchBinding::preflight_selected(
+    let mut plan = NativePlan::preflight_selected(
         home,
         &target.team,
         &target.seat,
@@ -722,7 +902,7 @@ pub(crate) struct NativePreparedReplacement {
     target: remote::RemoteTarget,
     sentinels: Vec<String>,
     binding: RepositoryBinding,
-    plan: launch::NativeLaunchBinding,
+    plan: NativePlan,
     checkpoint: RecoveryContext,
     prepared: PreparedReplacement,
     revoked: RevocationProof,
@@ -769,9 +949,12 @@ pub(crate) fn prepare_operator(
     if owner.generation != expected_generation || owner.state != OwnerState::Active {
         return Err(ReplacementError::GenerationMismatch);
     }
+    if !crate::teams::managed_launch_enabled(&owner.requested.harness) {
+        return Err(ReplacementError::LaunchUnavailable);
+    }
     let checkpoint =
         checkpoint_for_target(home, &authority, &target, &binding.0, sentinels, &budget)?;
-    let mut plan = launch::NativeLaunchBinding::preflight_selected(
+    let mut plan = NativePlan::preflight_selected(
         home,
         team,
         seat,
@@ -841,6 +1024,9 @@ pub(crate) fn start_operator(
         .map_err(|_| ReplacementError::PreparationExpired)?;
     plan.revalidate(&budget)
         .map_err(|_| ReplacementError::PreparationExpired)?;
+    if !crate::teams::managed_launch_enabled(&tuple(selection)?.harness) {
+        return Err(ReplacementError::LaunchUnavailable);
+    }
     let attempt = ready.start(budget)?;
     let mut runtime = NativeRuntime {
         home: &home,
@@ -892,7 +1078,7 @@ struct NativeRuntime<'a> {
     revoked: Option<RevocationProof>,
     phases: Vec<ReplacementPhase>,
     attempt: deadline::RuntimeAttempt,
-    plan: launch::NativeLaunchBinding,
+    plan: NativePlan,
     checkpoint: RecoveryContext,
     started: Option<NativeStarted>,
 }
@@ -904,7 +1090,7 @@ impl<'a> NativeRuntime<'a> {
         sentinels: &'a [String],
         binding: RepositoryBinding,
         budget: deadline::Deadline,
-        plan: launch::NativeLaunchBinding,
+        plan: NativePlan,
         checkpoint: RecoveryContext,
     ) -> Result<Self, ReplacementError> {
         authority.revalidate(&target)?;
@@ -981,6 +1167,12 @@ impl<'a> NativeRuntime<'a> {
         self.authority.revalidate(&self.target)?;
         effect(&guard)
     }
+}
+fn claude_stopped(snapshot: &OwnershipSnapshot, state: impl Fn(&ProcessIdentity) -> ProcessState) -> Result<(), ReplacementError> {
+    if !snapshot.complete || snapshot.processes.is_empty() || !snapshot.unowned_matches.is_empty()
+        || snapshot.processes.iter().any(|p| state(&p.identity) != ProcessState::Gone)
+    { return Err(ReplacementError::StopUnverified); }
+    Ok(())
 }
 fn same_identities(a: &OwnershipSnapshot, b: &OwnershipSnapshot) -> bool {
     a.seat == b.seat
@@ -1216,7 +1408,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         if checkpoint.worktree != self.checkpoint.worktree {
             return Err(ReplacementError::CheckpointUnavailable);
         }
-        let mut plan = launch::NativeLaunchBinding::preflight_selected(
+        let mut plan = NativePlan::preflight_selected(
             self.home,
             &self.target.team,
             &self.target.seat,
@@ -1229,8 +1421,17 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         self.plan.revalidate(self.attempt.budget())?;
         self.attempt.budget().forward(Duration::from_secs(90))?;
         self.attempt.admit_effects()?;
-        self.with_stop_guard(snapshot, |guard| {
-            launch::release_stopped_socket(self.home, guard)
+        let old_owner = OwnerStore::new(self.home.join(".aperture/run/owner"))
+            .read_owner(&self.target.seat)
+            .map_err(|_| ReplacementError::GenerationMismatch)?;
+        if old_owner.generation != self.target.expected_generation {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        // Preserve the locked process-proof boundary for both harnesses. No
+        // Claude socket is expected, but its absence is not stop evidence.
+        self.with_stop_guard(snapshot, |guard| match old_owner.requested.harness {
+            Harness::Codex => launch::release_stopped_socket(self.home, guard),
+            Harness::Claude => claude_stopped(guard.snapshot(), team_process::state),
         })?;
         {
             let _team = crate::owner::try_lock(
