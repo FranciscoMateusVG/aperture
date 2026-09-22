@@ -1,4 +1,5 @@
 import { stopSeatSchema, parseStopSeatReady } from "./team-stop.js";
+import { claudeStartupSmokeSchema, parseClaudeStartupSmoke } from "./team-claude-smoke.js";
 import { bootstrapSeatSchema, bootstrapSelection, parseBootstrapStarted, parseTeamList } from "./team-bootstrap.js";
 import { createTeamSchema, parseCreatedTeam } from "./team-create.js";
 import { parseRepositoryRegistry, parseSavedRepository, saveRepositorySchema } from "./team-repositories.js";
@@ -518,6 +519,23 @@ server.tool(
       const request = bootstrapSeatSchema.parse(input);
       const expected = bootstrapSelection(await invokeTeamControl({ action: "list_teams" }), request);
       const result = parseBootstrapStarted(await invokeTeamControl({ action: "bootstrap_seat", input: request }), request, expected);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_claude_startup_smoke",
+  "GLaDOS-only, operator-authorized diagnostic: one fresh approved Claude Sonnet 5 seat at generation zero. Performs real startup observation WITHOUT an initial prompt, then always stops/revokes the same candidate and leaves it quarantined. This consumes the attempt and cannot be retried automatically. It does NOT prove MCP readiness, enable Claude publicly, start a business mission, or leave a worker available. Exact selectors only; no caller model, authority, force, prompt or timeout. UNKNOWN requires inspection, never a retry.",
+  { input: claudeStartupSmokeSchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = claudeStartupSmokeSchema.parse(input);
+      const result = parseClaudeStartupSmoke(await invokeTeamControl({ action: "claude_startup_smoke", input: request }), request);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };

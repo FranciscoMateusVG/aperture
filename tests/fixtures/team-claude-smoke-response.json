@@ -1,0 +1,14 @@
+{
+  "action": "claude_startup_smoke",
+  "result": {
+    "team": "sonnet-smoke",
+    "seat": "sonnet-smoke-qa",
+    "generation": 1,
+    "model": "claude-sonnet-5",
+    "reasoning_observation": "not_observed",
+    "startup": "verified",
+    "cleanup": "quarantined",
+    "mcp_readiness": "not_run",
+    "public_enabled": false
+  }
+}

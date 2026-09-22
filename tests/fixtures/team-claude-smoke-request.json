@@ -1,0 +1,8 @@
+{
+  "action": "claude_startup_smoke",
+  "input": {
+    "team": "sonnet-smoke",
+    "seat": "sonnet-smoke-qa",
+    "expected_generation": 0
+  }
+}

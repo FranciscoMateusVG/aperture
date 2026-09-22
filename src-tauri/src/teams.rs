@@ -20,7 +20,7 @@ use crate::team_replacement::{
     CheckpointRecovery, ReplacementError, ReplacementPhase, StartSelection,
 };
 use crate::team_replacement::native::{
-    bootstrap_authorized, prepare_operator, replace_authorized, start_operator, stop_for_archive,
+    bootstrap_authorized, bootstrap_claude_smoke_authorized, prepare_operator, replace_authorized, start_operator, stop_for_archive,
     ReplacementAuthority,
 };
 use crate::team_replacement::remote::{
@@ -567,6 +567,28 @@ pub struct StopSeatView {
     pub blockers: Vec<RuntimeBlocker>,
 }
 
+/// One diagnostic attempt only; no tuple, prompt or caller authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeStartupSmokeInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClaudeStartupSmokeView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub model: String,
+    pub reasoning_observation: &'static str,
+    pub startup: &'static str,
+    pub cleanup: &'static str,
+    pub mcp_readiness: &'static str,
+    pub public_enabled: bool,
+}
+
 /// Target selectors only. The authenticated lead's team, seat and generation
 /// are derived from the current canonical capability and never accepted here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -595,6 +617,7 @@ pub enum TeamControlRequest {
     ListTeams,
     BootstrapSeat(BootstrapSeatInput),
     StopSeat(StopSeatInput),
+    ClaudeStartupSmoke(ClaudeStartupSmokeInput),
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
     Checkpoint(WriteCheckpointInput),
@@ -616,6 +639,7 @@ pub enum TeamControlResponse {
     ListTeams(Vec<TeamView>),
     BootstrapSeat(BootstrapView),
     StopSeat(StopSeatView),
+    ClaudeStartupSmoke(ClaudeStartupSmokeView),
     Approve(TeamView),
     Cancel(CancelPendingResult),
     Checkpoint(CheckpointReceipt),
@@ -1953,6 +1977,48 @@ pub fn team_bootstrap_seat(
     bootstrap_seat(&engine_from_state(&state)?, &AuthenticatedActor::operator_ui(), input)
 }
 
+fn claude_startup_smoke(engine: &TeamEngine, actor: &AuthenticatedActor, input: ClaudeStartupSmokeInput) -> TeamResult<ClaudeStartupSmokeView> {
+    if !actor.is_glados() {
+        return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"));
+    }
+    actor.revalidate_before_mutation().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability changed"))?;
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation != 0 {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "fresh diagnostic seat required"));
+    }
+    // This diagnostic never weakens the public launch policy or becomes a
+    // second bootstrap entrypoint for ordinary mission workers.
+    if managed_launch_enabled(&Harness::Claude) {
+        return Err(TeamError::state("startup-only diagnostic is not an ordinary launch"));
+    }
+    let view = engine.read_team_view(&input.team)?;
+    if view.state.state != TeamLifecycle::Active
+        || view.snapshot.seats.iter().filter(|s| s.name == input.seat
+            && s.harness == Harness::Claude && s.model == crate::team_claude_launch::MODEL
+            && s.reasoning.is_none()).count() != 1
+    { return Err(TeamError::state("approved exact Sonnet diagnostic seat required")); }
+    let diagnostic = bootstrap_claude_smoke_authorized(&engine.paths.home, actor,
+        &input.team, &input.seat, input.expected_generation, &[]).map_err(replacement_error)?;
+    project_claude_startup_smoke(&input, diagnostic)
+}
+
+fn project_claude_startup_smoke(
+    input: &ClaudeStartupSmokeInput,
+    diagnostic: crate::team_replacement::native::ClaudeSmokeDiagnostic,
+) -> TeamResult<ClaudeStartupSmokeView> {
+    if diagnostic.team != input.team || diagnostic.seat != input.seat
+        || input.expected_generation != 0 || diagnostic.generation != 1
+        || diagnostic.actual.harness != Harness::Claude
+        || diagnostic.actual.model != crate::team_claude_launch::MODEL
+        || diagnostic.actual.reasoning.is_some()
+    { return Err(TeamError::new("E_CONTROL_UNKNOWN", "diagnostic readback mismatch; inspect before any further action")); }
+    Ok(ClaudeStartupSmokeView {
+        team: diagnostic.team, seat: diagnostic.seat, generation: diagnostic.generation,
+        model: diagnostic.actual.model, reasoning_observation: "not_observed",
+        startup: "verified", cleanup: "quarantined", mcp_readiness: "not_run", public_enabled: false,
+    })
+}
+
 fn stop_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: StopSeatInput) -> TeamResult<StopSeatView> {
     if !actor.is_glados() {
         return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"));
@@ -2138,6 +2204,10 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
         TeamControlRequest::Create(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.create_team(&actor, input).map(TeamControlResponse::Create)
+        }
+        TeamControlRequest::ClaudeStartupSmoke(input) => {
+            let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
+            claude_startup_smoke(&engine, &actor, input).map(TeamControlResponse::ClaudeStartupSmoke)
         }
         TeamControlRequest::StopSeat(input) => {
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
@@ -2462,6 +2532,54 @@ mod tests {
     }
 
     include!("team_project_runtime_tests.rs");
+
+    #[test]
+    fn claude_startup_smoke_shared_wire_never_claims_mcp_or_public_readiness() {
+        let request: TeamControlRequest = serde_json::from_str(include_str!("../../tests/fixtures/team-claude-smoke-request.json")).unwrap();
+        let TeamControlRequest::ClaudeStartupSmoke(input) = request else { panic!("wrong action") };
+        let diagnostic = crate::team_replacement::native::ClaudeSmokeDiagnostic {
+            team: input.team.clone(), seat: input.seat.clone(), generation: 1,
+            actual: ExecutionTuple { harness: Harness::Claude, model: crate::team_claude_launch::MODEL.into(), reasoning: None },
+        };
+        let response = TeamControlResponse::ClaudeStartupSmoke(project_claude_startup_smoke(&input, diagnostic).unwrap());
+        let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/team-claude-smoke-response.json")).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), expected);
+        assert!(!managed_launch_enabled(&Harness::Claude));
+        for case in 0..6 {
+            let mut d = crate::team_replacement::native::ClaudeSmokeDiagnostic {
+                team: input.team.clone(), seat: input.seat.clone(), generation: 1,
+                actual: ExecutionTuple { harness: Harness::Claude, model: crate::team_claude_launch::MODEL.into(), reasoning: None },
+            };
+            match case {
+                0 => d.team = "other".into(), 1 => d.seat = "other".into(), 2 => d.generation = 2,
+                3 => d.actual.harness = Harness::Codex, 4 => d.actual.model = "sonnet".into(),
+                _ => d.actual.reasoning = Some(ReasoningEffort::High),
+            }
+            assert_eq!(project_claude_startup_smoke(&input, d).unwrap_err().code, "E_CONTROL_UNKNOWN");
+        }
+    }
+
+    #[test]
+    fn claude_startup_smoke_control_requires_real_capability_and_fresh_selectors() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("claude-smoke-control");
+        let _env = EnvRestore::set(&home);
+        // Invalid generation proves authentication runs BEFORE selector checks;
+        // this test never admits or launches a provider process.
+        let request = r#"{"action":"claude_startup_smoke","input":{"team":"smoke","seat":"smoke-qa","expected_generation":1}}"#;
+        assert_eq!(team_control_headless(request).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        assert_eq!(team_control_headless(request).unwrap_err().code, "E_GENERATION_MISMATCH");
+        for key in ["actor", "model", "reasoning", "prompt", "timeout", "force", "token"] {
+            let mut forged: serde_json::Value = serde_json::from_str(request).unwrap();
+            forged["input"][key] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<TeamControlRequest>(forged).is_err());
+        }
+        assert!(!home.join(".aperture/run/owner/smoke-qa.json").exists());
+        assert!(!home.join(".aperture/teams/smoke").exists());
+        assert!(!managed_launch_enabled(&Harness::Claude));
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn glados_stop_shared_wire_is_ready_not_started_or_archived() {

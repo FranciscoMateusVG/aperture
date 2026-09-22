@@ -91,6 +91,21 @@ context. Source tests do not establish a live stop/archive journey.
 
 ## Compatibility and limits
 
+### Claude startup diagnostic is not mission readiness
+
+The operator-authorized `team_claude_startup_smoke` action accepts only team,
+seat and generation zero for an approved, fresh Sonnet diagnostic seat. Native
+GLaDOS authentication and lifecycle revalidation remain authoritative. There
+is no initial prompt, caller model override or automatic retry. After exact
+pre-input model/session observation, the same candidate is stopped and revoked,
+and its owner is quarantined. An uncertain teardown is UNKNOWN, never success.
+
+The diagnostic receipt distinguishes startup verification from mission
+readiness: reasoning is `not_observed`, MCP readiness is `not_run`, and public
+Claude launch remains disabled. No business mission can use the diagnostic
+worker after it has been cleaned up. This source seam alone does not establish
+an installed smoke or Claude tool-call/BEADS roundtrip PASS.
+
 GUI, MCP and `aperture-team-control` must be built/published from the integrated
 head. An old binary cannot handle the new `catalog` / `create` /
 `list_repositories` / `save_repository` / `list_teams` / `bootstrap_seat` /
