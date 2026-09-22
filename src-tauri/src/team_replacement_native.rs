@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 enum NativePlan {
     Codex(launch::NativeLaunchBinding),
     Claude(crate::team_claude_launch::ClaudeBinding),
+    ClaudeSmoke(crate::team_claude_launch::ClaudeBinding, SmokeAdmission),
 }
 impl NativePlan {
     fn preflight(
@@ -60,11 +61,16 @@ impl NativePlan {
         }
     }
     fn revalidate(&self, budget: &deadline::Deadline) -> Result<(), ReplacementError> {
-        let harness = match self { Self::Codex(_) => Harness::Codex, Self::Claude(_) => Harness::Claude };
+        if let Self::ClaudeSmoke(binding, admission) = self {
+            admission.revalidate()?;
+            return binding.revalidate(budget).map_err(|_| ReplacementError::LaunchUnavailable);
+        }
+        let harness = match self { Self::Codex(_) => Harness::Codex, Self::Claude(_) | Self::ClaudeSmoke(..) => Harness::Claude };
         if !crate::teams::managed_launch_enabled(&harness) {
             return Err(ReplacementError::LaunchUnavailable);
         }
         match self {
+            Self::ClaudeSmoke(..) => Err(ReplacementError::AuthorizationRequired),
             Self::Codex(p) => p.revalidate(budget),
             Self::Claude(p) => p
                 .revalidate(budget)
@@ -76,6 +82,7 @@ impl NativePlan {
         e: Option<&crate::team_checkpoint::CheckpointEntry>,
     ) -> Result<(), ReplacementError> {
         match self {
+            Self::ClaudeSmoke(..) => Err(ReplacementError::AuthorizationRequired),
             Self::Codex(p) => p.bind_recovery(e),
             Self::Claude(p) => p
                 .bind_recovery(e)
@@ -133,6 +140,230 @@ fn authorize_bootstrap(actor: &AuthenticatedActor) -> Result<(), ReplacementErro
         Ok(())
     } else {
         Err(ReplacementError::AuthorizationRequired)
+    }
+}
+
+/// Issued only by the GLaDOS-authenticated diagnostic entry, never deserialized.
+/// It is not a switch on the public plan: its snapshot/target remain fixed.
+struct SmokeAdmission {
+    home: std::path::PathBuf,
+    team: String,
+    seat: String,
+    snapshot_sha256: String,
+}
+fn smoke_hash<T: serde::Serialize>(value: &T) -> Result<String, ReplacementError> {
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)
+        .map_err(|_| ReplacementError::OutcomeUnknown)?)))
+}
+fn smoke_tuple(t: &ExecutionTuple) -> bool {
+    t.harness == Harness::Claude && t.model == "claude-sonnet-5" && t.reasoning.is_none()
+}
+fn authorize_smoke(actor: &AuthenticatedActor) -> Result<(), ReplacementError> {
+    if !actor.is_glados() { return Err(ReplacementError::AuthorizationRequired); }
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)
+}
+impl SmokeAdmission {
+    fn issue(home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+        generation: u64) -> Result<Self, ReplacementError> {
+        authorize_smoke(actor)?;
+        if generation != 0 { return Err(ReplacementError::GenerationMismatch); }
+        if team.len() > 16 || !crate::agent_loader::is_valid_seat_name(team)
+            || !crate::agent_loader::is_valid_seat_name(seat) {
+            return Err(ReplacementError::AuthorizationRequired);
+        }
+        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
+            .map_err(|_| ReplacementError::NativeFailure)?;
+        let store = OwnerStore::new(home.join(".aperture/run/owner"));
+        let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
+        authorize_smoke(actor)?;
+        let snapshot: TeamSnapshot = read_private_json(&home.join(".aperture/teams").join(team).join("team.json"))
+            .map_err(|_| ReplacementError::AuthorizationRequired)?;
+        let admission = Self { home: home.into(), team: team.into(), seat: seat.into(), snapshot_sha256: smoke_hash(&snapshot)? };
+        admission.revalidate_locked()?;
+        let owner = store.read_owner_locked(seat).map_err(|_| ReplacementError::GenerationMismatch)?;
+        if owner.schema_version != 1 || owner.seat != seat || owner.generation != 0
+            || owner.state != OwnerState::Stale || owner.incarnation.is_some()
+            || owner.provisional_token_id.is_some() || owner.reservation_nonce_sha256.is_some()
+            || !smoke_tuple(&owner.requested) {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        Ok(admission)
+    }
+    fn matches_target(&self, home: &Path, team: &str, seat: &str, old_generation: u64) -> Result<(), ReplacementError> {
+        if self.home != home || self.team != team || self.seat != seat || old_generation != 0 {
+            return Err(ReplacementError::AuthorizationRequired);
+        }
+        Ok(())
+    }
+    fn revalidate(&self) -> Result<(), ReplacementError> {
+        let _team = crate::owner::try_lock(&self.home.join(".aperture/run/team-locks"), &self.team)
+            .map_err(|_| ReplacementError::NativeFailure)?;
+        self.revalidate_locked()
+    }
+    fn revalidate_locked(&self) -> Result<(), ReplacementError> {
+        match crate::teams::classify_managed_seat(&self.home, &self.seat)
+            .map_err(|_| ReplacementError::AuthorizationRequired)? {
+            Some(crate::teams::ManagedSeatState::Active { team, .. }) if team == self.team => {},
+            _ => return Err(ReplacementError::AuthorizationRequired),
+        }
+        let snapshot: TeamSnapshot = read_private_json(&self.home.join(".aperture/teams").join(&self.team).join("team.json"))
+            .map_err(|_| ReplacementError::AuthorizationRequired)?;
+        let seats: Vec<_> = snapshot.seats.iter().filter(|s| s.name == self.seat).collect();
+        if snapshot.team != self.team || smoke_hash(&snapshot)? != self.snapshot_sha256 || seats.len() != 1
+            || seats[0].harness != Harness::Claude || seats[0].model != "claude-sonnet-5" || seats[0].reasoning.is_some() {
+            return Err(ReplacementError::AuthorizationRequired);
+        }
+        Ok(())
+    }
+}
+
+/// Diagnostic only: no worker availability, PID, thread, bearer or raw payload.
+/// Successful construction requires consumption of the native teardown proof.
+pub(crate) struct ClaudeSmokeDiagnostic {
+    pub(crate) team: String,
+    pub(crate) seat: String,
+    pub(crate) generation: u64,
+    pub(crate) actual: ExecutionTuple,
+}
+
+pub(crate) fn bootstrap_claude_smoke_authorized(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    expected_generation: u64, _sentinels: &[String],
+) -> Result<ClaudeSmokeDiagnostic, ReplacementError> {
+    let budget = deadline::Deadline::new();
+    let admission = SmokeAdmission::issue(home, actor, team, seat, expected_generation)?;
+    let repo = repository::resolve_native(home, team, budget.forward_until(Duration::from_secs(10))?)
+        .map_err(|_| ReplacementError::RepoBindingUnavailable)?;
+    let selected = ExecutionTuple { harness: Harness::Claude, model: "claude-sonnet-5".into(), reasoning: None };
+    let binding = crate::team_claude_launch::ClaudeBinding::preflight(home, team, seat, &selected, &repo, None, &budget)
+        .map_err(|_| ReplacementError::LaunchUnavailable)?;
+    let plan = NativePlan::ClaudeSmoke(binding, admission);
+    authorize_smoke(actor)?;
+    plan.revalidate(&budget)?;
+    let mut attempt = deadline::RuntimeAttempt::begin_bootstrap(home, &AuthenticatedActor::launcher(), team, seat, budget)?;
+    attempt.admit_effects()?;
+    let mut started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor)) {
+        Ok(v) => v,
+        Err(e) => { let _ = attempt.finish_unknown(); return Err(e); }
+    };
+    let NativePlan::ClaudeSmoke(_, admission) = &plan else { unreachable!() };
+    // No prompt, kickoff or tool call. This is startup-only, never mission-ready.
+    let observed = authorize_smoke(actor).and_then(|_| activate_native_checked(home, team, &started, &attempt, Some(actor), Some(admission)));
+    // Finally uses the ORIGINAL cleanup deadline on every post-start outcome.
+    let completed = smoke_finally(observed, || cleanup_native(home, team, &started.reservation,
+        started.child.as_mut(), attempt.budget().cleanup_until()));
+    if let Err(e) = completed { let _ = attempt.finish_unknown(); return Err(e); }
+    let result = (|| {
+        let proof = SmokeCleanupProof::capture(admission, &started, attempt.id(), attempt.budget(), actor)?;
+        let actual = proof.actual.clone();
+        let generation = proof.generation;
+        attempt.finish_smoke_cleaned(proof, actor)?;
+        Ok(ClaudeSmokeDiagnostic { team: team.into(), seat: seat.into(), generation, actual })
+    })();
+    if result.is_err() { let _ = attempt.finish_unknown(); }
+    result
+}
+
+// Even an expired/revoked observation must run exact cleanup. A failed cleanup
+// takes precedence: an observation PASS cannot hide an uncertain live process.
+fn smoke_finally(observed: Result<(), ReplacementError>, cleanup: impl FnOnce() -> Result<(), ReplacementError>) -> Result<(), ReplacementError> {
+    cleanup()?;
+    observed
+}
+
+/// No serde, no public fields/constructor and no caller-supplied observation.
+/// Only the diagnostic's successful native finally can mint this value.
+pub(super) struct SmokeCleanupProof {
+    home: std::path::PathBuf,
+    team: String,
+    seat: String,
+    generation: u64,
+    attempt_id: String,
+    snapshot_sha256: String,
+    owner_sha256: String,
+    actual: ExecutionTuple,
+}
+impl SmokeCleanupProof {
+    fn capture(admission: &SmokeAdmission, started: &NativeStarted, attempt_id: &str,
+        budget: &deadline::Deadline, actor: &AuthenticatedActor) -> Result<Self, ReplacementError> {
+        let _team = crate::owner::try_lock(&admission.home.join(".aperture/run/team-locks"), &admission.team)
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        let store = OwnerStore::new(admission.home.join(".aperture/run/owner"));
+        let _seat = store.lock(&admission.seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        authorize_smoke(actor)?;
+        admission.revalidate_locked()?;
+        let owner = store.read_owner_locked(&admission.seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        let inc = owner.incarnation.as_ref().ok_or(ReplacementError::OutcomeUnknown)?;
+        if started.reservation.seat != admission.seat || started.reservation.generation != 1
+            || owner.generation != started.reservation.generation
+            || inc.pid != started.candidate.process.pid
+            || inc.start_time != team_process::birth_micros(&started.candidate.process)?
+            || inc.token_id != started.candidate.token_id
+            || inc.thread_id != started.candidate.observed.thread_id {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        let proof = Self { home: admission.home.clone(), team: admission.team.clone(), seat: admission.seat.clone(),
+            generation: owner.generation, attempt_id: attempt_id.into(), snapshot_sha256: admission.snapshot_sha256.clone(),
+            owner_sha256: smoke_hash(&owner)?, actual: ExecutionTuple { harness: inc.harness.clone(), model: inc.model.clone(), reasoning: inc.reasoning.clone() } };
+        proof.verify_locked(budget)?;
+        Ok(proof)
+    }
+    fn verify_locked(&self, budget: &deadline::Deadline) -> Result<(), ReplacementError> {
+        if Instant::now() >= budget.cleanup_until() { return Err(ReplacementError::Deadline); }
+        let owner: OwnerRecord = read_private_json(&self.home.join(".aperture/run/owner").join(format!("{}.json", self.seat)))
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        let inc = owner.incarnation.as_ref().ok_or(ReplacementError::OutcomeUnknown)?;
+        if owner.schema_version != 1 || owner.seat != self.seat || owner.generation != self.generation
+            || owner.state != OwnerState::Quarantined || owner.reservation_nonce_sha256.is_some()
+            || smoke_hash(&owner)? != self.owner_sha256 || !smoke_tuple(&owner.requested) || !smoke_tuple(&self.actual)
+            || !inc.observed || inc.harness != self.actual.harness || inc.model != self.actual.model || inc.reasoning != self.actual.reasoning
+            || inc.thread_id.is_empty() || inc.processes.is_empty() || inc.processes.len() > 256
+            || !inc.processes.iter().any(|p| p.pid == inc.pid && p.start_time == inc.start_time) {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        for p in &inc.processes {
+            if team_process::state(&team_process::identity_from_owner(p.pid, p.start_time)?) != ProcessState::Gone {
+                return Err(ReplacementError::StartCleanupUnverified);
+            }
+        }
+        let rev: RevokedState = read_private_json(&self.home.join(".aperture/run/revocations").join(format!("{}.json", self.seat)))
+            .map_err(|_| ReplacementError::RevocationUnverified)?;
+        let mut sorted = rev.revoked_token_ids.clone(); sorted.sort(); sorted.dedup();
+        if rev.schema_version != 1 || rev.seat != self.seat || rev.revoked_through_generation != self.generation
+            || sorted != rev.revoked_token_ids || sorted.is_empty() || sorted.len() > 4096
+            || sorted.iter().any(|s| s.len()!=64 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            || !sorted.contains(&inc.token_id) {
+            return Err(ReplacementError::RevocationUnverified);
+        }
+        let token = validate_component_path(&self.home.join(".aperture/run/hub-tokens"), &format!("{}.token", self.seat), true)
+            .map_err(|_| ReplacementError::RevocationUnverified)?;
+        if !matches!(std::fs::symlink_metadata(token), Err(e) if e.kind()==std::io::ErrorKind::NotFound) {
+            return Err(ReplacementError::RevocationUnverified);
+        }
+        match crate::teams::classify_managed_seat(&self.home, &self.seat)
+            .map_err(|_| ReplacementError::OutcomeUnknown)? {
+            Some(crate::teams::ManagedSeatState::Active { team, .. }) if team == self.team => {},
+            _ => return Err(ReplacementError::OutcomeUnknown),
+        }
+        let snapshot: TeamSnapshot = read_private_json(&self.home.join(".aperture/teams").join(&self.team).join("team.json"))
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if smoke_hash(&snapshot)? != self.snapshot_sha256 { return Err(ReplacementError::OutcomeUnknown); }
+        if Instant::now() >= budget.cleanup_until() { return Err(ReplacementError::Deadline); }
+        Ok(())
+    }
+    /// Lock order matches owner/attempt publication. No proof bytes leave here.
+    pub(super) fn with_revalidated<T>(self, home: &Path, team: &str, seat: &str,
+        old_generation: u64, attempt_id: &str, budget: &deadline::Deadline,
+        actor: &AuthenticatedActor, publish: impl FnOnce() -> Result<T, ReplacementError>) -> Result<T, ReplacementError> {
+        if self.home != home || self.team != team || self.seat != seat || old_generation != 0
+            || self.generation != 1 || self.attempt_id != attempt_id { return Err(ReplacementError::OutcomeUnknown); }
+        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        let store = OwnerStore::new(home.join(".aperture/run/owner"));
+        let _seat = store.lock(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        authorize_smoke(actor)?;
+        self.verify_locked(budget)?;
+        publish()
     }
 }
 
@@ -237,6 +468,10 @@ fn start_native(
         if let Some(actor) = bootstrap_actor {
             authorize_bootstrap(actor)?;
         }
+        if let NativePlan::ClaudeSmoke(_, admission) = plan {
+            admission.matches_target(home, team, seat, generation)?;
+            admission.revalidate_locked()?;
+        }
         store
             .reserve_start(&launcher, seat, generation, selected.clone())
             .map_err(|_| ReplacementError::GenerationMismatch)?
@@ -245,6 +480,7 @@ fn start_native(
     let result = (|| {
         let token = crate::hub_auth::managed::provision(home, team, &launcher, &reservation)
             .map_err(|_| ReplacementError::NativeFailure)?;
+        let smoke_admission = match plan { NativePlan::ClaudeSmoke(_, a) => Some(a), _ => None };
         match plan {
             NativePlan::Codex(plan) => {
                 let spec = plan.publish(&reservation, &token, attempt.budget())?;
@@ -291,13 +527,16 @@ fn start_native(
                     }
                 }
             }
-            NativePlan::Claude(plan) => {
+            NativePlan::Claude(plan) | NativePlan::ClaudeSmoke(plan, _) => {
                 let published = plan
                     .publish(&reservation, &token, attempt.budget())
                     .map_err(|_| ReplacementError::LaunchUnavailable)?;
                 attempt.budget().forward(Duration::from_secs(85))?;
                 if let Some(actor) = bootstrap_actor {
                     authorize_bootstrap(actor)?;
+                }
+                if let Some(admission) = smoke_admission {
+                    admission.revalidate()?;
                 }
                 let pending = published
                     .spawn(attempt.budget())
@@ -443,6 +682,13 @@ fn activate_native(
     attempt: &deadline::RuntimeAttempt,
     bootstrap_actor: Option<&AuthenticatedActor>,
 ) -> Result<(), ReplacementError> {
+    activate_native_checked(home, team, started, attempt, bootstrap_actor, None)
+}
+fn activate_native_checked(
+    home: &Path, team: &str, started: &NativeStarted,
+    attempt: &deadline::RuntimeAttempt, bootstrap_actor: Option<&AuthenticatedActor>,
+    smoke: Option<&SmokeAdmission>,
+) -> Result<(), ReplacementError> {
     attempt.budget().forward(Duration::from_secs(1))?;
     let observation = runtime_observation(home, team, &started.reservation, &started.harness)?
         .ok_or(ReplacementError::ModelUnverified)?;
@@ -452,6 +698,7 @@ fn activate_native(
         .record_runtime_observation(&launcher, &started.reservation, observation)
         .map_err(|_| ReplacementError::ModelUnverified)?;
     let _team = lock_activation(home, team, bootstrap_actor)?;
+    if let Some(admission) = smoke { admission.revalidate_locked()?; }
     attempt.budget().forward(Duration::from_secs(1))?;
     let owner = store
         .commit_start(&launcher, &started.reservation)

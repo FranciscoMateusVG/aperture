@@ -28,6 +28,10 @@ impl Deadline {
             started: Instant::now(),
         }
     }
+    #[cfg(test)]
+    pub(super) fn fixture_elapsed(elapsed: Duration) -> Self {
+        Self { started: Instant::now() - elapsed }
+    }
     fn remaining_at(&self, now: Instant) -> Duration {
         TOTAL.saturating_sub(now.saturating_duration_since(self.started))
     }
@@ -74,6 +78,7 @@ enum FactKind {
     Active,
     Failed,
     Unknown,
+    SmokeCleaned,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -558,6 +563,35 @@ impl RuntimeAttempt {
             return self.finish_unknown();
         }
         self.finish(FactKind::Failed)
+    }
+    /// A native-only proof, rechecked under team/seat locks, is the sole path
+    /// to this terminal. It never makes a bootstrap attempt eligible for retry.
+    pub(crate) fn finish_smoke_cleaned(
+        &mut self, proof: super::native::SmokeCleanupProof, actor: &AuthenticatedActor,
+    ) -> Result<(), ReplacementError> {
+        if self.terminal || !self.effects_admitted || self.admitted.old_generation != 0 {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        proof.with_revalidated(&self.home, &self.admitted.team, &self.admitted.seat,
+            self.admitted.old_generation, self.id(), &self.budget, actor, || {
+                let actual: Admission = read_private_json(&self.dir.join("admitted.json"))
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                let effects: Fact = read_private_json(&self.dir.join("effects.json"))
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                if actual != self.admitted || effects.schema_version != 1
+                    || effects.attempt_id != self.id() || effects.kind != FactKind::EffectsMayHaveOccurred {
+                    return Err(ReplacementError::OutcomeUnknown);
+                }
+                if Instant::now() >= self.budget.cleanup_until() { return Err(ReplacementError::Deadline); }
+                let fact = Fact { schema_version: 1, attempt_id: self.id().into(), kind: FactKind::SmokeCleaned };
+                write_private_json_atomic(&self.dir.join("terminal.json"), &fact, false)
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                if read_private_json::<Fact>(&self.dir.join("terminal.json"))
+                    .map_err(|_| ReplacementError::OutcomeUnknown)? != fact { return Err(ReplacementError::OutcomeUnknown); }
+                Ok(())
+            })?;
+        self.terminal = true;
+        Ok(())
     }
     pub(crate) fn finish_unknown(&mut self) -> Result<(), ReplacementError> {
         self.finish(FactKind::Unknown)?;
