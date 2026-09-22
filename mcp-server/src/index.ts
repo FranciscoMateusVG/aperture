@@ -1,3 +1,4 @@
+import { stopSeatSchema, parseStopSeatReady } from "./team-stop.js";
 import { bootstrapSeatSchema, bootstrapSelection, parseBootstrapStarted, parseTeamList } from "./team-bootstrap.js";
 import { createTeamSchema, parseCreatedTeam } from "./team-create.js";
 import { parseRepositoryRegistry, parseSavedRepository, saveRepositorySchema } from "./team-repositories.js";
@@ -517,6 +518,23 @@ server.tool(
       const request = bootstrapSeatSchema.parse(input);
       const expected = bootstrapSelection(await invokeTeamControl({ action: "list_teams" }), request);
       const result = parseBootstrapStarted(await invokeTeamControl({ action: "bootstrap_seat", input: request }), request, expected);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_stop_seat",
+  "GLaDOS-only: stop and revoke one exact seat with a freshly validated checkpoint, preserving context. This does not replace the worker or archive the team; archive is a separate action. Owner remains active at the same generation until archive, so do not infer process_count zero from owner metadata. Native bounded lifecycle proof is required. On unknown outcome inspect and reconcile; never automatically retry. No caller proofs, force/discard, model or authority fields.",
+  { input: stopSeatSchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = stopSeatSchema.parse(input);
+      const result = parseStopSeatReady(await invokeTeamControl({ action: "stop_seat", input: request }), request);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
