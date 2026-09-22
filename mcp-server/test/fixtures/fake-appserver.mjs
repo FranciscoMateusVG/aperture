@@ -33,6 +33,14 @@ export class FakeAppServer {
     this.threads = opts.threads ?? []; // [{ id: "..." }]
     this.delays = opts.delays ?? {}; // method → ms
     this.failures = opts.failures ?? {}; // method → remaining error count
+    this.mcpStatus = opts.mcpStatus ?? {
+      data: [
+        { name: "aperture-bus", runtimeStatus: "connected", toolsError: null,
+          tools: Object.fromEntries(["get_messages", "send_message", "mark_as_read", "query_tasks", "update_task"].map(name => [name, { name }])) },
+        { name: "sentry", runtimeStatus: "connected", toolsError: null, tools: { search_issues: { name: "search_issues" } } },
+      ], nextCursor: null,
+    };
+    this.mcpProbe = opts.mcpProbe ?? { content: [{ type: "text", text: "No unread messages." }], isError: false };
     this.threadStartModel = opts.threadStartModel;
     this.threadStartReasoning = opts.threadStartReasoning;
     /** @type {{method: string, params: unknown, id: number|string|null, ts: number}[]} */
@@ -96,6 +104,10 @@ export class FakeAppServer {
 
     let result = {};
     switch (msg.method) {
+      case "mcpServerStatus/list":
+        result = this.mcpStatus; break;
+      case "mcpServer/tool/call":
+        result = this.mcpProbe; break;
       case "thread/list":
         result = { data: this.threads };
         break;
