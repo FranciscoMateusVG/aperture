@@ -30,6 +30,25 @@ impl Fixture {
         assert!(status.success());
         f.write(".codex/auth.json", b"{}");
         f.write("tools/codex-fixture", b"synthetic never executed");
+        f.write("tools/node-fixture", b"synthetic node never executed");
+        std::fs::set_permissions(
+            f.home.join("tools/node-fixture"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        f.write(
+            ".volta/bin/node",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                f.home.join("tools/node-fixture").display()
+            )
+            .as_bytes(),
+        );
+        std::fs::set_permissions(
+            f.home.join(".volta/bin/node"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         std::fs::set_permissions(&f.executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         for p in [
             "mcp-server/start.sh",
@@ -116,6 +135,7 @@ fn generated_config_is_exact_toml_and_values_are_not_syntax_or_argv() {
     let output = config(
         &f.home,
         &f.infra,
+        &f.home.join("tools/node-fixture"),
         "t1-worker",
         "lead",
         &selected(),
@@ -131,6 +151,19 @@ fn generated_config_is_exact_toml_and_values_are_not_syntax_or_argv() {
     assert_eq!(parsed["model"].as_str(), Some("gpt-6-astra"));
     assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
     for server in ["aperture-bus", "sentry"] {
+        assert_eq!(
+            parsed["mcp_servers"][server]["command"].as_str(),
+            f.home.join("tools/node-fixture").to_str()
+        );
+        let script = if server == "aperture-bus" {
+            "mcp-server/dist/index.js"
+        } else {
+            "mcp-server-sentry/dist/index.js"
+        };
+        assert_eq!(
+            parsed["mcp_servers"][server]["args"][0].as_str(),
+            f.infra.join(script).to_str()
+        );
         assert_eq!(
             parsed["mcp_servers"][server]["env"]["APERTURE_TEAM_GENERATION"].as_str(),
             Some("1")
@@ -332,5 +365,39 @@ fn codex_executable_larger_cap_keeps_installed_identity_guards() {
         }
         assert!(installed_pin(&f.executable, &f.executable).is_err());
         assert!(f.plan().is_err());
+    }
+}
+
+#[test]
+fn volta_only_node_is_absolute_pinned_and_drift_fails_closed() {
+    let f = Fixture::new();
+    let p = f.plan().unwrap();
+    assert_eq!(p.node, f.home.join("tools/node-fixture"));
+    assert!(p.pins.contains_key(&p.node));
+    f.write("tools/node-fixture", b"changed node");
+    assert!(p.revalidate(&Deadline::new()).is_err());
+}
+#[test]
+fn node_absent_unsafe_or_shim_response_denied_without_fallback() {
+    let f = Fixture::new();
+    assert!(node_from_candidates(&f.home, &[f.home.join("missing")], &Deadline::new()).is_err());
+    let candidate = f.home.join(".volta/bin/node");
+    f.write(".volta/bin/node", b"#!/bin/sh\nprintf node\n");
+    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(node_from_candidates(&f.home, &[candidate.clone()], &Deadline::new()).is_err());
+    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(node_from_candidates(&f.home, &[candidate], &Deadline::new()).is_err());
+}
+#[test]
+fn node_removed_or_no_longer_executable_invalidates_preflight() {
+    for remove in [false, true] {
+        let f = Fixture::new();
+        let p = f.plan().unwrap();
+        if remove {
+            std::fs::remove_file(&p.node).unwrap();
+        } else {
+            std::fs::set_permissions(&p.node, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(p.revalidate(&Deadline::new()).is_err());
     }
 }

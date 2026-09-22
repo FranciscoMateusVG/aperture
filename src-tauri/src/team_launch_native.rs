@@ -119,6 +119,77 @@ fn binary(home: &Path) -> Result<PathBuf, ReplacementError> {
     }
     Err(error())
 }
+// Resolve the actual Node executable, not the Volta shim. No shell rc, caller
+// path/env override or project-selected runtime. The existing bounded native
+// subprocess primitive bounds output/time and reaps its process group.
+fn node_binary(home: &Path, budget: &Deadline) -> Result<PathBuf, ReplacementError> {
+    node_from_candidates(
+        home,
+        &[
+            home.join(".volta/bin/node"),
+            home.join(".npm-global/bin/node"),
+            home.join(".local/bin/node"),
+            PathBuf::from("/opt/homebrew/bin/node"),
+            PathBuf::from("/usr/local/bin/node"),
+            PathBuf::from("/usr/bin/node"),
+        ],
+        budget,
+    )
+}
+fn node_from_candidates(
+    home: &Path,
+    candidates: &[PathBuf],
+    budget: &Deadline,
+) -> Result<PathBuf, ReplacementError> {
+    for candidate in candidates {
+        match std::fs::symlink_metadata(candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(error()),
+            Ok(_) => {}
+        }
+        let executable = std::fs::canonicalize(candidate).map_err(|_| error())?;
+        let before = installed_file(&executable)?;
+        if std::fs::metadata(&executable).map_err(|_| error())?.mode() & 0o111 == 0 {
+            return Err(error());
+        }
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(["-p", "process.execPath"])
+            .current_dir(home)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin");
+        let output = super::repository::bounded_command(
+            command,
+            budget.forward_until(Duration::from_secs(3))?,
+        )
+        .map_err(|_| error())?;
+        if output.is_empty() || output.len() > 4096 || installed_file(&executable)? != before {
+            return Err(error());
+        }
+        let text = std::str::from_utf8(&output)
+            .map_err(|_| error())?
+            .trim_end_matches(['\r', '\n']);
+        if text.chars().any(char::is_control) {
+            return Err(error());
+        }
+        let path = PathBuf::from(text);
+        if !path.is_absolute() {
+            return Err(error());
+        }
+        let real = std::fs::canonicalize(&path).map_err(|_| error())?;
+        // A shim returned as 'Node' is not proof of the actual child executable.
+        if real.starts_with(home.join(".volta/bin")) {
+            return Err(error());
+        }
+        installed_file(&real)?;
+        if std::fs::metadata(&real).map_err(|_| error())?.mode() & 0o111 == 0 {
+            return Err(error());
+        }
+        return Ok(real);
+    }
+    Err(error())
+}
 fn inventory(root: &Path, budget: &Deadline) -> Result<BTreeMap<String, String>, ReplacementError> {
     let mut out = BTreeMap::new();
     let mut pending = vec![(root.to_path_buf(), 0usize)];
@@ -173,6 +244,7 @@ fn quote(s: &str) -> String {
 fn config(
     home: &Path,
     infra: &Path,
+    node: &Path,
     seat: &str,
     role: &str,
     tuple: &ExecutionTuple,
@@ -216,9 +288,9 @@ fn config(
     .map(|(k, v)| format!("{k} = {}", quote(v)))
     .collect::<Vec<_>>()
     .join(", ");
-    Ok(PrivateBytes(format!("model = {}\nmodel_reasoning_effort = {}\nmodel_instructions_file = {}\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n[projects.{}]\ntrust_level = \"trusted\"\n\n[mcp_servers.aperture-bus]\ncommand = \"/bin/sh\"\nargs = [{}]\nenv = {{ {} }}\n\n[mcp_servers.sentry]\ncommand = \"node\"\nargs = [{}]\nenv = {{ {} }}\n",
-        quote(&tuple.model),quote(r),p(&codex_home.join("prompt.md"))?,p(cwd)?,p(&infra.join("mcp-server/start.sh"))?,env,
-        p(&infra.join("mcp-server-sentry/dist/index.js"))?,env).into_bytes()))
+    Ok(PrivateBytes(format!("model = {}\nmodel_reasoning_effort = {}\nmodel_instructions_file = {}\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n[projects.{}]\ntrust_level = \"trusted\"\n\n[mcp_servers.aperture-bus]\ncommand = {}\nargs = [{}]\nenv = {{ {} }}\n\n[mcp_servers.sentry]\ncommand = {}\nargs = [{}]\nenv = {{ {} }}\n",
+        quote(&tuple.model),quote(r),p(&codex_home.join("prompt.md"))?,p(cwd)?,p(node)?,p(&infra.join("mcp-server/dist/index.js"))?,env,
+        p(node)?,p(&infra.join("mcp-server-sentry/dist/index.js"))?,env).into_bytes()))
 }
 pub(crate) struct NativeLaunchBinding {
     home: PathBuf,
@@ -230,6 +302,7 @@ pub(crate) struct NativeLaunchBinding {
     runtime: PathBuf,
     cwd: PathBuf,
     executable: PathBuf,
+    node: PathBuf,
     snapshot: crate::teams::TeamSnapshot,
     pins: BTreeMap<PathBuf, String>,
     skills: BTreeMap<String, String>,
@@ -323,6 +396,7 @@ impl NativeLaunchBinding {
         if *tuple != configured && !snapshot.fallbacks.contains(tuple) {
             return Err(error());
         }
+        let node = node_binary(home, budget)?;
         let mut pins = BTreeMap::new();
         let manifest: serde_json::Value =
             read_private_json(&runtime.join("manifest.json")).map_err(|_| error())?;
@@ -356,7 +430,7 @@ impl NativeLaunchBinding {
         open_private_file_nofollow(&auth).map_err(|_| error())?;
         for p in [
             executable.clone(),
-            infra.join("mcp-server/start.sh"),
+            node.clone(),
             infra.join("mcp-server/dist/index.js"),
             infra.join("mcp-server-sentry/dist/index.js"),
         ] {
@@ -377,6 +451,7 @@ impl NativeLaunchBinding {
             runtime,
             cwd,
             executable,
+            node,
             snapshot: snapshot.clone(),
             pins,
             skills,
@@ -432,6 +507,9 @@ impl NativeLaunchBinding {
         };
         let meta = std::fs::symlink_metadata(&cwd).map_err(|_| error())?;
         if cwd != self.cwd || (meta.dev(), meta.ino()) != self.cwd_identity {
+            return Err(error());
+        }
+        if std::fs::metadata(&self.node).map_err(|_| error())?.mode() & 0o111 == 0 {
             return Err(error());
         }
         for (p, before) in &self.pins {
@@ -551,6 +629,7 @@ impl NativeLaunchBinding {
         let cfg = config(
             &self.home,
             &self.infra,
+            &self.node,
             &self.seat,
             &self.role,
             &self.tuple,

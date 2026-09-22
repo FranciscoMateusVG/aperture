@@ -131,6 +131,7 @@ async function scenario(t, {
   failures = {},
   threadStartModel,
   threadStartReasoning,
+  mcpStatus, mcpProbe,
   beforeManagedOwnerReadback,
 } = {}) {
   const agent = `cbx${++sockCounter}`;
@@ -142,7 +143,7 @@ async function scenario(t, {
   writeFileSync(join(AGENTS, agent, "prompt.md"), "fixture");
   const sock = join(TMP, `${agent}.sock`);
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
-  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning });
+  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning, mcpStatus, mcpProbe });
   await server.start();
   const { hooks, logs, presence } = makeHooks(beforeManagedOwnerReadback);
   const bridge = new CodexBridgeClient(agent, sock, hooks);
@@ -364,6 +365,8 @@ test("managed Starting generation owns one exact fresh thread and stays silent u
   assert.equal(receipt.actual_reasoning, "high");
   assert.equal(bridge.isBound, false, "receipt is not an Active owner");
   assert.deepEqual(presence, [], "no managed presence before Active");
+  assert.equal(server.callsOf("mcpServerStatus/list").length, 0);
+  assert.equal(server.callsOf("mcpServer/tool/call").length, 0, "no MCP tool proof before Active");
   assert.equal(server.callsOf("turn/start").length, 0, "no kickoff or work before Active");
 
   dropClients(server);
@@ -692,4 +695,109 @@ test.after(() => {
   } catch {
     /* tmp reaper handles it */
   }
+});
+
+// Protocol shapes pinned to codex-cli 0.155.1 generate-ts (no real harness).
+async function activeMcpScenario(t, opts = {}) {
+  const s = await scenario(t, opts);
+  makeManagedSeat(s.agent);
+  writeManagedOwner(s.agent, "active", { thread_id: "t-mcp-existing" });
+  setUnread([msgRow("m-ready-proof", "glados", s.agent, "fixture mission must wait")]);
+  s.bridge.start();
+  return s;
+}
+
+test("managed MCP catalog plus real RO protocol call precede delivery on exact Active thread", async t => {
+  const s = await activeMcpScenario(t, { delays: { "mcpServer/tool/call": 100 } });
+  await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "RO proof started");
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  await waitFor(() => s.server.turnCallsContaining("m-ready-proof").length === 1, "mission released");
+  const probe = s.server.callsOf("mcpServer/tool/call")[0];
+  assert.deepEqual(probe.params, { threadId: "t-mcp-existing", server: "aperture-bus", tool: "get_messages", arguments: {} });
+  assert.ok(s.server.indexOf("turn/start") > s.server.indexOf("mcpServer/tool/call"));
+  assert.equal(s.bridge.mcpReadiness, "ready");
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+});
+
+for (const variant of ["failed", "missing", "empty", "required", "invalid-tool", "discovery", "duplicate", "cursor", "probe", "rpc"]) {
+  test(`managed MCP ${variant} is blocked: no turn, no retry, sanitized error`, async t => {
+    const s = await scenario(t);
+    makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "t-mcp-existing" });
+    const row = s.server.mcpStatus.data[0];
+    if (variant === "failed" || variant === "starting") row.runtimeStatus = variant;
+    if (variant === "missing") s.server.mcpStatus.data.shift();
+    if (variant === "empty") row.tools = {};
+    if (variant === "required") delete row.tools.send_message;
+    if (variant === "invalid-tool") row.tools.send_message = null;
+    if (variant === "discovery") row.toolsError = "PRIVATE_ERROR_SENTINEL";
+    if (variant === "duplicate") s.server.mcpStatus.data.push({ ...row });
+    if (variant === "cursor") s.server.mcpStatus.nextCursor = "same-cursor";
+    if (variant === "probe") s.server.mcpProbe = { content: [{ type: "text", text: "PRIVATE_ERROR_SENTINEL" }], isError: true };
+    if (variant === "rpc") s.server.failures["mcpServerStatus/list"] = 1;
+    setUnread([msgRow("m-private", "glados", s.agent, "fixture")]);
+    s.bridge.start();
+    await waitFor(() => s.bridge.mcpReadiness === "blocked", "MCP denial");
+    s.bridge.deliver(); await delay(150);
+    assert.equal(s.server.calls.filter(c => c.method.startsWith("turn/")).length, 0);
+    assert.equal(s.server.callsOf("initialize").length, 1, "no reconnect to retry admission");
+    assert.equal(s.bridge.isBound, false);
+    assert.equal(JSON.stringify(s.logs).includes("PRIVATE_ERROR_SENTINEL"), false);
+  });
+}
+
+test("MCP readiness owner drift during RO proof never binds or sends", async t => {
+  const s = await activeMcpScenario(t, { delays: { "mcpServer/tool/call": 100 } });
+  await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "probe");
+  mutateManagedOwner(s.agent, o => { o.generation++; });
+  await waitFor(() => s.bridge.mcpReadiness === "blocked", "owner drift blocked");
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  assert.equal(s.bridge.isBound, false);
+});
+
+test("later MCP failure revalidates before next mission and retains unread intent", async t => {
+  const s = await activeMcpScenario(t);
+  await waitFor(() => s.server.turnCallsContaining("m-ready-proof").length === 1, "initial admission");
+  s.server.mcpStatus.data[0].runtimeStatus = "failed";
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "failed", error: "PRIVATE_ERROR_SENTINEL" });
+  await waitFor(() => s.bridge.mcpReadiness === "blocked", "readiness invalidated");
+  setUnread([msgRow("m-held", "glados", s.agent, "later mission")]);
+  s.bridge.deliver(); await delay(150);
+  assert.equal(s.server.turnCallsContaining("m-held").length, 0);
+  assert.equal(JSON.stringify(s.logs).includes("PRIVATE_ERROR_SENTINEL"), false);
+});
+
+test("managed pending MCP startup may settle without a new thread or premature kickoff", async t => {
+  const s = await scenario(t);
+  makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "t-mcp-existing" });
+  s.server.mcpStatus.data[0].runtimeStatus = "starting";
+  s.bridge.start();
+  await waitFor(() => s.server.callsOf("mcpServerStatus/list").length > 0, "pending catalog");
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  s.server.mcpStatus.data[0].runtimeStatus = "connected";
+  await waitFor(() => s.bridge.mcpReadiness === "ready", "startup settled");
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+});
+
+test("failure during initial read proof cannot publish readiness", async t => {
+  const s = await activeMcpScenario(t, { delays: { "mcpServer/tool/call": 100 } });
+  await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "proof in flight");
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "failed", error: "PRIVATE_ERROR_SENTINEL" });
+  await waitFor(() => s.bridge.mcpReadiness === "blocked", "failure fenced");
+  await delay(150);
+  assert.equal(s.bridge.isBound, false);
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+});
+
+test("managed MCP startup deadline is finite and never releases a pending catalog", async t => {
+  const s = await scenario(t);
+  makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "t-mcp-existing" });
+  s.server.mcpStatus.data[0].runtimeStatus = "starting";
+  s.bridge.start();
+  await waitFor(() => s.bridge.mcpReadiness === "blocked", "20-second startup deadline", 22_000);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.ok(s.logs.some(x => x.code === "E_MCP_STARTUP_TIMEOUT"));
 });

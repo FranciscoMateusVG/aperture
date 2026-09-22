@@ -400,6 +400,14 @@ export class CodexBridgeClient {
   private initialized = false;
   /** True once this app-server session has received its fresh-session kickoff. */
   private kickoffInjected = false;
+  // Active/model observation is NOT MCP readiness. This is connection-local,
+  // never owner authority and never persisted as an observed model fact.
+  private managedMcpOwner: ManagedActiveRuntime | null = null;
+  private managedMcpProven = false;
+  private managedMcpEpoch = 0;
+  private managedMcpState: "not_checked" | "checking" | "ready" | "blocked" = "not_checked";
+
+  get mcpReadiness(): string { return this.managedMcpState; }
 
   private reconnectTimer: NodeJS.Timeout | null = null;
   private readyWaiters: Array<(v: void) => void> = [];
@@ -438,6 +446,9 @@ export class CodexBridgeClient {
 
   stop(): void {
     this.stopped = true;
+    this.managedMcpProven = false;
+    this.managedMcpState = "not_checked";
+    this.managedMcpEpoch++;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -588,6 +599,7 @@ export class CodexBridgeClient {
           if (confirmed === null || !sameActiveRuntime(active, confirmed)) {
             throw new Error("E_GENERATION_MISMATCH: managed owner changed during thread resume");
           }
+          if (!(await this.verifyManagedMcp(ws, active))) return;
           this.bindToThread(active.threadId, "thread_list");
           if (!this.hooks.skipReplay) this.deliver();
           return;
@@ -737,6 +749,7 @@ export class CodexBridgeClient {
         if (active === null || !activeMatchesObservation(active, owner, receipt)) {
           throw new Error("E_GENERATION_MISMATCH: active owner does not match observation");
         }
+        if (!(await this.verifyManagedMcp(ws, active))) return;
         this.bindToThread(receipt.thread_id, "thread_start");
         this.kickoffInjected = true;
         this.setTurnActive(true);
@@ -780,6 +793,102 @@ export class CodexBridgeClient {
       await delay(25);
     }
     throw new Error("E_FRESH_THREAD_UNVERIFIED: managed bridge disconnected before activation");
+  }
+
+  /** Codex 0.155.1 native protocol, exact thread only. No reload, turn,
+   * config mutation or pre-Active tool call. Error bodies/catalogs are private;
+   * only finite categories/counts leave this seam. Failed admission stays held
+   * on this connection; it does not reconnect/restart to manufacture success. */
+  private async verifyManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime): Promise<boolean> {
+    const proofOwner = this.managedMcpOwner;
+    this.managedMcpState = "checking";
+    this.managedMcpOwner = owner;
+    let epoch = this.managedMcpEpoch;
+    const deadline = Date.now() + 20_000;
+    let code = "E_MCP_STATUS_UNAVAILABLE";
+    let server: "aperture-bus" | "sentry" | "unknown" = "unknown";
+    const current = () => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN || this.stopped) return false;
+      const registry = loadSeatRegistry().seats.get(this.agent);
+      const now = readManagedActiveRuntime(this.agent);
+      return registry?.group === "team" && now !== null && sameActiveRuntime(owner, now);
+    };
+    const rpc = async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(code);
+      const result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
+      if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
+      if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error(code);
+      return result as Record<string, unknown>;
+    };
+    try {
+      // Only pending startup is polled; terminal failure never reloads/restarts.
+      admission: while (true) {
+        epoch = this.managedMcpEpoch;
+        const rows = new Map<string, Record<string, unknown>>();
+        let cursor: string | null = null;
+        const cursors = new Set<string>();
+        for (let page = 0; page < 4; page++) {
+          const result = await rpc("mcpServerStatus/list", {
+            threadId: owner.threadId, detail: "toolsAndAuthOnly", limit: 20, ...(cursor ? { cursor } : {}),
+          });
+          if (!Array.isArray(result.data) || result.data.length > 20) throw new Error(code);
+          for (const raw of result.data) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(code);
+            const row = raw as Record<string, unknown>;
+            if (typeof row.name !== "string" || rows.has(row.name)) throw new Error(code);
+            rows.set(row.name, row);
+          }
+          if (result.nextCursor === null) { cursor = null; break; }
+          if (typeof result.nextCursor !== "string" || !result.nextCursor || result.nextCursor.length > 4096 || cursors.has(result.nextCursor)) throw new Error(code);
+          cursor = result.nextCursor; cursors.add(cursor);
+        }
+        if (cursor !== null) throw new Error(code);
+        for (const name of ["aperture-bus", "sentry"] as const) {
+          server = name;
+          const row = rows.get(name);
+          if (!row) { code = "E_MCP_SERVER_MISSING"; throw new Error(code); }
+          if (row.runtimeStatus === "starting" || row.runtimeStatus === "notStarted") {
+            code = "E_MCP_STARTUP_TIMEOUT";
+            if (Date.now() + 200 >= deadline) throw new Error(code);
+            await delay(200);
+            continue admission;
+          }
+          if (row.runtimeStatus !== "connected") { code = "E_MCP_SERVER_NOT_CONNECTED"; throw new Error(code); }
+          if (row.toolsError !== null) { code = "E_MCP_DISCOVERY_FAILED"; throw new Error(code); }
+          if (!row.tools || typeof row.tools !== "object" || Array.isArray(row.tools)) throw new Error(code);
+          const tools = row.tools as Record<string, unknown>;
+          const names = Object.keys(tools);
+          if (names.length === 0 || names.length > 512) { code = "E_MCP_CATALOG_EMPTY"; throw new Error(code); }
+          if (name === "aperture-bus" && !["get_messages", "send_message", "mark_as_read", "query_tasks", "update_task"].every(k => {
+            const tool = tools[k];
+            return Object.hasOwn(tools, k) && tool !== null && typeof tool === "object" && !Array.isArray(tool) && (tool as Record<string, unknown>).name === k;
+          })) {
+            code = "E_MCP_REQUIRED_TOOL_MISSING"; throw new Error(code);
+          }
+        }
+        break;
+      }
+      // A catalog alone is not a callable proof. Read only the authenticated
+      // seat's inbox, do not ack/send or return its body to logs/the model.
+      if (!this.managedMcpProven || !proofOwner || !sameActiveRuntime(owner, proofOwner)) {
+        server = "aperture-bus"; code = "E_MCP_READ_PROBE_FAILED";
+        const result = await rpc("mcpServer/tool/call", { threadId: owner.threadId, server, tool: "get_messages", arguments: {} });
+        if (!Array.isArray(result.content) || result.content.length === 0 || (result.isError !== undefined && result.isError !== false)) throw new Error(code);
+      }
+      if (epoch !== this.managedMcpEpoch || !current()) { code = "E_MCP_READINESS_CHANGED"; throw new Error(code); }
+      this.managedMcpOwner = owner;
+      this.managedMcpProven = true;
+      this.managedMcpState = "ready";
+      this.hooks.log("codex_managed_mcp_ready", { agent: this.agent, generation: owner.generation, requiredServers: 2, readProbe: true });
+      return true;
+    } catch {
+      this.managedMcpProven = false;
+      this.managedMcpState = "blocked";
+      this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: owner.generation, code, server });
+      return false;
+    }
   }
 
   /** Make a known thread the bridge's sole delivery target and announce it once. */
@@ -896,6 +1005,10 @@ export class CodexBridgeClient {
   private onClose(): void {
     this.ws = null;
     this.initialized = false;
+    this.managedMcpOwner = null;
+    this.managedMcpProven = false;
+    this.managedMcpState = "not_checked";
+    this.managedMcpEpoch++;
     this.threadId = null;
     this.clearThreadReady();
     this.clearInjectRetry();
@@ -1007,9 +1120,18 @@ export class CodexBridgeClient {
 
     // Scope to our bound thread when the notification carries a threadId.
     const tid = p.threadId ?? p.thread_id;
-    if (this.threadId && typeof tid === "string" && tid !== this.threadId) return;
+    const expectedThread = this.threadId ?? this.managedMcpOwner?.threadId;
+    if (expectedThread && typeof tid === "string" && tid !== expectedThread) return;
 
     switch (method) {
+      case "mcpServer/startupStatus/updated":
+        if (this.managedMcpOwner && (p.name === "aperture-bus" || p.name === "sentry") && p.status !== "ready") {
+          this.managedMcpProven = false;
+          this.managedMcpEpoch++;
+          this.managedMcpState = "blocked";
+          this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: this.managedMcpOwner.generation, code: "E_MCP_STARTUP_CHANGED", server: p.name });
+        }
+        return;
       case "turn/started":
         this.setTurnActive(true);
         return;
@@ -1063,6 +1185,14 @@ export class CodexBridgeClient {
     const fresh = rows.filter((r) => typeof r.id === "string" && !this.delivered.has(r.id as string));
     if (fresh.length === 0) return;
 
+    // Revalidate readiness AFTER the awaited BEADS read, before dispatch.
+    // Existing standing-seat behavior is unchanged.
+    if (this.managedMcpOwner) {
+      const ws = this.ws;
+      if (!ws || !(await this.verifyManagedMcp(ws, this.managedMcpOwner))) return;
+    } else if (loadSeatRegistry().seats.get(this.agent)?.group === "team") {
+      return;
+    }
     const ids = fresh.map((r) => r.id as string);
     const text = fresh.map(formatBeadsMessage).join("\n\n");
     for (const id of ids) this.delivered.add(id);
