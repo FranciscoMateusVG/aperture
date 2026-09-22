@@ -141,6 +141,7 @@ fn node_from_candidates(
     candidates: &[PathBuf],
     budget: &Deadline,
 ) -> Result<PathBuf, ReplacementError> {
+    use std::os::unix::process::CommandExt;
     for candidate in candidates {
         match std::fs::symlink_metadata(candidate) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -154,6 +155,9 @@ fn node_from_candidates(
         }
         let mut command = std::process::Command::new(&executable);
         command
+            // Execute the validated canonical file, but preserve the logical
+            // name: Volta dispatches by argv[0] (node, not volta-shim).
+            .arg0(candidate)
             .args(["-p", "process.execPath"])
             .current_dir(home)
             .env_clear()

@@ -378,6 +378,65 @@ fn volta_only_node_is_absolute_pinned_and_drift_fails_closed() {
     assert!(p.revalidate(&Deadline::new()).is_err());
 }
 #[test]
+fn native_volta_shim_requires_node_argv0_while_exec_target_stays_canonical() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new();
+    // A shell script cannot model this: its interpreter replaces argv[0].
+    // Compile a tiny local executable with Volta's name-dispatch behavior.
+    f.write("tools/shim.c", br#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    const char *name = strrchr(argv[0], '/');
+    name = name ? name + 1 : argv[0];
+    if (strcmp(name, "node") != 0) return 126;
+    if (argc != 3 || strcmp(argv[1], "-p") || strcmp(argv[2], "process.execPath")) return 125;
+    const char *home = getenv("HOME"), *path = getenv("PATH");
+    if (!home || !path || strcmp(path, "/usr/bin:/bin")) return 124;
+    return printf("%s/tools/node-fixture\n", home) < 0 ? 123 : 0;
+}
+"#);
+    let shim = f.home.join(".volta/bin/volta-shim");
+    let output = std::process::Command::new("/usr/bin/cc")
+        .arg(f.home.join("tools/shim.c"))
+        .arg("-o")
+        .arg(&shim)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "native argv0 fixture must compile");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let candidate = f.home.join(".volta/bin/node");
+    std::fs::remove_file(&candidate).unwrap();
+    symlink(&shim, &candidate).unwrap();
+    let pinned = installed_file(&shim).unwrap();
+    let probe = |logical_name: &Path| {
+        std::process::Command::new(&shim)
+            .arg0(logical_name)
+            .args(["-p", "process.execPath"])
+            .current_dir(&f.home)
+            .env_clear()
+            .env("HOME", &f.home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap()
+    };
+    let wrong = probe(&shim);
+    assert_eq!(wrong.status.code(), Some(126));
+    assert!(wrong.stdout.is_empty());
+    assert!(probe(&candidate).status.success());
+    assert_eq!(
+        node_from_candidates(&f.home, &[candidate], &Deadline::new()).unwrap(),
+        f.home.join("tools/node-fixture")
+    );
+    assert_eq!(installed_file(&shim).unwrap(), pinned);
+    let plan = f.plan().unwrap();
+    assert!(plan.pins.contains_key(&plan.node));
+    assert_eq!(plan.node, f.home.join("tools/node-fixture"));
+    f.write("tools/node-fixture", b"changed actual Node");
+    assert!(plan.revalidate(&Deadline::new()).is_err());
+}
+#[test]
 fn node_absent_unsafe_or_shim_response_denied_without_fallback() {
     let f = Fixture::new();
     assert!(node_from_candidates(&f.home, &[f.home.join("missing")], &Deadline::new()).is_err());
