@@ -338,6 +338,7 @@ pub(crate) struct ClaudeBinding {
     snapshot: TeamSnapshot,
     pins: BTreeMap<PathBuf, String>,
     skills: BTreeMap<String, String>,
+    recovery: Option<crate::team_checkpoint::CheckpointPayload>,
 }
 impl ClaudeBinding {
     pub(crate) fn preflight(
@@ -471,7 +472,26 @@ impl ClaudeBinding {
             snapshot,
             pins,
             skills,
+            recovery: None,
         })
+    }
+    pub(crate) fn bind_recovery(
+        &mut self,
+        entry: Option<&crate::team_checkpoint::CheckpointEntry>,
+    ) -> Result<(), ClaudeError> {
+        if let Some(e) = entry {
+            if e.team != self.team
+                || e.seat != self.seat
+                || self.worktree.as_deref() != Some(e.payload.worktree.as_str())
+                || e.validation != crate::team_checkpoint::CheckpointValidation::Ok
+            {
+                return Err(ClaudeError::Invalid);
+            }
+            crate::team_checkpoint::validate_payload(&e.payload, &[])
+                .map_err(|_| ClaudeError::Invalid)?;
+            self.recovery = Some(e.payload.clone());
+        }
+        Ok(())
     }
     pub(crate) fn revalidate(&self, budget: &Deadline) -> Result<(), ClaudeError> {
         if active_team(&self.home, &self.team, &self.seat)? != self.snapshot {
@@ -604,8 +624,21 @@ impl ClaudeBinding {
                 return Err(ClaudeError::Invalid);
             }
         }
-        if self.worktree.is_some() {
+        if let Some(recovery) = &self.recovery {
+            prompt
+                .0
+                .extend_from_slice(b"\n\n# Validated recovery (bounded JSON data)\n");
+            prompt.0.extend_from_slice(
+                &serde_json::to_vec(recovery).map_err(|_| ClaudeError::Invalid)?,
+            );
+            if prompt.0.len() > PRIVATE_CAP {
+                return Err(ClaudeError::Invalid);
+            }
+        } else if self.worktree.is_some() {
             prompt.0.extend_from_slice(b"\n\nInventory the bound worktree before continuing. Do not assume pending effects completed.\n");
+        }
+        if prompt.0.len() > PRIVATE_CAP {
+            return Err(ClaudeError::Invalid);
         }
         let prompt_path = dest.join("prompt.md");
         write_private_bytes_atomic(&prompt_path, &prompt.0, false)
@@ -710,6 +743,222 @@ struct GateRelease {
     root_pid: u32,
     root_start_time_us: u64,
 }
+/// Documented CLI storage only: all project directories, no guessed cwd
+/// encoding and no JSONL body reads. This proves bounded observed absence,
+/// not atomic exclusion of an unrelated process running under the same UID.
+/// HOME is fixed and the exec environment omits all storage overrides.
+fn session_absent(home: &Path, session: &str, until: Instant) -> Result<(), ClaudeError> {
+    session_absent_bounded(home, session, until, 16_384)
+}
+fn session_absent_bounded(
+    home: &Path,
+    session: &str,
+    until: Instant,
+    cap: usize,
+) -> Result<(), ClaudeError> {
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    if !canonical_uuid(session) || !home.is_absolute() {
+        return Err(ClaudeError::Unsafe);
+    }
+    fn c(v: &[u8]) -> Result<CString, ClaudeError> {
+        CString::new(v).map_err(|_| ClaudeError::Unsafe)
+    }
+    fn open_at(parent: i32, name: &CStr) -> Result<File, ClaudeError> {
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(ClaudeError::Unsafe);
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    fn safe_dir(file: &File) -> Result<std::fs::Metadata, ClaudeError> {
+        let m = file.metadata().map_err(|_| ClaudeError::Unsafe)?;
+        if !m.is_dir()
+            || m.uid() != unsafe { libc::geteuid() }
+            || m.mode() & 0o022 != 0
+            || m.mode() & 0o500 != 0o500
+        {
+            return Err(ClaudeError::Unsafe);
+        }
+        Ok(m)
+    }
+    fn same(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+        (
+            a.dev(),
+            a.ino(),
+            a.mtime(),
+            a.mtime_nsec(),
+            a.ctime(),
+            a.ctime_nsec(),
+        ) == (
+            b.dev(),
+            b.ino(),
+            b.mtime(),
+            b.mtime_nsec(),
+            b.ctime(),
+            b.ctime_nsec(),
+        )
+    }
+    struct Dir(*mut libc::DIR);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    fn entries(
+        file: &File,
+        session: &str,
+        until: Instant,
+        left: &mut usize,
+        projects: bool,
+    ) -> Result<(), ClaudeError> {
+        let before = safe_dir(file)?;
+        // openat(.) creates an independent directory offset; dup would share it.
+        let copy = open_at(file.as_raw_fd(), c(b".")?.as_c_str())?;
+        use std::os::fd::IntoRawFd;
+        let fd = copy.into_raw_fd();
+        let raw = unsafe { libc::fdopendir(fd) };
+        if raw.is_null() {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(ClaudeError::Unsafe);
+        }
+        let dir = Dir(raw);
+        loop {
+            if Instant::now() >= until {
+                return Err(ClaudeError::Closed);
+            }
+            #[cfg(target_os = "macos")]
+            let errno = unsafe { libc::__error() };
+            #[cfg(not(target_os = "macos"))]
+            let errno = unsafe { libc::__errno_location() };
+            unsafe {
+                *errno = 0;
+            }
+            let ent = unsafe { libc::readdir(dir.0) };
+            if ent.is_null() {
+                if unsafe { *errno } != 0 {
+                    return Err(ClaudeError::Unsafe);
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            *left = left.checked_sub(1).ok_or(ClaudeError::Closed)?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(ClaudeError::Unsafe);
+            }
+            let st = unsafe { st.assume_init() };
+            let kind = st.st_mode & libc::S_IFMT;
+            if st.st_uid != unsafe { libc::geteuid() }
+                || st.st_mode & 0o022 != 0
+                || !(kind == libc::S_IFDIR || kind == libc::S_IFREG)
+                || (kind == libc::S_IFREG && (st.st_nlink != 1 || st.st_mode & 0o400 == 0))
+            {
+                return Err(ClaudeError::Unsafe);
+            }
+            // Includes UUID directory, ordinary transcript, orphaned/superseded
+            // transcript and any ambiguous name beginning with this identity.
+            if bytes.starts_with(session.as_bytes()) {
+                return Err(ClaudeError::Closed);
+            }
+            if projects {
+                if kind != libc::S_IFDIR {
+                    return Err(ClaudeError::Unsafe);
+                }
+                let child = open_at(file.as_raw_fd(), name)?;
+                let m = safe_dir(&child)?;
+                if (m.dev(), m.ino()) != (st.st_dev as u64, st.st_ino as u64) {
+                    return Err(ClaudeError::Unsafe);
+                }
+                entries(&child, session, until, left, false)?;
+                let mut after = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe {
+                    libc::fstatat(
+                        file.as_raw_fd(),
+                        name.as_ptr(),
+                        after.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return Err(ClaudeError::Unsafe);
+                }
+                let after = unsafe { after.assume_init() };
+                if after.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || (after.st_dev, after.st_ino) != (st.st_dev, st.st_ino)
+                {
+                    return Err(ClaudeError::Unsafe);
+                }
+            }
+        }
+        if !same(&before, &safe_dir(file)?) {
+            return Err(ClaudeError::Unsafe);
+        }
+        Ok(())
+    }
+    // Only OS-owned macOS aliases are resolved, never arbitrary HOME components.
+    #[cfg(target_os = "macos")]
+    let walked = [Path::new("/var"), Path::new("/tmp")]
+        .into_iter()
+        .find_map(|prefix| home.strip_prefix(prefix).ok().map(|rest| (prefix, rest)))
+        .map(|(p, r)| {
+            std::fs::canonicalize(p)
+                .map(|v| v.join(r))
+                .map_err(|_| ClaudeError::Unsafe)
+        })
+        .transpose()?
+        .unwrap_or_else(|| home.to_path_buf());
+    #[cfg(not(target_os = "macos"))]
+    let walked = home.to_path_buf();
+    let mut current = open_at(libc::AT_FDCWD, c(b"/")?.as_c_str())?;
+    for part in walked.components() {
+        match part {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(v) => {
+                current = open_at(current.as_raw_fd(), c(v.as_bytes())?.as_c_str())?;
+            }
+            _ => return Err(ClaudeError::Unsafe),
+        }
+    }
+    safe_dir(&current)?;
+    let config = open_at(current.as_raw_fd(), c(b".claude")?.as_c_str())?;
+    safe_dir(&config)?;
+    let projects = open_at(config.as_raw_fd(), c(b"projects")?.as_c_str())?;
+    let before = safe_dir(&projects)?;
+    let mut left = cap;
+    entries(&projects, session, until, &mut left, true)?;
+    let config_now = open_at(current.as_raw_fd(), c(b".claude")?.as_c_str())?;
+    let projects_now = open_at(config_now.as_raw_fd(), c(b"projects")?.as_c_str())?;
+    if !same(&before, &safe_dir(&projects_now)?) {
+        return Err(ClaudeError::Unsafe);
+    }
+    Ok(())
+}
+
 /// Metadata only, held by the lifecycle caller; no Deserialize and no signal
 /// methods. Cleanup is the existing exact OwnerStore/process/revocation path.
 pub(crate) struct PendingClaude {
@@ -754,6 +1003,18 @@ fn record_sha(record: &LaunchRecord) -> Result<String, ClaudeError> {
     ))
 }
 fn validate_record(home: &Path, r: &LaunchRecord, budget: &Deadline) -> Result<(), ClaudeError> {
+    let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or(ClaudeError::Unsafe)?;
+    validate_record_at(home, r, budget, infra)
+}
+// Internal root seam for hermetic packaging fixtures; never caller-selected.
+fn validate_record_at(
+    home: &Path,
+    r: &LaunchRecord,
+    budget: &Deadline,
+    infra: &Path,
+) -> Result<(), ClaudeError> {
     valid_selector(&r.team, &r.seat, r.generation)?;
     if r.schema_version != 1
         || [&r.executable, &r.helper, &r.node, &r.tmux, &r.cwd]
@@ -811,9 +1072,6 @@ fn validate_record(home: &Path, r: &LaunchRecord, budget: &Deadline) -> Result<(
         return Err(ClaudeError::Unsafe);
     }
     let runtime = home.join(".claude/aperture").join(&r.seat);
-    let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or(ClaudeError::Unsafe)?;
     let allowed_installed = [
         r.executable.clone(),
         r.node.clone(),
@@ -887,8 +1145,21 @@ impl PublishedClaude {
         &self.record.session_id
     }
     pub(crate) fn spawn(self, budget: &Deadline) -> Result<PendingClaude, ClaudeError> {
-        validate_record(&self.home, &self.record, budget)?;
+        let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(ClaudeError::Unsafe)?;
+        self.spawn_at(budget, infra)
+    }
+    fn spawn_at(self, budget: &Deadline, infra: &Path) -> Result<PendingClaude, ClaudeError> {
+        validate_record_at(&self.home, &self.record, budget, infra)?;
         let r = &self.record;
+        session_absent(
+            &self.home,
+            &r.session_id,
+            budget
+                .forward_until(Duration::from_secs(2))
+                .map_err(|_| ClaudeError::Closed)?,
+        )?;
         let dir = generation_dir(&self.home, &r.seat, r.generation);
         // Durable admission before the native tmux call; a lost response does
         // not grant permission to create another window. Gate times out itself.
@@ -955,6 +1226,34 @@ impl PendingClaude {
     pub(crate) fn session_id(&self) -> &str {
         self.published.session_id()
     }
+    pub(crate) fn cancel_unreleased(&self, until: Instant) -> Result<(), ClaudeError> {
+        let identity =
+            crate::team_process::identity_from_owner(self.process.pid, self.process.start_time)
+                .map_err(|_| ClaudeError::Process)?;
+        let release = generation_dir(
+            &self.published.home,
+            &self.published.record.seat,
+            self.published.record.generation,
+        )
+        .join("claude-release.json");
+        match std::fs::symlink_metadata(&release) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(ClaudeError::Closed),
+            Err(_) => return Err(ClaudeError::Unsafe),
+        }
+        loop {
+            match crate::team_process::state(&identity) {
+                crate::team_replacement::ProcessState::Gone => return Ok(()),
+                crate::team_replacement::ProcessState::Same => {}
+                _ => return Err(ClaudeError::Process),
+            }
+            if Instant::now() >= until {
+                return Err(ClaudeError::Closed);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Lifecycle caller has already durably bound this exact candidate and
     /// written its UUID attempt. No send-keys/prompt or harness input here.
     pub(crate) fn release(
@@ -1042,6 +1341,11 @@ pub(crate) fn gate_native(
         if Instant::now() > until {
             return Err(ClaudeError::Closed);
         }
+        session_absent(
+            home,
+            &r.session_id,
+            until.min(Instant::now() + Duration::from_secs(2)),
+        )?;
         // Advisory lock descriptors are close-on-exec. Keep the exact native
         // owner/token check locked through exec, not across a user-space gap.
         let _error = cmd.exec();
@@ -1208,6 +1512,9 @@ mod gate_tests {
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "CLAUDE_CODE_EFFORT_LEVEL",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_PROJECT_DIR_NAME",
+            "CLAUDE_CODE_SKIP_PROMPT_HISTORY",
         ] {
             assert!(!keys.contains(&key));
         }
@@ -1370,6 +1677,41 @@ mod publication_tests {
         }
     }
     #[test]
+    fn pre_spawn_collision_denies_before_native_tmux_admission() {
+        let f = Fixture::new();
+        let binding = f.binding().unwrap();
+        let (r, t) = f.reservation();
+        let published = binding
+            .publish_with_password(&r, &t, &Deadline::new(), "")
+            .unwrap();
+        let project = f.home.join(".claude/projects/unrelated-project");
+        ensure_private_dir(&project).unwrap();
+        session_absent(
+            &f.home,
+            published.session_id(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        write_private_bytes_atomic(
+            &project.join(format!("{}.jsonl", published.session_id())),
+            b"",
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            published.spawn_at(&Deadline::new(), &f.infra),
+            Err(ClaudeError::Closed)
+        ));
+        assert!(!generation_dir(&f.home, "t1-worker", 1)
+            .join("claude-spawn.json")
+            .exists());
+        assert!(OwnerStore::new(f.home.join(".aperture/run/owner"))
+            .read_owner("t1-worker")
+            .unwrap()
+            .incarnation
+            .is_none());
+    }
+    #[test]
     fn native_publication_is_private_no_replace_and_uses_absolute_node_for_both_mcps() {
         let f = Fixture::new();
         let binding = f.binding().unwrap();
@@ -1465,5 +1807,131 @@ mod publication_tests {
         assert!(installed(&script, true).is_ok());
         file.set_len(EXECUTABLE_CAP + 1).unwrap();
         assert!(installed(&script, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    struct F(PathBuf);
+    impl F {
+        fn new() -> Self {
+            let h = std::env::temp_dir().join(format!(
+                "aperture-claude-freshness-{}",
+                uuid::Uuid::new_v4()
+            ));
+            for rel in [
+                "",
+                ".claude",
+                ".claude/projects",
+                ".claude/projects/arbitrary-project-one",
+                ".claude/projects/not-a-cwd-encoding",
+            ] {
+                ensure_private_dir(&h.join(rel)).unwrap();
+            }
+            Self(h)
+        }
+        fn file(&self, rel: &str) {
+            write_private_bytes_atomic(&self.0.join(rel), b"", false).unwrap();
+        }
+        fn absent(&self, id: &str) -> Result<(), ClaudeError> {
+            session_absent(&self.0, id, Instant::now() + Duration::from_secs(2))
+        }
+    }
+    impl Drop for F {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn metadata_only_checks_every_project_and_recheck_detects_uuid_collision() {
+        for suffix in [
+            ".jsonl",
+            ".jsonl.superseded-fixture",
+            ".orphaned-fixture.jsonl",
+            "",
+        ] {
+            let f = F::new();
+            let id = uuid::Uuid::new_v4().to_string();
+            f.file(".claude/projects/arbitrary-project-one/unrelated.jsonl");
+            f.absent(&id).unwrap();
+            let path = format!(".claude/projects/not-a-cwd-encoding/{id}{suffix}");
+            if suffix.is_empty() {
+                ensure_private_dir(&f.0.join(path)).unwrap();
+            } else {
+                f.file(&path);
+            }
+            assert_eq!(f.absent(&id), Err(ClaudeError::Closed));
+        }
+    }
+    #[test]
+    fn metadata_scan_rejects_symlinks_hardlinks_permissions_and_missing_root() {
+        for bad in [
+            "project-link",
+            "leaf-link",
+            "hardlink",
+            "writable-dir",
+            "writable-file",
+            "unreadable-dir",
+            "missing-root",
+            "config-link",
+        ] {
+            let f = F::new();
+            let id = uuid::Uuid::new_v4().to_string();
+            let projects = f.0.join(".claude/projects");
+            let project = projects.join("arbitrary-project-one");
+            match bad {
+                "project-link" => symlink(&project, projects.join("redirect")).unwrap(),
+                "leaf-link" => {
+                    symlink(f.0.join("does-not-exist"), project.join("redirect.jsonl")).unwrap()
+                }
+                "hardlink" => {
+                    f.file(".claude/projects/arbitrary-project-one/one.jsonl");
+                    std::fs::hard_link(project.join("one.jsonl"), project.join("two.jsonl"))
+                        .unwrap();
+                }
+                "writable-dir" => {
+                    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o770))
+                        .unwrap()
+                }
+                "unreadable-dir" => {
+                    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o300))
+                        .unwrap()
+                }
+                "writable-file" => {
+                    f.file(".claude/projects/arbitrary-project-one/one.jsonl");
+                    std::fs::set_permissions(
+                        project.join("one.jsonl"),
+                        std::fs::Permissions::from_mode(0o660),
+                    )
+                    .unwrap();
+                }
+                "missing-root" => std::fs::rename(&projects, f.0.join("saved")).unwrap(),
+                "config-link" => {
+                    std::fs::rename(f.0.join(".claude"), f.0.join("saved")).unwrap();
+                    symlink(f.0.join("saved"), f.0.join(".claude")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(f.absent(&id).is_err(), "{bad}");
+            if bad == "unreadable-dir" {
+                std::fs::set_permissions(project, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn incomplete_metadata_scan_never_means_absent() {
+        let f = F::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            session_absent_bounded(&f.0, &id, Instant::now() + Duration::from_secs(2), 1),
+            Err(ClaudeError::Closed)
+        );
+        assert_eq!(
+            session_absent(&f.0, &id, Instant::now()),
+            Err(ClaudeError::Closed)
+        );
+        assert!(f.absent("not-a-uuid").is_err());
     }
 }

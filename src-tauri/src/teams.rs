@@ -336,12 +336,20 @@ pub struct TeamView {
     pub capabilities: TeamCapabilities,
 }
 
+/// Public native launch admission, not tuple/schema validity. Claude adapter
+/// fixtures may run internally, but all production entrypoints remain disabled
+/// until the paired installed startup/observation/readiness smoke is approved.
+/// Never replace this with a caller field, environment override, or UI flag.
+pub(crate) fn managed_launch_enabled(harness: &Harness) -> bool {
+    matches!(harness, Harness::Codex)
+}
+
 fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapabilities {
     let pending = *state == TeamLifecycle::Pending;
     let active = *state == TeamLifecycle::Active;
     let start = active && seats.iter().any(|seat| {
         let configured = seat.configured.tuple();
-        configured.harness == Harness::Codex
+        managed_launch_enabled(&configured.harness)
             && seat.observed_owner.as_ref().is_some_and(|owner| {
                 owner.generation == 0
                     && owner.state == OwnerState::Stale
@@ -355,7 +363,7 @@ fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapab
         seat.observed_owner.as_ref().is_some_and(|owner| {
             owner.generation > 0
                 && owner.state == OwnerState::Active
-                && owner.configured.harness == Harness::Codex
+                && managed_launch_enabled(&owner.configured.harness)
                 && owner.actual.as_ref() == Some(&owner.configured)
                 && owner.process_count > 0
                 && owner.thread_bound
@@ -2635,6 +2643,8 @@ mod tests {
 
     #[test]
     fn sonnet_full_id_is_literal_and_does_not_enable_managed_launch() {
+        assert!(managed_launch_enabled(&Harness::Codex));
+        assert!(!managed_launch_enabled(&Harness::Claude));
         let tuple = ExecutionTuple { harness: Harness::Claude, model: "claude-sonnet-5".into(), reasoning: None };
         assert!(validate_execution_tuple(&tuple).is_ok());
         for model in ["opus", "sonnet"] {
