@@ -629,6 +629,18 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
             .collect()
     };
 
+    // Managed seats have no legacy tmux/kickoff requirement. Classify outside
+    // both mutexes: unknown membership is read-only/unknown, never a re-kick.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let managed: HashMap<String, bool> = roster.iter().filter_map(|(name, _, _, _)| {
+        let membership = home.as_deref().map(|home| crate::teams::classify_managed_seat(home, name));
+        match membership {
+            Some(Ok(None)) => None,
+            Some(Ok(Some(crate::teams::ManagedSeatState::Active { .. }))) => Some((name.clone(), true)),
+            _ => Some((name.clone(), false)),
+        }
+    }).collect();
+
     // Is presence trustworthy right now? (§5 subscriber-down pause + grace.)
     let (subscriber_ok, past_grace) = {
         let s = shared.lock().unwrap();
@@ -645,6 +657,12 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
     {
         let mut s = shared.lock().unwrap();
         for (name, model, running, window_id) in &roster {
+            if let Some(active) = managed.get(name) {
+                dot_writes.push(managed_presence_write(name, *active,
+                    subscriber_ok && past_grace, s.presence.get(name), at));
+                // Observation only: managed lifecycle is never a legacy watchdog action.
+                continue;
+            }
             let kickoff_millis = if *running { read_kickoff_millis(name) } else { None };
 
             // Reset the attempt counter when a newer kickoff appears (fresh boot
@@ -795,6 +813,22 @@ struct DotWrite {
     dot_state_since: Option<String>,
     kickoff_fired_at: Option<String>,
     turn_state: Option<String>,
+}
+
+/// Managed presence comes from the authenticated hub, not terminal existence.
+/// No kickoff timestamp is fabricated and loss of evidence clears the turn.
+fn managed_presence_write(name: &str, active: bool, trustworthy: bool,
+    presence: Option<&Presence>, at: SystemTime) -> DotWrite {
+    let current = presence.filter(|p| active && trustworthy && p.online &&
+        p.online_since.is_some_and(|since|
+            at.duration_since(since).unwrap_or_default() >= ONLINE_DEBOUNCE));
+    DotWrite {
+        name: name.into(),
+        dot_state: current.map(|_| "online".into()),
+        dot_state_since: current.and_then(|p| p.online_since).map(iso8601),
+        kickoff_fired_at: None,
+        turn_state: current.and_then(|p| p.turn).map(|turn| turn.as_str().into()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1120,5 +1154,38 @@ mod tests {
 
         // spawned has no source clock → None (caller falls back to the tick).
         assert_eq!(dot_since(Dot::Spawned, None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod managed_presence_tests {
+    use super::*;
+    #[test]
+    fn managed_turn_does_not_require_a_terminal_or_legacy_kickoff() {
+        let at = now();
+        let mut presence = Presence { online: true,
+            online_since: Some(at - ONLINE_DEBOUNCE), turn: Some(Turn::Busy) };
+        let busy = managed_presence_write("team-worker", true, true, Some(&presence), at);
+        assert_eq!(busy.turn_state.as_deref(), Some("busy"));
+        assert_eq!(busy.dot_state.as_deref(), Some("online"));
+        assert!(busy.kickoff_fired_at.is_none());
+        presence.turn = Some(Turn::Idle);
+        assert_eq!(managed_presence_write("team-worker", true, true, Some(&presence), at)
+            .turn_state.as_deref(), Some("idle"));
+    }
+    #[test]
+    fn managed_absent_untrusted_inactive_or_unstable_presence_is_unknown() {
+        let at = now();
+        for (active, trusted, online, stable) in [
+            (false,true,true,true), (true,false,true,true),
+            (true,true,false,true), (true,true,true,false),
+        ] {
+            let presence = Presence { online, online_since: Some(if stable {at-ONLINE_DEBOUNCE} else {at}), turn: Some(Turn::Busy) };
+            let view = managed_presence_write("team-worker", active, trusted, Some(&presence), at);
+            assert!(view.turn_state.is_none()); assert!(view.dot_state.is_none());
+        }
+        assert!(managed_presence_write("team-worker", true, true, None, at).turn_state.is_none());
+        let joined = Presence { online: true, online_since: Some(at-ONLINE_DEBOUNCE), turn: None };
+        assert!(managed_presence_write("team-worker", true, true, Some(&joined), at).turn_state.is_none());
     }
 }
