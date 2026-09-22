@@ -1,3 +1,4 @@
+import { canOpenSeat } from "../services/team-terminal";
 import type { AgentDef, OwnerSummary, TeamView } from "../types";
 import { teamCommands, type TeamCommands } from "../services/team-commands";
 import { teamErrorCopy } from "../services/team-draft";
@@ -27,10 +28,9 @@ const badge = (status: SeatStatus) => `<span class="v4-badge v4-seat-status v4-s
 export function renderTeamGroup(team: TeamView, agents: readonly AgentDef[] = []): string {
   const turnOf = (name: string) => agents.find(a => a.name === name)?.turn_state;
   // Managed workers may be alive (app-server/thread) with no tmux window: never offer a click that cannot attach.
-  const windowOf = (name: string) => agents.find(a => a.name === name)?.tmux_window_id ?? null;
-  const openControl = (name: string) => windowOf(name)
-    ? `<button class="v4-button v4-button--small" data-action="open-seat" data-seat="${e(name)}">Open</button>`
-    : `<button class="v4-button v4-button--small" data-action="open-seat" data-seat="${e(name)}" disabled title="Terminal não conectado">Open</button><span class="v4-meta v4-seat__noterm">Terminal não conectado</span>`;
+  const openControl = (name: string) => canOpenSeat(team, name)
+    ? `<button class="v4-button v4-button--small" data-action="open-seat" data-team="${e(team.snapshot.team)}" data-seat="${e(name)}">Open</button>`
+    : `<button class="v4-button v4-button--small" data-action="open-seat" data-team="${e(team.snapshot.team)}" data-seat="${e(name)}" disabled title="Agente não disponível para abrir">Open</button><span class="v4-meta v4-seat__noterm">Agente não disponível para abrir</span>`;
   const turn = (name: string) => {
     const observed = turnOf(name);
     return observed === "busy" || observed === "idle" ? observed : "Unknown — no turn observation";
@@ -53,7 +53,7 @@ export function renderTeamGroup(team: TeamView, agents: readonly AgentDef[] = []
 export interface TeamsAreaOptions {
   api?: TeamCommands;
   listAgents: () => Promise<AgentDef[]>;
-  openAgent: (name: string) => Promise<void>;
+  openAgent: (team: TeamView, name: string) => Promise<void>;
   onTeamSeats: (names: string[]) => void;
 }
 /**
@@ -151,8 +151,11 @@ export function createTeamsArea(container: HTMLElement, legacyRoster: HTMLElemen
         refresh: async () => { await refresh(); return loaded ? teams.find(t => t.snapshot.team === teamName) : undefined; },
       }); return;
     }
-    if (action === "open-seat" && button.dataset.seat) {
-      try { await options.openAgent(button.dataset.seat); } catch { status.textContent = "No current terminal window could be opened. Refresh the observed state."; }
+    if (action === "open-seat" && button.dataset.seat && team && canOpenSeat(team, button.dataset.seat)) {
+      mutation = true; button.disabled = true;
+      try { await options.openAgent(team, button.dataset.seat); status.textContent = "Terminal aberto na sessão existente. Nenhum agente novo foi iniciado."; }
+      catch { status.textContent = "Não foi possível confirmar o terminal atual. Atualize antes de tentar novamente; nenhum worker novo foi solicitado."; }
+      finally { mutation = false; lastMarkup = ""; await refresh(); }
       return;
     }
     if (action === "cancel-pending" && team && team.state.state === "pending" && team.capabilities.cancel) {

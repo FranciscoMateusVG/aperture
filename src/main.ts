@@ -6,6 +6,8 @@ import { createAgentList } from "./components/AgentList";
 import { createFooter } from "./components/Footer";
 import { commands } from "./services/tauri-commands";
 
+import { terminalCommands } from "./services/team-terminal";
+
 const SESSION_NAME = "aperture";
 
 async function init() {
@@ -36,11 +38,7 @@ async function init() {
   createTeamsArea(teamHost, sidebarAgents, {
     listAgents: commands.listAgents,
     onTeamSeats: names => agentList.setTeamSeats(names),
-    openAgent: async name => {
-      const agent = (await commands.listAgents()).find(a => a.name === name);
-      if (!agent?.tmux_window_id) throw new Error("No current window");
-      await commands.tmuxSelectWindow(agent.tmux_window_id);
-    },
+    openAgent: terminalCommands.open,
   });
 
   // Bottom-of-sidebar version line (semver · git SHA · build date).

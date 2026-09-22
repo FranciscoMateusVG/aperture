@@ -20,6 +20,15 @@ fn usage() {
 }
 
 fn main() -> std::process::ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--attach-managed") {
+        let args: Vec<_> = std::env::args().skip(2).collect();
+        if args.len() != 4 { return std::process::ExitCode::from(2); }
+        let Ok(generation) = args[2].parse() else { return std::process::ExitCode::from(2); };
+        return match aperture_lib::attach_managed_terminal(args[0].clone(), args[1].clone(), generation, args[3].clone()) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => { eprintln!("{e}"); std::process::ExitCode::FAILURE }
+        };
+    }
     let mut agents: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {

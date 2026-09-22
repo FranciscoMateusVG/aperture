@@ -117,7 +117,7 @@ test("active card is compact by default: one row per seat, diagnostics and advan
    const at = html.indexOf(inside); assert.ok(at > 0, inside);
    assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
   }
-  assert.match(html, /2 seats · 0 trabalhando · 0 aguardando/); assert.match(html, /t1-backend · LEAD/); assert.match(html, /data-action="open-seat" data-seat="t1-backend"/);
+  assert.match(html, /2 seats · 0 trabalhando · 0 aguardando/); assert.match(html, /t1-backend · LEAD/); assert.match(html, /data-action="open-seat" data-team="t1" data-seat="t1-backend"/);
   const openAt = html.indexOf('data-action="open-seat"'); assert.ok(html.lastIndexOf("<details", openAt) < html.lastIndexOf("</details>", openAt) || html.lastIndexOf("<details", openAt) === -1, "Open stays on the seat row, outside details");
  });
 });
@@ -182,7 +182,7 @@ test("auto refresh does not repaint unchanged data and preserves open details an
   let paints = 0; const inner = { v: f.teams.innerHTML }; Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; paints++; } });
   await f.auto(); assert.equal(paints, 0, "identical markup is not reassigned");
   const d = new f.El(); d.dataset.details = "seat:t1:t1-backend"; d.open = true; f.teams.detailsEls = [d];
-  const btn = new f.El(); btn.dataset = { action: "open-seat", seat: "t1-backend" }; f.teams.childButtons = [btn]; f.doc.activeElement = btn;
+  const btn = new f.El(); btn.dataset = { action: "open-seat", team: "t1", seat: "t1-backend" }; f.teams.childButtons = [btn]; f.doc.activeElement = btn;
   let focused = 0; btn.focus = () => { focused++; }; f.teams.querySelector = sel => sel.includes('data-seat="t1-backend"') ? btn : null;
   const fresh = new f.El(); fresh.dataset.details = "seat:t1:t1-backend"; fresh.open = false;
   Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; paints++; f.teams.detailsEls = [fresh]; } });
@@ -202,37 +202,42 @@ test("auto refresh error marks the last-known data stale with a timestamp and di
  });
 });
 
-test("Open is offered only for seats with a tmux window; otherwise it is disabled with explicit text and never attaches", async () => {
- const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); t.seats[1].observed_owner = ownerIn("active", 1);
+test("Open attaches a verified active managed seat even without a preexisting tmux window", async () => {
+ const t = team("active"); t.seats[0].observed_owner = {...ownerIn("active",1),actual:{harness:"codex",model:"gpt-6-astra",reasoning:"high"},process_count:1,thread_bound:true};
  let opened = 0;
- await setup({ api: { list: async () => [t] }, openAgent: async () => { opened++; }, listAgents: async () => [{ name: "t1-backend", turn_state: "busy", tmux_window_id: "@7" }, { name: "t1-qa", turn_state: "idle", tmux_window_id: null }] }, async f => {
-  const html = f.teams.innerHTML;
-  assert.match(html, /data-action="open-seat" data-seat="t1-backend">Open</, "window present: live Open");
-  assert.match(html, /data-action="open-seat" data-seat="t1-qa" disabled title="Terminal não conectado">Open<\/button><span class="v4-meta v4-seat__noterm">Terminal não conectado<\/span>/, "no window: disabled Open with explicit text");
-  assert.match(html, /data-status="working">Trabalhando</); assert.match(html, /data-status="waiting">Aguardando</, "status stays separate from terminal availability");
-  assert.match(html, /Thread binding/, "diagnostics not removed");
-  const disabled = new f.El(); disabled.dataset = { action: "open-seat", seat: "t1-qa" }; disabled.disabled = true;
-  await f.root.handlers.click({ target: disabled }); assert.equal(opened, 0, "disabled Open never attaches");
-  const live = new f.El(); live.dataset = { action: "open-seat", seat: "t1-backend" };
-  await f.root.handlers.click({ target: live }); assert.equal(opened, 1, "live Open attaches");
+ await setup({ api: { list: async () => [t] }, openAgent: async (current, name) => { assert.equal(current.snapshot.team, "t1"); assert.equal(name,"t1-backend"); opened++; }, listAgents: async () => [] }, async f => {
+  assert.match(f.teams.innerHTML, /data-seat="t1-backend">Open</);
+  assert.match(f.teams.innerHTML, /data-seat="t1-qa" disabled/);
+  const live = new f.El(); live.dataset = { action:"open-seat",team:"t1",seat:"t1-backend" };
+  await f.root.handlers.click({target:live}); assert.equal(opened,1);
  });
 });
-test("with no agent observation at all, every seat shows 'Terminal não conectado' and no live Open", async () => {
- await setup({ api: { list: async () => { const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); return [t]; } }, listAgents: async () => [] }, async f => {
-  assert.doesNotMatch(f.teams.innerHTML, /data-seat="t1-[a-z]+">Open</); assert.match(f.teams.innerHTML, /Terminal não conectado/);
+test("Open cannot use a stale tmux window to bypass current owner eligibility", async () => {
+ const t = team("active"); t.seats[0].observed_owner = ownerIn("quarantined", 1); let opened=0;
+ await setup({api:{list:async()=>[t]},openAgent:async()=>{opened++},listAgents:async()=>[{name:"t1-backend",tmux_window_id:"@7"}]},async f=>{
+  assert.match(f.teams.innerHTML,/data-seat="t1-backend" disabled/);
+  const button=new f.El();button.dataset={action:"open-seat",team:"t1",seat:"t1-backend"};
+  await f.root.handlers.click({target:button});assert.equal(opened,0);
+ });
+});
+test("double Open while attach is pending is locked without starting a worker", async()=>{
+ const t=team("active");t.seats[0].observed_owner={...ownerIn("active",1),actual:{harness:"codex",model:"gpt-6-astra",reasoning:"high"},process_count:1,thread_bound:true};let finish,calls=0;
+ await setup({api:{list:async()=>[t]},openAgent:()=>{calls++;return new Promise(r=>finish=r)}},async f=>{
+  const button=new f.El();button.dataset={action:"open-seat",team:"t1",seat:"t1-backend"};
+  const first=f.root.handlers.click({target:button});await f.root.handlers.click({target:button});assert.equal(calls,1);finish();await first;
  });
 });
 
-test("error then identical success re-enables valid Open and keeps no-window Open disabled", async () => {
- let fail = false; const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); t.seats[1].observed_owner = ownerIn("active", 1);
+test("error then identical success re-enables valid Open and keeps ineligible Open disabled", async () => {
+ let fail = false; const t = team("active"); t.seats[0].observed_owner = {...ownerIn("active",1),actual:{harness:"codex",model:"gpt-6-astra",reasoning:"high"},process_count:1,thread_bound:true}; t.seats[1].observed_owner = ownerIn("stale", 0);
  await setup({ api: { list: async () => { if (fail) throw new Error("boom"); return [structuredClone(t)]; } }, listAgents: async () => [{ name: "t1-backend", turn_state: "idle", tmux_window_id: "@7" }, { name: "t1-qa", turn_state: "idle", tmux_window_id: null }] }, async f => {
   let paints = 0; const inner = { v: f.teams.innerHTML }; Object.defineProperty(f.teams, "innerHTML", { get: () => inner.v, set: v => { inner.v = v; paints++; } });
-  const live = new f.El(); live.dataset = { action: "open-seat", seat: "t1-backend" }; f.teams.childButtons = [live];
+  const live = new f.El(); live.dataset = { action: "open-seat", team: "t1", seat: "t1-backend" }; f.teams.childButtons = [live];
   fail = true; await f.auto(); assert.equal(live.disabled, true, "error disables actions"); assert.equal(paints, 0);
   fail = false; await f.auto();
   assert.equal(paints, 1, "identical data after an error still repaints"); assert.equal(f.teams.classList.contains("v4-stale"), false);
   assert.match(inner.v, /data-seat="t1-backend">Open</, "Open with a window is live again");
-  assert.match(inner.v, /data-seat="t1-qa" disabled title="Terminal não conectado"/, "Open without a window stays disabled");
+  assert.match(inner.v, /data-seat="t1-qa" disabled title="Agente não disponível para abrir"/, "Ineligible Open stays disabled");
   await f.auto(); assert.equal(paints, 1, "steady state: no further repaint");
  });
 });
@@ -251,7 +256,7 @@ test("stale copy before any successful read says 'nunca'", async () => {
  });
 });
 test("focus on an open details summary is restored by details key across a changed repaint", async () => {
- const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); let agents = [{ name: "t1-backend", turn_state: "idle" }];
+ const t = team("active"); t.seats[0].observed_owner = {...ownerIn("active",1),actual:{harness:"codex",model:"gpt-6-astra",reasoning:"high"},process_count:1,thread_bound:true}; let agents = [{ name: "t1-backend", turn_state: "idle" }];
  await setup({ api: { list: async () => [structuredClone(t)] }, listAgents: async () => agents }, async f => {
   const details = new f.El(); details.dataset.details = "seat:t1:t1-backend"; details.open = true;
   const summary = new f.El(); summary.dataset = {}; summary.closest = sel => sel === "details" ? details : null;

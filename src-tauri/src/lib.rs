@@ -11,6 +11,7 @@ mod teams;
 mod team_checkpoint;
 mod team_replacement;
 mod team_process;
+mod team_terminal;
 mod team_archive;
 mod team_archive_finalize;
 mod poller;
@@ -33,6 +34,9 @@ fn get_version() -> serde_json::Value {
         "built_at": env!("APERTURE_BUILD_DATE"),
     })
 }
+
+/// Attach only a terminal client to an existing managed worker.
+pub use team_terminal::attach_existing as attach_managed_terminal;
 
 /// Headless boot entry point (aperture-syepg). Boots ONE registered agent by
 /// name through the real spawn path (tmux window + launcher + Claude kickoff /
@@ -243,6 +247,7 @@ pub fn run() {
             teams::team_list,
             teams::team_cancel_pending,
             teams::team_bootstrap_seat,
+            team_terminal::team_open_seat,
             teams::team_prepare_replacement,
             teams::team_start_replacement,
             teams::team_archive,
