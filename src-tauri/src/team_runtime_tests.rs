@@ -12,6 +12,8 @@ struct Fake {
     turn: TurnState,
     rate: Option<u64>,
     checkpoint: CheckpointRecovery,
+    checkpoint_reads: u32,
+    checkpoint_after_first_read: Option<CheckpointRecovery>,
     requested: u32,
     signals: Vec<(u32, Signal, u64)>,
     kill_survives: bool,
@@ -74,6 +76,8 @@ impl Fake {
             turn: TurnState::Idle,
             rate: None,
             checkpoint: CheckpointRecovery::None,
+            checkpoint_reads: 0,
+            checkpoint_after_first_read: None,
             requested: 0,
             signals: vec![],
             kill_survives: false,
@@ -134,7 +138,12 @@ impl ReplacementRuntime for Fake {
         Ok(())
     }
     fn checkpoint_recovery(&mut self) -> CheckpointRecovery {
-        self.checkpoint
+        self.checkpoint_reads += 1;
+        if self.checkpoint_reads > 1 {
+            self.checkpoint_after_first_read.unwrap_or(self.checkpoint)
+        } else {
+            self.checkpoint
+        }
     }
     fn process_state(&mut self, p: &ProcessIdentity) -> ProcessState {
         *self.states.get(&p.pid).unwrap_or(&ProcessState::Gone)
@@ -1105,4 +1114,68 @@ fn native_owner_birth_unit_roundtrips_without_rounding_or_elapsed_guess() {
         })
         .is_err());
     }
+}
+
+#[test]
+fn archive_stop_without_valid_checkpoint_never_signals_or_revokes() {
+    for turn in [TurnState::Busy, TurnState::Idle, TurnState::Dead] {
+        for checkpoint in [CheckpointRecovery::None, CheckpointRecovery::Stale] {
+            let mut r = Fake::new();
+            r.turn = turn;
+            r.checkpoint = checkpoint;
+            assert!(matches!(
+                prepare_for_archive(&mut r, "t1-backend", 3, &ReplacementPolicy::default()),
+                Err(ReplacementError::CheckpointUnavailable)
+            ));
+            assert!(r.signals.is_empty());
+            assert!(!r.revoked);
+            assert!(!r.events.contains(&ReplacementPhase::Stopping));
+            assert_eq!(r.events.last(), Some(&ReplacementPhase::Blocked));
+            r.no_new();
+        }
+    }
+}
+
+#[test]
+fn archive_stop_rejects_checkpoint_downgraded_by_recent_rate_limit() {
+    let mut r = Fake::new();
+    r.checkpoint = CheckpointRecovery::Valid;
+    r.rate = Some(0);
+    assert!(matches!(
+        prepare_for_archive(&mut r, "t1-backend", 3, &ReplacementPolicy::default()),
+        Err(ReplacementError::CheckpointUnavailable)
+    ));
+    assert!(r.signals.is_empty());
+    assert!(!r.revoked);
+    r.no_new();
+}
+
+#[test]
+fn archive_stop_with_valid_checkpoint_finishes_ready_without_replacement() {
+    let mut r = Fake::new();
+    r.checkpoint = CheckpointRecovery::Valid;
+    let prepared = prepare_for_archive(
+        &mut r, "t1-backend", 3, &ReplacementPolicy::default(),
+    ).unwrap();
+    assert_eq!(prepared.checkpoint_recovery(), CheckpointRecovery::Valid);
+    assert!(r.revoked);
+    assert_eq!(r.events.last(), Some(&ReplacementPhase::Ready));
+    assert!(!r.events.contains(&ReplacementPhase::Starting));
+    assert_eq!(r.owner, 3);
+    r.no_new();
+}
+
+#[test]
+fn archive_stop_rechecks_checkpoint_before_first_signal() {
+    let mut r = Fake::new();
+    r.checkpoint = CheckpointRecovery::Valid;
+    r.checkpoint_after_first_read = Some(CheckpointRecovery::Stale);
+    assert!(matches!(
+        prepare_for_archive(&mut r, "t1-backend", 3, &ReplacementPolicy::default()),
+        Err(ReplacementError::CheckpointUnavailable)
+    ));
+    assert_eq!(r.checkpoint_reads, 2);
+    assert!(r.signals.is_empty());
+    assert!(!r.revoked);
+    r.no_new();
 }

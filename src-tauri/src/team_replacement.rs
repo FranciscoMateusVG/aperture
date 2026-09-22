@@ -349,6 +349,28 @@ pub fn prepare<R: ReplacementRuntime>(
     generation: u64,
     policy: &ReplacementPolicy,
 ) -> Result<PreparedReplacement, ReplacementError> {
+    prepare_checked(r, seat, generation, policy, false)
+}
+
+/// Archival is not emergency recovery: lack of a valid checkpoint never grants
+/// permission to discard context. This does not start a replacement or confer
+/// authority; the native caller must authenticate and retain its effect guards.
+pub(crate) fn prepare_for_archive<R: ReplacementRuntime>(
+    r: &mut R,
+    seat: &str,
+    generation: u64,
+    policy: &ReplacementPolicy,
+) -> Result<PreparedReplacement, ReplacementError> {
+    prepare_checked(r, seat, generation, policy, true)
+}
+
+fn prepare_checked<R: ReplacementRuntime>(
+    r: &mut R,
+    seat: &str,
+    generation: u64,
+    policy: &ReplacementPolicy,
+    require_valid_checkpoint: bool,
+) -> Result<PreparedReplacement, ReplacementError> {
     let result = (|| {
         if policy.poll_ms == 0 {
             return Err(ReplacementError::NativeFailure);
@@ -390,6 +412,15 @@ pub fn prepare<R: ReplacementRuntime>(
         surviving(r, &snapshot)?;
         if r.unowned_matches(&snapshot)? {
             return Err(ReplacementError::UnownedProcess);
+        }
+        // Re-read after the checkpoint wait and ownership checks, immediately
+        // before the first stop phase/signal. Ordinary replacement retains its
+        // explicit degraded-recovery behavior; archival never inherits it.
+        if require_valid_checkpoint
+            && (recovery != CheckpointRecovery::Valid
+                || r.checkpoint_recovery() != CheckpointRecovery::Valid)
+        {
+            return Err(ReplacementError::CheckpointUnavailable);
         }
         snapshot.processes.sort_by(|a, b| {
             b.depth
