@@ -592,6 +592,7 @@ pub struct ClaudeStartupSmokeView {
 /// Startup and submitted kickoff are facts separate from mission readiness.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ClaudeInboxProbeView {
+    pub cleanup: &'static str,
     pub team: String,
     pub seat: String,
     pub generation: u64,
@@ -2039,7 +2040,7 @@ fn project_claude_inbox_probe(input: &ClaudeStartupSmokeInput,
     }
     Ok(ClaudeInboxProbeView {team:probe.team, seat:probe.seat, generation:probe.generation,
         model:probe.actual.model, reasoning_observation:"not_observed", startup:"verified",
-        kickoff:"sent", owner_state:OwnerState::Active, mcp_readiness:"pending", public_enabled:false})
+        kickoff:"sent", owner_state:OwnerState::Quarantined, cleanup:"verified", mcp_readiness:"pending_verification", public_enabled:false})
 }
 
 fn claude_startup_smoke(engine: &TeamEngine, actor: &AuthenticatedActor, input: ClaudeStartupSmokeInput) -> TeamResult<ClaudeStartupSmokeView> {

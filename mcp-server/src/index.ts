@@ -529,7 +529,7 @@ server.tool(
 
 server.tool(
   "team_claude_inbox_probe",
-  "GLaDOS-only, operator-authorized diagnostic: start one NEW approved Sonnet 5/None seat at generation zero, observe pre-input identity, then submit ONE fixed native inbox kickoff after Active. Leaves the diagnostic active for a real BEADS roundtrip. A sent kickoff is NOT proof of tools, Monitor or mission readiness; verify those before any business dispatch. Public Claude launch remains disabled. No caller prompt/model/authority/timeout, no retry after unknown, no reuse of old diagnostics.",
+  "GLaDOS-only, operator-authorized diagnostic: start one NEW approved Sonnet 5/None seat at generation zero, observe pre-input identity, then submit ONE fixed native inbox kickoff after Active. Allows up to 30 seconds for a pre-enqueued BEADS diagnostic, then always cleans up the same candidate and leaves it quarantined. Verify the reply/read-state separately after return; an incomplete roundtrip stays NOT_RUN. A sent kickoff is NOT proof of tools, Monitor or mission readiness; verify those before any business dispatch. Public Claude launch remains disabled. No caller prompt/model/authority/timeout, no retry after unknown, no reuse of old diagnostics.",
   { input: claudeInboxProbeSchema },
   async ({ input }) => {
     const denied = gladosControlDenied();

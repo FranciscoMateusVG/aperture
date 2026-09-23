@@ -16,8 +16,9 @@ test('shared native wire proves kickoff sent but not tools or public readiness',
   const result = parseClaudeInboxProbe(fixture('response'), input).result;
   assert.equal(result.startup, 'verified');
   assert.equal(result.kickoff, 'sent');
-  assert.equal(result.owner_state, 'active');
-  assert.equal(result.mcp_readiness, 'pending');
+  assert.equal(result.owner_state, 'quarantined');
+  assert.equal(result.cleanup, 'verified');
+  assert.equal(result.mcp_readiness, 'pending_verification');
   assert.equal(result.public_enabled, false);
 });
 
@@ -33,7 +34,7 @@ test('strict smoke selectors never accept caller authority, prompts or a second 
 test('mismatched or overstated diagnostic receipts are UNKNOWN without retry authority', () => {
   for (const delta of [{ team: 'other' }, { seat: 'other' }, { generation: 2 },
     { model: 'sonnet' }, { reasoning_observation: 'high' }, { startup: 'assumed' },
-    { kickoff: 'ready' }, { owner_state: 'quarantined' }, { cleanup: 'quarantined' }, { mcp_readiness: 'passed' }, { public_enabled: true },
+    { kickoff: 'ready' }, { owner_state: 'active' }, { cleanup: 'quarantined' }, { mcp_readiness: 'passed' }, { public_enabled: true },
     { thread_id: 'caller' }, { token: 'fixture' }]) {
     const value = fixture('response'); Object.assign(value.result, delta);
     assert.throws(() => parseClaudeInboxProbe(value, input), /E_CONTROL_UNKNOWN/);

@@ -8,8 +8,9 @@
     "reasoning_observation": "not_observed",
     "startup": "verified",
     "kickoff": "sent",
-    "owner_state": "active",
-    "mcp_readiness": "pending",
-    "public_enabled": false
+    "owner_state": "quarantined",
+    "mcp_readiness": "pending_verification",
+    "public_enabled": false,
+    "cleanup": "verified"
   }
 }

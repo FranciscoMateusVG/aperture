@@ -8,7 +8,7 @@ const response = z.object({
     team: name.max(16), seat: name, generation: z.literal(1),
     model: z.literal("claude-sonnet-5"), reasoning_observation: z.literal("not_observed"),
     startup: z.literal("verified"), kickoff: z.literal("sent"),
-    owner_state: z.literal("active"), mcp_readiness: z.literal("pending"), public_enabled: z.literal(false),
+    owner_state: z.literal("quarantined"), cleanup: z.literal("verified"), mcp_readiness: z.literal("pending_verification"), public_enabled: z.literal(false),
   }).strict(),
 }).strict();
 export function parseClaudeInboxProbe(value: unknown, input: ClaudeStartupSmokeSelectors) {

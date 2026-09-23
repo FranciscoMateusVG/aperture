@@ -935,18 +935,14 @@ fn inbox_probe_native_denies_non_glados_before_any_launch_or_kickoff() {
 }
 
 #[test]
-fn inbox_probe_finally_cleans_every_post_start_error_including_terminal_failure() {
+fn inbox_probe_finally_always_cleans_including_successful_input_window() {
     use std::cell::Cell;
-    for phase_ok in [false,true] { for finish_ok in [false,true] { for cleanup_ok in [false,true] {
-        let finished=Cell::new(0);let cleaned=Cell::new(0);
-        let result=finish_inbox_probe(if phase_ok {Ok(42)}else{Err(ReplacementError::ModelUnverified)},
-            ||{finished.set(finished.get()+1);if finish_ok {Ok(())}else{Err(ReplacementError::OutcomeUnknown)}},
-            ||{cleaned.set(cleaned.get()+1);if cleanup_ok {Ok(())}else{Err(ReplacementError::NativeFailure)}});
-        assert_eq!(finished.get(),u32::from(phase_ok));
-        assert_eq!(cleaned.get(),u32::from(!(phase_ok&&finish_ok)));
-        if phase_ok&&finish_ok {assert_eq!(result,Ok(42));}
-        else if !cleanup_ok {assert_eq!(result,Err(ReplacementError::StartCleanupUnverified));}
-        else if !phase_ok {assert_eq!(result,Err(ReplacementError::ModelUnverified));}
-        else {assert_eq!(result,Err(ReplacementError::OutcomeUnknown));}
-    }}}
+    for sequence_ok in [false,true] { for cleanup_ok in [false,true] {
+        let cleaned=Cell::new(0);
+        let result=smoke_finally(if sequence_ok {Ok(())} else {Err(ReplacementError::OutcomeUnknown)},
+            ||{cleaned.set(cleaned.get()+1);if cleanup_ok {Ok(())}else{Err(ReplacementError::StartCleanupUnverified)}});
+        assert_eq!(cleaned.get(),1);
+        if !cleanup_ok {assert_eq!(result,Err(ReplacementError::StartCleanupUnverified));}
+        else {assert_eq!(result.is_ok(),sequence_ok);}
+    }}
 }

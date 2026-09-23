@@ -333,7 +333,7 @@ fn start_claude_diagnostic(home: &Path, actor: &AuthenticatedActor, team: &str,
     Ok((plan, attempt, started))
 }
 
-/// An observed active candidate after ONE fixed kickoff. This is not evidence
+/// A cleaned diagnostic after ONE fixed kickoff. This is not evidence
 /// of a callable MCP, a Monitor hello or a mission-ready worker.
 pub(crate) struct ClaudeInboxProbe {
     pub(crate) team: String,
@@ -352,43 +352,30 @@ pub(crate) fn bootstrap_claude_inbox_probe_authorized(home: &Path,
     }
     let (plan, mut attempt, mut started) = start_claude_diagnostic(home, actor, team, seat, expected_generation)?;
     let NativePlan::ClaudeSmoke(_, admission) = &plan else { unreachable!() };
-    let result = inbox_after_activation(
+    let observed = inbox_after_activation(
         || activate_native_checked(home, team, &started, &attempt, Some(actor), Some(admission)),
         || crate::team_claude_kickoff::kickoff_active(home, actor, team, seat,
             started.reservation.generation, attempt.budget().forward_until(Duration::from_secs(15))?),
         || {
-            let _team = lock_activation(home, team, Some(actor))?;
-            let store = OwnerStore::new(home.join(".aperture/run/owner"));
-            let _seat = store.lock(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
-            admission.revalidate_locked()?;
-            let owner = store.read_owner_locked(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
-            let i = owner.incarnation.as_ref().ok_or(ReplacementError::OutcomeUnknown)?;
-            let actual = ExecutionTuple {harness:i.harness.clone(), model:i.model.clone(), reasoning:i.reasoning.clone()};
-            if owner.state != OwnerState::Active || owner.generation != started.reservation.generation
-                || !i.observed || !smoke_tuple(&actual) || actual != owner.requested
-                || i.pid != started.candidate.process.pid
-                || i.start_time != team_process::birth_micros(&started.candidate.process)?
-                || i.token_id != started.candidate.token_id
-                || i.thread_id != started.candidate.observed.thread_id {
-                return Err(ReplacementError::OutcomeUnknown);
-            }
-            Ok(ClaudeInboxProbe {team:team.into(), seat:seat.into(), generation:owner.generation, actual})
+            // Keep the ORIGINAL reservation alive, never create a new stop
+            // authority. This diagnostic carries no business task. BEADS
+            // reply/read-state is inspected externally, not inferred here.
+            let until = attempt.budget().forward_until(Duration::from_secs(30))?;
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            authorize_smoke(actor)
         },
     );
-    // Terminal failures receive the SAME finally as observation/kickoff
-    // failures. No retry and no detached worker hidden behind an error.
-    let cleanup_until = attempt.budget().cleanup_until();
-    let result = finish_inbox_probe(result, || attempt.finish_active(), ||
-        cleanup_native(home, team, &started.reservation, started.child.as_mut(), cleanup_until));
+    let completed = smoke_finally(observed, || cleanup_native(home, team,
+        &started.reservation, started.child.as_mut(), attempt.budget().cleanup_until()));
+    if let Err(e) = completed { let _ = attempt.finish_unknown(); return Err(e); }
+    let result = (|| {
+        let proof = SmokeCleanupProof::capture(admission, &started, attempt.id(), attempt.budget(), actor)?;
+        let actual = proof.actual.clone();
+        let generation = proof.generation;
+        attempt.finish_smoke_cleaned(proof, actor)?;
+        Ok(ClaudeInboxProbe {team:team.into(), seat:seat.into(), generation, actual})
+    })();
     if result.is_err() { let _ = attempt.finish_unknown(); }
-    result
-}
-
-fn finish_inbox_probe<T>(result: Result<T, ReplacementError>,
-    finish: impl FnOnce() -> Result<(), ReplacementError>,
-    cleanup: impl FnOnce() -> Result<(), ReplacementError>) -> Result<T, ReplacementError> {
-    let result = result.and_then(|value| { finish()?; Ok(value) });
-    if result.is_err() { cleanup().map_err(|_| ReplacementError::StartCleanupUnverified)?; }
     result
 }
 
