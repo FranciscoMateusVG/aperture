@@ -53,7 +53,7 @@ impl NativePlan {
                 home, team, seat, tuple, repo, worktree, budget,
             )
             .map(Self::Codex),
-            Harness::Claude => crate::team_claude_launch::ClaudeBinding::preflight(
+            Harness::Claude => crate::team_claude_launch::ClaudeBinding::preflight_normal(
                 home, team, seat, tuple, repo, worktree, budget,
             )
             .map(Self::Claude)
@@ -711,6 +711,7 @@ fn start_native(
                             team,
                             &reservation,
                             pending.session_id(),
+                            pending.launch_mode(),
                         )
                         .map_err(|_| ReplacementError::ModelUnverified)
                     },
