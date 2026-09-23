@@ -1,3 +1,4 @@
+import type { ValidateCheckpointSelectors } from "./team-checkpoint-validation.js";
 import type { StopSeatSelectors } from "./team-stop.js";
 import type { ClaudeStartupSmokeSelectors } from "./team-claude-smoke.js";
 import type { CreateTeamSelectors } from "./team-create.js";
@@ -11,9 +12,10 @@ const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_STDOUT_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 4 * 1024;
 const ORDINARY_TIMEOUT_MS = 15_000;
-// Native replace/bootstrap/stop/smoke children own a 170s deadline with a
+// Native lifecycle children own a 170s deadline with a
 // bounded cleanup reserve. This parent watchdog is deliberately larger and is
 // only a last-resort crash boundary; expiry never means rollback succeeded.
+// Checkpoint validation shares this fixed budget/group, never a caller timeout.
 const REPLACE_TIMEOUT_MS = 180_000;
 // Archive performs two bounded native projections (30s + 20s) before the
 // journaled fsync/move/readback phase. Expiry is crash/unknown semantics; the
@@ -88,6 +90,7 @@ export type TeamControlRequest =
   | { action: "list_teams" }
   | { action: "bootstrap_seat"; input: { team: string; seat: string; expected_generation: number } }
   | { action: "stop_seat"; input: StopSeatSelectors }
+  | { action: "validate_checkpoint"; input: ValidateCheckpointSelectors }
   | { action: "claude_startup_smoke"; input: ClaudeStartupSmokeSelectors }
   | { action: "claude_inbox_probe"; input: ClaudeStartupSmokeSelectors }
   | { action: "approve"; input: ActivationSelectors }
@@ -157,7 +160,7 @@ function parseObject(text: string): Record<string, unknown> {
 }
 
 export function teamControlWatchdogMs(action: TeamControlRequest["action"]): number {
-  return (action === "replace" || action === "bootstrap_seat" || action === "stop_seat" || action === "claude_startup_smoke" || action === "claude_inbox_probe") ? REPLACE_TIMEOUT_MS : action === "archive" || action === "rollback_archive" ? ARCHIVE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
+  return (action === "validate_checkpoint" || action === "replace" || action === "bootstrap_seat" || action === "stop_seat" || action === "claude_startup_smoke" || action === "claude_inbox_probe") ? REPLACE_TIMEOUT_MS : action === "archive" || action === "rollback_archive" ? ARCHIVE_TIMEOUT_MS : ORDINARY_TIMEOUT_MS;
 }
 
 function killControlProcessGroup(child: ReturnType<typeof spawn>, isolated: boolean): void {
@@ -181,7 +184,7 @@ export async function invokeTeamControl(request: TeamControlRequest): Promise<Re
   const path = binaryPath();
   validateBinary(path);
   return await new Promise((resolve, reject) => {
-    const isolated = request.action === "claude_inbox_probe" || request.action === "claude_startup_smoke" || request.action === "stop_seat" || request.action === "bootstrap_seat" || request.action === "replace" || request.action === "archive" || request.action === "rollback_archive";
+    const isolated = request.action === "validate_checkpoint" || request.action === "claude_inbox_probe" || request.action === "claude_startup_smoke" || request.action === "stop_seat" || request.action === "bootstrap_seat" || request.action === "replace" || request.action === "archive" || request.action === "rollback_archive";
     const child = spawn(path, [], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
