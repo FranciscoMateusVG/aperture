@@ -891,3 +891,20 @@ fn recovery_entry_rejects_non_glados_and_non_diagnostic_selectors_before_effects
     }
     assert_eq!(std::fs::read_dir(&f.0).unwrap().count(),0);
 }
+
+#[test]
+fn claude_observation_lock_contention_is_pending_not_false_model_failure() {
+    let _envlock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);
+    let _actor=smoke_fixture(&f);let store=OwnerStore::new(f.0.join(".aperture/run/owner"));
+    let tuple=ExecutionTuple{harness:Harness::Claude,model:"claude-sonnet-5".into(),reasoning:None};
+    let reservation=store.reserve_start(&AuthenticatedActor::launcher(),"t1-worker",0,tuple).unwrap();
+    for team_locked in [true,false] {
+        let lock=if team_locked {crate::owner::try_lock(&f.0.join(".aperture/run/team-locks"),"t1").unwrap()}
+            else {store.lock("t1-worker").unwrap()};
+        assert!(matches!(runtime_observation(&f.0,"t1",&reservation,&Harness::Claude),Ok(None)));
+        drop(lock);
+        // The fixture has no candidate: after lock release its identity is
+        // invalid, so it MUST fail rather than treating invalid data as pending.
+        assert!(matches!(runtime_observation(&f.0,"t1",&reservation,&Harness::Claude),Err(ReplacementError::ModelUnverified)));
+    }
+}

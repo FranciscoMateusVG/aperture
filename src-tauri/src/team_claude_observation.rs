@@ -367,9 +367,9 @@ fn locked(
 ) -> Result<Locked, ClaudeError> {
     valid_selector(team, seat, generation.unwrap_or(1))?;
     let team_guard =
-        try_lock(&home.join(".aperture/run/team-locks"), team).map_err(|_| ClaudeError::Owner)?;
+        try_lock(&home.join(".aperture/run/team-locks"), team).map_err(observation_lock_error)?;
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
-    let seat_guard = store.lock(seat).map_err(|_| ClaudeError::Owner)?;
+    let seat_guard = store.lock(seat).map_err(observation_lock_error)?;
     let owner: OwnerRecord =
         read_private_json(&store.record_path(seat)).map_err(|_| ClaudeError::Owner)?;
     validate_owner(&owner, seat, generation)?;
@@ -381,6 +381,11 @@ fn locked(
         snapshot_sha256,
         team_generation,
     })
+}
+fn observation_lock_error(error: String) -> ClaudeError {
+    // Only actual flock contention is pending. Unsafe files, permission errors
+    // and changed identity remain hard failures; none can become readiness.
+    if error == "E_LOCK_HELD: lock is owned by another process" { ClaudeError::Busy } else { ClaudeError::Owner }
 }
 fn validate_owner(
     owner: &OwnerRecord,

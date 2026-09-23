@@ -104,7 +104,7 @@ fn runtime_observation(
         },
         Harness::Claude => match crate::team_claude_observation::read_native(home, team, res) {
             Ok(v) => Ok(Some(v.into_runtime_observation())),
-            Err(crate::team_claude_launch::ClaudeError::Missing) => Ok(None),
+            Err(crate::team_claude_launch::ClaudeError::Missing | crate::team_claude_launch::ClaudeError::Busy) => Ok(None),
             Err(_) => Err(ReplacementError::ModelUnverified),
         },
     }
