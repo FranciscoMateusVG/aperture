@@ -52,7 +52,8 @@ function handler(denied, invoke) {
   let callback;
   runInNewContext(source.slice(start, end), {
     server: { tool(_name, description, schema, fn) {
-      assert.match(description, /operator-authorized diagnostic/);
+      assert.match(description, /Historical diagnostic, retired for new launches/);
+      assert.match(description, /Use team_bootstrap_seat/);
       assert.equal(schema.input, claudeInboxProbeSchema); callback = fn;
     } },
     gladosControlDenied: () => denied, claudeInboxProbeSchema, parseClaudeInboxProbe,
