@@ -589,6 +589,21 @@ pub struct ClaudeStartupSmokeView {
     pub public_enabled: bool,
 }
 
+/// Startup and submitted kickoff are facts separate from mission readiness.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClaudeInboxProbeView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub model: String,
+    pub reasoning_observation: &'static str,
+    pub startup: &'static str,
+    pub kickoff: &'static str,
+    pub owner_state: OwnerState,
+    pub mcp_readiness: &'static str,
+    pub public_enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReconciledClaudeStartupView {
     pub team: String,
@@ -629,6 +644,7 @@ pub enum TeamControlRequest {
     BootstrapSeat(BootstrapSeatInput),
     StopSeat(StopSeatInput),
     ClaudeStartupSmoke(ClaudeStartupSmokeInput),
+    ClaudeInboxProbe(ClaudeStartupSmokeInput),
     ReconcileClaudeStartup(ClaudeStartupSmokeInput),
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
@@ -652,6 +668,7 @@ pub enum TeamControlResponse {
     BootstrapSeat(BootstrapView),
     StopSeat(StopSeatView),
     ClaudeStartupSmoke(ClaudeStartupSmokeView),
+    ClaudeInboxProbe(ClaudeInboxProbeView),
     ReconcileClaudeStartup(ReconciledClaudeStartupView),
     Approve(TeamView),
     Cancel(CancelPendingResult),
@@ -1990,6 +2007,41 @@ pub fn team_bootstrap_seat(
     bootstrap_seat(&engine_from_state(&state)?, &AuthenticatedActor::operator_ui(), input)
 }
 
+fn claude_inbox_probe(engine: &TeamEngine, actor: &AuthenticatedActor, input: ClaudeStartupSmokeInput) -> TeamResult<ClaudeInboxProbeView> {
+    // Auth precedes even selector validation. The input cannot choose a
+    // prompt, mode, actor, model or a retained/old generation.
+    if !actor.is_glados() { return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required")); }
+    actor.revalidate_before_mutation().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability changed"))?;
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation != 0 {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "fresh inbox diagnostic seat required"));
+    }
+    if managed_launch_enabled(&Harness::Claude) {
+        return Err(TeamError::state("inbox probe is not an ordinary launch"));
+    }
+    let view = engine.read_team_view(&input.team)?;
+    if view.state.state != TeamLifecycle::Active
+        || view.snapshot.seats.iter().filter(|s| s.name == input.seat && s.harness == Harness::Claude
+            && s.model == crate::team_claude_launch::MODEL && s.reasoning.is_none()).count() != 1 {
+        return Err(TeamError::state("approved exact Sonnet diagnostic seat required"));
+    }
+    let probe = crate::team_replacement::native::bootstrap_claude_inbox_probe_authorized(
+        &engine.paths.home, actor, &input.team, &input.seat, input.expected_generation).map_err(replacement_error)?;
+    project_claude_inbox_probe(&input, probe)
+}
+
+fn project_claude_inbox_probe(input: &ClaudeStartupSmokeInput,
+    probe: crate::team_replacement::native::ClaudeInboxProbe) -> TeamResult<ClaudeInboxProbeView> {
+    if probe.team != input.team || probe.seat != input.seat || input.expected_generation != 0
+        || probe.generation != 1 || probe.actual.harness != Harness::Claude
+        || probe.actual.model != crate::team_claude_launch::MODEL || probe.actual.reasoning.is_some() {
+        return Err(TeamError::new("E_CONTROL_UNKNOWN", "inbox probe readback mismatch; inspect without retry"));
+    }
+    Ok(ClaudeInboxProbeView {team:probe.team, seat:probe.seat, generation:probe.generation,
+        model:probe.actual.model, reasoning_observation:"not_observed", startup:"verified",
+        kickoff:"sent", owner_state:OwnerState::Active, mcp_readiness:"pending", public_enabled:false})
+}
+
 fn claude_startup_smoke(engine: &TeamEngine, actor: &AuthenticatedActor, input: ClaudeStartupSmokeInput) -> TeamResult<ClaudeStartupSmokeView> {
     if !actor.is_glados() {
         return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"));
@@ -2217,6 +2269,10 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
         TeamControlRequest::Create(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.create_team(&actor, input).map(TeamControlResponse::Create)
+        }
+        TeamControlRequest::ClaudeInboxProbe(input) => {
+            let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
+            claude_inbox_probe(&engine, &actor, input).map(TeamControlResponse::ClaudeInboxProbe)
         }
         TeamControlRequest::ClaudeStartupSmoke(input) => {
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
@@ -2555,6 +2611,43 @@ mod tests {
     }
 
     include!("team_project_runtime_tests.rs");
+
+    #[test]
+    fn claude_inbox_probe_shared_wire_separates_input_from_readiness() {
+        let req: TeamControlRequest = serde_json::from_str(include_str!("../../tests/fixtures/team-claude-inbox-request.json")).unwrap();
+        let TeamControlRequest::ClaudeInboxProbe(input) = req else { panic!("wrong action") };
+        let make = || crate::team_replacement::native::ClaudeInboxProbe {
+            team:input.team.clone(),seat:input.seat.clone(),generation:1,
+            actual:ExecutionTuple {harness:Harness::Claude,model:crate::team_claude_launch::MODEL.into(),reasoning:None},
+        };
+        let response = TeamControlResponse::ClaudeInboxProbe(project_claude_inbox_probe(&input,make()).unwrap());
+        let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/team-claude-inbox-response.json")).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(),expected);
+        for case in 0..6 {
+            let mut p = make();
+            match case {0=>p.team="other".into(),1=>p.seat="other".into(),2=>p.generation=2,
+                3=>p.actual.harness=Harness::Codex,4=>p.actual.model="sonnet".into(),_=>p.actual.reasoning=Some(ReasoningEffort::High)};
+            assert_eq!(project_claude_inbox_probe(&input,p).unwrap_err().code,"E_CONTROL_UNKNOWN");
+        }
+        assert!(!managed_launch_enabled(&Harness::Claude));
+    }
+
+    #[test]
+    fn claude_inbox_probe_auth_precedes_selectors_and_input_is_never_caller_owned() {
+        let _guard=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home=temp_root("inbox-probe-control");let _env=EnvRestore::set(&home);
+        let request=r#"{"action":"claude_inbox_probe","input":{"team":"probe","seat":"probe-qa","expected_generation":1}}"#;
+        assert_eq!(team_control_headless(request).unwrap_err().code,"E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        assert_eq!(team_control_headless(request).unwrap_err().code,"E_GENERATION_MISMATCH");
+        for key in ["actor","model","reasoning","prompt","timeout","force","token","mode","pane","window"] {
+            let mut v:serde_json::Value=serde_json::from_str(request).unwrap();v["input"][key]="forged".into();
+            assert!(serde_json::from_value::<TeamControlRequest>(v).is_err());
+        }
+        assert!(!home.join(".aperture/run/owner/probe-qa.json").exists());
+        assert!(!managed_launch_enabled(&Harness::Claude));
+        fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn claude_startup_smoke_shared_wire_never_claims_mcp_or_public_readiness() {

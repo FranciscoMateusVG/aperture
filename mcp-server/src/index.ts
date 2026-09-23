@@ -1,3 +1,4 @@
+import { claudeInboxProbeSchema, parseClaudeInboxProbe } from "./team-claude-inbox.js";
 import { stopSeatSchema, parseStopSeatReady } from "./team-stop.js";
 import { claudeStartupSmokeSchema, parseClaudeStartupSmoke } from "./team-claude-smoke.js";
 import { bootstrapSeatSchema, bootstrapSelection, parseBootstrapStarted, parseTeamList } from "./team-bootstrap.js";
@@ -519,6 +520,23 @@ server.tool(
       const request = bootstrapSeatSchema.parse(input);
       const expected = bootstrapSelection(await invokeTeamControl({ action: "list_teams" }), request);
       const result = parseBootstrapStarted(await invokeTeamControl({ action: "bootstrap_seat", input: request }), request, expected);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_claude_inbox_probe",
+  "GLaDOS-only, operator-authorized diagnostic: start one NEW approved Sonnet 5/None seat at generation zero, observe pre-input identity, then submit ONE fixed native inbox kickoff after Active. Leaves the diagnostic active for a real BEADS roundtrip. A sent kickoff is NOT proof of tools, Monitor or mission readiness; verify those before any business dispatch. Public Claude launch remains disabled. No caller prompt/model/authority/timeout, no retry after unknown, no reuse of old diagnostics.",
+  { input: claudeInboxProbeSchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = claudeInboxProbeSchema.parse(input);
+      const result = parseClaudeInboxProbe(await invokeTeamControl({ action: "claude_inbox_probe", input: request }), request);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };

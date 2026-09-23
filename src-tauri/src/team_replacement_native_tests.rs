@@ -908,3 +908,45 @@ fn claude_observation_lock_contention_is_pending_not_false_model_failure() {
         assert!(matches!(runtime_observation(&f.0,"t1",&reservation,&Harness::Claude),Err(ReplacementError::ModelUnverified)));
     }
 }
+
+#[test]
+fn inbox_probe_no_input_before_active_and_no_retry_after_uncertain_send() {
+    use std::cell::RefCell;
+    for fail in ["activate","kickoff","readback","none"] {
+        let events=RefCell::new(Vec::new());
+        let result=inbox_after_activation(
+            ||{events.borrow_mut().push("active");if fail=="activate" {Err(ReplacementError::ModelUnverified)}else{Ok(())}},
+            ||{events.borrow_mut().push("kickoff");if fail=="kickoff" {Err(ReplacementError::OutcomeUnknown)}else{Ok(())}},
+            ||{events.borrow_mut().push("readback");if fail=="readback" {Err(ReplacementError::OutcomeUnknown)}else{Ok(())}},
+        );
+        let expected=match fail {"activate"=>vec!["active"],"kickoff"=>vec!["active","kickoff"],_=>vec!["active","kickoff","readback"]};
+        assert_eq!(*events.borrow(),expected);assert_eq!(result.is_ok(),fail=="none");
+    }
+}
+
+#[test]
+fn inbox_probe_native_denies_non_glados_before_any_launch_or_kickoff() {
+    let f=Fixture::new();
+    for actor in [AuthenticatedActor::launcher(),AuthenticatedActor::operator_ui()] {
+        assert!(matches!(bootstrap_claude_inbox_probe_authorized(&f.0,&actor,"t1","t1-worker",0),Err(ReplacementError::AuthorizationRequired)));
+    }
+    assert!(!f.0.join(".aperture/run/managed/t1-worker").exists());
+    assert!(!crate::teams::managed_launch_enabled(&Harness::Claude));
+}
+
+#[test]
+fn inbox_probe_finally_cleans_every_post_start_error_including_terminal_failure() {
+    use std::cell::Cell;
+    for phase_ok in [false,true] { for finish_ok in [false,true] { for cleanup_ok in [false,true] {
+        let finished=Cell::new(0);let cleaned=Cell::new(0);
+        let result=finish_inbox_probe(if phase_ok {Ok(42)}else{Err(ReplacementError::ModelUnverified)},
+            ||{finished.set(finished.get()+1);if finish_ok {Ok(())}else{Err(ReplacementError::OutcomeUnknown)}},
+            ||{cleaned.set(cleaned.get()+1);if cleanup_ok {Ok(())}else{Err(ReplacementError::NativeFailure)}});
+        assert_eq!(finished.get(),u32::from(phase_ok));
+        assert_eq!(cleaned.get(),u32::from(!(phase_ok&&finish_ok)));
+        if phase_ok&&finish_ok {assert_eq!(result,Ok(42));}
+        else if !cleanup_ok {assert_eq!(result,Err(ReplacementError::StartCleanupUnverified));}
+        else if !phase_ok {assert_eq!(result,Err(ReplacementError::ModelUnverified));}
+        else {assert_eq!(result,Err(ReplacementError::OutcomeUnknown));}
+    }}}
+}

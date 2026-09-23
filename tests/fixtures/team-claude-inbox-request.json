@@ -1,0 +1,8 @@
+{
+  "action": "claude_inbox_probe",
+  "input": {
+    "team": "sonnet-inbox",
+    "seat": "sonnet-inbox-qa",
+    "expected_generation": 0
+  }
+}

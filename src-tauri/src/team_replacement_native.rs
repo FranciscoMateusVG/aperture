@@ -309,10 +309,11 @@ pub(crate) fn reconcile_stopped_claude_smoke(home: &Path, actor: &AuthenticatedA
     Ok(())
 }
 
-pub(crate) fn bootstrap_claude_smoke_authorized(
-    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
-    expected_generation: u64, _sentinels: &[String],
-) -> Result<ClaudeSmokeDiagnostic, ReplacementError> {
+// Shared pre-input admission and launch; both diagnostic paths use the same
+// g0 capability, snapshot, D1 and cleanup substrate. No public policy switch.
+fn start_claude_diagnostic(home: &Path, actor: &AuthenticatedActor, team: &str,
+    seat: &str, expected_generation: u64,
+) -> Result<(NativePlan, deadline::RuntimeAttempt, NativeStarted), ReplacementError> {
     let budget = deadline::Deadline::new();
     let admission = SmokeAdmission::issue(home, actor, team, seat, expected_generation)?;
     let repo = repository::resolve_native(home, team, budget.forward_until(Duration::from_secs(10))?)
@@ -325,10 +326,87 @@ pub(crate) fn bootstrap_claude_smoke_authorized(
     plan.revalidate(&budget)?;
     let mut attempt = deadline::RuntimeAttempt::begin_bootstrap(home, &AuthenticatedActor::launcher(), team, seat, budget)?;
     attempt.admit_effects()?;
-    let mut started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor)) {
+    let started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor)) {
         Ok(v) => v,
         Err(e) => { let _ = attempt.finish_unknown(); return Err(e); }
     };
+    Ok((plan, attempt, started))
+}
+
+/// An observed active candidate after ONE fixed kickoff. This is not evidence
+/// of a callable MCP, a Monitor hello or a mission-ready worker.
+pub(crate) struct ClaudeInboxProbe {
+    pub(crate) team: String,
+    pub(crate) seat: String,
+    pub(crate) generation: u64,
+    pub(crate) actual: ExecutionTuple,
+}
+
+/// Operator-approved diagnostic only. The ordinary Claude launch gate remains
+/// false. The first input is the native constant, strictly AFTER D1/Active.
+pub(crate) fn bootstrap_claude_inbox_probe_authorized(home: &Path,
+    actor: &AuthenticatedActor, team: &str, seat: &str, expected_generation: u64,
+) -> Result<ClaudeInboxProbe, ReplacementError> {
+    if crate::teams::managed_launch_enabled(&Harness::Claude) {
+        return Err(ReplacementError::AuthorizationRequired);
+    }
+    let (plan, mut attempt, mut started) = start_claude_diagnostic(home, actor, team, seat, expected_generation)?;
+    let NativePlan::ClaudeSmoke(_, admission) = &plan else { unreachable!() };
+    let result = inbox_after_activation(
+        || activate_native_checked(home, team, &started, &attempt, Some(actor), Some(admission)),
+        || crate::team_claude_kickoff::kickoff_active(home, actor, team, seat,
+            started.reservation.generation, attempt.budget().forward_until(Duration::from_secs(15))?),
+        || {
+            let _team = lock_activation(home, team, Some(actor))?;
+            let store = OwnerStore::new(home.join(".aperture/run/owner"));
+            let _seat = store.lock(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+            admission.revalidate_locked()?;
+            let owner = store.read_owner_locked(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+            let i = owner.incarnation.as_ref().ok_or(ReplacementError::OutcomeUnknown)?;
+            let actual = ExecutionTuple {harness:i.harness.clone(), model:i.model.clone(), reasoning:i.reasoning.clone()};
+            if owner.state != OwnerState::Active || owner.generation != started.reservation.generation
+                || !i.observed || !smoke_tuple(&actual) || actual != owner.requested
+                || i.pid != started.candidate.process.pid
+                || i.start_time != team_process::birth_micros(&started.candidate.process)?
+                || i.token_id != started.candidate.token_id
+                || i.thread_id != started.candidate.observed.thread_id {
+                return Err(ReplacementError::OutcomeUnknown);
+            }
+            Ok(ClaudeInboxProbe {team:team.into(), seat:seat.into(), generation:owner.generation, actual})
+        },
+    );
+    // Terminal failures receive the SAME finally as observation/kickoff
+    // failures. No retry and no detached worker hidden behind an error.
+    let cleanup_until = attempt.budget().cleanup_until();
+    let result = finish_inbox_probe(result, || attempt.finish_active(), ||
+        cleanup_native(home, team, &started.reservation, started.child.as_mut(), cleanup_until));
+    if result.is_err() { let _ = attempt.finish_unknown(); }
+    result
+}
+
+fn finish_inbox_probe<T>(result: Result<T, ReplacementError>,
+    finish: impl FnOnce() -> Result<(), ReplacementError>,
+    cleanup: impl FnOnce() -> Result<(), ReplacementError>) -> Result<T, ReplacementError> {
+    let result = result.and_then(|value| { finish()?; Ok(value) });
+    if result.is_err() { cleanup().map_err(|_| ReplacementError::StartCleanupUnverified)?; }
+    result
+}
+
+// Production sequence, tested with inert effects: activation failure cannot
+// submit input, and an uncertain submission cannot be repeated or readied.
+fn inbox_after_activation<T>(activate: impl FnOnce() -> Result<(), ReplacementError>,
+    kickoff: impl FnOnce() -> Result<(), ReplacementError>,
+    readback: impl FnOnce() -> Result<T, ReplacementError>) -> Result<T, ReplacementError> {
+    activate()?;
+    kickoff()?;
+    readback()
+}
+
+pub(crate) fn bootstrap_claude_smoke_authorized(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    expected_generation: u64, _sentinels: &[String],
+) -> Result<ClaudeSmokeDiagnostic, ReplacementError> {
+    let (plan, mut attempt, mut started) = start_claude_diagnostic(home, actor, team, seat, expected_generation)?;
     let NativePlan::ClaudeSmoke(_, admission) = &plan else { unreachable!() };
     // No prompt, kickoff or tool call. This is startup-only, never mission-ready.
     let observed = authorize_smoke(actor).and_then(|_| activate_native_checked(home, team, &started, &attempt, Some(actor), Some(admission)));
