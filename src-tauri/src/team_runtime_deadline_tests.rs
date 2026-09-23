@@ -531,3 +531,23 @@ fn smoke_terminal_is_distinct_and_not_a_reprepare_grant() {
     assert_ne!(FactKind::SmokeCleaned,FactKind::Ready);
     assert_ne!(FactKind::SmokeCleaned,FactKind::Failed);
 }
+
+#[test]
+fn stopped_recovery_requires_expired_effectful_matching_unfinished_attempt() {
+    for variant in ["valid","fresh","foreign","noeffects","success","wrongkind","unknown","reconciled"] {
+        let f=Fixture::new();let dir=f.0.join(".aperture/teams/t1/runtime-attempts/t1-worker/g0");ensure_private_dir(&dir).unwrap();
+        let mut a=Admission {schema_version:1,attempt_id:uuid::Uuid::new_v4().to_string(),team:"t1".into(),seat:"t1-worker".into(),old_generation:0,
+            admitted_at_ms:chrono::Utc::now().timestamp_millis()-200_000,native_budget_ms:170_000,cleanup_reserve_ms:40_000};
+        if variant=="fresh" {a.admitted_at_ms=chrono::Utc::now().timestamp_millis();}
+        if variant=="foreign" {a.team="t2".into();}
+        write_private_json_atomic(&dir.join("admitted.json"),&a,false).unwrap();
+        let fact=Fact {schema_version:1,attempt_id:a.attempt_id.clone(),kind:if variant=="wrongkind" {FactKind::Ready}else {FactKind::EffectsMayHaveOccurred}};
+        if variant!="noeffects" {write_private_json_atomic(&dir.join("effects.json"),&fact,false).unwrap();}
+        if variant=="success"||variant=="unknown" {
+            let t=Fact {schema_version:1,attempt_id:a.attempt_id.clone(),kind:if variant=="success" {FactKind::SmokeCleaned}else{FactKind::Unknown}};
+            write_private_json_atomic(&dir.join("terminal.json"),&t,false).unwrap();
+        }
+        if variant=="reconciled" {write_private_json_atomic(&dir.join("reconciled.json"),&fact,false).unwrap();}
+        assert_eq!(UnfinishedBootstrap::read_locked(&f.0,"t1","t1-worker").is_ok(),matches!(variant,"valid"|"unknown"),"{variant}");
+    }
+}

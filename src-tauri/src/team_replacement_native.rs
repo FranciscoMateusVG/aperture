@@ -227,6 +227,88 @@ pub(crate) struct ClaudeSmokeDiagnostic {
     pub(crate) actual: ExecutionTuple,
 }
 
+/// No caller proof and no reservation reconstruction. Owns the existing
+/// process-snapshot locks until revocation and the exact owner CAS complete.
+pub(crate) struct StoppedSmokeProof {
+    home: std::path::PathBuf,
+    team: String,
+    expected: OwnerRecord,
+    attempt: deadline::UnfinishedBootstrap,
+    guard: team_process::PersistedProcessSnapshot,
+}
+impl StoppedSmokeProof {
+    pub(crate) fn verified_owner(&self, root: &Path, actor: &AuthenticatedActor) -> Result<OwnerRecord, ReplacementError> {
+        authorize_smoke(actor)?;
+        if root != self.home.join(".aperture/run/owner") { return Err(ReplacementError::AuthorizationRequired); }
+        self.attempt.revalidate_locked(&self.home)?;
+        let current: OwnerRecord = read_private_json(&root.join(format!("{}.json", self.expected.seat)))
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if current != self.expected { return Err(ReplacementError::GenerationMismatch); }
+        crate::team_claude_observation::abandoned_attempt_matches_locked(&self.home, &self.team, &current)
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if self.guard.snapshot().processes.iter().any(|p| team_process::state(&p.identity) != ProcessState::Gone) {
+            return Err(ReplacementError::StopUnverified);
+        }
+        let i = current.incarnation.as_ref().ok_or(ReplacementError::OutcomeUnknown)?;
+        crate::ws_hub::managed_control::verify_floor(&self.home, &current.seat, current.generation, &i.token_id)?;
+        let token = self.home.join(".aperture/run/hub-tokens").join(format!("{}.token", current.seat));
+        if !matches!(std::fs::symlink_metadata(token), Err(e) if e.kind()==std::io::ErrorKind::NotFound) {
+            return Err(ReplacementError::RevocationUnverified);
+        }
+        Ok(current)
+    }
+}
+
+/// Explicit recovery of an already stopped, unobserved g1 diagnostic. Never
+/// signals, spawns, resets, fabricates a nonce or claims startup succeeded.
+pub(crate) fn reconcile_stopped_claude_smoke(home: &Path, actor: &AuthenticatedActor,
+    team: &str, seat: &str, generation: u64) -> Result<(), ReplacementError> {
+    authorize_smoke(actor)?;
+    if generation != 1 || crate::teams::managed_launch_enabled(&Harness::Claude)
+        || team.len() > 16 || !crate::agent_loader::is_valid_seat_name(team)
+        || !crate::agent_loader::is_valid_seat_name(seat) { return Err(ReplacementError::GenerationMismatch); }
+    let store = OwnerStore::new(home.join(".aperture/run/owner"));
+    let (before, attempt) = {
+        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team).map_err(|_| ReplacementError::NativeFailure)?;
+        let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
+        authorize_smoke(actor)?;
+        let before = store.read_owner_locked(seat).map_err(|_| ReplacementError::GenerationMismatch)?;
+        crate::team_claude_observation::abandoned_attempt_matches_locked(home, team, &before)
+            .map_err(|_| ReplacementError::GenerationMismatch)?;
+        let attempt = deadline::UnfinishedBootstrap::read_locked(home, team, seat)?;
+        (before, attempt)
+    };
+    // Fresh collection and exact CAS are the same substrate as native stop;
+    // recovery refuses any live/recycled/unreadable member before any mutation.
+    let until = Instant::now() + Duration::from_secs(30);
+    let snapshot = team_process::native::collect_native_until(home, team, seat, generation, until)?;
+    if snapshot.processes.iter().any(|p| team_process::state(&p.identity) != ProcessState::Gone) {
+        return Err(ReplacementError::StopUnverified);
+    }
+    authorize_smoke(actor)?;
+    if store.read_owner(seat).map_err(|_| ReplacementError::OutcomeUnknown)? != before {
+        return Err(ReplacementError::GenerationMismatch);
+    }
+    let guard = team_process::persist_for_stop(home, team, &AuthenticatedActor::launcher(), snapshot)?;
+    let expected = store.read_owner_locked(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    crate::team_claude_observation::abandoned_attempt_matches_locked(home, team, &expected)
+        .map_err(|_| ReplacementError::GenerationMismatch)?;
+    attempt.revalidate_locked(home)?;
+    authorize_smoke(actor)?;
+    crate::ws_hub::managed_control::revoke_stopped_before(home, &guard, until)?;
+    let proof = StoppedSmokeProof {home:home.into(), team:team.into(), expected, attempt, guard};
+    store.quarantine_reconciled_smoke(actor, &proof).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    // Same guard still owns both locks. Original UNKNOWN/absent terminal stays
+    // untouched; the recovery fact records stop/revocation, not smoke success.
+    proof.attempt.record_locked(home)?;
+    let owner = store.read_owner_locked(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    if owner.generation != generation || owner.state != OwnerState::Quarantined
+        || owner.reservation_nonce_sha256.is_some() || owner.provisional_token_id.is_some() {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    Ok(())
+}
+
 pub(crate) fn bootstrap_claude_smoke_authorized(
     home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
     expected_generation: u64, _sentinels: &[String],

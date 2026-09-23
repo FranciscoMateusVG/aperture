@@ -79,6 +79,53 @@ enum FactKind {
     Failed,
     Unknown,
     SmokeCleaned,
+    StoppedReconciled,
+}
+
+/// Read-only handle to an EXPIRED bootstrap, never a renewed RuntimeAttempt.
+/// Recovery preserves the original terminal (including UNKNOWN) and cannot
+/// mint an observation PASS or another start permit.
+pub(crate) struct UnfinishedBootstrap { dir: PathBuf, admission: Admission }
+impl UnfinishedBootstrap {
+    pub(crate) fn read_locked(home: &Path, team: &str, seat: &str) -> Result<Self, ReplacementError> {
+        let dir = home.join(".aperture/teams").join(team).join("runtime-attempts").join(seat).join("g0");
+        let a: Admission = read_private_json(&dir.join("admitted.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        let f: Fact = read_private_json(&dir.join("effects.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        if a.schema_version != 1 || a.team != team || a.seat != seat || a.old_generation != 0
+            || !crate::team_claude_launch::canonical_uuid(&a.attempt_id)
+            || a.native_budget_ms != 170_000 || a.cleanup_reserve_ms != 40_000
+            || a.admitted_at_ms <= 0 || a.admitted_at_ms.checked_add(180_000).is_none_or(|end| now <= end)
+            || f.schema_version != 1 || f.attempt_id != a.attempt_id || f.kind != FactKind::EffectsMayHaveOccurred {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        match std::fs::symlink_metadata(dir.join("terminal.json")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(_) => {
+                let t: Fact = read_private_json(&dir.join("terminal.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
+                if t.schema_version != 1 || t.attempt_id != a.attempt_id || t.kind != FactKind::Unknown {
+                    return Err(ReplacementError::OutcomeUnknown);
+                }
+            },
+            _ => return Err(ReplacementError::OutcomeUnknown),
+        }
+        if !matches!(std::fs::symlink_metadata(dir.join("reconciled.json")), Err(e) if e.kind()==std::io::ErrorKind::NotFound) {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        Ok(Self {dir, admission:a})
+    }
+    pub(crate) fn revalidate_locked(&self, home: &Path) -> Result<(), ReplacementError> {
+        let current = Self::read_locked(home, &self.admission.team, &self.admission.seat)?;
+        if current.admission != self.admission || current.dir != self.dir { return Err(ReplacementError::OutcomeUnknown); }
+        Ok(())
+    }
+    pub(crate) fn record_locked(&self, home: &Path) -> Result<(), ReplacementError> {
+        self.revalidate_locked(home)?;
+        let fact = Fact {schema_version:1, attempt_id:self.admission.attempt_id.clone(), kind:FactKind::StoppedReconciled};
+        write_private_json_atomic(&self.dir.join("reconciled.json"), &fact, false).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if read_private_json::<Fact>(&self.dir.join("reconciled.json")).map_err(|_| ReplacementError::OutcomeUnknown)? != fact { return Err(ReplacementError::OutcomeUnknown); }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

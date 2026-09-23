@@ -474,6 +474,23 @@ impl OwnerStore {
     /// Refresh the exact root+descendant identity set immediately before a
     /// launcher stop. No caller-supplied provenance is persisted, and no
     /// process may be signalled unless this CAS succeeds first.
+    pub(crate) fn quarantine_reconciled_smoke(
+        &self, actor: &AuthenticatedActor,
+        proof: &crate::team_replacement::native::StoppedSmokeProof,
+    ) -> Result<OwnerRecord, String> {
+        // The native-only proof owns both locks and rechecks process absence,
+        // exact attempt/owner identity, live GLaDOS authority and revoked token.
+        let mut record = proof.verified_owner(&self.root, actor)
+            .map_err(|_| "E_RECONCILIATION_INVALID: stopped diagnostic proof changed".to_string())?;
+        record.state = OwnerState::Quarantined;
+        record.reservation_nonce_sha256 = None;
+        record.provisional_token_id = None;
+        record.since = now();
+        record.writer = actor.principal().into();
+        self.write_unlocked(&record, true)?;
+        Ok(record)
+    }
+
     pub(crate) fn record_process_snapshot(
         &self,
         actor: &AuthenticatedActor,

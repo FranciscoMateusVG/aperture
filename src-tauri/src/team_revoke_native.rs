@@ -517,7 +517,7 @@ struct NativeRevocationFloor {
     revoked_through_generation: u64,
     revoked_token_ids: Vec<String>,
 }
-fn verify_floor(
+pub(crate) fn verify_floor(
     home: &Path,
     seat: &str,
     generation: u64,

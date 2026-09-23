@@ -589,6 +589,17 @@ pub struct ClaudeStartupSmokeView {
     pub public_enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReconciledClaudeStartupView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub owner_state: OwnerState,
+    pub startup: &'static str,
+    pub cleanup: &'static str,
+    pub public_enabled: bool,
+}
+
 /// Target selectors only. The authenticated lead's team, seat and generation
 /// are derived from the current canonical capability and never accepted here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,6 +629,7 @@ pub enum TeamControlRequest {
     BootstrapSeat(BootstrapSeatInput),
     StopSeat(StopSeatInput),
     ClaudeStartupSmoke(ClaudeStartupSmokeInput),
+    ReconcileClaudeStartup(ClaudeStartupSmokeInput),
     Approve(ActivateTeamInput),
     Cancel(CancelPendingInput),
     Checkpoint(WriteCheckpointInput),
@@ -640,6 +652,7 @@ pub enum TeamControlResponse {
     BootstrapSeat(BootstrapView),
     StopSeat(StopSeatView),
     ClaudeStartupSmoke(ClaudeStartupSmokeView),
+    ReconcileClaudeStartup(ReconciledClaudeStartupView),
     Approve(TeamView),
     Cancel(CancelPendingResult),
     Checkpoint(CheckpointReceipt),
@@ -2209,6 +2222,16 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
             claude_startup_smoke(&engine, &actor, input).map(TeamControlResponse::ClaudeStartupSmoke)
         }
+        TeamControlRequest::ReconcileClaudeStartup(input) => {
+            let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
+            crate::team_replacement::native::reconcile_stopped_claude_smoke(
+                &engine.paths.home, &actor, &input.team, &input.seat, input.expected_generation,
+            ).map_err(replacement_error)?;
+            Ok(TeamControlResponse::ReconcileClaudeStartup(ReconciledClaudeStartupView {
+                team:input.team, seat:input.seat, generation:input.expected_generation,
+                owner_state:OwnerState::Quarantined, startup:"not_verified", cleanup:"stopped_reconciled", public_enabled:false,
+            }))
+        }
         TeamControlRequest::StopSeat(input) => {
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
             stop_seat(&engine, &actor, input).map(TeamControlResponse::StopSeat)
@@ -2557,6 +2580,29 @@ mod tests {
             }
             assert_eq!(project_claude_startup_smoke(&input, d).unwrap_err().code, "E_CONTROL_UNKNOWN");
         }
+    }
+
+    #[test]
+    fn stopped_recovery_control_is_authenticated_strict_and_never_reports_startup_pass() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("claude-recovery-control"); let _env = EnvRestore::set(&home);
+        let request = r#"{"action":"reconcile_claude_startup","input":{"team":"smoke","seat":"smoke-qa","expected_generation":0}}"#;
+        assert_eq!(team_control_headless(request).unwrap_err().code,"E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        assert_eq!(team_control_headless(request).unwrap_err().code,"E_GENERATION_MISMATCH");
+        for key in ["actor","proof","pid","token","nonce","force","model"] {
+            let mut forged:serde_json::Value=serde_json::from_str(request).unwrap();
+            forged["input"][key]="forged".into();
+            assert!(serde_json::from_value::<TeamControlRequest>(forged).is_err());
+        }
+        let result=serde_json::to_value(TeamControlResponse::ReconcileClaudeStartup(ReconciledClaudeStartupView {
+            team:"smoke".into(),seat:"smoke-qa".into(),generation:1,owner_state:OwnerState::Quarantined,
+            startup:"not_verified",cleanup:"stopped_reconciled",public_enabled:false,
+        })).unwrap();
+        assert_eq!(result["result"]["startup"],"not_verified");
+        assert_eq!(result["result"]["owner_state"],"quarantined");
+        assert!(!home.join(".aperture/run/owner/smoke-qa.json").exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

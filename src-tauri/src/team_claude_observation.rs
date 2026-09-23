@@ -463,6 +463,23 @@ fn attempt_matches(a: &ClaudeAttempt, ctx: &Locked, team: &str) -> Result<(), Cl
     }
     Ok(())
 }
+/// Recovery only: caller holds canonical team and owner locks. This proves the
+/// durable attempt binding, NOT startup observation, liveness or a new permit.
+pub(crate) fn abandoned_attempt_matches_locked(home: &Path, team: &str, owner: &OwnerRecord) -> Result<(), ClaudeError> {
+    validate_owner(owner, &owner.seat, Some(1))?;
+    if owner.incarnation.as_ref().is_none_or(|i| i.observed) { return Err(ClaudeError::Owner); }
+    let (generation, hash) = snapshot(home, team, &owner.seat, &owner.requested)?;
+    let a: ClaudeAttempt = bounded_json(&runtime_path(home, &owner.seat, 1, "attempt"))?;
+    let i = owner.incarnation.as_ref().ok_or(ClaudeError::Owner)?;
+    if a.schema_version != 1 || a.team != team || a.seat != owner.seat || a.generation != 1
+        || a.team_generation != generation || a.snapshot_sha256 != hash
+        || Some(a.reservation_nonce_sha256.as_str()) != owner.reservation_nonce_sha256.as_deref()
+        || a.token_id != i.token_id || a.root_pid != i.pid || a.root_start_time_us != i.start_time
+        || a.requested_model != owner.requested.model || !canonical_uuid(&a.session_id) {
+        return Err(ClaudeError::Owner);
+    }
+    Ok(())
+}
 /// Launcher-only in-memory reservation. Called AFTER candidate ownership is
 /// durable and BEFORE releasing the harness gate; no PID/session from a DTO.
 pub(crate) fn record_attempt(

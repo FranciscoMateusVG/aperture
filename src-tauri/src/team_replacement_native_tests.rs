@@ -808,3 +808,86 @@ fn smoke_finally_runs_once_on_success_auth_drift_and_observation_failure() {
         }
     }
 }
+
+// Recovery fixtures never launch a harness or call the hub. The PID is beyond
+// the native allocation range; native absence is nevertheless checked.
+fn stopped_recovery_fixture(f: &Fixture) -> (AuthenticatedActor, StoppedSmokeProof) {
+    let actor = smoke_fixture(f);
+    let store = OwnerStore::new(f.0.join(".aperture/run/owner"));
+    let launcher = AuthenticatedActor::launcher();
+    let tuple = ExecutionTuple {harness:Harness::Claude,model:"claude-sonnet-5".into(),reasoning:None};
+    let res = store.reserve_start(&launcher,"t1-worker",0,tuple.clone()).unwrap();
+    store.bind_and_publish_token(&launcher,&res,"a".repeat(64),||Ok(())).unwrap();
+    let pid=2_000_000_001; let birth=1_790_000_000_000_001;
+    store.record_start_candidate(&launcher,&res,Incarnation {pid,start_time:birth,
+        thread_id:String::new(),token_id:"a".repeat(64),harness:Harness::Claude,
+        model:tuple.model,reasoning:None,observed:false,
+        processes:vec![crate::owner::ProcessIdentity {pid,start_time:birth,ppid:1,pgid:pid,
+            cmdline_sha256:"b".repeat(64),cwd:"/fixture".into()}]}).unwrap();
+    let owner=store.read_owner("t1-worker").unwrap();
+    let snapshot_hash={use sha2::{Digest,Sha256};format!("{:x}",Sha256::digest(std::fs::read(f.0.join(".aperture/teams/t1/team.json")).unwrap()))};
+    f.write(".aperture/run/t1-worker.g1.claude-attempt.json",&serde_json::json!({
+        "schema_version":1,"team":"t1","seat":"t1-worker","generation":1,
+        "reservation_nonce_sha256":owner.reservation_nonce_sha256,"snapshot_sha256":snapshot_hash,
+        "team_generation":1,"token_id":"a".repeat(64),"root_pid":pid,"root_start_time_us":birth,
+        "session_id":uuid::Uuid::new_v4().to_string(),"requested_model":"claude-sonnet-5","created_at_ms":1}));
+    let id=uuid::Uuid::new_v4().to_string();
+    f.write(".aperture/teams/t1/runtime-attempts/t1-worker/g0/admitted.json",&serde_json::json!({
+        "schema_version":1,"attempt_id":id,"team":"t1","seat":"t1-worker","old_generation":0,
+        "admitted_at_ms":chrono::Utc::now().timestamp_millis()-200_000,"native_budget_ms":170_000,"cleanup_reserve_ms":40_000}));
+    f.write(".aperture/teams/t1/runtime-attempts/t1-worker/g0/effects.json",&serde_json::json!({
+        "schema_version":1,"attempt_id":id,"kind":"effects_may_have_occurred"}));
+    let attempt=deadline::UnfinishedBootstrap::read_locked(&f.0,"t1","t1-worker").unwrap();
+    let mut s=snapshot();s.thread_id.clear();s.processes[0].identity=team_process::identity_from_owner(pid,birth).unwrap();
+    s.processes[0].process_group=pid;s.processes[0].cmdline_sha256="b".repeat(64);
+    let guard=team_process::persist_for_stop(&f.0,"t1",&launcher,s).unwrap();
+    let expected=store.read_owner_locked("t1-worker").unwrap();
+    f.write(".aperture/run/revocations/t1-worker.json",&revoked_value());
+    (actor,StoppedSmokeProof {home:f.0.clone(),team:"t1".into(),expected,attempt,guard})
+}
+#[test]
+fn recovery_quarantines_exact_stopped_owner_without_observation_reset_or_new_start() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);
+    let (actor,p)=stopped_recovery_fixture(&f);
+    let store=OwnerStore::new(f.0.join(".aperture/run/owner"));
+    let original=p.expected.clone();
+    let result=store.quarantine_reconciled_smoke(&actor,&p).unwrap();
+    assert_eq!(result.state,OwnerState::Quarantined);assert_eq!(result.generation,1);
+    assert_eq!(result.incarnation,original.incarnation);assert!(!result.incarnation.unwrap().observed);
+    assert!(result.provisional_token_id.is_none());assert!(result.reservation_nonce_sha256.is_none());
+    p.attempt.record_locked(&f.0).unwrap();
+    let dir=f.0.join(".aperture/teams/t1/runtime-attempts/t1-worker/g0");
+    assert!(!dir.join("terminal.json").exists());
+    let fact:serde_json::Value=read_private_json(&dir.join("reconciled.json")).unwrap();
+    assert_eq!(fact["kind"],"stopped_reconciled");
+    assert!(store.quarantine_reconciled_smoke(&actor,&p).is_err());
+    assert!(!f.0.join(".aperture/run/managed").exists());
+}
+#[test]
+fn recovery_proof_rejects_drift_and_missing_revocation_without_owner_write() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for kind in ["actor","owner","attempt","floor","token","snapshot","active"] {
+        let f=Fixture::new();let _env=SmokeEnv::set(&f);let (actor,p)=stopped_recovery_fixture(&f);
+        match kind {
+            "actor"=>write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/glados.token"),b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",true).unwrap(),
+            "owner"|"active"=>{let mut o=p.expected.clone(); if kind=="owner" {o.generation=2;} else {o.state=OwnerState::Active;}
+                f.write(".aperture/run/owner/t1-worker.json",&serde_json::to_value(o).unwrap());},
+            "attempt"=>f.write(".aperture/run/t1-worker.g1.claude-attempt.json",&serde_json::json!({})),
+            "floor"=>std::fs::remove_file(f.0.join(".aperture/run/revocations/t1-worker.json")).unwrap(),
+            "token"=>write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/t1-worker.token"),b"not-revoked",false).unwrap(),
+            "snapshot"=>{let mut s:TeamSnapshot=read_private_json(&f.0.join(".aperture/teams/t1/team.json")).unwrap();s.mission="changed".into();f.write(".aperture/teams/t1/team.json",&serde_json::to_value(s).unwrap());},
+            _=>unreachable!(),
+        }
+        let path=f.0.join(".aperture/run/owner/t1-worker.json");let before=std::fs::read(&path).unwrap();
+        assert!(OwnerStore::new(f.0.join(".aperture/run/owner")).quarantine_reconciled_smoke(&actor,&p).is_err(),"{kind}");
+        assert_eq!(std::fs::read(path).unwrap(),before);
+    }
+}
+#[test]
+fn recovery_entry_rejects_non_glados_and_non_diagnostic_selectors_before_effects() {
+    let f=Fixture::new();
+    for actor in [AuthenticatedActor::operator_ui(),AuthenticatedActor::launcher()] {
+        assert_eq!(reconcile_stopped_claude_smoke(&f.0,&actor,"t1","t1-worker",1),Err(ReplacementError::AuthorizationRequired));
+    }
+    assert_eq!(std::fs::read_dir(&f.0).unwrap().count(),0);
+}
