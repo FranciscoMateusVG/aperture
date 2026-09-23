@@ -7,6 +7,19 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const MODEL: &str = "claude-sonnet-5";
 pub(crate) const WINDOW_MS: i64 = 85_000;
+/// Native plan policy, never a DTO/env/stdin override. Omitted old records remain
+/// diagnostic/pre-input and serialize identically, preserving historical hashes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClaudeLaunchMode {
+    #[default]
+    DiagnosticPreinput,
+    NormalPositional,
+}
+impl ClaudeLaunchMode {
+    fn is_diagnostic(&self) -> bool { *self == Self::DiagnosticPreinput }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeError {
     Invalid,
@@ -69,6 +82,7 @@ fn shell_atom(value: &str) -> Result<String, ClaudeError> {
 /// This plan is never Deserialize: no worker path/session/model authority.
 /// The fixed helper is supplied by the native installation binding, not a DTO.
 pub(crate) struct ClaudeLaunchPlan {
+    mode: ClaudeLaunchMode,
     pub(crate) session_id: String,
     pub(crate) settings_path: PathBuf,
     pub(crate) mcp_path: PathBuf,
@@ -76,6 +90,22 @@ pub(crate) struct ClaudeLaunchPlan {
     pub(crate) settings: serde_json::Value,
 }
 impl ClaudeLaunchPlan {
+    fn for_mode(home: &Path, team: &str, seat: &str, generation: u64,
+        tuple: &ExecutionTuple, helper: &Path, mode: ClaudeLaunchMode) -> Result<Self, ClaudeError> {
+        let mut plan = Self::new(home, team, seat, generation, tuple, helper)?;
+        plan.mode = mode;
+        if mode == ClaudeLaunchMode::NormalPositional {
+            plan.argv.push(crate::launcher::KICKOFF_TEXT.into());
+        }
+        Ok(plan)
+    }
+    fn append_system_prompt(&mut self, path: &Path) {
+        // Keep the existing standing kickoff as exactly one final positional
+        // argv item. Do not reuse the standing permission-bypass flag.
+        let at = self.argv.len() - usize::from(self.mode == ClaudeLaunchMode::NormalPositional);
+        self.argv.splice(at..at, ["--append-system-prompt-file".into(), path.to_string_lossy().into_owned()]);
+    }
+
     pub(crate) fn new(
         home: &Path,
         team: &str,
@@ -118,6 +148,7 @@ impl ClaudeLaunchPlan {
             mcp_path.to_str().ok_or(ClaudeError::Unsafe)?.into(),
         ];
         Ok(Self {
+            mode: ClaudeLaunchMode::DiagnosticPreinput,
             session_id,
             settings_path,
             mcp_path,
@@ -145,6 +176,8 @@ pub(crate) struct ClaudeAttempt {
     pub(crate) session_id: String,
     pub(crate) requested_model: String,
     pub(crate) created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "ClaudeLaunchMode::is_diagnostic")]
+    pub(crate) mode: ClaudeLaunchMode,
 }
 
 #[cfg(test)]
@@ -200,6 +233,24 @@ mod tests {
             Path::new("/fixture/.aperture/run/managed/t1-lead/g1/claude-settings.json")
         );
         assert!(a.mcp_path.ends_with("claude-mcp.json"));
+    }
+    #[test]
+    fn normal_plan_reuses_one_standing_positional_prompt_without_permission_bypass() {
+        let mut normal = ClaudeLaunchPlan::for_mode(Path::new("/fixture"), "t1", "t1-lead", 1,
+            &tuple(), Path::new("/installed/aperture-boot"), ClaudeLaunchMode::NormalPositional).unwrap();
+        normal.append_system_prompt(Path::new("/fixture/prompt.md"));
+        assert_eq!(normal.argv.last().unwrap(), crate::launcher::KICKOFF_TEXT);
+        assert_eq!(normal.argv.iter().filter(|a| a.as_str() == crate::launcher::KICKOFF_TEXT).count(), 1);
+        assert_eq!(normal.argv.len(), 12);
+        assert_eq!(&normal.argv[9..11], ["--append-system-prompt-file", "/fixture/prompt.md"]);
+        for flag in ["--dangerously-skip-permissions", "--resume", "--continue", "--fork-session", "--fallback-model"] {
+            assert!(!normal.argv.iter().any(|a| a == flag));
+        }
+        let mut diagnostic = ClaudeLaunchPlan::new(Path::new("/fixture"), "t1", "t1-lead", 1,
+            &tuple(), Path::new("/installed/aperture-boot")).unwrap();
+        diagnostic.append_system_prompt(Path::new("/fixture/prompt.md"));
+        assert_eq!(diagnostic.argv.len(), 11);
+        assert!(!diagnostic.argv.iter().any(|a| a == crate::launcher::KICKOFF_TEXT));
     }
     #[test]
     fn alias_codex_reasoning_and_bad_selectors_are_not_authority() {
@@ -323,6 +374,7 @@ fn active_team(home: &Path, team: &str, seat: &str) -> Result<TeamSnapshot, Clau
 /// Fixed-path native material, never a command DTO and never Debug. The caller
 /// supplies only a BoundRepository already resolved by immutable team policy.
 pub(crate) struct ClaudeBinding {
+    mode: ClaudeLaunchMode,
     home: PathBuf,
     team: String,
     seat: String,
@@ -343,6 +395,15 @@ pub(crate) struct ClaudeBinding {
     recovery: Option<crate::team_checkpoint::CheckpointPayload>,
 }
 impl ClaudeBinding {
+    /// Normal lifecycle only; diagnostic callers retain `preflight` below.
+    pub(crate) fn preflight_normal(home: &Path, team: &str, seat: &str,
+        tuple: &ExecutionTuple, repo: &repository::BoundRepository,
+        worktree: Option<&str>, budget: &Deadline) -> Result<Self, ClaudeError> {
+        let mut binding = Self::preflight(home, team, seat, tuple, repo, worktree, budget)?;
+        binding.mode = ClaudeLaunchMode::NormalPositional;
+        Ok(binding)
+    }
+
     pub(crate) fn preflight(
         home: &Path,
         team: &str,
@@ -458,6 +519,7 @@ impl ClaudeBinding {
             return Err(ClaudeError::Unsafe);
         }
         Ok(Self {
+            mode: ClaudeLaunchMode::DiagnosticPreinput,
             home: home.into(),
             team: team.into(),
             seat: seat.into(),
@@ -595,13 +657,14 @@ impl ClaudeBinding {
             _ => return Err(ClaudeError::Closed),
         }
         ensure_private_dir(&dest).map_err(|_| ClaudeError::Unsafe)?;
-        let plan = ClaudeLaunchPlan::new(
+        let mut plan = ClaudeLaunchPlan::for_mode(
             &self.home,
             &self.team,
             &self.seat,
             res.generation,
             &self.tuple,
             &self.helper,
+            self.mode,
         )?;
         let mut prompt = private_bytes(&self.runtime.join("prompt.md"), PRIVATE_CAP)?;
         let resident = private_bytes(&self.runtime.join("resident.txt"), 8192)?;
@@ -676,11 +739,8 @@ impl ClaudeBinding {
         mcp.take();
         write_private_json_atomic(&plan.settings_path, &plan.settings, false)
             .map_err(|_| ClaudeError::Unsafe)?;
-        let mut args = plan.argv.clone();
-        args.extend([
-            "--append-system-prompt-file".into(),
-            prompt_path.to_string_lossy().into_owned(),
-        ]);
+        plan.append_system_prompt(&prompt_path);
+        let args = plan.argv.clone();
         let mut record = LaunchRecord {
             schema_version: 1,
             team: self.team.clone(),
@@ -702,6 +762,7 @@ impl ClaudeBinding {
             args,
             pins: self.pins.clone(),
             private_pins: BTreeMap::new(),
+            mode: self.mode,
         };
         for p in [&plan.settings_path, &plan.mcp_path, &prompt_path] {
             record
@@ -737,6 +798,8 @@ struct LaunchRecord {
     args: Vec<String>,
     pins: BTreeMap<PathBuf, String>,
     private_pins: BTreeMap<PathBuf, String>,
+    #[serde(default, skip_serializing_if = "ClaudeLaunchMode::is_diagnostic")]
+    mode: ClaudeLaunchMode,
 }
 pub(crate) struct PublishedClaude {
     home: PathBuf,
@@ -1043,7 +1106,7 @@ fn validate_record_at(
         return Err(ClaudeError::Owner);
     }
     let base = generation_dir(home, &r.seat, r.generation);
-    let mut plan = ClaudeLaunchPlan::new(
+    let mut plan = ClaudeLaunchPlan::for_mode(
         home,
         &r.team,
         &r.seat,
@@ -1054,14 +1117,12 @@ fn validate_record_at(
             reasoning: None,
         },
         &r.helper,
+        r.mode,
     )?;
     // Only the native attempt's preallocated UUID is allowed. The rest of argv
     // is rederived; a private malformed record cannot add flags/initial input.
     plan.argv[3] = r.session_id.clone();
-    plan.argv.extend([
-        "--append-system-prompt-file".into(),
-        base.join("prompt.md").to_string_lossy().into_owned(),
-    ]);
+    plan.append_system_prompt(&base.join("prompt.md"));
     if plan.argv != r.args {
         return Err(ClaudeError::Invalid);
     }
@@ -1260,6 +1321,7 @@ impl PublishedClaude {
     }
 }
 impl PendingClaude {
+    pub(crate) fn launch_mode(&self) -> ClaudeLaunchMode { self.published.record.mode }
     pub(crate) fn session_id(&self) -> &str {
         self.published.session_id()
     }
@@ -1292,7 +1354,8 @@ impl PendingClaude {
     }
 
     /// Lifecycle caller has already durably bound this exact candidate and
-    /// written its UUID attempt. No send-keys/prompt or harness input here.
+    /// written its UUID/mode attempt. No send-keys here; NORMAL argv carries
+    /// the fixed first prompt only after the durable candidate gate is released.
     pub(crate) fn release(
         &self,
         res: &StartReservation,
@@ -1313,7 +1376,8 @@ impl PendingClaude {
             &r.seat,
             r.generation,
             |a| {
-                if a.session_id != r.session_id
+                if a.mode != r.mode
+                    || a.session_id != r.session_id
                     || a.token_id != r.token_id
                     || a.root_pid != self.process.pid
                     || a.root_start_time_us != self.process.start_time
@@ -1402,6 +1466,7 @@ fn validate_release(
         || release.root_pid != pid
         || release.root_pid != a.root_pid
         || release.root_start_time_us != a.root_start_time_us
+        || a.mode != r.mode
         || a.team != r.team
         || a.seat != r.seat
         || a.generation != r.generation
@@ -1507,6 +1572,7 @@ mod gate_tests {
             args: plan.argv,
             pins: BTreeMap::new(),
             private_pins: BTreeMap::new(),
+            mode: ClaudeLaunchMode::DiagnosticPreinput,
         };
         let a = ClaudeAttempt {
             schema_version: 1,
@@ -1522,6 +1588,7 @@ mod gate_tests {
             session_id: r.session_id.clone(),
             requested_model: MODEL.into(),
             created_at_ms: 1,
+            mode: ClaudeLaunchMode::DiagnosticPreinput,
         };
         let release = GateRelease {
             schema_version: 1,
@@ -1531,6 +1598,26 @@ mod gate_tests {
             root_start_time_us: a.root_start_time_us,
         };
         (r, a, release)
+    }
+    #[test]
+    fn old_private_facts_keep_bytes_and_default_preinput_while_normal_mode_is_bound() {
+        let (mut r, mut a, mut release) = fixture();
+        let old_record = serde_json::to_vec(&r).unwrap();
+        let old_attempt = serde_json::to_vec(&a).unwrap();
+        assert!(serde_json::to_value(&r).unwrap().get("mode").is_none());
+        assert!(serde_json::to_value(&a).unwrap().get("mode").is_none());
+        assert_eq!(serde_json::to_vec(&serde_json::from_slice::<LaunchRecord>(&old_record).unwrap()).unwrap(), old_record);
+        assert_eq!(serde_json::to_vec(&serde_json::from_slice::<ClaudeAttempt>(&old_attempt).unwrap()).unwrap(), old_attempt);
+        r.mode = ClaudeLaunchMode::NormalPositional;
+        release.launch_sha256 = record_sha(&r).unwrap();
+        // Recomputing a launch digest cannot silently promote a diagnostic attempt.
+        assert_eq!(validate_release(&r, &a, &release, a.root_pid), Err(ClaudeError::Owner));
+        a.mode = ClaudeLaunchMode::NormalPositional;
+        release.attempt_sha256 = digest(&serde_json::to_vec(&a).unwrap());
+        assert!(validate_release(&r, &a, &release, a.root_pid).is_ok());
+        assert_ne!(serde_json::to_vec(&a).unwrap(), old_attempt);
+        let mut bad = serde_json::to_value(&a).unwrap(); bad["mode"] = serde_json::json!("caller_override");
+        assert!(serde_json::from_value::<ClaudeAttempt>(bad).is_err());
     }
     #[test]
     fn gate_release_binds_every_native_identity_and_both_private_artifacts() {
@@ -1806,6 +1893,23 @@ mod publication_tests {
             .unwrap()
             .incarnation
             .is_none());
+    }
+    #[test]
+    fn native_normal_publication_rederives_positional_argv_and_denies_mode_or_prompt_drift() {
+        let f = Fixture::new();
+        let mut binding = f.binding().unwrap();
+        binding.mode = ClaudeLaunchMode::NormalPositional;
+        let (r, t) = f.reservation();
+        let mut published = binding.publish_with_password(&r, &t, &Deadline::new(), "").unwrap();
+        assert_eq!(published.record.mode, ClaudeLaunchMode::NormalPositional);
+        assert_eq!(published.record.args.last().unwrap(), crate::launcher::KICKOFF_TEXT);
+        validate_record_at(&f.home, &published.record, &Deadline::new(), &f.infra).unwrap();
+        published.record.mode = ClaudeLaunchMode::DiagnosticPreinput;
+        assert!(matches!(validate_record_at(&f.home, &published.record, &Deadline::new(), &f.infra), Err(ClaudeError::Invalid)));
+        published.record.mode = ClaudeLaunchMode::NormalPositional;
+        *published.record.args.last_mut().unwrap() = "caller supplied mission".into();
+        assert!(matches!(validate_record_at(&f.home, &published.record, &Deadline::new(), &f.infra), Err(ClaudeError::Invalid)));
+        assert!(!generation_dir(&f.home, "t1-worker", 1).join("claude-spawn.json").exists());
     }
     #[test]
     fn native_publication_is_private_no_replace_and_uses_absolute_node_for_both_mcps() {

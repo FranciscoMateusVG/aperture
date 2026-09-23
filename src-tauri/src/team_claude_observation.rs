@@ -1,13 +1,14 @@
-//! Claude pre-input observation boundary. Status-line stdin contributes only the
+//! Claude real model/session observation boundary (diagnostic pre-input by default). Status-line stdin contributes only the
 //! documented model/session/pre-input fields; all runtime authority is native.
 use crate::state::{ExecutionTuple, Harness};
-use crate::team_claude_launch::{canonical_uuid, ClaudeAttempt, ClaudeError, MODEL, WINDOW_MS};
+use crate::team_claude_launch::{canonical_uuid, ClaudeAttempt, ClaudeError, ClaudeLaunchMode, MODEL, WINDOW_MS};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
 const SAMPLE_CAP: u64 = 64 * 1024;
 /// Projected payload, never deserialized as a runtime receipt or owner proof.
 struct StartupSample {
+    preinput: bool,
     session_id: String,
     model: String,
 }
@@ -37,28 +38,22 @@ fn sample(reader: impl Read) -> Result<StartupSample, ClaudeError> {
         "root_start_time_us",
         "observed_at_ms",
         "authenticated",
+        "mode",
+        "launch_mode",
+        "observation_policy",
     ] {
         if object.contains_key(forbidden) {
             return Err(ClaudeError::Invalid);
         }
     }
-    if object.contains_key("prompt_id") || object.contains_key("prompt_cache") {
-        return Err(ClaudeError::PostInput);
-    }
-    let context = value
-        .get("context_window")
-        .and_then(|v| v.as_object())
-        .ok_or(ClaudeError::PostInput)?;
-    if context.get("current_usage") != Some(&serde_json::Value::Null) {
-        return Err(ClaudeError::PostInput);
-    }
-    for field in ["total_input_tokens", "total_output_tokens"] {
-        if let Some(v) = context.get(field) {
-            if v.as_u64() != Some(0) {
-                return Err(ClaudeError::PostInput);
-            }
-        }
-    }
+    // Project only a predicate: private native attempt policy decides whether
+    // pre-input is required. Never retain prompt/tool/context contents.
+    let preinput = !object.contains_key("prompt_id") && !object.contains_key("prompt_cache")
+        && value.get("context_window").and_then(|v| v.as_object()).is_some_and(|context| {
+            context.get("current_usage") == Some(&serde_json::Value::Null)
+                && ["total_input_tokens", "total_output_tokens"].iter().all(|f|
+                    context.get(*f).is_none_or(|v| v.as_u64() == Some(0)))
+        });
     let version = value
         .get("version")
         .and_then(|v| v.as_str())
@@ -97,6 +92,7 @@ fn sample(reader: impl Read) -> Result<StartupSample, ClaudeError> {
         return Err(ClaudeError::Model);
     }
     Ok(StartupSample {
+        preinput,
         session_id: session.into(),
         model: model.into(),
     })
@@ -124,6 +120,9 @@ fn project(
     input: StartupSample,
     now: i64,
 ) -> Result<ClaudeReceipt, ClaudeError> {
+    if attempt.mode == ClaudeLaunchMode::DiagnosticPreinput && !input.preinput {
+        return Err(ClaudeError::PostInput);
+    }
     if attempt.schema_version != 1
         || attempt.requested_model != MODEL
         || attempt.session_id != input.session_id
@@ -168,7 +167,9 @@ mod tests {
         serde_json::json!({"version":"2.1.263","session_id":uuid::Uuid::new_v4().to_string(),"model":{"id":MODEL},"context_window":{"current_usage":null,"total_input_tokens":0,"total_output_tokens":0}})
     }
     fn parse(v: &serde_json::Value) -> Result<StartupSample, ClaudeError> {
-        sample(serde_json::to_vec(v).unwrap().as_slice())
+        let input = sample(serde_json::to_vec(v).unwrap().as_slice())?;
+        if !input.preinput { return Err(ClaudeError::PostInput); }
+        Ok(input)
     }
     fn attempt(v: &serde_json::Value) -> ClaudeAttempt {
         ClaudeAttempt {
@@ -185,6 +186,33 @@ mod tests {
             session_id: v["session_id"].as_str().unwrap().into(),
             requested_model: MODEL.into(),
             created_at_ms: 1000,
+            mode: ClaudeLaunchMode::DiagnosticPreinput,
+        }
+    }
+    #[test]
+    fn normal_accepts_real_statusline_pre_or_post_input_but_diagnostic_never_does() {
+        for post_input in [false, true] {
+            let mut v = input();
+            if post_input {
+                v["prompt_id"] = serde_json::json!("synthetic-first-input");
+                v["prompt_cache"] = serde_json::json!({});
+                v["context_window"]["current_usage"] = serde_json::json!({"input_tokens":12});
+                v["context_window"]["total_input_tokens"] = serde_json::json!(12);
+            }
+            let mut a = attempt(&v);
+            assert_eq!(project(&a, sample(serde_json::to_vec(&v).unwrap().as_slice()).unwrap(), 1001).is_ok(), !post_input);
+            a.mode = ClaudeLaunchMode::NormalPositional;
+            let receipt = project(&a, sample(serde_json::to_vec(&v).unwrap().as_slice()).unwrap(), 1001).unwrap();
+            assert_eq!(receipt.actual().unwrap().model, MODEL);
+            assert_eq!(receipt.actual().unwrap().reasoning, None);
+            let mut wrong = v.clone(); wrong["session_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+            assert!(project(&a, sample(serde_json::to_vec(&wrong).unwrap().as_slice()).unwrap(), 1001).is_err());
+            wrong["model"]["id"] = serde_json::json!("sonnet");
+            assert!(sample(serde_json::to_vec(&wrong).unwrap().as_slice()).is_err());
+        }
+        for field in ["mode", "launch_mode", "observation_policy"] {
+            let mut v = input(); v[field] = serde_json::json!("normal_positional");
+            assert!(matches!(sample(serde_json::to_vec(&v).unwrap().as_slice()), Err(ClaudeError::Invalid)));
         }
     }
     #[test]
@@ -492,12 +520,14 @@ pub(crate) fn record_attempt(
     team: &str,
     reservation: &StartReservation,
     session_uuid: &str,
+    mode: ClaudeLaunchMode,
 ) -> Result<(), ClaudeError> {
     record_checked(
         home,
         team,
         reservation,
         session_uuid,
+        mode,
         &team_process::state,
         chrono::Utc::now().timestamp_millis(),
     )
@@ -507,6 +537,7 @@ fn record_checked(
     team: &str,
     reservation: &StartReservation,
     session_uuid: &str,
+    mode: ClaudeLaunchMode,
     state: &impl Fn(&ProcessIdentity) -> ProcessState,
     now: i64,
 ) -> Result<(), ClaudeError> {
@@ -540,6 +571,7 @@ fn record_checked(
         session_id: session_uuid.into(),
         requested_model: o.requested.model.clone(),
         created_at_ms: now,
+        mode,
     };
     write_private_json_atomic(
         &runtime_path(home, &o.seat, o.generation, "attempt"),
@@ -643,7 +675,7 @@ fn write_checked(
     current(home, team, &ctx, state)?;
     ancestry(&root, pid, observe)?;
     // The first ancestry/owner-authenticated payload closes the window even
-    // when malformed, post-input or mismatched. A later good sample cannot
+    // when malformed, diagnostic post-input or mismatched. A later good sample cannot
     // erase the failed attempt. Never retain raw payload in rejection facts.
     match projected {
         Ok(receipt) => write_private_json_atomic(&observed_path, &receipt, false)
@@ -744,7 +776,8 @@ mod native_tests {
         now: i64,
     }
     impl Fixture {
-        fn new() -> Self {
+        fn new() -> Self { Self::new_in_mode(ClaudeLaunchMode::DiagnosticPreinput) }
+        fn new_in_mode(mode: ClaudeLaunchMode) -> Self {
             let home = std::env::temp_dir().join(format!(
                 "aperture-claude-observation-{}",
                 uuid::Uuid::new_v4()
@@ -807,6 +840,7 @@ mod native_tests {
                 "t1",
                 &f.reservation,
                 &f.session,
+                mode,
                 &|_| ProcessState::Same,
                 f.now,
             )
@@ -874,6 +908,34 @@ mod native_tests {
         }
     }
     #[test]
+    fn native_normal_postinput_receipt_still_requires_real_observation_before_active() {
+        let f = Fixture::new_in_mode(ClaudeLaunchMode::NormalPositional);
+        let actor = AuthenticatedActor::launcher();
+        assert!(f.store.commit_start(&actor, &f.reservation).is_err());
+        let mut input = f.input(); input["prompt_id"] = json!("synthetic-input");
+        input["context_window"]["current_usage"] = json!({"input_tokens":5});
+        f.write_value(input).unwrap();
+        let observed = f.read().unwrap().into_runtime_observation();
+        assert_eq!(observed.thread_id, f.session);
+        assert!(!f.owner().incarnation.as_ref().unwrap().observed);
+        assert_eq!(f.owner().state, OwnerState::Starting);
+        f.store.record_runtime_observation(&actor, &f.reservation, observed).unwrap();
+        f.store.commit_start(&actor, &f.reservation).unwrap();
+        assert_eq!(f.owner().state, OwnerState::Active);
+        assert!(matches!(f.write(), Err(ClaudeError::Owner)));
+    }
+    #[test]
+    fn observation_hash_rejects_private_mode_drift_and_stdin_cannot_select_normal() {
+        let f = Fixture::new(); f.write().unwrap();
+        f.alter("attempt", "mode", json!("normal_positional"));
+        assert!(matches!(f.read(), Err(ClaudeError::Invalid)));
+        let f = Fixture::new(); let mut input=f.input();
+        input["mode"] = json!("normal_positional"); input["prompt_id"] = json!("synthetic-input");
+        assert!(matches!(f.write_value(input), Err(ClaudeError::Invalid)));
+        assert!(!f.path("observation").exists());
+        assert!(!f.owner().incarnation.unwrap().observed);
+    }
+    #[test]
     fn native_first_receipt_is_append_only_and_shared_owner_cas_retains_literal_none() {
         let f = Fixture::new();
         let before = f.owner();
@@ -886,6 +948,7 @@ mod native_tests {
             "t1",
             &f.reservation,
             &uuid::Uuid::new_v4().to_string(),
+            ClaudeLaunchMode::DiagnosticPreinput,
             &|_| ProcessState::Same,
             f.now
         )
