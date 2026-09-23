@@ -1372,7 +1372,7 @@ pub(crate) fn gate_native(
     let budget = Deadline::new();
     validate_record(home, &r, &budget)?;
     let release: GateRelease = read_private_json(&path).map_err(|_| ClaudeError::Unsafe)?;
-    let mut cmd = gate_command(home, &r);
+    let mut cmd = gate_command(home, &r)?;
     crate::team_claude_observation::with_gated_attempt(home, team, seat, generation, |a| {
         validate_release(&r, a, &release, std::process::id())?;
         if Instant::now() > until {
@@ -1413,12 +1413,45 @@ fn validate_release(
     }
     Ok(())
 }
-fn gate_command(home: &Path, r: &LaunchRecord) -> Command {
+/// Claude's macOS credential lookup requires the login name even when HOME is
+/// correct. Derive it from the effective OS identity, never inherited USER or a
+/// caller field. This selects existing storage; it does not read credentials.
+fn native_login_name() -> Result<String, ClaudeError> {
+    let uid = unsafe { libc::geteuid() };
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || entry.pw_uid != uid || entry.pw_name.is_null() {
+        return Err(ClaudeError::Unsafe);
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+        .to_str()
+        .map_err(|_| ClaudeError::Unsafe)?;
+    if name.is_empty()
+        || name.len() > 256
+        || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return Err(ClaudeError::Unsafe);
+    }
+    Ok(name.to_owned())
+}
+fn gate_command(home: &Path, r: &LaunchRecord) -> Result<Command, ClaudeError> {
+    let username = native_login_name()?;
     let mut cmd = Command::new(&r.executable);
     cmd.args(&r.args)
         .current_dir(&r.cwd)
         .env_clear()
         .env("HOME", home)
+        .env("USER", username)
         .env(
             "PATH",
             format!(
@@ -1435,7 +1468,7 @@ fn gate_command(home: &Path, r: &LaunchRecord) -> Command {
         .env("APERTURE_HUB_TOKEN_FILE", home.join(".aperture/run/hub-tokens").join(format!("{}.token", r.seat)))
         .env("APERTURE_TEAM_GENERATION", r.generation.to_string())
         .env(crate::team_claude_inbox::MANAGED_HUB_CLIENT_ENV, Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("native repo parent").join("mcp-server/dist/hub-client.js"));
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -1524,7 +1557,7 @@ mod gate_tests {
     #[test]
     fn gate_command_has_exact_model_session_and_no_inherited_environment() {
         let (r, _, _) = fixture();
-        let cmd = gate_command(Path::new("/fixture"), &r);
+        let cmd = gate_command(Path::new("/fixture"), &r).unwrap();
         assert_eq!(cmd.get_program(), r.executable.as_os_str());
         assert_eq!(cmd.get_current_dir(), Some(r.cwd.as_path()));
         let args: Vec<_> = cmd.get_args().map(|x| x.to_str().unwrap()).collect();
@@ -1545,7 +1578,8 @@ mod gate_tests {
                 "HOME",
                 "LANG",
                 "PATH",
-                "TERM"
+                "TERM",
+                "USER"
             ]
         );
         for key in [
@@ -1566,13 +1600,31 @@ mod gate_tests {
         inert.cwd = std::env::temp_dir();
         inert.args.clear();
         let output = gate_command(Path::new("/fixture"), &inert)
+            .unwrap()
             .output()
             .unwrap();
         assert!(output.status.success());
         let actual = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(actual.lines().count(), 8);
+        assert_eq!(actual.lines().count(), 9);
+        // Independent OS identity oracle; never invoke Claude or read credentials.
+        let identity = Command::new("/usr/bin/id").arg("-un").output().unwrap();
+        assert!(identity.status.success());
+        let username = String::from_utf8(identity.stdout).unwrap();
+        assert!(actual.lines().any(|line| line == format!("USER={}", username.trim())));
         assert!(actual.lines().any(|line| line == format!("APERTURE_MANAGED_HUB_CLIENT={}", Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("mcp-server/dist/hub-client.js").display())));
         assert!(actual.lines().any(|line| line == format!("APERTURE_HUB_TOKEN_FILE=/fixture/.aperture/run/hub-tokens/{}.token", inert.seat)));
+    }
+    #[test]
+    fn gate_user_is_os_identity_even_with_poisoned_inherited_user() {
+        // Re-run the inert gate contract in a separate process to avoid mutating
+        // the parallel test runner's environment. This never launches Claude.
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "team_claude_launch::gate_tests::gate_command_has_exact_model_session_and_no_inherited_environment"])
+            .env("USER", "wrong-user-fixture")
+            .env("LOGNAME", "wrong-user-fixture")
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "inert gate must use OS identity, not inherited USER");
     }
     #[test]
     fn tmux_response_is_exact_id_metadata_not_untrusted_shell_or_multiline() {

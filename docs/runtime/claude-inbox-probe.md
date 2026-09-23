@@ -54,3 +54,14 @@ headless replacement, global permission bypass or new daemon is introduced.
 
 The older `team_claude_startup_smoke` contract is unchanged: no kickoff, always
 cleanup/quarantine, MCP `not_run`. A startup-only PASS is not this journey.
+
+## macOS authentication environment
+
+The gate preserves `env_clear` but explicitly supplies `USER` from the effective
+OS user's passwd entry, not the caller's environment. The installed 2.1.263
+diagnostic reached its first input but immediately reported `authentication_failed`
+with `Not logged in`; the local comparison isolated missing `USER`. The gate
+does not read, copy or refresh credentials and does not add provider credentials,
+configuration-directory overrides or permission bypasses. An inert child-env
+regression checks the OS identity even when inherited `USER` is deliberately
+wrong. Source PASS does not establish a new authenticated inbox roundtrip.
