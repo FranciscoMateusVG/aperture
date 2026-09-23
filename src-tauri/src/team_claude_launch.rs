@@ -643,6 +643,12 @@ impl ClaudeBinding {
         if prompt.0.len() > PRIVATE_CAP {
             return Err(ClaudeError::Invalid);
         }
+        // This appendix supplies the actual harness inbox recipe; role prompts
+        // alone only say to await dispatch. It submits no input before D1.
+        let inbox = crate::team_claude_inbox::managed_inbox_recipe(&self.seat)
+            .map_err(|_| ClaudeError::Invalid)?;
+        prompt.0.extend_from_slice(inbox.as_bytes());
+        if prompt.0.len() > PRIVATE_CAP { return Err(ClaudeError::Invalid); }
         let prompt_path = dest.join("prompt.md");
         write_private_bytes_atomic(&prompt_path, &prompt.0, false)
             .map_err(|_| ClaudeError::Unsafe)?;
@@ -1428,7 +1434,7 @@ fn gate_command(home: &Path, r: &LaunchRecord) -> Command {
         .env("AGENT_NAME", &r.seat)
         .env("APERTURE_HUB_TOKEN_FILE", home.join(".aperture/run/hub-tokens").join(format!("{}.token", r.seat)))
         .env("APERTURE_TEAM_GENERATION", r.generation.to_string())
-        .env("APERTURE_MANAGED_HUB_CLIENT", Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("native repo parent").join("mcp-server/dist/hub-client.js"));
+        .env(crate::team_claude_inbox::MANAGED_HUB_CLIENT_ENV, Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("native repo parent").join("mcp-server/dist/hub-client.js"));
     cmd
 }
 
@@ -1760,6 +1766,12 @@ mod publication_tests {
             .publish_with_password(&r, &t, &Deadline::new(), "")
             .unwrap();
         let dir = generation_dir(&f.home, "t1-worker", 1);
+        let prompt = private_bytes(&dir.join("prompt.md"), PRIVATE_CAP).unwrap();
+        let prompt = std::str::from_utf8(&prompt.0).unwrap();
+        let recipe = crate::team_claude_inbox::managed_inbox_recipe("t1-worker").unwrap();
+        assert!(prompt.ends_with(&recipe));
+        assert_eq!(prompt.matches("# Managed inbox (Claude seat").count(), 1);
+        assert!(prompt.starts_with("fixture mission"));
         let config: serde_json::Value = read_private_json(&dir.join("claude-mcp.json")).unwrap();
         for server in ["aperture-bus", "sentry"] {
             assert_eq!(
