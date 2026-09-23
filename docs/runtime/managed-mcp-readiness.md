@@ -73,3 +73,30 @@ package and approved window: verify the same managed thread lists required tools
 one RO call succeeds, then witness the authorized lead -> QA -> root roundtrip.
 No business/provider turn or live recovery was run in this source task. Do not
 claim this proof for the still-running old generation or perform an automatic retry.
+
+## Claude normal launch: process, observation and messaging are separate
+
+The normal-launch change uses the standing launcher's fixed **positional** boot
+prompt, not simulated keys and not the startup diagnostic's 30-second teardown.
+An actual status-line model/session observation may arrive before or after that
+first input. Configuration is never substituted for observation. Starting still
+means activation is pending; Active still requires the observed exact tuple.
+Historical pre-input diagnostics keep their own stricter contract.
+
+The existing hub client waits **locally**, without opening a socket, if its
+private owner is Starting with its exact token digest and generation. It re-reads
+that same identity up to the native 170-second total launch budget. A changed,
+revoked, unsafe or disappearing owner fails closed; it never follows a new
+generation. Once Active it uses the unchanged managed hello and hub admission.
+Standing clients without managed owner records retain their previous behavior.
+`HUB_OWNER_PENDING` means wait; `HUB_OWNER_ACTIVE` means only local activation,
+not hub acceptance or callable MCP. `HUB_OWNER_TIMEOUT` is a distinct terminal
+startup timeout, not a bad-token claim; inspect instead of retrying the launch.
+
+Bootstrap's MCP preflight recognizes only exact Claude `claude-sonnet-5` with
+reasoning `null`, and still requires native `capabilities.start`. Its success
+parser still rejects missing actual observation. This does not enable the native
+Claude gate by itself. Business dispatch remains separate: witness a real BEADS
+message, reply and read acknowledgment through the new seat before assigning
+work. Permission policy and workspace trust must be explicit; neither is silently
+changed by this client wait. Installed normal-launch/roundtrip evidence is pending.

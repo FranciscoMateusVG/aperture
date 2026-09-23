@@ -1,8 +1,9 @@
 //! Claude-only managed inbox recipe (aperture-337gb, operator exception A).
 //!
 //! The publisher appends this constant text to the rendered role prompt of a
-//! managed Claude seat. It is read by the seat only after its owner is Active
-//! and the single authenticated constant kickoff has fired; the text itself
+//! managed Claude seat. Its normal positional boot prompt may run while native
+//! model observation is still Starting; the client waits locally for Active.
+//! The text itself
 //! starts no turn, sends no keys, reads no token and adds no channel. It only
 //! tells the seat how to use tooling that already exists: the native Claude
 //! Code `Monitor` tool, the existing `hub-client.js`, and the BEADS inbox tools
@@ -43,10 +44,10 @@ Your only inbox is BEADS through aperture-bus, pushed live by the hub. Use exact
 1. Monitor first. Before any inbox call, start the inbox monitor with the native Claude Code Monitor tool as a persistent bash command, exactly:\n\
    Monitor(command: {command}, persistent: true)\n\
    The client path comes from that environment variable and the client reads its own credential from the launcher environment. Never look up, type, print, store or pass a credential. Do not use the Monitor ws source: it cannot send the hello and the hub would treat you as offline.\n\
-2. Then drain the inbox: call get_messages, process each message, and call mark_as_read for a message only after you have actually handled it.\n\
+2. If the monitor reports HUB_OWNER_PENDING, wait for HUB_OWNER_ACTIVE before any inbox call; do not restart it or do project work. This is native activation in progress. HUB_OWNER_ACTIVE confirms only local activation, not hub delivery or working tools. Then drain the inbox: call get_messages, process each message, and call mark_as_read for a message only after you have actually handled it.\n\
 3. Every Monitor event whose type is \"message\" means a BEADS message is waiting: get_messages, process, mark_as_read. Do not poll on a timer instead.\n\
 4. A HUB_RECONNECTING line means wait; the client reconnects by itself. HUB_RECONNECTED means unread messages are replaying now.\n\
-5. Do NOT restart the monitor after HUB_IDENTITY_INVALID, or after HUB_SOCKET_CLOSED with code 4000 (a newer monitor replaced this one), 4001 (hello rejected) or 4003 (managed identity rejected). Keep the exact line; if the aperture-bus update_task tool is callable, record it on your assigned bead, then wait for dispatch.\n\
+5. Do NOT restart the monitor after HUB_IDENTITY_INVALID or HUB_OWNER_TIMEOUT, or after HUB_SOCKET_CLOSED with code 4000 (a newer monitor replaced this one), 4001 (hello rejected) or 4003 (managed identity rejected). Keep the exact line; if the aperture-bus update_task tool is callable, record it on your assigned bead, then wait for dispatch.\n\
 6. If the Monitor tool is unavailable, or the command exits at once (for example a HUB_CLIENT_ERROR line), that is an honest blocker: record it on your assigned bead with update_task only if that tool is callable, then stop. If aperture-bus itself is absent there is no way to send anything: stay idle and say so in your terminal; never invent another channel: no background Bash loops, no file watching, no tmux, no hooks, no other harness.\n\
 7. Do no project work before a scoped dispatch arrives through this inbox. Boot order is fixed: monitor, then get_messages, then only the work that was dispatched.\n"
     ))

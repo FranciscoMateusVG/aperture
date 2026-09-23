@@ -13,6 +13,8 @@ const view = z.object({ snapshot: z.object({ team: name, project: z.string(), re
 export const bootstrapSeatSchema = z.object({ team: name.max(16), seat: name, expected_generation: z.literal(0) }).strict();
 export type BootstrapSeatSelectors = z.infer<typeof bootstrapSeatSchema>;
 const same = (a: z.infer<typeof tuple>, b: z.infer<typeof tuple>) => a.harness === b.harness && a.model === b.model && a.reasoning === b.reasoning;
+const supported = (t: z.infer<typeof tuple>) => t.harness === "codex" ||
+  (t.harness === "claude" && t.model === "claude-sonnet-5" && t.reasoning === null);
 export function parseTeamList(value: unknown) {
   return z.object({ action: z.literal("list_teams"), result: z.array(view) }).parse(value);
 }
@@ -25,7 +27,7 @@ export function bootstrapSelection(value: unknown, input: BootstrapSeatSelectors
   const snapshots = team.snapshot.seats.filter(s => s.name === input.seat);
   if (seats.length !== 1 || snapshots.length !== 1) throw new Error("E_CONTROL_STALE: seat unavailable");
   const s = seats[0], o = s.observed_owner;
-  if (team.state.state !== "active" || !team.capabilities.start || snapshots[0].harness !== "codex" ||
+  if (team.state.state !== "active" || !team.capabilities.start || !supported(snapshots[0]) ||
     !o || o.generation !== 0 || o.state !== "stale" || o.actual !== null || o.process_count !== 0 || o.thread_bound ||
     !same(s.configured, snapshots[0]) || !same(o.configured, snapshots[0])) {
     throw new Error("E_CONTROL_STALE: seat is not eligible for first start; no automatic retry");

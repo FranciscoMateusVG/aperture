@@ -53,7 +53,7 @@
  */
 
 import WebSocket from "ws";
-import { managedHelloFields } from "./managed-identity.js";
+import { ManagedActivationTimeout, managedHelloFields, waitForManagedActive } from "./managed-identity.js";
 import { readFileSync } from "node:fs";
 
 /** First reconnect delay; doubles on every consecutive failure. */
@@ -155,7 +155,24 @@ function onConnected(): void {
   }
 }
 
-function connect(): void {
+async function connect(): Promise<void> {
+  let waitedForOwner = false;
+  try {
+    await waitForManagedActive(agent, agentToken, {
+      // Presence only narrows admission; this value never grants identity.
+      managedExpected: process.env.APERTURE_TEAM_GENERATION !== undefined,
+      onWaiting: () => {
+        waitedForOwner = true;
+        console.log("HUB_OWNER_PENDING waiting for native activation; no hello sent");
+      },
+    });
+  } catch (error) {
+    exitWithLine(error instanceof ManagedActivationTimeout
+      ? "HUB_OWNER_TIMEOUT native activation was not confirmed before the deadline; inspect without restarting"
+      : "HUB_IDENTITY_INVALID managed seat did not activate with its exact identity; do not restart", 1);
+    return;
+  }
+  if (waitedForOwner) console.log("HUB_OWNER_ACTIVE native activation verified; connecting to hub");
   const ws = new WebSocket(url, { perMessageDeflate: false });
   // ws emits `error` then `close` for a failed connect (and for most runtime
   // errors); whichever fires first owns the reconnect decision for this socket.

@@ -76,3 +76,59 @@ test("managed hello derives generation and token identity from the active OwnerR
 test("standing seat without an owner record emits no managed authority fields", () => {
   assert.deepEqual(managedHelloFields("standing-seat", "cd".repeat(32)), {});
 });
+
+const { waitForManagedActive } = await import('../dist/managed-identity.js');
+const starting = { seat, generation: 7, tokenId: digest, state: 'starting' };
+function clocked(states) {
+  let clock = 0, reads = 0, waits = 0;
+  return {
+    options: {
+      readOwner: () => {
+        const value = states[Math.min(reads++, states.length - 1)];
+        if (value instanceof Error) throw value;
+        return value;
+      },
+      now: () => clock,
+      sleep: async ms => { clock += ms; },
+      onWaiting: () => { waits++; },
+    },
+    counts: () => ({ clock, reads, waits }),
+  };
+}
+test('monitor waits for same native Active identity; Starting still cannot send a hello', async () => {
+  const c = clocked([starting, starting, { ...starting, state: 'active' }]);
+  await waitForManagedActive(seat, token, c.options);
+  assert.deepEqual(c.counts(), { clock: 200, reads: 3, waits: 1 });
+  const ready = clocked([{ ...starting, state: 'active' }]);
+  await waitForManagedActive(seat, token, ready.options);
+  assert.equal(ready.counts().waits, 0);
+});
+test('monitor fails closed on generation/token/revocation/removal drift and finite timeout', async () => {
+  const missing = Object.assign(new Error('absent'), { code: 'ENOENT' });
+  for (const value of [
+    { ...starting, generation: 8, state: 'active' },
+    { ...starting, tokenId: 'c'.repeat(64), state: 'active' },
+    { ...starting, seat: 'foreign-seat', state: 'active' },
+    { ...starting, state: 'quarantined' },
+    { ...starting, state: 'stale' }, missing, new Error('unsafe record'),
+  ]) {
+    const c = clocked([starting, value]);
+    await assert.rejects(waitForManagedActive(seat, token, c.options));
+    assert.equal(c.counts().reads, 2);
+  }
+  const timeout = clocked([starting]);
+  await assert.rejects(waitForManagedActive(seat, token, timeout.options), /deadline/);
+  assert.equal(timeout.counts().clock, 170_000);
+});
+test('startup wait does not upgrade missing managed state to a standing hello', async () => {
+  const missing = Object.assign(new Error('absent'), { code: 'ENOENT' });
+  const standing = clocked([missing]);
+  await waitForManagedActive(seat, token, standing.options);
+  const managed = clocked([missing]);
+  await assert.rejects(waitForManagedActive(seat, token, { ...managed.options, managedExpected: true }));
+  for (const owner of [{ ...starting, tokenId: 'c'.repeat(64) }, { ...starting, generation: 0 }]) {
+    const c = clocked([owner]);
+    await assert.rejects(waitForManagedActive(seat, token, c.options));
+    assert.equal(c.counts().waits, 0);
+  }
+});

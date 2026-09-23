@@ -41,3 +41,22 @@ test('bootstrap receipt matches the actual Rust-serialized shared wire fixture',
  const wire=JSON.parse(readFileSync(new URL('../../tests/fixtures/team-bootstrap-response.json',import.meta.url),'utf8'));
  assert.equal(parseBootstrapStarted(wire,input,tuple).result.owner.actual.model,'gpt-5.6-sol');
 });
+
+test('normal Claude admission is exact Sonnet/None, still requires native capability and actual observation',()=>{
+ const claude={harness:'claude',model:'claude-sonnet-5',reasoning:null};
+ function claudeList(t=claude){
+  const v=list(), row=v.result[0], s={...seat,...t};
+  row.snapshot.seats=[s]; row.seats[0].configured=s;
+  row.seats[0].observed_owner.configured=t;
+  return v;
+ }
+ assert.deepEqual(bootstrapSelection(claudeList(),input),claude);
+ for(const t of [{...claude,model:'sonnet'},{...claude,model:'claude-other'},{...claude,reasoning:'high'}])
+  assert.throws(()=>bootstrapSelection(claudeList(t),input));
+ const disabled=claudeList();disabled.result[0].capabilities.start=false;
+ assert.throws(()=>bootstrapSelection(disabled,input));
+ const wire=started();wire.result.owner.configured=claude;wire.result.owner.actual=claude;
+ assert.deepEqual(parseBootstrapStarted(wire,input,claude).result.owner.actual,claude);
+ wire.result.owner.actual=null;
+ assert.throws(()=>parseBootstrapStarted(wire,input,claude),/E_CONTROL_UNKNOWN/);
+});

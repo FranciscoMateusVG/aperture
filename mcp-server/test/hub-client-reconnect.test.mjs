@@ -19,8 +19,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 
@@ -312,5 +314,49 @@ test("stale detection: no frames for APERTURE_HUB_STALE_MS → HUB_SOCKET_STALE,
   } finally {
     client.kill();
     hub.stop();
+  }
+});
+
+test('managed monitor sends no socket or hello before Active; same generation connects afterwards', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'aperture-monitor-starting-'));
+  const run = join(home, '.aperture', 'run');
+  const owner = join(run, 'owner');
+  for (const dir of [home, join(home, '.aperture'), run, owner]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+  }
+  const digest = createHash('sha256').update(TOKEN).digest('hex');
+  function publish(state) {
+    const path = join(owner, `${AGENT}.json`);
+    writeFileSync(`${path}.tmp`, JSON.stringify({
+      schema_version: 1, seat: AGENT, generation: 1, state,
+      provisional_token_id: state === 'starting' ? digest : null,
+      incarnation: { token_id: digest },
+    }), { mode: 0o600 });
+    renameSync(`${path}.tmp`, path);
+  }
+  publish('starting');
+  const hub = startFakeHub(0);
+  await hub.listening;
+  const client = spawnClient(hub.wss.address().port, {
+    HOME: home, APERTURE_RUN_DIR: run, APERTURE_OWNER_DIR: owner,
+    APERTURE_TEAM_GENERATION: '1',
+  });
+  try {
+    await client.waitForLine(startsWith('HUB_OWNER_PENDING'), 'waiting on native owner');
+    await sleep(150);
+    assert.equal(hub.wss.clients.size, 0, 'no socket exists before native Active');
+    assert.equal(hub.hellos.length, 0);
+    publish('active');
+    await hub.waitForHellos(1);
+    assert.equal(client.lines.filter(startsWith('HUB_OWNER_ACTIVE')).length, 1);
+    assert.deepEqual(hub.hellos[0], {
+      type: 'hello', role: 'agent', agent: AGENT, token: TOKEN,
+      generation: 1, token_id: digest,
+    });
+    assert.equal(client.proc.exitCode, null);
+    assert.equal(client.lines.some(line => line.includes(TOKEN)), false);
+  } finally {
+    client.kill(); hub.stop(); rmSync(home, { recursive: true, force: true });
   }
 });
