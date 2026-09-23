@@ -1,4 +1,4 @@
-//! Append-only lead-validation facts. Internal collector/authority callbacks,
+//! Append-only authenticated validation facts. Internal collector/authority callbacks,
 //! NOT a JSON command accepting caller-asserted validation or observations.
 use crate::journal::{
     ensure_private_dir, read_private_json, validate_component_path, write_private_json_atomic,
@@ -24,6 +24,16 @@ pub(crate) struct ValidationContext {
     pub lead_seat: String,
     pub lead_generation: u64,
 }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ValidatorKind {
+    #[default]
+    Lead,
+    Glados,
+}
+impl ValidatorKind {
+    fn is_lead(&self) -> bool { *self == Self::Lead }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ValidationFact {
@@ -31,11 +41,17 @@ pub(crate) struct ValidationFact {
     checkpoint_id: String,
     content_hash: String,
     fact_seq: u64,
+    // Omitted for legacy facts, preserving their canonical serialization.
+    #[serde(default, skip_serializing_if = "ValidatorKind::is_lead")]
+    validator_kind: ValidatorKind,
     validated_by: String,
     validator_generation: u64,
     validated_at: u64,
     observation: ArtifactObservation,
     result: CheckpointValidation,
+}
+impl ValidationFact {
+    pub(crate) fn result(&self) -> &CheckpointValidation { &self.result }
 }
 struct LockedHistory {
     // Drop seat locks before team lock. Acquire seats in lexical order.
@@ -257,13 +273,18 @@ fn read_facts(
             .ok_or(CheckpointError::Corrupt)?;
         observation_is_safe(entry, &fact.observation, sentinels)
             .map_err(|_| CheckpointError::Corrupt)?;
+        let validator_matches = match fact.validator_kind {
+            ValidatorKind::Lead => fact.validated_by == ctx.lead_seat
+                && fact.validator_generation > 0
+                && fact.validator_generation <= ctx.lead_generation,
+            ValidatorKind::Glados => fact.validated_by == "glados"
+                && fact.validator_generation == ctx.generation,
+        };
         if fact.schema_version != 1
             || fact.checkpoint_id != entry.checkpoint_id
             || fact.content_hash != entry.content_hash
             || fact.fact_seq != nums[2]
-            || fact.validated_by != ctx.lead_seat
-            || fact.validator_generation == 0
-            || fact.validator_generation > ctx.lead_generation
+            || !validator_matches
             || fact.validated_at < entry.written_at
             || fact.result
                 != crate::team_checkpoint::validate_against_artifacts(entry, &fact.observation)
@@ -365,8 +386,41 @@ pub(crate) fn validate_native<F, C>(
     seq: u64,
     now: u64,
     sentinels: &[String],
-    mut revalidate: F,
-    mut collect: C,
+    revalidate: F,
+    collect: C,
+) -> Result<ValidationFact, CheckpointError>
+where
+    F: FnMut() -> Result<(), CheckpointError>,
+    C: FnMut(&CheckpointEntry) -> Result<ArtifactObservation, CheckpointError>,
+{
+    validate_as(home, ctx, seq, now, sentinels, ValidatorKind::Lead, revalidate, collect)
+}
+
+/// Root authority is a real native capability, never a worker-provided kind/name.
+/// Selecting an immutable checkpoint explicitly approves its mission binding;
+/// its artifact validity is still computed by the native repository collector.
+pub(crate) fn validate_glados_native<C>(
+    home: &Path,
+    actor: &crate::team_auth::AuthenticatedActor,
+    ctx: &ValidationContext,
+    seq: u64,
+    now: u64,
+    sentinels: &[String],
+    collect: C,
+) -> Result<ValidationFact, CheckpointError>
+where C: FnMut(&CheckpointEntry) -> Result<ArtifactObservation, CheckpointError>,
+{
+    let revalidate = || {
+        if !actor.is_glados() { return Err(CheckpointError::Generation); }
+        actor.revalidate_before_mutation().map_err(|_| CheckpointError::Generation)
+    };
+    validate_as(home, ctx, seq, now, sentinels, ValidatorKind::Glados, revalidate, collect)
+}
+
+fn validate_as<F, C>(
+    home: &Path, ctx: &ValidationContext, seq: u64, now: u64,
+    sentinels: &[String], validator: ValidatorKind,
+    mut revalidate: F, mut collect: C,
 ) -> Result<ValidationFact, CheckpointError>
 where
     F: FnMut() -> Result<(), CheckpointError>,
@@ -400,8 +454,9 @@ where
         fact_seq: (facts.len() as u64)
             .checked_add(1)
             .ok_or(CheckpointError::Corrupt)?,
-        validated_by: ctx.lead_seat.clone(),
-        validator_generation: ctx.lead_generation,
+        validator_kind: validator,
+        validated_by: if validator.is_lead() { ctx.lead_seat.clone() } else { "glados".into() },
+        validator_generation: if validator.is_lead() { ctx.lead_generation } else { ctx.generation },
         validated_at: now,
         result: crate::team_checkpoint::validate_against_artifacts(entry, &observation),
         observation,

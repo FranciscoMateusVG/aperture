@@ -1097,6 +1097,47 @@ fn validate_checkpoint_authorized(
         .ok_or(ReplacementError::CheckpointUnavailable)
 }
 
+/// Explicit root checkpoint validation without replace/start/stop effects.
+/// The selector approves an immutable checkpoint's task/worktree binding;
+/// Git/PR observations and the resulting verdict are collected natively.
+pub(crate) fn validate_checkpoint_glados(
+    home: &Path, actor: &AuthenticatedActor, target: &remote::RemoteTarget,
+    seq: u64, sentinels: &[String],
+) -> Result<crate::team_checkpoint::CheckpointValidation, ReplacementError> {
+    use crate::team_checkpoint::{native::validation, CheckpointError};
+    if !actor.is_glados() { return Err(ReplacementError::AuthorizationRequired); }
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)?;
+    selectors(target)?;
+    if seq == 0 { return Err(ReplacementError::CheckpointUnavailable); }
+    let snapshot: TeamSnapshot = read_private_json(&home.join(".aperture/teams")
+        .join(&target.team).join("team.json")).map_err(|_| ReplacementError::GenerationMismatch)?;
+    let owners = OwnerStore::new(home.join(".aperture/run/owner"));
+    let owner = owners.read_owner(&target.seat).map_err(|_| ReplacementError::GenerationMismatch)?;
+    if owner.generation != target.expected_generation || owner.state != OwnerState::Active {
+        return Err(ReplacementError::GenerationMismatch);
+    }
+    let lead = owners.read_owner(&snapshot.lead).map_err(|_| ReplacementError::GenerationMismatch)?;
+    let ctx = validation::ValidationContext {
+        team: target.team.clone(), seat: target.seat.clone(), generation: target.expected_generation,
+        lead_seat: snapshot.lead, lead_generation: lead.generation,
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    let repo = repository::resolve_native(home, &target.team, until)
+        .map_err(|_| ReplacementError::RepoBindingUnavailable)?;
+    let fact = validation::validate_glados_native(home, actor, &ctx, seq,
+        chrono::Utc::now().timestamp_millis().try_into().map_err(|_| ReplacementError::NativeFailure)?,
+        sentinels, |entry| {
+            // Validation holds the owner locks. Reject a generation that changed
+            // between preflight and lock acquisition, before collecting anything.
+            let current: OwnerRecord = read_private_json(&owners.record_path(&target.seat))
+                .map_err(|_| CheckpointError::Corrupt)?;
+            if current != owner { return Err(CheckpointError::Generation); }
+            repository::collect_native(&repo, entry, until).map_err(|_| CheckpointError::Invalid)
+        }).map_err(|_| ReplacementError::CheckpointUnavailable)?;
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::OutcomeUnknown)?;
+    Ok(fact.result().clone())
+}
+
 struct RecoveryContext {
     worktree: String,
     entry: Option<crate::team_checkpoint::CheckpointEntry>,

@@ -464,6 +464,97 @@ mod tests {
             open_pr: e.payload.open_pr.clone(),
         })
     }
+
+    struct RootEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl RootEnv {
+        fn new(home: &Path) -> Self {
+            let keys = ["HOME", "APERTURE_AGENTS_DIR", "APERTURE_TEAMS_DIR", "APERTURE_HUB_TOKEN_FILE"];
+            let old = keys.into_iter().map(|k| (k, std::env::var_os(k))).collect();
+            std::env::set_var("HOME", home);
+            std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
+            std::env::set_var("APERTURE_TEAMS_DIR", home.join(".aperture/teams"));
+            let token = home.join(".aperture/run/hub-tokens/glados.token");
+            crate::journal::ensure_private_dir(token.parent().unwrap()).unwrap();
+            crate::journal::write_private_bytes_atomic(&token, b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false).unwrap();
+            std::env::set_var("APERTURE_HUB_TOKEN_FILE", &token);
+            let root = home.join(".claude/aperture/glados");
+            crate::journal::ensure_private_dir(&root).unwrap();
+            crate::journal::write_private_bytes_atomic(&root.join("prompt.md"), b"fixture", false).unwrap();
+            write_private_json_atomic(&root.join("manifest.json"), &serde_json::json!({
+                "name":"GLaDOS", "model":"sonnet", "window":"glados", "role":"orchestrator", "enabled":true
+            }), false).unwrap();
+            Self(old)
+        }
+    }
+    impl Drop for RootEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                if let Some(v) = v { std::env::set_var(k,v); } else { std::env::remove_var(k); }
+            }
+        }
+    }
+    #[test]
+    fn glados_checkpoint_validates_lead_without_impersonating_it_and_keeps_legacy_facts() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let f = Fixture::new();
+        let _env = RootEnv::new(&f.0);
+        let actor = crate::team_auth::authenticate_glados_control().unwrap();
+        write_native(&f.0, &ctx(), 1, payload(), 1, &[], || Ok(())).unwrap();
+        validation::validate_native(&f.0, &lead_context(), 1, 2, &[], || Ok(()), actual).unwrap();
+        let old_path = f.dir().join(".validation/1-1-1.json");
+        let old = std::fs::read(&old_path).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&old).unwrap().get("validator_kind").is_none());
+        let fact = validation::validate_glados_native(&f.0, &actor, &lead_context(), 1, 3, &[], actual).unwrap();
+        assert_eq!(fact.result(), &CheckpointValidation::Ok);
+        let json = serde_json::to_value(&fact).unwrap();
+        assert_eq!(json["validator_kind"], "glados");
+        assert_eq!(json["validated_by"], "glados");
+        assert_eq!(json["validator_generation"], 1);
+        assert_eq!(std::fs::read(&old_path).unwrap(), old);
+        assert_eq!(super::read_raw_entries(&f.dir(), 1).unwrap()[0].validation, CheckpointValidation::Pending);
+        assert_eq!(validation::historical_bindings_native(&f.0, &lead_context(), &[], || Ok(())).unwrap().len(), 1);
+        assert_eq!(validation::checkpoint_evidence_native(&f.0, &lead_context(), &[], || Ok(())).unwrap().validated_entries[0].validation, CheckpointValidation::Ok);
+    }
+    #[test]
+    fn glados_checkpoint_wrong_authority_or_revoked_capability_publishes_nothing() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let f = Fixture::new();
+        let _env = RootEnv::new(&f.0);
+        write_native(&f.0, &ctx(), 1, payload(), 1, &[], || Ok(())).unwrap();
+        for actor in [crate::team_auth::AuthenticatedActor::launcher(), crate::team_auth::AuthenticatedActor::operator_ui()] {
+            assert_eq!(validation::validate_glados_native(&f.0, &actor, &lead_context(), 1, 2, &[], |_| panic!("unauthorized collector")), Err(CheckpointError::Generation));
+        }
+        let actor = crate::team_auth::authenticate_glados_control().unwrap();
+        assert_eq!(validation::validate_glados_native(&f.0, &actor, &lead_context(), 1, 2, &[], |entry| {
+            crate::journal::write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/glados.token"), b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true).unwrap();
+            actual(entry)
+        }), Err(CheckpointError::Generation));
+        assert!(!f.dir().join(".validation").exists());
+    }
+    #[test]
+    fn glados_checkpoint_divergence_is_not_binding_and_validator_forgery_is_rejected() {
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let f = Fixture::new();
+        let _env = RootEnv::new(&f.0);
+        let actor = crate::team_auth::authenticate_glados_control().unwrap();
+        write_native(&f.0, &ctx(), 1, payload(), 1, &[], || Ok(())).unwrap();
+        let fact = validation::validate_glados_native(&f.0, &actor, &lead_context(), 1, 2, &[], |e| {
+            let mut a = actual(e)?; a.head_sha = "b".repeat(40); Ok(a)
+        }).unwrap();
+        assert!(matches!(fact.result(), CheckpointValidation::Divergent { .. }));
+        assert!(validation::historical_bindings_native(&f.0, &lead_context(), &[], || Ok(())).unwrap().is_empty());
+        let path = f.dir().join(".validation/1-1-1.json");
+        let original = serde_json::to_value(&fact).unwrap();
+        for (key,value) in [("validator_kind",serde_json::json!("lead")), ("validator_kind",serde_json::json!("unknown")),
+            ("validated_by",serde_json::json!("t1-backend")), ("validator_generation",serde_json::json!(2)),
+            ("result",serde_json::json!({"status":"ok"}))] {
+            let mut bad = original.clone(); bad[key] = value;
+            write_private_json_atomic(&path, &bad, true).unwrap();
+            assert!(validation::validated_entries_native(&f.0, &lead_context(), &[], || Ok(())).is_err());
+        }
+        write_private_json_atomic(&path, &original, true).unwrap();
+        assert!(validation::checkpoint_evidence_native(&f.0, &lead_context(), &[], || Ok(())).is_ok());
+    }
     #[test]
     fn validation_facts_are_append_only_and_latest_valid_is_not_latest_file() {
         let f = Fixture::new();

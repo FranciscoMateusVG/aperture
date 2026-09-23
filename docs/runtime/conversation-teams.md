@@ -68,6 +68,30 @@ binds every seat to the same contract:
 
 ## Stop a seat without replacement
 
+Before stop, the seat writes its checkpoint and GLaDOS explicitly selects that
+immutable checkpoint with
+`team_validate_checkpoint({input:{team,seat,expected_generation,seq}})`.
+Selection authorizes that checkpoint's task/worktree binding, not its claimed
+contents: the native repository-bound Git/PR collector computes the result.
+GLaDOS must check that the selected task/worktree belongs to the approved mission;
+never select a worker's arbitrary suggestion without that check. The tool accepts
+no path, observation, validator identity or caller-supplied result.
+
+The reply echoes the selectors and reports `validation: "ok"`, `"divergent"` or
+`"rejected"`. Only `ok` supplies a historical binding; stop still collects fresh
+evidence. A pending checkpoint is never relabeled by assertion. The append-only
+fact records `validator_kind: "glados"`, `validated_by: "glados"` and the target's
+generation; GLaDOS does not impersonate a team lead. This also permits validating
+the lead's own checkpoint. Existing lead facts omit `validator_kind` and retain
+their canonical bytes. An older binary rejects new GLaDOS facts rather than
+misreading them as lead approval; rolling back software does not roll back state.
+
+Keep the checkpoint's worktree available through validation and stop. Validate
+and stop workers first, then the lead last; archive is a separate reconciled
+action. Do not remove the worktree first and then manufacture evidence to recover
+from the resulting missing-artifact failure. If validation times out, inspect the
+append-only fact before deciding any next action; do not automatically retry.
+
 GLaDOS uses `team_stop_seat({input:{team,seat,expected_generation}})` to stop and
 revoke one exact current seat only when the native collector proves a current,
 validated checkpoint. The input contains selectors only: no caller-supplied

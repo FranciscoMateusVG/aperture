@@ -567,6 +567,24 @@ pub struct StopSeatView {
     pub blockers: Vec<RuntimeBlocker>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ValidateCheckpointInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ValidateCheckpointView {
+    pub team: String,
+    pub seat: String,
+    pub generation: u64,
+    pub seq: u64,
+    pub validation: &'static str,
+}
+
 /// One diagnostic attempt only; no tuple, prompt or caller authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -644,6 +662,7 @@ pub enum TeamControlRequest {
     ListTeams,
     BootstrapSeat(BootstrapSeatInput),
     StopSeat(StopSeatInput),
+    ValidateCheckpoint(ValidateCheckpointInput),
     ClaudeStartupSmoke(ClaudeStartupSmokeInput),
     ClaudeInboxProbe(ClaudeStartupSmokeInput),
     ReconcileClaudeStartup(ClaudeStartupSmokeInput),
@@ -668,6 +687,7 @@ pub enum TeamControlResponse {
     ListTeams(Vec<TeamView>),
     BootstrapSeat(BootstrapView),
     StopSeat(StopSeatView),
+    ValidateCheckpoint(ValidateCheckpointView),
     ClaudeStartupSmoke(ClaudeStartupSmokeView),
     ClaudeInboxProbe(ClaudeInboxProbeView),
     ReconcileClaudeStartup(ReconciledClaudeStartupView),
@@ -2085,6 +2105,34 @@ fn project_claude_startup_smoke(
     })
 }
 
+fn validate_checkpoint(engine: &TeamEngine, actor: &AuthenticatedActor, input: ValidateCheckpointInput) -> TeamResult<ValidateCheckpointView> {
+    if !actor.is_glados() {
+        return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"));
+    }
+    actor.revalidate_before_mutation().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability changed"))?;
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation == 0 || input.seq == 0 {
+        return Err(TeamError::new("E_GENERATION_MISMATCH", "checkpoint selectors are invalid"));
+    }
+    let view = engine.read_team_view(&input.team)?;
+    if view.state.state != TeamLifecycle::Active
+        || view.snapshot.seats.iter().filter(|s| s.name == input.seat).count() != 1
+    { return Err(TeamError::state("active team seat required")); }
+    let result = crate::team_replacement::native::validate_checkpoint_glados(
+        &engine.paths.home, actor,
+        &RemoteTarget { team: input.team.clone(), seat: input.seat.clone(), expected_generation: input.expected_generation },
+        input.seq, &[]).map_err(replacement_error)?;
+    use crate::team_checkpoint::CheckpointValidation;
+    let validation = match result {
+        CheckpointValidation::Ok => "ok",
+        CheckpointValidation::Divergent { .. } => "divergent",
+        CheckpointValidation::Rejected { .. } => "rejected",
+        CheckpointValidation::Pending => return Err(TeamError::new("E_CONTROL_UNKNOWN", "validation was not confirmed; inspect before retry")),
+    };
+    Ok(ValidateCheckpointView { team: input.team, seat: input.seat,
+        generation: input.expected_generation, seq: input.seq, validation })
+}
+
 fn stop_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: StopSeatInput) -> TeamResult<StopSeatView> {
     if !actor.is_glados() {
         return Err(TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"));
@@ -2288,6 +2336,10 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
                 team:input.team, seat:input.seat, generation:input.expected_generation,
                 owner_state:OwnerState::Quarantined, startup:"not_verified", cleanup:"stopped_reconciled", public_enabled:false,
             }))
+        }
+        TeamControlRequest::ValidateCheckpoint(input) => {
+            let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
+            validate_checkpoint(&engine, &actor, input).map(TeamControlResponse::ValidateCheckpoint)
         }
         TeamControlRequest::StopSeat(input) => {
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
@@ -2732,6 +2784,37 @@ mod tests {
         });
         let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/team-stop-response.json")).unwrap();
         assert_eq!(serde_json::to_value(response).unwrap(), expected);
+    }
+
+    #[test]
+    fn glados_checkpoint_wire_and_authority_are_selectors_only() {
+        let request: TeamControlRequest = serde_json::from_str(include_str!("../../tests/fixtures/team-checkpoint-validation-request.json")).unwrap();
+        assert!(matches!(request, TeamControlRequest::ValidateCheckpoint(ValidateCheckpointInput { expected_generation:1, seq:2, .. })));
+        let view = TeamControlResponse::ValidateCheckpoint(ValidateCheckpointView {
+            team:"mural".into(), seat:"mural-frontend".into(), generation:1, seq:2, validation:"ok",
+        });
+        assert_eq!(serde_json::to_value(&view).unwrap(), serde_json::from_str::<serde_json::Value>(include_str!("../../tests/fixtures/team-checkpoint-validation-response.json")).unwrap());
+        for key in ["actor", "path", "worktree", "observation", "result", "validator_kind", "force", "token"] {
+            let mut forged = serde_json::to_value(&request).unwrap();
+            forged["input"][key] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<TeamControlRequest>(forged).is_err());
+        }
+        let _guard = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home = temp_root("glados-checkpoint-control");
+        let _env = EnvRestore::set(&home);
+        let invalid = r#"{"action":"validate_checkpoint","input":{"team":"t1","seat":"t1-frontend","expected_generation":0,"seq":1}}"#;
+        assert_eq!(team_control_headless(invalid).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        assert_eq!(team_control_headless(invalid).unwrap_err().code, "E_GENERATION_MISMATCH");
+        let target = RemoteTarget { team:"t1".into(), seat:"t1-frontend".into(), expected_generation:1 };
+        for actor in [AuthenticatedActor::operator_ui(), AuthenticatedActor::launcher()] {
+            assert_eq!(crate::team_replacement::native::validate_checkpoint_glados(&home, &actor, &target, 1, &[]).unwrap_err(), ReplacementError::AuthorizationRequired);
+        }
+        let actor = authenticate_glados_control().unwrap();
+        write_private_bytes_atomic(&home.join(".aperture/run/hub-tokens/glados.token"), b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true).unwrap();
+        assert_eq!(crate::team_replacement::native::validate_checkpoint_glados(&home, &actor, &target, 1, &[]).unwrap_err(), ReplacementError::AuthorizationRequired);
+        assert!(!home.join(".aperture/teams/t1").exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
