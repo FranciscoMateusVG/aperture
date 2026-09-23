@@ -336,12 +336,17 @@ pub struct TeamView {
     pub capabilities: TeamCapabilities,
 }
 
-/// Public native launch admission, not tuple/schema validity. Claude adapter
-/// fixtures may run internally, but all production entrypoints remain disabled
-/// until the paired installed startup/observation/readiness smoke is approved.
+/// Operator-approved normal launch, not a claim of mission readiness. Native
+/// preflight still requires the exact supported tuple and real model observation.
 /// Never replace this with a caller field, environment override, or UI flag.
 pub(crate) fn managed_launch_enabled(harness: &Harness) -> bool {
-    matches!(harness, Harness::Codex)
+    matches!(harness, Harness::Codex | Harness::Claude)
+}
+
+pub(crate) fn managed_execution_enabled(tuple: &ExecutionTuple) -> bool {
+    managed_launch_enabled(&tuple.harness)
+        && (tuple.harness == Harness::Codex
+            || (tuple.model == crate::team_claude_launch::MODEL && tuple.reasoning.is_none()))
 }
 
 fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapabilities {
@@ -349,7 +354,7 @@ fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapab
     let active = *state == TeamLifecycle::Active;
     let start = active && seats.iter().any(|seat| {
         let configured = seat.configured.tuple();
-        managed_launch_enabled(&configured.harness)
+        managed_execution_enabled(&configured)
             && seat.observed_owner.as_ref().is_some_and(|owner| {
                 owner.generation == 0
                     && owner.state == OwnerState::Stale
@@ -363,7 +368,7 @@ fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapab
         seat.observed_owner.as_ref().is_some_and(|owner| {
             owner.generation > 0
                 && owner.state == OwnerState::Active
-                && managed_launch_enabled(&owner.configured.harness)
+                && managed_execution_enabled(&owner.configured)
                 && owner.actual.as_ref() == Some(&owner.configured)
                 && owner.process_count > 0
                 && owner.thread_bound
@@ -2682,7 +2687,6 @@ mod tests {
                 3=>p.actual.harness=Harness::Codex,4=>p.actual.model="sonnet".into(),_=>p.actual.reasoning=Some(ReasoningEffort::High)};
             assert_eq!(project_claude_inbox_probe(&input,p).unwrap_err().code,"E_CONTROL_UNKNOWN");
         }
-        assert!(!managed_launch_enabled(&Harness::Claude));
     }
 
     #[test]
@@ -2698,7 +2702,6 @@ mod tests {
             assert!(serde_json::from_value::<TeamControlRequest>(v).is_err());
         }
         assert!(!home.join(".aperture/run/owner/probe-qa.json").exists());
-        assert!(!managed_launch_enabled(&Harness::Claude));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2713,7 +2716,6 @@ mod tests {
         let response = TeamControlResponse::ClaudeStartupSmoke(project_claude_startup_smoke(&input, diagnostic).unwrap());
         let expected: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/team-claude-smoke-response.json")).unwrap();
         assert_eq!(serde_json::to_value(response).unwrap(), expected);
-        assert!(!managed_launch_enabled(&Harness::Claude));
         for case in 0..6 {
             let mut d = crate::team_replacement::native::ClaudeSmokeDiagnostic {
                 team: input.team.clone(), seat: input.seat.clone(), generation: 1,
@@ -2762,6 +2764,11 @@ mod tests {
         assert_eq!(team_control_headless(request).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
         prepare_glados(&home);
         assert_eq!(team_control_headless(request).unwrap_err().code, "E_GENERATION_MISMATCH");
+        // Normal launch replaces the diagnostic launch surface, not its history.
+        for action in ["claude_startup_smoke", "claude_inbox_probe"] {
+            let fresh = serde_json::json!({"action":action,"input":{"team":"smoke","seat":"smoke-qa","expected_generation":0}});
+            assert_eq!(team_control_headless(&fresh.to_string()).unwrap_err().code, "E_STATE_CONFLICT");
+        }
         for key in ["actor", "model", "reasoning", "prompt", "timeout", "force", "token"] {
             let mut forged: serde_json::Value = serde_json::from_str(request).unwrap();
             forged["input"][key] = serde_json::json!("forged");
@@ -2769,7 +2776,6 @@ mod tests {
         }
         assert!(!home.join(".aperture/run/owner/smoke-qa.json").exists());
         assert!(!home.join(".aperture/teams/smoke").exists());
-        assert!(!managed_launch_enabled(&Harness::Claude));
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -3079,9 +3085,9 @@ mod tests {
     }
 
     #[test]
-    fn sonnet_full_id_is_literal_and_does_not_enable_managed_launch() {
+    fn normal_sonnet_admission_is_literal_and_legacy_aliases_do_not_launch() {
         assert!(managed_launch_enabled(&Harness::Codex));
-        assert!(!managed_launch_enabled(&Harness::Claude));
+        assert!(managed_launch_enabled(&Harness::Claude));
         let tuple = ExecutionTuple { harness: Harness::Claude, model: "claude-sonnet-5".into(), reasoning: None };
         assert!(validate_execution_tuple(&tuple).is_ok());
         for model in ["opus", "sonnet"] {
@@ -3094,12 +3100,23 @@ mod tests {
         seat.configured.model = tuple.model;
         seat.configured.reasoning = None;
         seat.observed_owner = Some(capability_owner(&seat.configured, 0, OwnerState::Stale));
-        let caps = team_capabilities(&TeamLifecycle::Active, &[seat]);
-        assert!(!caps.start && !caps.replace, "adapter and installed smoke are separate gates");
+        let caps = team_capabilities(&TeamLifecycle::Active, &[seat.clone()]);
+        assert!(caps.start && !caps.replace, "fresh exact normal Sonnet is startable, not observed or replaceable");
+        seat.observed_owner = Some(capability_owner(&seat.configured, 1, OwnerState::Active));
+        let running = team_capabilities(&TeamLifecycle::Active, &[seat.clone()]);
+        assert!(!running.start && running.replace);
+        seat.observed_owner.as_mut().unwrap().actual = None;
+        assert!(!team_capabilities(&TeamLifecycle::Active, &[seat]).replace);
+        for model in ["opus", "sonnet", "claude-sonnet-guessed"] {
+            let mut old = capability_seat("t1-qa", Harness::Claude, None);
+            old.configured.model = model.into();
+            old.observed_owner = Some(capability_owner(&old.configured, 0, OwnerState::Stale));
+            assert!(!team_capabilities(&TeamLifecycle::Active, &[old]).start);
+        }
     }
 
     #[test]
-    fn capabilities_are_action_and_seat_eligible_without_enabling_claude() {
+    fn capabilities_are_action_and_seat_eligible_without_enabling_legacy_claude_aliases() {
         let mut codex = capability_seat("t1-backend", Harness::Codex, None);
         codex.observed_owner = Some(capability_owner(
             &codex.configured,

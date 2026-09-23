@@ -45,7 +45,7 @@ impl NativePlan {
         worktree: Option<&str>,
         budget: &deadline::Deadline,
     ) -> Result<Self, ReplacementError> {
-        if !crate::teams::managed_launch_enabled(&tuple.harness) {
+        if !crate::teams::managed_execution_enabled(tuple) {
             return Err(ReplacementError::LaunchUnavailable);
         }
         match tuple.harness {
@@ -1289,7 +1289,7 @@ pub(crate) fn replace_authorized(
     selectors(&target)?;
     let binding = require_repository_binding(home, &target, &budget)?;
     authority.revalidate(&target)?;
-    if !crate::teams::managed_launch_enabled(&tuple(selection)?.harness) {
+    if !crate::teams::managed_execution_enabled(&tuple(selection)?) {
         return Err(ReplacementError::LaunchUnavailable);
     }
     let checkpoint =
@@ -1429,7 +1429,7 @@ fn prepare_authenticated(
     if owner.generation != expected_generation || owner.state != OwnerState::Active {
         return Err(ReplacementError::GenerationMismatch);
     }
-    if !crate::teams::managed_launch_enabled(&owner.requested.harness) {
+    if !crate::teams::managed_execution_enabled(&owner.requested) {
         return Err(ReplacementError::LaunchUnavailable);
     }
     let checkpoint =
@@ -1505,7 +1505,7 @@ pub(crate) fn start_operator(
         .map_err(|_| ReplacementError::PreparationExpired)?;
     plan.revalidate(&budget)
         .map_err(|_| ReplacementError::PreparationExpired)?;
-    if !crate::teams::managed_launch_enabled(&tuple(selection)?.harness) {
+    if !crate::teams::managed_execution_enabled(&tuple(selection)?) {
         return Err(ReplacementError::LaunchUnavailable);
     }
     let attempt = ready.start(budget)?;

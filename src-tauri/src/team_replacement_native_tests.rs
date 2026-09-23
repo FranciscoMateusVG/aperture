@@ -562,7 +562,7 @@ fn claude_stopped_requires_all_exact_identities_gone_not_socket_absence() {
 }
 
 #[test]
-fn disabled_claude_native_plan_denies_before_runtime_io_without_affecting_codex_policy() {
+fn legacy_claude_alias_denies_before_runtime_io_without_affecting_normal_policy() {
     let f = Fixture::new();
     let home = f.0.canonicalize().unwrap();
     let root = home.join("projects/aperture");
@@ -582,10 +582,10 @@ fn disabled_claude_native_plan_denies_before_runtime_io_without_affecting_codex_
     let before = std::fs::read(home.join(".aperture/teams/t1/team.json")).unwrap();
     let requested = ExecutionTuple {
         harness: Harness::Claude,
-        model: crate::team_claude_launch::MODEL.into(),
+        model: "sonnet".into(),
         reasoning: None,
     };
-    // Deliberately missing HOME: policy must reject before examining any native
+    // Legacy alias and deliberately missing HOME: reject before examining native
     // runtime, executable, token, attempt or process, even with a bound repo.
     assert!(matches!(
         NativePlan::preflight_selected(
@@ -633,7 +633,7 @@ fn disabled_claude_native_plan_denies_before_runtime_io_without_affecting_codex_
         ".aperture/teams/t1/team.json",
         &serde_json::from_slice(&before).unwrap(),
     );
-    assert!(!crate::teams::managed_launch_enabled(&Harness::Claude));
+    assert!(crate::teams::managed_launch_enabled(&Harness::Claude), "normal launch does not make legacy aliases executable");
     assert!(crate::teams::managed_launch_enabled(&Harness::Codex));
     assert!(!home.join("missing-home").exists());
     assert!(!home.join(".aperture/run").exists());
@@ -720,7 +720,7 @@ fn smoke_authority_is_glados_only_before_any_runtime_io() {
         assert!(matches!(bootstrap_claude_smoke_authorized(&f.0,&actor,"t1","t1-worker",0,&[]),Err(ReplacementError::AuthorizationRequired)));
     }
     assert!(!f.0.join(".aperture").exists());
-    assert!(!crate::teams::managed_launch_enabled(&Harness::Claude));
+    assert!(crate::teams::managed_launch_enabled(&Harness::Claude), "historical diagnostic tests never enable a different launch path");
 }
 #[test]
 fn smoke_admission_pins_g0_exact_tuple_snapshot_and_current_capability() {
@@ -931,7 +931,7 @@ fn inbox_probe_native_denies_non_glados_before_any_launch_or_kickoff() {
         assert!(matches!(bootstrap_claude_inbox_probe_authorized(&f.0,&actor,"t1","t1-worker",0),Err(ReplacementError::AuthorizationRequired)));
     }
     assert!(!f.0.join(".aperture/run/managed/t1-worker").exists());
-    assert!(!crate::teams::managed_launch_enabled(&Harness::Claude));
+    assert!(crate::teams::managed_launch_enabled(&Harness::Claude), "old inbox probe remains denied after normal launch admission");
 }
 
 #[test]

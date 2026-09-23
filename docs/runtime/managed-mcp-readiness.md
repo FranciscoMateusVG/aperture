@@ -114,9 +114,27 @@ The flag is derived from the private normal launch mode, never from a caller
 field or inherited environment. Historical pre-input diagnostics do not receive
 it. Personal settings and trust records are not edited. This is an explicit
 operator risk acceptance, not evidence of installed readiness or a passed live
-journey; public Claude admission remains disabled pending the remaining gates.
+journey. The normal-launch admission change below is a separate step.
 
 The operator also explicitly confirmed the same autonomy for Codex team seats.
 Their existing native-generated configuration already sets `approval_policy =
 "never"` and `sandbox_mode = "danger-full-access"`; regression assertions now pin
 both values. No running Codex process is restarted or reconfigured by this change.
+
+### Normal admission replaces diagnostic launch
+
+Following the operator's explicit simplification direction, the native ordinary
+bootstrap now admits Claude `claude-sonnet-5` with reasoning `None` alongside
+Codex. Legacy Claude aliases remain readable, but are not executable offers.
+Starting still becomes Active only after the actual model/session observation;
+neither the permission flag nor the configured argv substitutes for that fact.
+New calls to the old startup/inbox diagnostic entrypoints are rejected; their
+files and historical receipts are preserved. There is no 30-second shutdown in
+ordinary launch, and no simulated Enter.
+
+Before assigning a business task, GLaDOS must witness the new seat's real BEADS
+reply and read acknowledgment, and report any missing tool/trust/turn as a
+blocker. Open selects its existing worker window. At completion the worker
+writes a checkpoint, GLaDOS validates its selected sequence with native Git/PR
+evidence, then uses StopSeat and reconciled archive. No diagnostic roundtrip or
+installed normal journey is claimed by the source admission change itself.

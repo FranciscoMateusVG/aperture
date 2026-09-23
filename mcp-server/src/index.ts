@@ -512,7 +512,7 @@ server.tool(
 
 server.tool(
   "team_bootstrap_seat",
-  "GLaDOS-only: start one eligible Codex seat of an already approved team through native ownership, fresh session and exact model observation. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
+  "GLaDOS-only: start one eligible Codex or exact Claude Sonnet 5/None seat of an already approved team through native ownership, fresh session and real exact model observation. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. Started is not messaging readiness: require a real BEADS reply/read acknowledgment before business dispatch. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
   { input: bootstrapSeatSchema },
   async ({ input }) => {
     const denied = gladosControlDenied();
@@ -530,7 +530,7 @@ server.tool(
 
 server.tool(
   "team_claude_inbox_probe",
-  "GLaDOS-only, operator-authorized diagnostic: start one NEW approved Sonnet 5/None seat at generation zero, observe pre-input identity, then submit ONE fixed native inbox kickoff after Active. Allows up to 30 seconds for a pre-enqueued BEADS diagnostic, then always cleans up the same candidate and leaves it quarantined. Verify the reply/read-state separately after return; an incomplete roundtrip stays NOT_RUN. A sent kickoff is NOT proof of tools, Monitor or mission readiness; verify those before any business dispatch. Public Claude launch remains disabled. No caller prompt/model/authority/timeout, no retry after unknown, no reuse of old diagnostics.",
+  "Historical diagnostic, retired for new launches; native rejects it now. Use team_bootstrap_seat for normal workers. Historical contract: start one NEW approved Sonnet 5/None seat at generation zero, observe pre-input identity, then submit ONE fixed native inbox kickoff after Active. Allows up to 30 seconds for a pre-enqueued BEADS diagnostic, then always cleans up the same candidate and leaves it quarantined. Verify the reply/read-state separately after return; an incomplete roundtrip stays NOT_RUN. A sent kickoff is NOT proof of tools, Monitor or mission readiness; verify those before any business dispatch. No caller prompt/model/authority/timeout, no retry after unknown, no reuse of old diagnostics.",
   { input: claudeInboxProbeSchema },
   async ({ input }) => {
     const denied = gladosControlDenied();
@@ -547,7 +547,7 @@ server.tool(
 
 server.tool(
   "team_claude_startup_smoke",
-  "GLaDOS-only, operator-authorized diagnostic: one fresh approved Claude Sonnet 5 seat at generation zero. Performs real startup observation WITHOUT an initial prompt, then always stops/revokes the same candidate and leaves it quarantined. This consumes the attempt and cannot be retried automatically. It does NOT prove MCP readiness, enable Claude publicly, start a business mission, or leave a worker available. Exact selectors only; no caller model, authority, force, prompt or timeout. UNKNOWN requires inspection, never a retry.",
+  "Historical diagnostic, retired for new launches; native rejects it now. Use team_bootstrap_seat. Historical contract: GLaDOS-only, operator-authorized diagnostic: one fresh approved Claude Sonnet 5 seat at generation zero. Performs real startup observation WITHOUT an initial prompt, then always stops/revokes the same candidate and leaves it quarantined. This consumes the attempt and cannot be retried automatically. It does NOT prove MCP readiness, enable Claude publicly, start a business mission, or leave a worker available. Exact selectors only; no caller model, authority, force, prompt or timeout. UNKNOWN requires inspection, never a retry.",
   { input: claudeStartupSmokeSchema },
   async ({ input }) => {
     const denied = gladosControlDenied();
