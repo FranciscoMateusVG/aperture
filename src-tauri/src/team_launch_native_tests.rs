@@ -150,6 +150,9 @@ fn generated_config_is_exact_toml_and_values_are_not_syntax_or_argv() {
     assert!(parsed.get("evil").is_none());
     assert_eq!(parsed["model"].as_str(), Some("gpt-6-astra"));
     assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
+    // Operator confirmed autonomous tool execution for Codex as well as Claude.
+    assert_eq!(parsed["approval_policy"].as_str(), Some("never"));
+    assert_eq!(parsed["sandbox_mode"].as_str(), Some("danger-full-access"));
     for server in ["aperture-bus", "sentry"] {
         assert_eq!(
             parsed["mcp_servers"][server]["command"].as_str(),

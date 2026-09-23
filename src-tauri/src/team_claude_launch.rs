@@ -95,13 +95,16 @@ impl ClaudeLaunchPlan {
         let mut plan = Self::new(home, team, seat, generation, tuple, helper)?;
         plan.mode = mode;
         if mode == ClaudeLaunchMode::NormalPositional {
+            // Operator-approved standing-Claude permission policy (2026-09-23).
+            // Diagnostic modes retain their original permission behavior.
+            plan.argv.push("--dangerously-skip-permissions".into());
             plan.argv.push(crate::launcher::KICKOFF_TEXT.into());
         }
         Ok(plan)
     }
     fn append_system_prompt(&mut self, path: &Path) {
         // Keep the existing standing kickoff as exactly one final positional
-        // argv item. Do not reuse the standing permission-bypass flag.
+        // argv item, after all native-generated flags.
         let at = self.argv.len() - usize::from(self.mode == ClaudeLaunchMode::NormalPositional);
         self.argv.splice(at..at, ["--append-system-prompt-file".into(), path.to_string_lossy().into_owned()]);
     }
@@ -235,15 +238,17 @@ mod tests {
         assert!(a.mcp_path.ends_with("claude-mcp.json"));
     }
     #[test]
-    fn normal_plan_reuses_one_standing_positional_prompt_without_permission_bypass() {
+    fn normal_plan_reuses_operator_authorized_standing_permission_policy() {
         let mut normal = ClaudeLaunchPlan::for_mode(Path::new("/fixture"), "t1", "t1-lead", 1,
             &tuple(), Path::new("/installed/aperture-boot"), ClaudeLaunchMode::NormalPositional).unwrap();
         normal.append_system_prompt(Path::new("/fixture/prompt.md"));
         assert_eq!(normal.argv.last().unwrap(), crate::launcher::KICKOFF_TEXT);
         assert_eq!(normal.argv.iter().filter(|a| a.as_str() == crate::launcher::KICKOFF_TEXT).count(), 1);
-        assert_eq!(normal.argv.len(), 12);
-        assert_eq!(&normal.argv[9..11], ["--append-system-prompt-file", "/fixture/prompt.md"]);
-        for flag in ["--dangerously-skip-permissions", "--resume", "--continue", "--fork-session", "--fallback-model"] {
+        assert_eq!(normal.argv.len(), 13);
+        assert_eq!(normal.argv[9], "--dangerously-skip-permissions");
+        assert_eq!(normal.argv.iter().filter(|a| a.as_str() == "--dangerously-skip-permissions").count(), 1);
+        assert_eq!(&normal.argv[10..12], ["--append-system-prompt-file", "/fixture/prompt.md"]);
+        for flag in ["--resume", "--continue", "--fork-session", "--fallback-model"] {
             assert!(!normal.argv.iter().any(|a| a == flag));
         }
         let mut diagnostic = ClaudeLaunchPlan::new(Path::new("/fixture"), "t1", "t1-lead", 1,
@@ -251,6 +256,7 @@ mod tests {
         diagnostic.append_system_prompt(Path::new("/fixture/prompt.md"));
         assert_eq!(diagnostic.argv.len(), 11);
         assert!(!diagnostic.argv.iter().any(|a| a == crate::launcher::KICKOFF_TEXT));
+        assert!(!diagnostic.argv.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
     #[test]
     fn alias_codex_reasoning_and_bad_selectors_are_not_authority() {

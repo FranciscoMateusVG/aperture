@@ -100,3 +100,23 @@ Claude gate by itself. Business dispatch remains separate: witness a real BEADS
 message, reply and read acknowledgment through the new seat before assigning
 work. Permission policy and workspace trust must be explicit; neither is silently
 changed by this client wait. Installed normal-launch/roundtrip evidence is pending.
+
+### Operator-approved normal Claude permissions (2026-09-23)
+
+The operator explicitly chose the same autonomous tool-permission policy as
+standing Wheatley. Normal managed Claude therefore receives the native
+`--dangerously-skip-permissions` flag exactly once, before the fixed positional
+boot prompt. This bypasses interactive tool approval; it does not grant a new
+mission, publication authority, access to another seat, or permission to expose
+credentials. Authenticated native lifecycle controls remain unchanged.
+
+The flag is derived from the private normal launch mode, never from a caller
+field or inherited environment. Historical pre-input diagnostics do not receive
+it. Personal settings and trust records are not edited. This is an explicit
+operator risk acceptance, not evidence of installed readiness or a passed live
+journey; public Claude admission remains disabled pending the remaining gates.
+
+The operator also explicitly confirmed the same autonomy for Codex team seats.
+Their existing native-generated configuration already sets `approval_policy =
+"never"` and `sandbox_mode = "danger-full-access"`; regression assertions now pin
+both values. No running Codex process is restarted or reconfigured by this change.
