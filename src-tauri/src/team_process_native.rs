@@ -398,39 +398,88 @@ fn refresh_depths(
     }
     Ok(())
 }
-#[cfg(target_os = "macos")]
-fn native_table(deadline: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
-    // proc_listpids returns BYTES (unlike proc_listallpids's count wrapper).
-    // PROC_ALL_PIDS=1 is pinned by the macOS SDK sys/proc_info.h.
-    let mut pids = vec![0i32; MAX_PIDS + 1];
-    let bytes = unsafe {
-        libc::proc_listpids(
-            1,
-            0,
-            pids.as_mut_ptr().cast(),
-            (pids.len() * std::mem::size_of::<i32>()) as i32,
-        )
-    };
-    if bytes <= 0 || bytes as usize % std::mem::size_of::<i32>() != 0 {
-        return Err(ReplacementError::StopUnverified);
-    }
-    let count = bytes as usize / std::mem::size_of::<i32>();
-    if count > MAX_PIDS {
-        return Err(ReplacementError::StopUnverified);
-    }
-    let mut out = vec![];
-    let mut seen = HashSet::new();
-    for pid in pids.into_iter().take(count).filter(|p| *p > 1) {
-        if Instant::now() > deadline || !seen.insert(pid) {
+// Darwin LP64 kinfo_proc ABI from SDK sys/sysctl.h + sys/proc.h. These
+// offsets are verified against the installed SDK by the C layout oracle in
+// tests. Decode only metadata; never expose comm/login/kernel pointer fields.
+// Unknown architectures fail closed instead of guessing another ABI.
+#[cfg(all(target_os = "macos", target_pointer_width = "64", target_endian = "little",
+    any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod process_table {
+    use super::*;
+    pub(super) const ROW_SIZE: usize = 648;
+    pub(super) const PID: usize = 40;
+    pub(super) const START_SEC: usize = 0;
+    pub(super) const START_USEC: usize = 8;
+    pub(super) const UID: usize = 420;
+    pub(super) const PPID: usize = 560;
+    pub(super) const PGID: usize = 564;
+
+    pub(super) fn decode(bytes: &[u8], capacity: usize, deadline: Instant)
+        -> Result<Vec<ProcessMetadata>, ReplacementError>
+    {
+        if bytes.is_empty() || bytes.len() >= capacity || bytes.len() % ROW_SIZE != 0
+            || bytes.len() / ROW_SIZE > MAX_PIDS {
             return Err(ReplacementError::StopUnverified);
         }
-        if let Some(p) = observe(pid as u32)? {
-            out.push(p);
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for row in bytes.chunks_exact(ROW_SIZE) {
+            if Instant::now() >= deadline { return Err(ReplacementError::StopUnverified); }
+            let word = |at| u32::from_ne_bytes(row[at..at+4].try_into().unwrap());
+            let pid = word(PID);
+            if pid > i32::MAX as u32 || !seen.insert(pid) {
+                return Err(ReplacementError::StopUnverified);
+            }
+            // Kernel and launchd are not signal candidates, as in the original table.
+            if pid <= 1 { continue; }
+            let sec = i64::from_ne_bytes(row[START_SEC..START_SEC+8].try_into().unwrap());
+            let usec = word(START_USEC) as i32;
+            let ppid = word(PPID);
+            let pgid = word(PGID);
+            if sec <= 0 || !(0..1_000_000).contains(&usec)
+                || (sec as u64).checked_mul(1_000_000).and_then(|v| v.checked_add(usec as u64)).is_none()
+                || ppid > i32::MAX as u32 || pgid > i32::MAX as u32 {
+                return Err(ReplacementError::StopUnverified);
+            }
+            out.push(ProcessMetadata {
+                identity: ProcessIdentity { pid, start_time: format!("{}.{:06}", sec, usec) },
+                ppid, pgid, uid: word(UID),
+            });
         }
+        Ok(out)
     }
-    Ok(out)
+
+    pub(super) fn read(deadline: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
+        if Instant::now() >= deadline { return Err(ReplacementError::StopUnverified); }
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL, 0];
+        let mut needed: usize = 0;
+        // Size probe plus ONE bounded read; growth/ENOMEM is uncertainty, not a
+        // partial table or an automatic retry. No UID/EPERM-based exclusions.
+        let rc = unsafe { libc::sysctl(mib.as_mut_ptr(), 4, std::ptr::null_mut(),
+            &mut needed, std::ptr::null_mut(), 0) };
+        if rc != 0 || needed == 0 || needed > MAX_PIDS * ROW_SIZE
+            || Instant::now() >= deadline {
+            return Err(ReplacementError::StopUnverified);
+        }
+        let capacity = (needed + 64 * ROW_SIZE).min((MAX_PIDS + 1) * ROW_SIZE);
+        let mut storage = vec![0u64; capacity.div_ceil(8)];
+        let mut len = capacity;
+        let rc = unsafe { libc::sysctl(mib.as_mut_ptr(), 4, storage.as_mut_ptr().cast(),
+            &mut len, std::ptr::null_mut(), 0) };
+        if rc != 0 || len >= capacity { return Err(ReplacementError::StopUnverified); }
+        // Aligned initialized allocation; len bounded above, fixed byte decoder
+        // avoids creating a Rust struct from the kernel's padding/pointer fields.
+        let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), len) };
+        decode(bytes, capacity, deadline)
+    }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(target_os = "macos", target_pointer_width = "64", target_endian = "little",
+    any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn native_table(deadline: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
+    process_table::read(deadline)
+}
+#[cfg(not(all(target_os = "macos", target_pointer_width = "64", target_endian = "little",
+    any(target_arch = "aarch64", target_arch = "x86_64"))))]
 fn native_table(_: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
     Err(ReplacementError::StopUnverified)
 }
