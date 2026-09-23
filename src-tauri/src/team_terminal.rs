@@ -349,6 +349,18 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
     let _team = owner::try_lock(&home.join(".aperture/run/team-locks"), &input.team)?;
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
     let _seat = store.lock(&input.seat)?;
+    // A Claude worker already runs inside its own launch window. Open selects
+    // that exact window; the Codex client path below is untouched.
+    if store.read_owner_locked(&input.seat)?.requested.harness == Harness::Claude {
+        return open_claude_with(
+            &mut NativeClaude {
+                home,
+                input: &input,
+                store: &store,
+            },
+            &input,
+        );
+    }
     let before = binding(home, &input, &store)?;
     let dir = home.join(".aperture/run/terminals");
     journal::ensure_private_dir(&dir)?;
@@ -509,6 +521,140 @@ pub async fn team_open_seat(
                 .into(),
             message: "Could not attach the current managed terminal; refresh before retry".into(),
         })
+}
+
+// ---------------------------------------------------------------------------
+// Claude seats: the worker IS the tmux window created at launch (window name
+// `<seat>-g<gen>`, pane root process == owner incarnation pid). Open therefore
+// only locates and selects that window. No client receipt, no new-window, no
+// helper, no worker/thread, no keys. Every negative returns before `select`.
+// ---------------------------------------------------------------------------
+const CLAUDE_PANE_FORMAT: &str =
+    "#{session_name}|#{window_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{window_name}";
+/// Private injection boundary for hermetic ordering tests only. The public
+/// entrypoint always uses `NativeClaude`; no DTO supplies any of these facts.
+trait ClaudeWindowIo {
+    fn owner(&mut self) -> Result<OwnerRecord>;
+    fn live(&mut self, pid: u32, birth: u64) -> Result<()>;
+    fn panes(&mut self) -> Result<String>;
+    fn select(&mut self, window: &str) -> Result<()>;
+}
+struct NativeClaude<'a> {
+    home: &'a Path,
+    input: &'a OpenSeatInput,
+    store: &'a OwnerStore,
+}
+impl ClaudeWindowIo for NativeClaude<'_> {
+    fn owner(&mut self) -> Result<OwnerRecord> {
+        match teams::classify_managed_seat(self.home, &self.input.seat).map_err(|_| ERROR)? {
+            Some(ManagedSeatState::Active { team, .. }) if team == self.input.team => {}
+            _ => return Err(ERROR.into()),
+        }
+        let r = self.store.read_owner_locked(&self.input.seat)?;
+        claude_owner_valid(self.input, &r)?;
+        Ok(r)
+    }
+    fn live(&mut self, pid: u32, birth: u64) -> Result<()> {
+        live(pid, birth)
+    }
+    fn panes(&mut self) -> Result<String> {
+        tmux(&args(&[
+            "list-panes",
+            "-s",
+            "-t",
+            "aperture",
+            "-F",
+            CLAUDE_PANE_FORMAT,
+        ]))
+    }
+    fn select(&mut self, window: &str) -> Result<()> {
+        if !window_id(window) {
+            return Err(ERROR.into());
+        }
+        tmux(&args(&["select-window", "-t", window])).map(|_| ())
+    }
+}
+/// Exact Active Claude owner: approved Sonnet 5 / reasoning None, observed
+/// session id, no pending reservation, and the pane root process recorded.
+fn claude_owner_valid(input: &OpenSeatInput, r: &OwnerRecord) -> Result<()> {
+    let i = r.incarnation.as_ref().ok_or(ERROR)?;
+    if r.schema_version != 1
+        || r.seat != input.seat
+        || r.generation != input.expected_generation
+        || r.generation == 0
+        || r.state != OwnerState::Active
+        || r.requested.harness != Harness::Claude
+        || r.requested.model != crate::team_claude_launch::MODEL
+        || r.requested.reasoning.is_some()
+        || r.reservation_nonce_sha256.is_some()
+        || r.provisional_token_id.is_some()
+        || !i.observed
+        || i.harness != r.requested.harness
+        || i.model != r.requested.model
+        || i.reasoning != r.requested.reasoning
+        || i.pid <= 1
+        || i.start_time == 0
+        || !crate::team_claude_launch::canonical_uuid(&i.thread_id)
+        || !i
+            .processes
+            .iter()
+            .any(|p| p.pid == i.pid && p.start_time == i.start_time)
+    {
+        return Err(ERROR.into());
+    }
+    Ok(())
+}
+fn pane_id(s: &str) -> bool {
+    s.starts_with('%') && s.len() > 1 && s.len() < 24 && s[1..].bytes().all(|b| b.is_ascii_digit())
+}
+/// Exactly one live pane in session `aperture` whose root pid is the owner pid
+/// and whose window carries the launch name. Malformed rows fail closed.
+fn claude_window(out: &str, pid: u32, name: &str) -> Result<String> {
+    if out.len() > 8192 {
+        return Err(ERROR.into());
+    }
+    let mut found: Option<String> = None;
+    for (n, line) in out.lines().enumerate() {
+        if n >= 4096 {
+            return Err(ERROR.into());
+        }
+        let p: Vec<&str> = line.splitn(6, '|').collect();
+        if p.len() != 6 || !window_id(p[1]) || !pane_id(p[2]) {
+            return Err(ERROR.into());
+        }
+        let row_pid: u32 = p[3].parse().map_err(|_| ERROR)?;
+        if row_pid != pid {
+            continue;
+        }
+        if found.is_some() || p[0] != "aperture" || p[4] != "0" || p[5] != name {
+            return Err(ERROR.into());
+        }
+        found = Some(p[1].to_string());
+    }
+    found.ok_or_else(|| ERROR.into())
+}
+/// Production sequence: owner -> live -> panes -> live -> owner -> select.
+/// The only mutating verb runs after the second live/owner recheck.
+fn open_claude_with(io: &mut impl ClaudeWindowIo, input: &OpenSeatInput) -> Result<OpenSeatView> {
+    let owner = io.owner()?;
+    let (pid, birth) = {
+        let i = owner.incarnation.as_ref().ok_or(ERROR)?;
+        (i.pid, i.start_time)
+    };
+    io.live(pid, birth)?;
+    let name = format!("{}-g{}", input.seat, input.expected_generation);
+    let window = claude_window(&io.panes()?, pid, &name)?;
+    io.live(pid, birth)?;
+    if io.owner()? != owner {
+        return Err(ERROR.into());
+    }
+    io.select(&window)?;
+    Ok(OpenSeatView {
+        team: input.team.clone(),
+        seat: input.seat.clone(),
+        generation: input.expected_generation,
+        window_id: window,
+    })
 }
 #[cfg(test)]
 #[path = "team_terminal_tests.rs"]

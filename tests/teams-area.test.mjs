@@ -268,3 +268,23 @@ test("focus on an open details summary is restored by details key across a chang
   assert.match(inner.v, /Trabalhando/); assert.equal(fresh.open, true, "details reopened"); assert.equal(focused, 1, "summary refocused by details key");
  });
 });
+
+test("Claude seat Open is enabled only for an exact observed Sonnet 5/None owner and never without actual", async () => {
+ const sonnet = { harness: "claude", model: "claude-sonnet-5", reasoning: null };
+ const t = team("active"); t.seats[1].observed_owner = { ...ownerIn("active", 1), configured: { ...sonnet }, actual: { ...sonnet }, process_count: 1, thread_bound: true };
+ let opened = 0;
+ await setup({ api: { list: async () => [t] }, openAgent: async (current, name) => { assert.equal(current.snapshot.team, "t1"); assert.equal(name, "t1-qa"); opened++; }, listAgents: async () => [] }, async f => {
+  assert.match(f.teams.innerHTML, /data-seat="t1-qa">Open</);
+  const live = new f.El(); live.dataset = { action: "open-seat", team: "t1", seat: "t1-qa" };
+  await f.root.handlers.click({ target: live }); assert.equal(opened, 1);
+ });
+ for (const patch of [{ actual: null }, { actual: { ...sonnet, model: "sonnet" } }, { configured: { ...sonnet, reasoning: "high" }, actual: { ...sonnet, reasoning: "high" } }]) {
+  const c = team("active"); c.seats[1].observed_owner = { ...ownerIn("active", 1), configured: { ...sonnet }, actual: { ...sonnet }, process_count: 1, thread_bound: true, ...patch };
+  let calls = 0;
+  await setup({ api: { list: async () => [c] }, openAgent: async () => { calls++; }, listAgents: async () => [] }, async f => {
+   assert.match(f.teams.innerHTML, /data-seat="t1-qa" disabled/);
+   const button = new f.El(); button.dataset = { action: "open-seat", team: "t1", seat: "t1-qa" };
+   await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
+  });
+ }
+});

@@ -38,4 +38,8 @@ After a paired release and authorized window, Open twice must select the same
 client on the exact owner thread; closing that client must leave the worker
 identity unchanged. Changed owner/socket/client identity must refuse attachment.
 This witness is NOT_RUN until explicitly recorded; no new worker or mission is
-started by Open, and Claude remains outside this Codex-only command.
+started by Open. Claude seats take a narrower path: the worker already runs in
+the tmux window created at launch (`<seat>-g<gen>`, pane root process = the Active
+owner pid), so Open only locates that window (session `aperture`, exact pid, live,
+not dead, exact name), rechecks process and owner, then `select-window`. It never
+creates a client, receipt, worker, thread or key, and never closes the window.

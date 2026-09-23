@@ -204,3 +204,244 @@ fn existing_client_reuse_requires_exact_binding_pid_birth_and_live_pane() {
     stale.binding = "b".repeat(64);
     assert!(!reusable(&stale, &b, pid, false));
 }
+
+// ---- Claude: select the existing worker window; never create or key ----------
+fn claude_input() -> OpenSeatInput {
+    OpenSeatInput {
+        team: "test".into(),
+        seat: "test-qa".into(),
+        expected_generation: 1,
+    }
+}
+fn claude_record() -> OwnerRecord {
+    let tuple = ExecutionTuple {
+        harness: Harness::Claude,
+        model: crate::team_claude_launch::MODEL.into(),
+        reasoning: None,
+    };
+    let mut r = record();
+    r.seat = "test-qa".into();
+    r.requested = tuple.clone();
+    let i = r.incarnation.as_mut().unwrap();
+    i.harness = tuple.harness;
+    i.model = tuple.model;
+    i.reasoning = tuple.reasoning;
+    i.thread_id = "12345678-1234-4234-8234-123456789012".into();
+    r
+}
+const PANES_OK: &str = "aperture|@7|%3|42|0|test-qa-g1\naperture|@2|%1|7|0|glados\n";
+struct FakeClaude {
+    owners: Vec<Result<OwnerRecord>>,
+    live_fail_at: Option<usize>,
+    lives: usize,
+    panes: String,
+    events: Vec<&'static str>,
+}
+impl FakeClaude {
+    fn ok() -> Self {
+        Self {
+            owners: vec![Ok(claude_record()), Ok(claude_record())],
+            live_fail_at: None,
+            lives: 0,
+            panes: PANES_OK.into(),
+            events: vec![],
+        }
+    }
+}
+impl ClaudeWindowIo for FakeClaude {
+    fn owner(&mut self) -> Result<OwnerRecord> {
+        self.events.push("owner");
+        if self.owners.is_empty() {
+            return Err(ERROR.into());
+        }
+        self.owners.remove(0)
+    }
+    fn live(&mut self, pid: u32, birth: u64) -> Result<()> {
+        self.events.push("live");
+        self.lives += 1;
+        if self.live_fail_at == Some(self.lives) || pid != 42 || birth != 123 {
+            return Err(ERROR.into());
+        }
+        Ok(())
+    }
+    fn panes(&mut self) -> Result<String> {
+        self.events.push("panes");
+        Ok(self.panes.clone())
+    }
+    fn select(&mut self, window: &str) -> Result<()> {
+        self.events.push("select");
+        assert!(window_id(window));
+        Ok(())
+    }
+}
+#[test]
+fn claude_open_selects_existing_window_only_after_second_live_and_owner_recheck() {
+    let mut io = FakeClaude::ok();
+    let v = open_claude_with(&mut io, &claude_input()).unwrap();
+    assert_eq!(v.window_id, "@7");
+    assert_eq!(
+        (v.team.as_str(), v.seat.as_str(), v.generation),
+        ("test", "test-qa", 1)
+    );
+    assert_eq!(
+        io.events,
+        ["owner", "live", "panes", "live", "owner", "select"]
+    );
+    let value = serde_json::to_value(&v).unwrap();
+    assert_eq!(
+        value.as_object().unwrap().len(),
+        4,
+        "same response shape as Codex"
+    );
+}
+#[test]
+fn claude_open_negatives_never_reach_select() {
+    let mut drifted = claude_record();
+    drifted.incarnation.as_mut().unwrap().pid = 43;
+    let cases: Vec<(&str, FakeClaude)> = vec![
+        (
+            "owner unavailable",
+            FakeClaude {
+                owners: vec![Err(ERROR.into())],
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "live fails before panes",
+            FakeClaude {
+                live_fail_at: Some(1),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "live fails after panes",
+            FakeClaude {
+                live_fail_at: Some(2),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "owner drifts after panes",
+            FakeClaude {
+                owners: vec![Ok(claude_record()), Ok(drifted)],
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "owner gone after panes",
+            FakeClaude {
+                owners: vec![Ok(claude_record())],
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "no matching pane",
+            FakeClaude {
+                panes: "aperture|@2|%1|7|0|glados\n".into(),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "duplicate pid rows",
+            FakeClaude {
+                panes: "aperture|@7|%3|42|0|test-qa-g1\naperture|@8|%4|42|0|test-qa-g1\n".into(),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "dead pane",
+            FakeClaude {
+                panes: "aperture|@7|%3|42|1|test-qa-g1\n".into(),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "foreign session",
+            FakeClaude {
+                panes: "other|@7|%3|42|0|test-qa-g1\n".into(),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "foreign window name",
+            FakeClaude {
+                panes: "aperture|@7|%3|42|0|test-qa-g2\n".into(),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "malformed row",
+            FakeClaude {
+                panes: "aperture|@7;kill|%3|42|0|test-qa-g1\n".into(),
+                ..FakeClaude::ok()
+            },
+        ),
+        (
+            "empty output",
+            FakeClaude {
+                panes: String::new(),
+                ..FakeClaude::ok()
+            },
+        ),
+    ];
+    for (name, mut io) in cases {
+        assert!(
+            open_claude_with(&mut io, &claude_input()).is_err(),
+            "{name}"
+        );
+        assert!(
+            !io.events.contains(&"select"),
+            "{name}: select must never run"
+        );
+    }
+}
+#[test]
+fn claude_window_parser_is_exact_and_tolerates_pipes_in_foreign_names() {
+    assert_eq!(claude_window(PANES_OK, 42, "test-qa-g1").unwrap(), "@7");
+    assert_eq!(
+        claude_window(
+            "aperture|@1|%1|9|0|a|b|c\naperture|@7|%3|42|0|test-qa-g1\n",
+            42,
+            "test-qa-g1"
+        )
+        .unwrap(),
+        "@7"
+    );
+    for (out, pid) in [
+        ("aperture|@7|%3|42|0|test-qa-g1\n", 41u32),
+        ("aperture|@7|%3|42|0\n", 42),
+        ("aperture|@7|3|42|0|test-qa-g1\n", 42),
+        ("aperture|@7|%3|x|0|test-qa-g1\n", 42),
+        ("aperture|@7|%3|42|2|test-qa-g1\n", 42),
+    ] {
+        assert!(claude_window(out, pid, "test-qa-g1").is_err(), "{out:?}");
+    }
+    assert!(claude_window(&"a".repeat(8193), 42, "x").is_err());
+}
+#[test]
+fn claude_owner_requires_exact_active_observed_sonnet_none() {
+    assert!(claude_owner_valid(&claude_input(), &claude_record()).is_ok());
+    for kind in 0..12 {
+        let mut r = claude_record();
+        match kind {
+            0 => r.state = OwnerState::Starting,
+            1 => r.state = OwnerState::Quarantined,
+            2 => r.generation = 2,
+            3 => r.requested.harness = Harness::Codex,
+            4 => r.requested.model = "sonnet".into(),
+            5 => r.requested.reasoning = Some(ReasoningEffort::High),
+            6 => r.incarnation.as_mut().unwrap().observed = false,
+            7 => r.incarnation.as_mut().unwrap().model = "different".into(),
+            8 => r.incarnation.as_mut().unwrap().thread_id = "not-a-uuid".into(),
+            9 => r.reservation_nonce_sha256 = Some("a".repeat(64)),
+            10 => r.incarnation.as_mut().unwrap().processes.clear(),
+            _ => r.incarnation.as_mut().unwrap().start_time = 999,
+        }
+        assert!(
+            claude_owner_valid(&claude_input(), &r).is_err(),
+            "mutation {kind}"
+        );
+    }
+    // The Codex guard still rejects a Claude owner and vice versa.
+    assert!(owner_valid(&claude_input(), &claude_record()).is_err());
+}
