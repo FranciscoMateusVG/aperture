@@ -362,3 +362,26 @@ int main(void) {
         println!("readonly table={} compared={} privileged_denied={} gone={} recycled={}",table.len(),compared,denied,gone,recycled);
     }
 }
+
+/// Explicitly authorized one-shot diagnostic; never run in routine suites.
+/// The target is fixed, not a caller-supplied process or ownership assertion.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "operator-authorized RO Sonnet diagnostic only; reads real HOME/process metadata"]
+fn sonnet_diagnostic_collect_readonly_once() {
+    let home = std::env::var_os("HOME").expect("HOME unavailable");
+    match collect_native(Path::new(&home), "sonnet-smoke", "sonnet-smoke-qa", 1) {
+        Ok(snapshot) => {
+            let gone = snapshot.processes.iter()
+                .filter(|p| state(&p.identity) == ProcessState::Gone).count();
+            println!("diagnostic_collect=OK complete={} owned_count={} gone_count={} unowned_match_count={}",
+                snapshot.complete, snapshot.processes.len(), gone, snapshot.unowned_matches.len());
+            // Collection is evidence only; unowned matches remain blockers for
+            // downstream policy. No persistence/stop/revoke follows this test.
+        }
+        Err(error) => {
+            println!("diagnostic_collect={}", error.code());
+            panic!("read-only collector returned fixed error {}", error.code());
+        }
+    }
+}
