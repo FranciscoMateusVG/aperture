@@ -46,8 +46,8 @@ Your only inbox is BEADS through aperture-bus, pushed live by the hub. Use exact
 2. Then drain the inbox: call get_messages, process each message, and call mark_as_read for a message only after you have actually handled it.\n\
 3. Every Monitor event whose type is \"message\" means a BEADS message is waiting: get_messages, process, mark_as_read. Do not poll on a timer instead.\n\
 4. A HUB_RECONNECTING line means wait; the client reconnects by itself. HUB_RECONNECTED means unread messages are replaying now.\n\
-5. Do NOT restart the monitor after HUB_IDENTITY_INVALID, or after HUB_SOCKET_CLOSED with code 4000 (a newer monitor replaced this one), 4001 (hello rejected) or 4003 (managed identity rejected). Record the exact line on your assigned bead with update_task and wait for dispatch.\n\
-6. If the Monitor tool is unavailable, or the command exits at once (for example a HUB_CLIENT_ERROR line), that is an honest blocker: record it on your assigned bead with update_task and stop. Do not invent another channel: no background Bash loops, no file watching, no tmux, no hooks, no other harness.\n\
+5. Do NOT restart the monitor after HUB_IDENTITY_INVALID, or after HUB_SOCKET_CLOSED with code 4000 (a newer monitor replaced this one), 4001 (hello rejected) or 4003 (managed identity rejected). Keep the exact line; if the aperture-bus update_task tool is callable, record it on your assigned bead, then wait for dispatch.\n\
+6. If the Monitor tool is unavailable, or the command exits at once (for example a HUB_CLIENT_ERROR line), that is an honest blocker: record it on your assigned bead with update_task only if that tool is callable, then stop. If aperture-bus itself is absent there is no way to send anything: stay idle and say so in your terminal; never invent another channel: no background Bash loops, no file watching, no tmux, no hooks, no other harness.\n\
 7. Do no project work before a scoped dispatch arrives through this inbox. Boot order is fixed: monitor, then get_messages, then only the work that was dispatched.\n"
     ))
 }
@@ -147,7 +147,7 @@ mod tests {
         // tmux and hooks appear exactly once, inside the prohibition sentence.
         let prohibition = r
             .lines()
-            .find(|l| l.contains("Do not invent another channel"))
+            .find(|l| l.contains("never invent another channel"))
             .unwrap();
         for word in ["tmux", "hooks"] {
             assert_eq!(r.matches(word).count(), 1, "{word}");
@@ -188,13 +188,18 @@ mod tests {
         ] {
             assert!(no_restart.contains(code), "{code}");
         }
-        assert!(no_restart.contains("update_task"));
+        assert!(no_restart.contains("if the aperture-bus update_task tool is callable"));
+        assert!(no_restart.contains("Keep the exact line"));
         assert!(r.contains("A HUB_RECONNECTING line means wait"));
         assert!(r.contains("HUB_RECONNECTED means unread messages are replaying now."));
         let blocker = r.lines().find(|l| l.contains("honest blocker")).unwrap();
         assert!(blocker.contains("Monitor tool is unavailable"));
         assert!(blocker.contains("HUB_CLIENT_ERROR"));
-        assert!(blocker.contains("update_task"));
+        assert!(blocker.contains("update_task only if that tool is callable"));
+        assert!(
+            blocker.contains("If aperture-bus itself is absent there is no way to send anything")
+        );
+        assert!(blocker.contains("never invent another channel"));
         assert!(!r.contains("restart the monitor after HUB_RECONNECTING"));
     }
 }
