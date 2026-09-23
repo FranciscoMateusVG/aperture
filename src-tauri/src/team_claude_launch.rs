@@ -446,6 +446,7 @@ impl ClaudeBinding {
         }
         for p in [
             infra.join("mcp-server/dist/index.js"),
+            infra.join("mcp-server/dist/hub-client.js"),
             infra.join("mcp-server-sentry/dist/index.js"),
         ] {
             pins.insert(p.clone(), installed(&p, false)?);
@@ -1080,6 +1081,7 @@ fn validate_record_at(
         r.helper.clone(),
         r.tmux.clone(),
         infra.join("mcp-server/dist/index.js"),
+        infra.join("mcp-server/dist/hub-client.js"),
         infra.join("mcp-server-sentry/dist/index.js"),
     ];
     for p in &allowed_installed {
@@ -1142,6 +1144,33 @@ fn validate_record_at(
     }
     Ok(())
 }
+/// Read only the private launch's tmux pin for post-Active kickoff. Never a
+/// caller path and never permission to launch/replace another harness.
+pub(crate) fn kickoff_tmux(
+    home: &Path, team: &str, owner: &OwnerRecord, snapshot: &TeamSnapshot,
+) -> Result<(PathBuf, String), ClaudeError> {
+    let tmux = select_binary(&[
+        PathBuf::from("/opt/homebrew/bin/tmux"), PathBuf::from("/usr/local/bin/tmux"),
+    ])?;
+    kickoff_tmux_at(home, team, owner, snapshot, &tmux)
+}
+fn kickoff_tmux_at(
+    home: &Path, team: &str, owner: &OwnerRecord, snapshot: &TeamSnapshot, tmux: &Path,
+) -> Result<(PathBuf, String), ClaudeError> {
+    valid_selector(team, &owner.seat, owner.generation)?;
+    let r: LaunchRecord = read_private_json(&generation_dir(home, &owner.seat, owner.generation)
+        .join("claude-launch.json")).map_err(|_| ClaudeError::Unsafe)?;
+    let inc = owner.incarnation.as_ref().ok_or(ClaudeError::Owner)?;
+    let pin = installed(&tmux, true)?;
+    if r.schema_version != 1 || r.team != team || r.seat != owner.seat
+        || r.generation != owner.generation || r.session_id != inc.thread_id
+        || r.token_id != inc.token_id || r.snapshot_sha256 != digest(&serde_json::to_vec(snapshot).map_err(|_| ClaudeError::Invalid)?)
+        || r.tmux != tmux || r.pins.get(tmux) != Some(&pin) {
+        return Err(ClaudeError::Owner);
+    }
+    Ok((tmux.to_path_buf(), pin))
+}
+
 impl PublishedClaude {
     pub(crate) fn session_id(&self) -> &str {
         &self.record.session_id
@@ -1397,7 +1426,9 @@ fn gate_command(home: &Path, r: &LaunchRecord) -> Command {
         .env("TERM", "xterm-256color")
         .env("LANG", "en_US.UTF-8")
         .env("AGENT_NAME", &r.seat)
-        .env("APERTURE_TEAM_GENERATION", r.generation.to_string());
+        .env("APERTURE_HUB_TOKEN_FILE", home.join(".aperture/run/hub-tokens").join(format!("{}.token", r.seat)))
+        .env("APERTURE_TEAM_GENERATION", r.generation.to_string())
+        .env("APERTURE_MANAGED_HUB_CLIENT", Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("native repo parent").join("mcp-server/dist/hub-client.js"));
     cmd
 }
 
@@ -1502,6 +1533,8 @@ mod gate_tests {
             keys,
             vec![
                 "AGENT_NAME",
+                "APERTURE_HUB_TOKEN_FILE",
+                "APERTURE_MANAGED_HUB_CLIENT",
                 "APERTURE_TEAM_GENERATION",
                 "HOME",
                 "LANG",
@@ -1531,7 +1564,9 @@ mod gate_tests {
             .unwrap();
         assert!(output.status.success());
         let actual = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(actual.lines().count(), 6);
+        assert_eq!(actual.lines().count(), 8);
+        assert!(actual.lines().any(|line| line == format!("APERTURE_MANAGED_HUB_CLIENT={}", Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("mcp-server/dist/hub-client.js").display())));
+        assert!(actual.lines().any(|line| line == format!("APERTURE_HUB_TOKEN_FILE=/fixture/.aperture/run/hub-tokens/{}.token", inert.seat)));
     }
     #[test]
     fn tmux_response_is_exact_id_metadata_not_untrusted_shell_or_multiline() {
@@ -1605,6 +1640,7 @@ mod publication_tests {
             .unwrap();
             for p in [
                 "infra/mcp-server/dist/index.js",
+                "infra/mcp-server/dist/hub-client.js",
                 "infra/mcp-server-sentry/dist/index.js",
             ] {
                 f.write(p, b"fixture JS never executed");
@@ -1764,6 +1800,37 @@ mod publication_tests {
         );
         assert!(!dir.join("claude-spawn.json").exists());
         assert!(!dir.join("claude-release.json").exists());
+    }
+    #[test]
+    fn kickoff_tmux_pin_binds_private_launch_snapshot_session_and_token() {
+        let f=Fixture::new(); let binding=f.binding().unwrap(); let (r,t)=f.reservation();
+        let p=binding.publish_with_password(&r,&t,&Deadline::new(),"").unwrap();
+        let snapshot=active_team(&f.home,"t1","t1-worker").unwrap();
+        let owner:OwnerRecord=serde_json::from_value(json!({"schema_version":1,"seat":"t1-worker","generation":1,"state":"active","since":"2026-09-20T00:00:00Z","writer":"launcher","reservation_nonce_sha256":null,"provisional_token_id":null,"requested":{"harness":"claude","model":MODEL,"reasoning":null},"incarnation":{"pid":77,"start_time":123,"thread_id":p.record.session_id,"token_id":p.record.token_id,"harness":"claude","model":MODEL,"reasoning":null,"observed":true,"processes":[]}})).unwrap();
+        let tmux=f.home.join("tools/tmux");
+        assert_eq!(kickoff_tmux_at(&f.home,"t1",&owner,&snapshot,&tmux).unwrap().0,tmux);
+        let mut changed=owner.clone(); changed.incarnation.as_mut().unwrap().thread_id=uuid::Uuid::new_v4().to_string();
+        assert!(kickoff_tmux_at(&f.home,"t1",&changed,&snapshot,&tmux).is_err());
+        changed=owner.clone(); changed.incarnation.as_mut().unwrap().token_id="f".repeat(64);
+        assert!(kickoff_tmux_at(&f.home,"t1",&changed,&snapshot,&tmux).is_err());
+        let mut changed_snapshot=snapshot.clone();changed_snapshot.mission="other fixture".into();
+        assert!(kickoff_tmux_at(&f.home,"t1",&owner,&changed_snapshot,&tmux).is_err());
+        f.write("tools/tmux",b"changed executable");
+        std::fs::set_permissions(&tmux,std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(kickoff_tmux_at(&f.home,"t1",&owner,&snapshot,&tmux).is_err());
+    }
+    #[test]
+    fn managed_hub_script_is_required_and_pinned_before_publication() {
+        let f=Fixture::new();
+        let binding=f.binding().unwrap();
+        let hub=f.infra.join("mcp-server/dist/hub-client.js");
+        assert_eq!(binding.pins.get(&hub),Some(&installed(&hub,false).unwrap()));
+        let (r,t)=f.reservation();
+        f.write("infra/mcp-server/dist/hub-client.js",b"changed fixture script");
+        assert!(binding.publish_with_password(&r,&t,&Deadline::new(),"").is_err());
+        assert!(!generation_dir(&f.home,"t1-worker",1).join("claude-launch.json").exists());
+        std::fs::remove_file(&hub).unwrap();
+        assert!(f.binding().is_err());
     }
     #[test]
     fn native_publication_revalidates_owner_snapshot_runtime_node_and_links_before_files() {

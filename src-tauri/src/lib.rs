@@ -1,5 +1,6 @@
 mod team_claude_launch;
 mod team_claude_inbox;
+mod team_claude_kickoff;
 mod team_claude_observation;
 mod agent_loader;
 mod agents;
