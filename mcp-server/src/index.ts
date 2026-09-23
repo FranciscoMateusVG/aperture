@@ -1,3 +1,4 @@
+import { validateCheckpointSchema, parseCheckpointValidation } from "./team-checkpoint-validation.js";
 import { claudeInboxProbeSchema, parseClaudeInboxProbe } from "./team-claude-inbox.js";
 import { stopSeatSchema, parseStopSeatReady } from "./team-stop.js";
 import { claudeStartupSmokeSchema, parseClaudeStartupSmoke } from "./team-claude-smoke.js";
@@ -554,6 +555,23 @@ server.tool(
     try {
       const request = claudeStartupSmokeSchema.parse(input);
       const result = parseClaudeStartupSmoke(await invokeTeamControl({ action: "claude_startup_smoke", input: request }), request);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  "team_validate_checkpoint",
+  "GLaDOS-only: validate one exact checkpoint sequence using native authenticated Git/PR collection. Returns ok, divergent or rejected without stopping any worker. Only ok permits attempting team_stop_seat as a separate action; it never proves a stop or authorizes discard. UNKNOWN requires inspection and reconciliation, never automatic retry. Selectors only: no caller path, actor, evidence or validation result.",
+  { input: validateCheckpointSchema },
+  async ({ input }) => {
+    const denied = gladosControlDenied();
+    if (denied) return denied;
+    try {
+      const request = validateCheckpointSchema.parse(input);
+      const result = parseCheckpointValidation(await invokeTeamControl({ action: "validate_checkpoint", input: request }), request);
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
