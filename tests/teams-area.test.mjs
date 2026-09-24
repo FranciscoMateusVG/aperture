@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "vite";
+import { readFile } from "node:fs/promises";
 import { preset, catalog, team, clone } from "./fixtures/team-ui.mjs";
 const vite = await createServer({ appType: "custom", logLevel: "silent", server: { middlewareMode: true } });
 const { createTeamCommands } = await vite.ssrLoadModule("/src/services/team-commands.ts");
@@ -206,7 +207,7 @@ test("Open attaches a verified active managed seat even without a preexisting tm
  const t = team("active"); t.seats[0].observed_owner = {...ownerIn("active",1),actual:{harness:"codex",model:"gpt-6-astra",reasoning:"high"},process_count:1,thread_bound:true};
  let opened = 0;
  await setup({ api: { list: async () => [t] }, openAgent: async (current, name) => { assert.equal(current.snapshot.team, "t1"); assert.equal(name,"t1-backend"); opened++; }, listAgents: async () => [] }, async f => {
-  assert.match(f.teams.innerHTML, /data-seat="t1-backend">Open</);
+  assert.match(f.teams.innerHTML, /data-seat="t1-backend">Abrir</);
   assert.match(f.teams.innerHTML, /data-seat="t1-qa" disabled/);
   const live = new f.El(); live.dataset = { action:"open-seat",team:"t1",seat:"t1-backend" };
   await f.root.handlers.click({target:live}); assert.equal(opened,1);
@@ -236,7 +237,7 @@ test("error then identical success re-enables valid Open and keeps ineligible Op
   fail = true; await f.auto(); assert.equal(live.disabled, true, "error disables actions"); assert.equal(paints, 0);
   fail = false; await f.auto();
   assert.equal(paints, 1, "identical data after an error still repaints"); assert.equal(f.teams.classList.contains("v4-stale"), false);
-  assert.match(inner.v, /data-seat="t1-backend">Open</, "Open with a window is live again");
+  assert.match(inner.v, /data-seat="t1-backend">Abrir</, "Open with a window is live again");
   assert.match(inner.v, /data-seat="t1-qa" disabled title="Agente não disponível para abrir"/, "Ineligible Open stays disabled");
   await f.auto(); assert.equal(paints, 1, "steady state: no further repaint");
  });
@@ -274,7 +275,7 @@ test("Claude seat Open is enabled only for an exact observed Sonnet 5/None owner
  const t = team("active"); t.seats[1].observed_owner = { ...ownerIn("active", 1), configured: { ...sonnet }, actual: { ...sonnet }, process_count: 1, thread_bound: true };
  let opened = 0;
  await setup({ api: { list: async () => [t] }, openAgent: async (current, name) => { assert.equal(current.snapshot.team, "t1"); assert.equal(name, "t1-qa"); opened++; }, listAgents: async () => [] }, async f => {
-  assert.match(f.teams.innerHTML, /data-seat="t1-qa">Open</);
+  assert.match(f.teams.innerHTML, /data-seat="t1-qa">Abrir</);
   const live = new f.El(); live.dataset = { action: "open-seat", team: "t1", seat: "t1-qa" };
   await f.root.handlers.click({ target: live }); assert.equal(opened, 1);
  });
@@ -287,4 +288,36 @@ test("Claude seat Open is enabled only for an exact observed Sonnet 5/None owner
    await f.root.handlers.click({ target: button }); assert.equal(calls, 0);
   });
  }
+});
+
+test("seat row is clean: status badge, name, role and Abrir only; model, generation, repo and epic live inside details", () => {
+ const t = team("active"); t.state.epic_id = "aperture-epic1";
+ t.seats[0].observed_owner = { ...ownerIn("active", 1), actual: { harness: "codex", model: "gpt-6-astra", reasoning: "high" }, process_count: 1, thread_bound: true };
+ t.seats[1].observed_owner = ownerIn("active", 1);
+ const html = renderTeamGroup(t, [{ name: "t1-backend", turn_state: "busy" }]);
+ const rows = [...html.matchAll(/<div class="v4-seat__row">(.*?)<\/div>/g)].map(m => m[1]);
+ assert.equal(rows.length, 2, "one visible row per seat");
+ assert.match(rows[0], /^<span class="v4-badge v4-seat-status v4-seat-status--working" data-status="working">Trabalhando<\/span><span class="v4-seat__name" title="t1-backend">t1-backend · LEAD<\/span><span class="v4-seat__role">backend<\/span><button class="v4-button v4-button--small" data-action="open-seat" data-team="t1" data-seat="t1-backend">Abrir<\/button>$/);
+ assert.match(rows[1], /<span class="v4-seat__role">qa<\/span><button[^>]*data-seat="t1-qa" disabled title="Agente não disponível para abrir">Abrir<\/button>$/);
+ for (const row of rows) assert.doesNotMatch(row, /gpt-6-astra|sonnet|codex|claude|· g1|v4-meta|repository|epic|v4-seat__noterm/, "row carries no technical metadata");
+ const head = html.slice(0, html.indexOf("</div></div>"));
+ assert.match(head, /<h2 title="t1">t1<\/h2><p class="v4-meta">2 seats · 1 trabalhando · 0 aguardando<\/p>/);
+ assert.match(head, /v4-status">active<\/span>/); assert.doesNotMatch(head, /repository|epic|lead:|· g1|gpt-6-astra/, "header is team + count + lifecycle only");
+ for (const inside of ["repository: aperture (immutable)", "lead: t1-backend", "generation: g1", "epic: aperture-epic1", "codex · gpt-6-astra · high", "active · g1", "<dt>Terminal</dt><dd>Agente não disponível para abrir</dd>"]) {
+  const at = html.indexOf(inside); assert.ok(at > 0, inside);
+  assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
+ }
+ assert.equal((html.match(/<details class="v4-details" data-details="/g) ?? []).length, 3); assert.doesNotMatch(html, /<details[^>]*\sopen/);
+});
+test("long seat names keep a title for the ellipsis and the stylesheet forbids the wrapped metadata column", async () => {
+ const t = team("active"); const long = "t1-" + "x".repeat(120);
+ t.snapshot.seats[0].name = long; t.seats[0].configured.name = long; t.snapshot.lead = long;
+ assert.match(renderTeamGroup(t), new RegExp(`<span class="v4-seat__name" title="${long}">${long} · LEAD</span><span class="v4-seat__role">backend</span>`));
+ const css = await readFile(new URL("../src/teams.css", import.meta.url), "utf8");
+ const rule = sel => { const at = css.indexOf(`\n${sel} {`); assert.ok(at >= 0, sel); return css.slice(at, css.indexOf("}", at)); };
+ for (const sel of [".v4-seat__name", ".v4-seat__role", ".v4-team__title h2, .v4-team__title .v4-meta"]) { assert.match(rule(sel), /text-overflow: ellipsis/, sel); assert.match(rule(sel), /white-space: nowrap/, sel); assert.match(rule(sel), /overflow-wrap: normal/, sel); }
+ assert.match(rule(".v4-seat__name"), /min-width: 0/); assert.match(rule(".v4-seat__row"), /flex-wrap: nowrap/);
+ assert.doesNotMatch(css, /\.v4-seat__row \.v4-meta/, "no flexible metadata span in the row");
+ assert.match(rule(".v4-button--small"), /min-height: var\(--v4-target\)/); assert.match(css, /--v4-target: 44px/);
+ const narrow = css.slice(css.indexOf("@media (max-width: 700px)")); assert.match(narrow, /\.v4-seat__name \{ flex: 1 1 100%; \}/); assert.match(narrow, /\.v4-seat__row \{ flex-wrap: wrap/);
 });
