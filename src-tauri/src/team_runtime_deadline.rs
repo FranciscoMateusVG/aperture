@@ -320,6 +320,19 @@ impl RuntimeAttempt {
     ) -> Result<Self, ReplacementError> {
         Self::begin_checked(home, actor, team, seat, 0, budget, true, false)
     }
+    /// Explicit recovery of the first bootstrap: the owner must be exactly the
+    /// quarantined, unobserved g1. The attempt lands in `runtime-attempts/<seat>/g1`;
+    /// the historical `g0` facts are never opened for writing, and an existing
+    /// `g1` refuses (one admission, no retry).
+    pub(crate) fn begin_bootstrap_recovery(
+        home: &Path,
+        actor: &AuthenticatedActor,
+        team: &str,
+        seat: &str,
+        budget: Deadline,
+    ) -> Result<Self, ReplacementError> {
+        Self::begin_checked(home, actor, team, seat, 1, budget, true, false)
+    }
     fn begin_checked(
         home: &Path,
         actor: &AuthenticatedActor,
@@ -352,7 +365,18 @@ impl RuntimeAttempt {
             .map_err(|_| ReplacementError::NativeFailure)?;
         let owner: OwnerRecord = read_private_json(&store.record_path(seat))
             .map_err(|_| ReplacementError::GenerationMismatch)?;
-        let state_ok = if bootstrap {
+        let state_ok = if bootstrap && generation == 1 {
+            // Recovery of the first bootstrap: quarantined, never observed, thread
+            // never bound, no nonce; a retained provisional id must be the
+            // incarnation's own token id (nothing is cleaned to fit).
+            owner.state == OwnerState::Quarantined
+                && owner.reservation_nonce_sha256.is_none()
+                && owner.incarnation.as_ref().is_some_and(|i| {
+                    !i.observed
+                        && i.thread_id.is_empty()
+                        && owner.provisional_token_id.as_deref().is_none_or(|p| p == i.token_id)
+                })
+        } else if bootstrap {
             owner.generation == 0
                 && owner.state == OwnerState::Stale
                 && owner.incarnation.is_none()
