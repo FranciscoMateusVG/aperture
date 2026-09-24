@@ -356,11 +356,18 @@ fn team_capabilities(state: &TeamLifecycle, seats: &[TeamSeatView]) -> TeamCapab
         let configured = seat.configured.tuple();
         managed_execution_enabled(&configured)
             && seat.observed_owner.as_ref().is_some_and(|owner| {
-                owner.generation == 0
+                let fresh = owner.generation == 0
                     && owner.state == OwnerState::Stale
+                    && owner.process_count == 0;
+                // Recoverable first Claude bootstrap: quarantined g1, never observed,
+                // thread never bound. process_count is persisted history, not
+                // liveness (a Gone root is still counted); the native proof decides.
+                let recoverable = owner.generation == 1
+                    && owner.state == OwnerState::Quarantined
+                    && configured.harness == Harness::Claude;
+                (fresh || recoverable)
                     && owner.configured == configured
                     && owner.actual.is_none()
-                    && owner.process_count == 0
                     && !owner.thread_bound
             })
     });
@@ -2229,7 +2236,9 @@ fn stop_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: StopSeatInp
 
 fn bootstrap_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: BootstrapSeatInput) -> TeamResult<BootstrapView> {
     validate_team_name(&input.team)?;
-    if !is_valid_seat_name(&input.seat) || input.expected_generation != 0 {
+    // 0 = first start; 1 = explicit recovery of a first Claude bootstrap that
+    // ended Quarantined g1 unobserved (native proof decides, never this selector).
+    if !is_valid_seat_name(&input.seat) || input.expected_generation > 1 {
         return Err(TeamError::new("E_GENERATION_MISMATCH", "bootstrap selectors are invalid"));
     }
     let started = bootstrap_authorized(
@@ -2971,16 +2980,22 @@ mod tests {
         let request = r#"{"action":"bootstrap_seat","input":{"team":"t1","seat":"t1-frontend","expected_generation":1}}"#;
         assert_eq!(team_control_headless(request).unwrap_err().code, "E_CONTROL_UNAUTHORIZED");
         prepare_glados(&home);
-        // The real authenticated child reaches selector validation, not a fake
-        // operator actor. No real launch or state mutation is needed for this test.
+        // The real authenticated child reaches the recovery proof, which finds no
+        // owner record for the seat (not the recoverable generation), not a fake
+        // operator actor; selector 2 still fails at validation.
         assert_eq!(team_control_headless(request).unwrap_err().code, "E_GENERATION_MISMATCH");
+        assert_eq!(team_control_headless(&request.replace("\"expected_generation\":1", "\"expected_generation\":2")).unwrap_err().code, "E_GENERATION_MISMATCH");
         for key in ["actor", "model", "timeout", "generation", "token"] {
             let mut forged: serde_json::Value = serde_json::from_str(request).unwrap();
             forged["input"][key] = serde_json::json!("forged");
             assert!(serde_json::from_value::<TeamControlRequest>(forged).is_err());
         }
         let actor = authenticate_glados_control().unwrap();
+        // Selector 1 is the recovery entry: with GLaDOS authenticated it reaches the
+        // native proof, which finds no owner record; 2 is never a selector.
         assert_eq!(bootstrap_authorized(&home, &actor, "t1", "t1-frontend", 1).unwrap_err(),
+            crate::team_replacement::ReplacementError::GenerationMismatch);
+        assert_eq!(bootstrap_authorized(&home, &actor, "t1", "t1-frontend", 2).unwrap_err(),
             crate::team_replacement::ReplacementError::GenerationMismatch);
         // Capability is valid at preflight; a replacement before final commit
         // must fail under the same lock activation uses, without owner mutation.
@@ -3223,6 +3238,28 @@ mod tests {
             old.observed_owner = Some(capability_owner(&old.configured, 0, OwnerState::Stale));
             assert!(!team_capabilities(&TeamLifecycle::Active, &[old]).start);
         }
+        // Recoverable first Claude bootstrap: quarantined g1, never observed, thread
+        // never bound. process_count is history (the Gone root is still recorded),
+        // so it is not required to be zero; the native proof decides liveness.
+        let mut recoverable = capability_seat("t1-qa", Harness::Claude, None);
+        recoverable.configured.model = "claude-sonnet-5".into();
+        recoverable.configured.reasoning = None;
+        recoverable.observed_owner = Some(capability_owner(&recoverable.configured, 1, OwnerState::Quarantined));
+        recoverable.observed_owner.as_mut().unwrap().process_count = 1;
+        assert!(team_capabilities(&TeamLifecycle::Active, &[recoverable.clone()]).start, "quarantined unobserved g1 Claude is startable");
+        for corrupt in [
+            |o: &mut OwnerSummary| o.thread_bound = true,
+            |o: &mut OwnerSummary| o.actual = Some(o.configured.clone()),
+            |o: &mut OwnerSummary| o.generation = 2,
+            |o: &mut OwnerSummary| o.state = OwnerState::Stale,
+        ] {
+            let mut invalid = recoverable.clone();
+            corrupt(invalid.observed_owner.as_mut().unwrap());
+            assert!(!team_capabilities(&TeamLifecycle::Active, &[invalid]).start);
+        }
+        let mut codex = capability_seat("t1-backend", Harness::Codex, None);
+        codex.observed_owner = Some(capability_owner(&codex.configured, 1, OwnerState::Quarantined));
+        assert!(!team_capabilities(&TeamLifecycle::Active, &[codex]).start, "recovery is a Claude first-bootstrap closure only");
     }
 
     #[test]

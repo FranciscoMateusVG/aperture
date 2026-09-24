@@ -312,18 +312,255 @@ fn bootstrap_is_operator_g0_only_and_never_creates_state_for_bad_selector() {
             .unwrap_err(),
         ReplacementError::AuthorizationRequired
     );
+    // Selector 1 is the GLaDOS-only recovery entry: the operator UI and the
+    // launcher are refused before any native proof; 2 is never a selector.
+    for actor in [AuthenticatedActor::operator_ui(), AuthenticatedActor::launcher()] {
+        assert_eq!(
+            bootstrap_authorized(&home, &actor, "t1", "t1-worker", 1).unwrap_err(),
+            ReplacementError::AuthorizationRequired
+        );
+    }
     assert_eq!(
-        bootstrap_authorized(
-            &home,
-            &AuthenticatedActor::operator_ui(),
-            "t1",
-            "t1-worker",
-            1
-        )
-        .unwrap_err(),
+        bootstrap_authorized(&home, &AuthenticatedActor::operator_ui(), "t1", "t1-worker", 2)
+            .unwrap_err(),
         ReplacementError::GenerationMismatch
     );
     assert!(!home.exists());
+}
+
+/// Factual shape of the failed QA seat (2026-09-24 readback): quarantined g1,
+/// incarnation never observed and thread never bound, the gated root recorded
+/// and Gone, provisional token id retained and equal to the incarnation token,
+/// no hub token, revocation floor exactly g1 for that digest, normal launch and
+/// attempt records, g0 attempt expired with an Unknown terminal.
+struct Recovery { f: Fixture, attempt: crate::team_claude_launch::ClaudeAttempt, raw_sha: String, typed_sha: String }
+impl Recovery {
+    const TEAM: &'static str = "t1";
+    const SEAT: &'static str = "t1-qa";
+    fn token() -> String { "a".repeat(64) }
+    fn new() -> Self {
+        use sha2::{Digest, Sha256};
+        let f = Fixture::new();
+        let home = f.0.clone();
+        let agent = home.join(".claude/aperture").join(Self::SEAT);
+        f.write(".claude/aperture/t1-qa/manifest.json", &serde_json::json!({"name":Self::SEAT,"role":"qa","model":crate::team_claude_launch::MODEL,"enabled":true}));
+        f.write(".claude/aperture/t1-qa/TEAM", &serde_json::json!({"schema_version":1,"team":Self::TEAM,"role":"qa"}));
+        write_private_bytes_atomic(&agent.join(".complete"), b"complete\n", true).unwrap();
+        write_private_bytes_atomic(&agent.join("prompt.md"), b"fixture", true).unwrap();
+        f.write(".aperture/teams/t1/team.json", &serde_json::json!({
+            "schema_version":1,"team":Self::TEAM,"project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture",
+            "preset":{"id":null,"sha256":null},"lead":Self::SEAT,
+            "seats":[{"name":Self::SEAT,"role":"qa","harness":"claude","model":crate::team_claude_launch::MODEL,"reasoning":null}],
+            "fallbacks":[],"grants":[],"created_at":"2026-09-24T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()}));
+        f.write(".aperture/teams/t1/state.json", &serde_json::json!({"schema_version":1,"state":"active","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-24T00:00:00Z"}));
+        let raw = std::fs::read(home.join(".aperture/teams/t1/team.json")).unwrap();
+        let raw_sha = format!("{:x}", Sha256::digest(&raw));
+        let typed: TeamSnapshot = serde_json::from_slice(&raw).unwrap();
+        let typed_sha = smoke_hash(&typed).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let g0 = uuid::Uuid::new_v4().to_string();
+        f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/admitted.json", &serde_json::json!({"schema_version":1,"attempt_id":g0,"team":Self::TEAM,"seat":Self::SEAT,"old_generation":0,"admitted_at_ms":now-300_000,"native_budget_ms":170000,"cleanup_reserve_ms":40000}));
+        f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/effects.json", &serde_json::json!({"schema_version":1,"attempt_id":g0,"kind":"effects_may_have_occurred"}));
+        f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/terminal.json", &serde_json::json!({"schema_version":1,"attempt_id":g0,"kind":"unknown"}));
+        let attempt = crate::team_claude_launch::ClaudeAttempt {
+            schema_version: 1, team: Self::TEAM.into(), seat: Self::SEAT.into(), generation: 1,
+            reservation_nonce_sha256: "c".repeat(64), snapshot_sha256: raw_sha.clone(), team_generation: 1,
+            token_id: Self::token(), root_pid: 900001, root_start_time_us: 42,
+            session_id: uuid::Uuid::new_v4().to_string(), requested_model: crate::team_claude_launch::MODEL.into(),
+            created_at_ms: now - 200_000, mode: crate::team_claude_launch::ClaudeLaunchMode::NormalPositional,
+        };
+        let r = Self { f, attempt, raw_sha, typed_sha };
+        r.owner(|_| {});
+        r.attempt_file(|_| {});
+        r.launch(|_| {});
+        r.release(|_| {});
+        r.revocations(|_| {});
+        ensure_private_dir(&home.join(".aperture/run/hub-tokens")).unwrap();
+        r
+    }
+    fn home(&self) -> std::path::PathBuf { self.f.0.clone() }
+    fn owner_value(&self) -> serde_json::Value {
+        serde_json::json!({"schema_version":1,"seat":Self::SEAT,"generation":1,"state":"quarantined",
+            "reservation_nonce_sha256":null,"provisional_token_id":Self::token(),
+            "requested":{"harness":"claude","model":crate::team_claude_launch::MODEL,"reasoning":null},
+            "incarnation":{"pid":900001,"start_time":42,"thread_id":"","token_id":Self::token(),"harness":"claude","model":crate::team_claude_launch::MODEL,"reasoning":null,"observed":false,
+                "processes":[{"pid":900001,"start_time":42,"ppid":1,"pgid":900001,"cmdline_sha256":"b".repeat(64),"cwd":"/fixture"}]},
+            "since":"2026-09-24T00:00:00Z","writer":"launcher"})
+    }
+    fn owner(&self, mutate: impl Fn(&mut serde_json::Value)) {
+        let mut v = self.owner_value(); mutate(&mut v);
+        self.f.write(".aperture/run/owner/t1-qa.json", &v);
+    }
+    fn attempt_file(&self, mutate: impl Fn(&mut serde_json::Value)) {
+        let mut v = serde_json::to_value(&self.attempt).unwrap(); mutate(&mut v);
+        self.f.write(".aperture/run/t1-qa.g1.claude-attempt.json", &v);
+    }
+    fn launch(&self, mutate: impl Fn(&mut serde_json::Value)) {
+        let mut v = serde_json::json!({"schema_version":1,"team":Self::TEAM,"seat":Self::SEAT,"generation":1,"session_id":self.attempt.session_id,
+            "token_id":Self::token(),"snapshot_sha256":self.typed_sha,"mode":"normal_positional","args":["--model",crate::team_claude_launch::MODEL]});
+        mutate(&mut v);
+        self.f.write(".aperture/run/managed/t1-qa/g1/claude-launch.json", &v);
+    }
+    fn release(&self, mutate: impl Fn(&mut serde_json::Value)) {
+        let mut v = serde_json::json!({"schema_version":1,"attempt_sha256":smoke_hash(&self.attempt).unwrap(),"launch_sha256":"d".repeat(64),"root_pid":900001,"root_start_time_us":42});
+        mutate(&mut v);
+        self.f.write(".aperture/run/managed/t1-qa/g1/claude-release.json", &v);
+    }
+    fn revocations(&self, mutate: impl Fn(&mut serde_json::Value)) {
+        let mut v = serde_json::json!({"schema_version":1,"seat":Self::SEAT,"revoked_through_generation":1,"revoked_token_ids":[Self::token()]});
+        mutate(&mut v);
+        self.f.write(".aperture/run/revocations/t1-qa.json", &v);
+    }
+    fn owner_record(&self) -> OwnerRecord { read_private_json(&self.home().join(".aperture/run/owner/t1-qa.json")).unwrap() }
+    fn proof(&self) -> Result<(String, String), ReplacementError> {
+        RecoveryAdmission::proof_locked(&self.home(), Self::TEAM, Self::SEAT, &self.owner_record())
+    }
+    fn g0_bytes(&self) -> Vec<Vec<u8>> {
+        ["admitted", "effects", "terminal"].iter()
+            .map(|n| std::fs::read(self.home().join(format!(".aperture/teams/t1/runtime-attempts/t1-qa/g0/{n}.json"))).unwrap())
+            .collect()
+    }
+}
+
+#[test]
+fn recovery_proof_accepts_only_the_factual_quarantined_first_claude_bootstrap() {
+    let r = Recovery::new();
+    let (typed, token) = r.proof().unwrap();
+    assert_eq!((typed, token), (r.typed_sha.clone(), Recovery::token()));
+    // Retained provisional equal to the incarnation token is the factual case;
+    // None is also accepted; anything else is not the proved incarnation.
+    r.owner(|o| o["provisional_token_id"] = serde_json::Value::Null);
+    assert!(r.proof().is_ok());
+    r.owner(|o| o["provisional_token_id"] = serde_json::json!("f".repeat(64)));
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch);
+    let owner_cases: [(&str, fn(&mut serde_json::Value)); 8] = [
+        ("active owner", |o| o["state"] = "active".into()),
+        ("starting owner", |o| o["state"] = "starting".into()),
+        ("generation 2", |o| o["generation"] = 2.into()),
+        ("observed", |o| o["incarnation"]["observed"] = true.into()),
+        ("thread bound", |o| o["incarnation"]["thread_id"] = uuid::Uuid::new_v4().to_string().into()),
+        ("nonce present", |o| o["reservation_nonce_sha256"] = "e".repeat(64).into()),
+        ("no recorded processes", |o| o["incarnation"]["processes"] = serde_json::json!([])),
+        ("root not recorded", |o| o["incarnation"]["processes"][0]["pid"] = 900002.into()),
+    ];
+    for (name, mutate) in owner_cases {
+        r.owner(mutate);
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch, "{name}");
+    }
+    // A recorded process that is not Gone (this test process, wrong birth) stops.
+    let pid = std::process::id();
+    r.owner(|o| {
+        o["incarnation"]["pid"] = pid.into();
+        o["incarnation"]["processes"][0]["pid"] = pid.into();
+    });
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::StopUnverified);
+    r.owner(|_| {});
+    assert!(r.proof().is_ok());
+    // Token/floor.
+    write_private_bytes_atomic(&r.home().join(".aperture/run/hub-tokens/t1-qa.token"), b"x", true).unwrap();
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
+    std::fs::remove_file(r.home().join(".aperture/run/hub-tokens/t1-qa.token")).unwrap();
+    r.revocations(|v| v["revoked_through_generation"] = 2.into());
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
+    r.revocations(|v| v["revoked_token_ids"] = serde_json::json!(["9".repeat(64)]));
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
+    r.revocations(|_| {});
+    // g0 must be an expired normal bootstrap with an Unknown terminal, never reconciled.
+    r.f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/terminal.json", &serde_json::json!({"schema_version":1,"attempt_id":"x","kind":"active"}));
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
+    let g0: serde_json::Value = read_private_json(&r.home().join(".aperture/teams/t1/runtime-attempts/t1-qa/g0/admitted.json")).unwrap();
+    r.f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/terminal.json", &serde_json::json!({"schema_version":1,"attempt_id":g0["attempt_id"],"kind":"unknown"}));
+    assert!(r.proof().is_ok());
+    r.f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/reconciled.json", &serde_json::json!({"schema_version":1,"attempt_id":g0["attempt_id"],"kind":"stopped_reconciled"}));
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
+    std::fs::remove_file(r.home().join(".aperture/teams/t1/runtime-attempts/t1-qa/g0/reconciled.json")).unwrap();
+    // Category comes from BOTH records being normal_positional and bound to this owner.
+    r.attempt_file(|a| { a.as_object_mut().unwrap().remove("mode"); });
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "diagnostic attempt");
+    r.attempt_file(|a| a["token_id"] = "9".repeat(64).into());
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt of another token");
+    r.attempt_file(|a| a["snapshot_sha256"] = r.typed_sha.clone().into());
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt binds the raw snapshot digest");
+    r.attempt_file(|_| {});
+    r.launch(|l| { l.as_object_mut().unwrap().remove("mode"); });
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "diagnostic launch record");
+    r.launch(|l| l["session_id"] = uuid::Uuid::new_v4().to_string().into());
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "launch of another session");
+    r.launch(|l| l["snapshot_sha256"] = r.raw_sha.clone().into());
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "launch binds the typed snapshot digest");
+    r.launch(|_| {});
+    r.release(|v| v["attempt_sha256"] = "9".repeat(64).into());
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "release of another attempt");
+    r.release(|_| {});
+    assert!(r.proof().is_ok());
+    // Unobserved means no sample and no proven rejection; one admission means no g2 and no attempt g1.
+    for (path, is_dir) in [
+        (".aperture/run/t1-qa.g1.claude-observation.json", false),
+        (".aperture/run/t1-qa.g1.claude-rejected.json", false),
+        (".aperture/run/t1-qa.g2.claude-attempt.json", false),
+        (".aperture/run/managed/t1-qa/g2", true),
+        (".aperture/teams/t1/runtime-attempts/t1-qa/g1", true),
+    ] {
+        let p = r.home().join(path);
+        if is_dir { ensure_private_dir(&p).unwrap(); } else { r.f.write(path, &serde_json::json!({})); }
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "{path}");
+        if is_dir { std::fs::remove_dir_all(&p).unwrap(); } else { std::fs::remove_file(&p).unwrap(); }
+    }
+    assert!(r.proof().is_ok());
+    // The tuple never decides the category, but recovery closes a Claude first
+    // bootstrap only: the same sealed snapshot with a coherent Codex seat is not
+    // launchable here (a non-catalog literal is already rejected at parse time).
+    let mut snapshot: serde_json::Value = read_private_json(&r.home().join(".aperture/teams/t1/team.json")).unwrap();
+    snapshot["seats"][0]["harness"] = "codex".into();
+    snapshot["seats"][0]["model"] = "gpt-6-astra".into();
+    snapshot["seats"][0]["reasoning"] = "high".into();
+    r.f.write(".aperture/teams/t1/team.json", &snapshot);
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::LaunchUnavailable);
+    snapshot["seats"][0]["harness"] = "claude".into();
+    snapshot["seats"][0]["model"] = "claude-opus-5-5".into();
+    snapshot["seats"][0]["reasoning"] = serde_json::Value::Null;
+    r.f.write(".aperture/teams/t1/team.json", &snapshot);
+    assert!(r.proof().is_err(), "non-admitted literal never proves");
+}
+
+#[test]
+fn recovery_deadline_admission_writes_only_runtime_attempt_g1_and_refuses_a_second() {
+    let r = Recovery::new();
+    let before = r.g0_bytes();
+    let launcher = AuthenticatedActor::launcher();
+    // The ordinary first-start admission never accepts the quarantined owner.
+    assert_eq!(
+        deadline::RuntimeAttempt::begin_bootstrap(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
+        ReplacementError::GenerationMismatch
+    );
+    let attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).unwrap();
+    let g1 = r.home().join(".aperture/teams/t1/runtime-attempts/t1-qa/g1");
+    let admitted: serde_json::Value = read_private_json(&g1.join("admitted.json")).unwrap();
+    assert_eq!(admitted["old_generation"], 1);
+    assert_eq!(admitted["seat"], "t1-qa");
+    assert_eq!(r.g0_bytes(), before, "g0 facts are never rewritten");
+    assert!(!g1.join("effects.json").exists());
+    drop(attempt);
+    // One admission only: the existing g1 refuses, and so does the proof afterwards.
+    assert_eq!(
+        deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
+        ReplacementError::OutcomeUnknown
+    );
+    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
+    assert_eq!(r.g0_bytes(), before);
+    // The deadline arm also rejects an observed or thread-bound quarantined owner.
+    std::fs::remove_dir_all(&g1).unwrap();
+    r.owner(|o| o["incarnation"]["observed"] = true.into());
+    assert_eq!(
+        deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
+        ReplacementError::GenerationMismatch
+    );
+    r.owner(|o| o["provisional_token_id"] = "f".repeat(64).into());
+    assert_eq!(
+        deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
+        ReplacementError::GenerationMismatch
+    );
+    assert!(!g1.exists());
 }
 
 fn claude_candidate_fixture(f: &Fixture) -> (OwnerStore, StartReservation, Incarnation) {
