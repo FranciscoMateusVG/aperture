@@ -173,7 +173,11 @@ struct LaunchFacts {
     #[serde(default)]
     mode: crate::team_claude_launch::ClaudeLaunchMode,
 }
-/// Bounded projection of the gate release (`claude-release.json`).
+/// Bounded projection of the gate release (`claude-release.json`). Limit: its
+/// `launch_sha256` is the digest of the private `LaunchRecord` serialization
+/// and is NOT recomputed here; the release is bound through `attempt_sha256`
+/// (same producer as the observation receipt) and the root identity, and the
+/// launch record is bound separately by session, token and snapshot digest.
 #[derive(serde::Deserialize)]
 struct ReleaseFacts {
     schema_version: u32,
@@ -201,11 +205,31 @@ pub(crate) struct RecoveryAdmission {
     seat: String,
     snapshot_sha256: String,
     token_id: String,
+    /// Set once the deadline admission for THIS recovery exists; the
+    /// pre-reserve proof accepts only that attempt's open `g1`.
+    attempt_id: Option<String>,
+}
+/// Which `runtime-attempts/<seat>/g1` state the proof must find. Before the
+/// deadline admission nothing may exist there (one admission ever); before
+/// the reserve exactly the current attempt must be open (admitted + effects,
+/// no terminal). Neither phase accepts another attempt.
+#[derive(Clone, Copy)]
+pub(crate) enum RecoveryPhase<'a> {
+    PreAdmission,
+    PreReserve { attempt_id: &'a str },
 }
 impl RecoveryAdmission {
     fn issue(home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str)
         -> Result<Self, ReplacementError> {
         authorize_recovery(actor)?;
+        let admission = Self::issue_checked(home, team, seat, || authorize_recovery(actor))?;
+        authorize_recovery(actor)?;
+        Ok(admission)
+    }
+    /// Locked proof without the caller's authority: `authorize` runs again
+    /// inside the locks. Used by `issue` and, in tests, with an inert authority.
+    fn issue_checked(home: &Path, team: &str, seat: &str,
+        authorize: impl Fn() -> Result<(), ReplacementError>) -> Result<Self, ReplacementError> {
         if !crate::teams::managed_launch_enabled(&Harness::Claude) {
             return Err(ReplacementError::LaunchUnavailable);
         }
@@ -217,14 +241,19 @@ impl RecoveryAdmission {
             .map_err(|_| ReplacementError::NativeFailure)?;
         let store = OwnerStore::new(home.join(".aperture/run/owner"));
         let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
-        authorize_recovery(actor)?;
+        authorize()?;
         let owner = store.read_owner_locked(seat).map_err(|_| ReplacementError::GenerationMismatch)?;
-        let (snapshot_sha256, token_id) = Self::proof_locked(home, team, seat, &owner)?;
-        Ok(Self { home: home.into(), team: team.into(), seat: seat.into(), snapshot_sha256, token_id })
+        let (snapshot_sha256, token_id) = Self::proof_locked(home, team, seat, &owner, RecoveryPhase::PreAdmission)?;
+        Ok(Self { home: home.into(), team: team.into(), seat: seat.into(), snapshot_sha256, token_id, attempt_id: None })
     }
-    /// Full pre-reserve proof against the locked owner. Returns the typed
-    /// snapshot digest and the incarnation token id it was proved for.
-    fn proof_locked(home: &Path, team: &str, seat: &str, owner: &OwnerRecord)
+    /// Bind this admission to the deadline attempt just admitted for it.
+    fn bind_attempt(mut self, attempt_id: &str) -> Self {
+        self.attempt_id = Some(attempt_id.into());
+        self
+    }
+    /// Full owner proof against the locked owner for one phase. Returns the
+    /// typed snapshot digest and the incarnation token id it was proved for.
+    fn proof_locked(home: &Path, team: &str, seat: &str, owner: &OwnerRecord, phase: RecoveryPhase<'_>)
         -> Result<(String, String), ReplacementError> {
         use sha2::{Digest, Sha256};
         use std::io::Read;
@@ -317,17 +346,22 @@ impl RecoveryAdmission {
         // Unobserved means neither an observation nor a proven rejection exists.
         absent(&run.join(format!("{seat}.g1.claude-observation.json")))?;
         absent(&run.join(format!("{seat}.g1.claude-rejected.json")))?;
-        // Single admission: nothing of g2 and no runtime-attempt g1 may exist yet.
+        // Nothing of g2 may exist. The runtime-attempt g1 is phase-dependent:
+        // absent before the deadline admission (one admission ever), exactly the
+        // current attempt (admitted + effects, no terminal) before the reserve.
         absent(&run.join(format!("{seat}.g2.claude-attempt.json")))?;
         absent(&run.join("managed").join(seat).join("g2"))?;
-        absent(&team_dir.join("runtime-attempts").join(seat).join("g1"))?;
+        match phase {
+            RecoveryPhase::PreAdmission => absent(&team_dir.join("runtime-attempts").join(seat).join("g1"))?,
+            RecoveryPhase::PreReserve { attempt_id } => deadline::recovery_attempt_open_locked(home, team, seat, attempt_id)?,
+        }
         Ok((typed_sha, inc.token_id.clone()))
     }
-    /// Re-run the full owner proof under the caller's locks immediately before
-    /// the effective reserve. The owner must still be the proved one.
-    fn reprove_locked(&self, store: &OwnerStore) -> Result<(), ReplacementError> {
+    /// Re-run the full owner proof under the caller's locks for one phase. The
+    /// owner must still be the proved one (same snapshot, same token digest).
+    fn reprove_locked(&self, store: &OwnerStore, phase: RecoveryPhase<'_>) -> Result<(), ReplacementError> {
         let owner = store.read_owner_locked(&self.seat).map_err(|_| ReplacementError::GenerationMismatch)?;
-        let (snapshot_sha256, token_id) = Self::proof_locked(&self.home, &self.team, &self.seat, &owner)?;
+        let (snapshot_sha256, token_id) = Self::proof_locked(&self.home, &self.team, &self.seat, &owner, phase)?;
         if snapshot_sha256 != self.snapshot_sha256 || token_id != self.token_id {
             return Err(ReplacementError::GenerationMismatch);
         }
@@ -846,20 +880,21 @@ fn bootstrap_recovery_authorized(
         model: seats[0].model.clone(),
         reasoning: seats[0].reasoning.clone(),
     };
-    let plan = match NativePlan::preflight(home, team, seat, &selected, &repo, None, &budget)? {
-        NativePlan::Claude(binding) => NativePlan::ClaudeRecovery(binding, admission),
+    let binding = match NativePlan::preflight(home, team, seat, &selected, &repo, None, &budget)? {
+        NativePlan::Claude(binding) => binding,
         _ => return Err(ReplacementError::LaunchUnavailable),
     };
     authorize_recovery(actor)?;
-    // Re-prove under team then seat locks immediately before the deadline
-    // admission; the deadline admission then re-checks the owner itself.
-    if let NativePlan::ClaudeRecovery(_, admission) = &plan {
+    // Re-prove (pre-admission phase: no runtime-attempt g1 yet) under team then
+    // seat locks immediately before the deadline admission, which re-checks the
+    // owner itself and creates runtime-attempts/<seat>/g1 for THIS recovery.
+    {
         let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
             .map_err(|_| ReplacementError::NativeFailure)?;
         let store = OwnerStore::new(home.join(".aperture/run/owner"));
         let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
         authorize_recovery(actor)?;
-        admission.reprove_locked(&store)?;
+        admission.reprove_locked(&store, RecoveryPhase::PreAdmission)?;
     }
     let mut attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(
         home,
@@ -869,6 +904,8 @@ fn bootstrap_recovery_authorized(
         budget,
     )?;
     attempt.admit_effects()?;
+    // From here the proof is pre-reserve: exactly this attempt's open g1.
+    let plan = NativePlan::ClaudeRecovery(binding, admission.bind_attempt(attempt.id()));
     let mut started = match start_native(home, team, seat, 1, selected, &plan, &attempt, Some(actor)) {
         Ok(v) => v,
         Err(e) => {
@@ -909,6 +946,40 @@ fn bootstrap_recovery_authorized(
     Ok(started.candidate.observed)
 }
 
+/// The only reserve a recovery may take. Caller holds the team lock. The owner
+/// is re-proved (pre-reserve phase) under the seat lock, which is then
+/// released: `OwnerStore::reserve_start` re-acquires it and applies its own
+/// guarantees (expected generation, Stale|Quarantined, fresh nonce, no
+/// incarnation). The reservation is then bound to that proof by readback:
+/// generation 2, Starting, the reservation's nonce digest, the selected tuple,
+/// no incarnation, no provisional id. Anything else is not the proved owner.
+fn reserve_recovery(
+    store: &OwnerStore,
+    admission: &RecoveryAdmission,
+    seat: &str,
+    selected: &ExecutionTuple,
+) -> Result<StartReservation, ReplacementError> {
+    use sha2::{Digest, Sha256};
+    let attempt_id = admission.attempt_id.as_deref().ok_or(ReplacementError::OutcomeUnknown)?;
+    {
+        let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
+        admission.reprove_locked(store, RecoveryPhase::PreReserve { attempt_id })?;
+    }
+    let reservation = store
+        .reserve_start(&AuthenticatedActor::launcher(), seat, 1, selected.clone())
+        .map_err(|_| ReplacementError::GenerationMismatch)?;
+    let owner = store.read_owner(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    let nonce_sha256 = format!("{:x}", Sha256::digest(reservation.nonce().as_bytes()));
+    if reservation.seat != seat || reservation.generation != 2
+        || owner.seat != seat || owner.generation != 2 || owner.state != OwnerState::Starting
+        || owner.incarnation.is_some() || owner.provisional_token_id.is_some()
+        || owner.reservation_nonce_sha256.as_deref() != Some(nonce_sha256.as_str())
+        || owner.requested != *selected {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    Ok(reservation)
+}
+
 fn start_native(
     home: &Path,
     team: &str,
@@ -934,16 +1005,15 @@ fn start_native(
             admission.revalidate_locked()?;
         }
         if let NativePlan::ClaudeRecovery(_, admission) = plan {
-            // GLaDOS again, then the full owner proof under team then seat lock,
-            // immediately before the only reserve this recovery may take.
+            // GLaDOS again, then the pre-reserve proof and the bound reserve.
             authorize_recovery(bootstrap_actor.ok_or(ReplacementError::AuthorizationRequired)?)?;
             admission.matches_target(home, team, seat, generation)?;
-            let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
-            admission.reprove_locked(&store)?;
+            reserve_recovery(&store, admission, seat, &selected)?
+        } else {
+            store
+                .reserve_start(&launcher, seat, generation, selected.clone())
+                .map_err(|_| ReplacementError::GenerationMismatch)?
         }
-        store
-            .reserve_start(&launcher, seat, generation, selected.clone())
-            .map_err(|_| ReplacementError::GenerationMismatch)?
     };
     let mut child = None;
     let result = (|| {

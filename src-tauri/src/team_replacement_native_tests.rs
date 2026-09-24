@@ -413,8 +413,12 @@ impl Recovery {
     }
     fn owner_record(&self) -> OwnerRecord { read_private_json(&self.home().join(".aperture/run/owner/t1-qa.json")).unwrap() }
     fn proof(&self) -> Result<(String, String), ReplacementError> {
-        RecoveryAdmission::proof_locked(&self.home(), Self::TEAM, Self::SEAT, &self.owner_record())
+        RecoveryAdmission::proof_locked(&self.home(), Self::TEAM, Self::SEAT, &self.owner_record(), RecoveryPhase::PreAdmission)
     }
+    fn tuple() -> ExecutionTuple {
+        ExecutionTuple { harness: Harness::Claude, model: crate::team_claude_launch::MODEL.into(), reasoning: None }
+    }
+    fn file_bytes(&self, relative: &str) -> Vec<u8> { std::fs::read(self.home().join(relative)).unwrap() }
     fn g0_bytes(&self) -> Vec<Vec<u8>> {
         ["admitted", "effects", "terminal"].iter()
             .map(|n| std::fs::read(self.home().join(format!(".aperture/teams/t1/runtime-attempts/t1-qa/g0/{n}.json"))).unwrap())
@@ -561,6 +565,82 @@ fn recovery_deadline_admission_writes_only_runtime_attempt_g1_and_refuses_a_seco
         ReplacementError::GenerationMismatch
     );
     assert!(!g1.exists());
+}
+
+/// The production order with an inert fixture: locked issue (pre-admission
+/// proof), deadline admission + effects, pre-reserve proof against THAT
+/// attempt, bound g2 reserve. No launch, gate, token, provider or process.
+#[test]
+fn recovery_production_order_reaches_a_bound_g2_reservation_and_only_once() {
+    let r = Recovery::new();
+    let home = r.home();
+    let store = OwnerStore::new(home.join(".aperture/run/owner"));
+    let g0_before = r.g0_bytes();
+    let attempt_bytes = r.file_bytes(".aperture/run/t1-qa.g1.claude-attempt.json");
+    let launch_bytes = r.file_bytes(".aperture/run/managed/t1-qa/g1/claude-launch.json");
+    let admission = RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", || Ok(())).unwrap();
+    assert_eq!((admission.snapshot_sha256.clone(), admission.token_id.clone()), (r.typed_sha.clone(), Recovery::token()));
+    assert!(admission.attempt_id.is_none());
+    // An unbound admission never reserves.
+    assert_eq!(reserve_recovery(&store, &admission, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::OutcomeUnknown);
+    // Pre-admission phase under the same locks production takes.
+    {
+        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), "t1").unwrap();
+        let _seat = store.lock("t1-qa").unwrap();
+        admission.reprove_locked(&store, RecoveryPhase::PreAdmission).unwrap();
+    }
+    let mut attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", deadline::Deadline::new()).unwrap();
+    attempt.admit_effects().unwrap();
+    let g1 = home.join(".aperture/teams/t1/runtime-attempts/t1-qa/g1");
+    assert!(g1.join("admitted.json").exists() && g1.join("effects.json").exists() && !g1.join("terminal.json").exists());
+    // The regression GLaDOS found: after the admission the pre-admission phase
+    // must refuse, and the pre-reserve phase accepts exactly this attempt.
+    assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreAdmission).unwrap_err(), ReplacementError::OutcomeUnknown);
+    let other = uuid::Uuid::new_v4().to_string();
+    assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: &other }).unwrap_err(), ReplacementError::OutcomeUnknown);
+    assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: "not-a-uuid" }).unwrap_err(), ReplacementError::OutcomeUnknown);
+    let bound = admission.bind_attempt(attempt.id());
+    bound.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: attempt.id() }).unwrap();
+    // The bound reserve, with the team lock held as in start_native.
+    let reservation = {
+        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), "t1").unwrap();
+        reserve_recovery(&store, &bound, "t1-qa", &Recovery::tuple()).unwrap()
+    };
+    assert_eq!(reservation.generation, 2);
+    let owner = store.read_owner("t1-qa").unwrap();
+    assert_eq!(owner.generation, 2);
+    assert_eq!(owner.state, OwnerState::Starting);
+    assert!(owner.incarnation.is_none() && owner.provisional_token_id.is_none());
+    assert!(owner.reservation_nonce_sha256.is_some());
+    assert_eq!(owner.requested, Recovery::tuple());
+    // Every historical fact is intact; only the owner and the new g1 attempt moved.
+    assert_eq!(r.g0_bytes(), g0_before);
+    assert_eq!(r.file_bytes(".aperture/run/t1-qa.g1.claude-attempt.json"), attempt_bytes);
+    assert_eq!(r.file_bytes(".aperture/run/managed/t1-qa/g1/claude-launch.json"), launch_bytes);
+    assert!(!home.join(".aperture/run/t1-qa.g2.claude-attempt.json").exists());
+    // Once: the proof is pre-reserve only, the admission is one-shot, and a
+    // second reserve or admission never happens.
+    assert_eq!(bound.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: attempt.id() }).unwrap_err(), ReplacementError::GenerationMismatch);
+    bound.revalidate_locked().unwrap();
+    assert_eq!(reserve_recovery(&store, &bound, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::GenerationMismatch);
+    assert_eq!(
+        deadline::RuntimeAttempt::begin_bootstrap_recovery(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
+        ReplacementError::GenerationMismatch
+    );
+    assert_eq!(RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", || Ok(())).err().unwrap(), ReplacementError::GenerationMismatch);
+    // A finished attempt (terminal written) is never a pre-reserve match.
+    let r2 = Recovery::new();
+    let home2 = r2.home();
+    let store2 = OwnerStore::new(home2.join(".aperture/run/owner"));
+    let admission2 = RecoveryAdmission::issue_checked(&home2, "t1", "t1-qa", || Ok(())).unwrap();
+    let mut attempt2 = deadline::RuntimeAttempt::begin_bootstrap_recovery(&home2, &AuthenticatedActor::launcher(), "t1", "t1-qa", deadline::Deadline::new()).unwrap();
+    attempt2.admit_effects().unwrap();
+    let bound2 = admission2.bind_attempt(attempt2.id());
+    bound2.reprove_locked(&store2, RecoveryPhase::PreReserve { attempt_id: attempt2.id() }).unwrap();
+    assert_eq!(attempt2.finish_unknown().unwrap_err(), ReplacementError::OutcomeUnknown);
+    assert_eq!(bound2.reprove_locked(&store2, RecoveryPhase::PreReserve { attempt_id: attempt2.id() }).unwrap_err(), ReplacementError::OutcomeUnknown);
+    assert_eq!(reserve_recovery(&store2, &bound2, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::OutcomeUnknown);
+    assert_eq!(store2.read_owner("t1-qa").unwrap().state, OwnerState::Quarantined);
 }
 
 fn claude_candidate_fixture(f: &Fixture) -> (OwnerStore, StartReservation, Incarnation) {
