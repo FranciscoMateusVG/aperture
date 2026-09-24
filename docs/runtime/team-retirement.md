@@ -4,7 +4,7 @@ The root-authenticated `retire_seat` action takes only team, seat, expected_gene
 
 With accept_checkpoint_loss=false, the existing native validated checkpoint collector must still yield Valid immediately before stopping. With true, checkpoint recovery is honestly recorded as None, no checkpoint is requested or fabricated. Neither path grants a replacement permit or starts anything. Both retain complete ownership collection (including peer attribution), PID/birth checks, unknown-process denial, bounded exact stop, durable revocation and token deletion.
 
-An explicit retirement has a one-shot child in the existing runtime-attempt ledger. A prior pre-effect Failed may precede it; pending, post-effect, Unknown and Ready attempts do not permit it. There is no automatic retry. Any partial/uncertain result requires factual inspection.
+An explicit retirement has a one-shot child in the existing runtime-attempt ledger. A prior pre-effect Failed may precede it; pending, post-effect, Unknown and Ready attempts do not permit it. There is no automatic retry. A new explicit root call may follow a Failed retirement only when its effects file is absent; it publishes a fresh child admission and preserves every prior fact. Pending, Ready, Unknown and effectful attempts remain denied. Any partial/uncertain result requires factual inspection.
 
 Native stop publishes retired.json only after stop/revocation readback under team/seat locks. It binds the exact owner, team snapshot, team and owner generations, token digest and checkpoint-loss decision. Archive derives Retirement only when all seats have these facts; a mixture fails closed. Revalidation checks facts and process absence under locks immediately before the existing archive journal is written.
 

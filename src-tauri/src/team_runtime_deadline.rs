@@ -275,6 +275,19 @@ impl ReadyAttempt {
         RuntimeAttempt::publish(&self.home, dir, admitted, budget)
     }
 }
+// An explicit new call may follow only a proved pre-effect rejection. Never
+// reuse or overwrite the old admission/terminal, and never retry inside a call.
+fn failed_before_effects(dir:&Path,team:&str,seat:&str,generation:u64)->Result<(),ReplacementError> {
+    let a:Admission=read_private_json(&dir.join("admitted.json")).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    let f:Fact=read_private_json(&dir.join("terminal.json")).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    if a.schema_version!=1 || a.team!=team || a.seat!=seat || a.old_generation!=generation
+        || f.schema_version!=1 || f.attempt_id!=a.attempt_id || f.kind!=FactKind::Failed
+        || !matches!(std::fs::symlink_metadata(dir.join("effects.json")),Err(e) if e.kind()==std::io::ErrorKind::NotFound) {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    Ok(())
+}
+
 impl RuntimeAttempt {
     /// Called only after native action authority, repo and launch preflight.
     /// Launcher identity and current managed owner are rechecked under locks.
@@ -382,34 +395,37 @@ impl RuntimeAttempt {
         let mut dir = validate_component_path(&seat_dir, &format!("g{generation}"), true)
             .map_err(|_| ReplacementError::NativeFailure)?;
         if retirement {
-            // Never overlap a live/unknown replacement. A pre-effect Failed is
-            // not a retry: the explicit withdrawal gets its own one-shot child.
-            if std::fs::symlink_metadata(&dir).is_ok() {
-                let a: Admission = read_private_json(&dir.join("admitted.json"))
-                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
-                let f: Fact = read_private_json(&dir.join("terminal.json"))
-                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
-                if a.schema_version != 1 || a.team != team || a.seat != seat
-                    || a.old_generation != generation || f.schema_version != 1
-                    || f.attempt_id != a.attempt_id || f.kind != FactKind::Failed
-                    || !matches!(std::fs::symlink_metadata(dir.join("effects.json")),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
-                    return Err(ReplacementError::OutcomeUnknown);
-                }
-            } else if !matches!(std::fs::symlink_metadata(&dir),
-                Err(e) if e.kind()==std::io::ErrorKind::NotFound) {
-                return Err(ReplacementError::OutcomeUnknown);
+            // The parent is either an ordinary pre-effect Failed, or only the
+            // container created by a previous explicit retirement admission.
+            match std::fs::symlink_metadata(&dir) {
+                Ok(_) => match std::fs::symlink_metadata(dir.join("admitted.json")) {
+                    Ok(_) => failed_before_effects(&dir,team,seat,generation)?,
+                    Err(e) if e.kind()==std::io::ErrorKind::NotFound => {
+                        let names=std::fs::read_dir(&dir).map_err(|_|ReplacementError::OutcomeUnknown)?
+                            .take(2).map(|v|v.map(|v|v.file_name())).collect::<Result<Vec<_>,_>>()
+                            .map_err(|_|ReplacementError::OutcomeUnknown)?;
+                        if names.len()!=1 || names[0]!="retirement" {return Err(ReplacementError::OutcomeUnknown);}
+                    }
+                    _=>return Err(ReplacementError::OutcomeUnknown),
+                },
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+                _=>return Err(ReplacementError::OutcomeUnknown),
             }
             ensure_private_dir(&dir).map_err(|_| ReplacementError::OutcomeUnknown)?;
             dir = validate_component_path(&dir, "retirement", true)
                 .map_err(|_| ReplacementError::OutcomeUnknown)?;
         }
         let mut prior_ready = None;
-        // Only a completed Ready can be superseded by a fresh preparation.
-        // Unknown/active/pending/failed attempts never grant blind retry.
+        // Ordinary preparation supersedes only Ready. Explicit retirement may
+        // traverse only pre-effect Failed facts. No live/uncertain work retries.
         for ordinal in 0..32 {
             match std::fs::symlink_metadata(&dir) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Ok(_) if retirement && ordinal<31 => {
+                    failed_before_effects(&dir,team,seat,generation)?;
+                    dir=validate_component_path(&dir,"reprepare",true)
+                        .map_err(|_|ReplacementError::OutcomeUnknown)?;
+                }
                 Ok(_) if !bootstrap && !retirement && ordinal < 31 => {
                     validate_component_path(
                         &seat_dir,

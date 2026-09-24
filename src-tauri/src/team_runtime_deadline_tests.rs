@@ -568,3 +568,25 @@ fn retirement_admission_is_one_shot_and_never_overlaps_an_uncertain_attempt() {
         } else {assert!(attempt.is_err());}
     }
 }
+
+#[test]
+fn retirement_explicit_readmission_preserves_failed_history_and_denies_any_effect() {
+    for mode in ["failed","pending","unknown","effects","ready","foreign","symlink"] {
+        let f=Fixture::new();f.managed();let actor=AuthenticatedActor::launcher();
+        let mut a=RuntimeAttempt::begin_retirement(&f.0,&actor,"t1","t1-worker",1,Deadline::new()).unwrap();
+        match mode {
+            "failed"|"foreign"|"symlink"=>a.finish_failed().unwrap(),
+            "unknown"=>{let _=a.finish_unknown();},
+            "effects"=>{a.admit_effects().unwrap();let _=a.finish_failed();},
+            "ready"=>{a.finish_failed().unwrap();let mut fact:Fact=read_private_json(&a.dir.join("terminal.json")).unwrap();fact.kind=FactKind::Ready;write_private_json_atomic(&a.dir.join("terminal.json"),&fact,true).unwrap();},
+            _=>{},
+        }
+        if mode=="foreign" {let mut fact:Fact=read_private_json(&a.dir.join("terminal.json")).unwrap();fact.attempt_id="foreign".into();write_private_json_atomic(&a.dir.join("terminal.json"),&fact,true).unwrap();}
+        if mode=="symlink" {std::fs::remove_file(a.dir.join("terminal.json")).unwrap();symlink("missing",a.dir.join("terminal.json")).unwrap();}
+        let before=std::fs::read(a.dir.join("admitted.json")).unwrap();
+        let next=RuntimeAttempt::begin_retirement(&f.0,&actor,"t1","t1-worker",1,Deadline::new());
+        if mode=="failed" {let next=next.unwrap();assert!(next.dir.ends_with("retirement/reprepare"));assert_ne!(a.id(),next.id());}
+        else {assert!(next.is_err(),"{mode}");assert!(!a.dir.join("reprepare").exists());}
+        assert_eq!(std::fs::read(a.dir.join("admitted.json")).unwrap(),before);
+    }
+}
