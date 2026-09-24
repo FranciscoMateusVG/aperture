@@ -478,6 +478,19 @@ fn claude_owner_requires_exact_active_observed_sonnet_none() {
             "mutation {kind}"
         );
     }
+    for model in ["claude-fable-5-1", "claude-opus-5"] {
+        let mut r = claude_record();
+        r.requested.model = model.into();
+        assert!(claude_owner_valid(&claude_input(), &r).is_err(), "{model} requested but Sonnet observed");
+        r.incarnation.as_mut().unwrap().model = model.into();
+        assert!(claude_owner_valid(&claude_input(), &r).is_ok(), "{model} exact observed owner opens");
+    }
+    for model in ["fable", "claude-fable-5", "claude-opus-5-5", "claude-fable-5-1[1m]"] {
+        let mut r = claude_record();
+        r.requested.model = model.into();
+        r.incarnation.as_mut().unwrap().model = model.into();
+        assert!(claude_owner_valid(&claude_input(), &r).is_err(), "{model} is not an exact literal");
+    }
     // The Codex guard still rejects a Claude owner and vice versa.
     assert!(owner_valid(&claude_input(), &claude_record()).is_err());
 }
