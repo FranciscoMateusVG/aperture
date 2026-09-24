@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    os::unix::{
-        fs::{FileTypeExt, MetadataExt},
-        process::CommandExt,
-    },
+    os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -48,12 +45,166 @@ struct Binding {
     hash: String,
     thread: String,
     socket: PathBuf,
-    socket_id: (u64, u64),
+    socket_binding: SocketBinding,
     runtime: PathBuf,
     executable: PathBuf,
     executable_id: (u64, u64),
     pid: u32,
     birth: u64,
+}
+// Path metadata is pinned as well as the kernel peer. This is a bounded
+// check/recheck, not atomic exclusion of a malicious concurrent same-UID swap.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PathPin {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    links: u64,
+}
+impl PathPin {
+    fn read(path: &Path) -> Result<Self> {
+        let m = fs::symlink_metadata(path).map_err(|_| ERROR)?;
+        Ok(Self {
+            path: path.into(),
+            dev: m.dev(),
+            ino: m.ino(),
+            uid: m.uid(),
+            mode: m.mode(),
+            // Directory child counts are not endpoint identity; unrelated
+            // entries in /private/tmp must not invalidate the pin.
+            links: if m.is_dir() { 0 } else { m.nlink() },
+        })
+    }
+    fn kind(&self, kind: libc::mode_t) -> bool {
+        self.mode & u32::from(libc::S_IFMT) == u32::from(kind)
+    }
+    fn recheck(&self) -> Result<()> {
+        if Self::read(&self.path)? != *self {
+            return Err(ERROR.into());
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct SocketBinding {
+    path: PathBuf,
+    pins: Vec<PathPin>,
+    link: Option<(PathBuf, PathBuf)>,
+}
+impl SocketBinding {
+    fn recheck(&self) -> Result<()> {
+        for pin in &self.pins {
+            pin.recheck()?;
+        }
+        if let Some((link, target)) = &self.link {
+            if fs::read_link(link).map_err(|_| ERROR)? != *target {
+                return Err(ERROR.into());
+            }
+        }
+        Ok(())
+    }
+}
+fn system_tmp_pins() -> Result<Vec<PathPin>> {
+    ["/", "/private", "/private/tmp"]
+        .into_iter()
+        .map(|p| {
+            let pin = PathPin::read(Path::new(p))?;
+            let safe_mode = if p == "/private/tmp" {
+                pin.mode & 0o7777 == 0o1777
+            } else {
+                pin.mode & 0o7022 == 0
+            };
+            if !pin.kind(libc::S_IFDIR) || pin.uid != 0 || !safe_mode {
+                return Err(ERROR.into());
+            }
+            Ok(pin)
+        })
+        .collect()
+}
+// Only called with the fixed native daemon directory in production. The
+// separate parameter permits hermetic filesystem fixtures, never request paths.
+fn pin_socket(socket: &Path, daemon: &Path, uid: u32) -> Result<SocketBinding> {
+    let entry = PathPin::read(socket)?;
+    if entry.uid != uid {
+        return Err(ERROR.into());
+    }
+    let mut pins = vec![entry.clone()];
+    let (path, link) = if entry.kind(libc::S_IFLNK) {
+        if entry.links != 1 {
+            return Err(ERROR.into());
+        }
+        let target = fs::read_link(socket).map_err(|_| ERROR)?;
+        let name = target.file_name().and_then(|s| s.to_str()).ok_or(ERROR)?;
+        // Observed 0.156.1 native basename: 64 lowercase hexadecimal bytes.
+        // Exact reconstruction also rejects dot components/repeated separators.
+        if name.len() != 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || target.as_os_str() != daemon.join(name).as_os_str()
+        {
+            return Err(ERROR.into());
+        }
+        let dir = PathPin::read(daemon)?;
+        if !dir.kind(libc::S_IFDIR) || dir.uid != uid || dir.mode & 0o7777 != 0o700 {
+            return Err(ERROR.into());
+        }
+        pins.push(dir);
+        pins.push(PathPin::read(&target)?);
+        (target.clone(), Some((socket.into(), target)))
+    } else {
+        (socket.into(), None)
+    };
+    let leaf = pins.last().ok_or(ERROR)?;
+    if !leaf.kind(libc::S_IFSOCK)
+        || leaf.uid != uid
+        || leaf.mode & 0o7777 != 0o600
+        || leaf.links != 1
+    {
+        return Err(ERROR.into());
+    }
+    let result = SocketBinding { path, pins, link };
+    result.recheck()?;
+    Ok(result)
+}
+fn resolve_socket(socket: &Path) -> Result<SocketBinding> {
+    let uid = unsafe { libc::geteuid() };
+    let entry = PathPin::read(socket)?;
+    let parents = if entry.kind(libc::S_IFLNK) {
+        system_tmp_pins()?
+    } else {
+        vec![]
+    };
+    let mut binding = pin_socket(
+        socket,
+        &PathBuf::from(format!("/private/tmp/codex-daemon-{uid}")),
+        uid,
+    )?;
+    if binding.pins.first() != Some(&entry) {
+        return Err(ERROR.into());
+    }
+    binding.pins.extend(parents);
+    binding.recheck()?;
+    Ok(binding)
+}
+fn verify_socket_with(
+    socket: &Path,
+    pid: u32,
+    resolve: impl Fn(&Path) -> Result<SocketBinding>,
+    peer: impl FnOnce(&Path, u32) -> Result<()>,
+) -> Result<SocketBinding> {
+    let binding = resolve(socket)?;
+    peer(&binding.path, pid)?;
+    // Recollect link and all components after connecting, before any TUI work.
+    if resolve(socket)? != binding {
+        return Err(ERROR.into());
+    }
+    Ok(binding)
+}
+fn verified_socket(socket: &Path, pid: u32) -> Result<SocketBinding> {
+    verify_socket_with(socket, pid, resolve_socket, socket_peer)
 }
 fn selectors(input: &OpenSeatInput) -> Result<()> {
     if input.team.len() > 16
@@ -255,20 +406,20 @@ fn binding(home: &Path, input: &OpenSeatInput, store: &OwnerStore) -> Result<Bin
         ),
     )?;
     let socket = run.join(format!("{}.sock", input.seat));
-    let m = fs::symlink_metadata(&socket).map_err(|_| ERROR)?;
-    if !m.file_type().is_socket() || m.uid() != unsafe { libc::geteuid() } {
-        return Err(ERROR.into());
-    }
-    socket_peer(&socket, i.pid)?;
+    let socket_binding = verified_socket(&socket, i.pid)?;
     let bin = process_executable(i.pid)?;
     let executable_id = executable(&bin)?;
     live(i.pid, i.start_time)?;
-    let bytes = serde_json::to_vec(&r).map_err(|_| ERROR)?;
+    // Carry socket/executable pins across parent-to-helper admission as well as
+    // repeated checks within each process. An old owner-only receipt cannot bind
+    // a newly replaced endpoint.
+    let bytes = serde_json::to_vec(&(&r, &socket_binding, &runtime, &bin, executable_id))
+        .map_err(|_| ERROR)?;
     Ok(Binding {
         hash: format!("{:x}", Sha256::digest(bytes)),
         thread: i.thread_id.clone(),
-        socket,
-        socket_id: (m.dev(), m.ino()),
+        socket: socket_binding.path.clone(),
+        socket_binding,
         runtime,
         executable: bin,
         executable_id,

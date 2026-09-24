@@ -180,7 +180,11 @@ fn existing_client_reuse_requires_exact_binding_pid_birth_and_live_pane() {
         hash: "a".repeat(64),
         thread: "exact-thread".into(),
         socket: "/fixture.sock".into(),
-        socket_id: (1, 2),
+        socket_binding: SocketBinding {
+            path: "/fixture.sock".into(),
+            pins: vec![],
+            link: None,
+        },
         runtime: "/fixture".into(),
         executable: "/fixture/bin".into(),
         executable_id: (3, 4),
@@ -444,4 +448,182 @@ fn claude_owner_requires_exact_active_observed_sonnet_none() {
     }
     // The Codex guard still rejects a Claude owner and vice versa.
     assert!(owner_valid(&claude_input(), &claude_record()).is_err());
+}
+
+// Isolated socket metadata fixtures: no app-server, TUI, tmux or provider.
+struct SocketFixture {
+    root: PathBuf,
+    daemon: PathBuf,
+    link: PathBuf,
+    target: PathBuf,
+    _listener: std::os::unix::net::UnixListener,
+}
+impl SocketFixture {
+    fn new() -> Self {
+        use std::os::unix::{
+            fs::{symlink, PermissionsExt},
+            net::UnixListener,
+        };
+        // Keep Unix pathname below sockaddr_un capacity, including 64-byte name.
+        let root = PathBuf::from(format!(
+            "/private/tmp/ats-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let daemon = root.join("d");
+        fs::create_dir(&daemon).unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = daemon.join("a".repeat(64));
+        let listener = UnixListener::bind(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = root.join("run.sock");
+        symlink(&target, &link).unwrap();
+        Self {
+            root,
+            daemon,
+            target,
+            link,
+            _listener: listener,
+        }
+    }
+    fn pin(&self) -> Result<SocketBinding> {
+        pin_socket(&self.link, &self.daemon, unsafe { libc::geteuid() })
+    }
+    fn relink(&self, path: &Path) {
+        fs::remove_file(&self.link).unwrap();
+        std::os::unix::fs::symlink(path, &self.link).unwrap();
+    }
+}
+impl Drop for SocketFixture {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+#[test]
+fn native_daemon_socket_shape_and_direct_socket_are_pinned() {
+    let f = SocketFixture::new();
+    let pin = f.pin().unwrap();
+    assert_eq!(pin.path, f.target);
+    assert_eq!(pin.pins.len(), 3);
+    assert_eq!(pin.link, Some((f.link.clone(), f.target.clone())));
+    pin.recheck().unwrap();
+    let direct = resolve_socket(&f.target).unwrap();
+    assert_eq!(direct.path, f.target);
+    assert!(direct.link.is_none());
+    assert_eq!(
+        tui_args("exact-thread", &pin.path)[3],
+        format!("unix://{}", f.target.display())
+    );
+    // Production resolver cannot admit fixture parent paths through the link.
+    assert!(resolve_socket(&f.link).is_err());
+    assert_eq!(system_tmp_pins().unwrap().len(), 3);
+}
+#[test]
+fn native_daemon_socket_rejects_all_non_native_link_targets() {
+    let f = SocketFixture::new();
+    for target in [
+        f.daemon.join("socket"),
+        f.daemon.join("a".repeat(63)),
+        f.daemon.join("a".repeat(65)),
+        f.daemon.join("A".repeat(64)),
+        f.daemon.join("g".repeat(64)),
+        f.root.join("foreign").join("a".repeat(64)),
+        PathBuf::from("d").join("a".repeat(64)),
+        PathBuf::from(format!("{}/./{}", f.daemon.display(), "a".repeat(64))),
+        PathBuf::from(format!("{}//{}", f.daemon.display(), "a".repeat(64))),
+        f.daemon.join("..").join("d").join("a".repeat(64)),
+    ] {
+        f.relink(&target);
+        assert!(f.pin().is_err(), "non-native link must fail");
+    }
+}
+#[test]
+fn native_daemon_socket_rejects_unsafe_directory_leaf_and_uid() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let f = SocketFixture::new();
+    for mode in [0o755, 0o770, 0o1700] {
+        fs::set_permissions(&f.daemon, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(f.pin().is_err());
+    }
+    fs::set_permissions(&f.daemon, fs::Permissions::from_mode(0o700)).unwrap();
+    for mode in [0o666, 0o660, 0o601, 0o1600] {
+        fs::set_permissions(&f.target, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(f.pin().is_err());
+        assert!(resolve_socket(&f.target).is_err());
+    }
+    fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(pin_socket(&f.link, &f.daemon, unsafe { libc::geteuid() } + 1).is_err());
+    let moved = f.root.join("old");
+    fs::rename(&f.daemon, &moved).unwrap();
+    symlink(&moved, &f.daemon).unwrap();
+    assert!(f.pin().is_err());
+    fs::remove_file(&f.daemon).unwrap();
+    fs::rename(moved, &f.daemon).unwrap();
+    let old = f.root.join("old.sock");
+    fs::rename(&f.target, &old).unwrap();
+    symlink(&old, &f.target).unwrap();
+    assert!(f.pin().is_err());
+    fs::remove_file(&f.target).unwrap();
+    fs::write(&f.target, b"not a socket").unwrap();
+    fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(f.pin().is_err());
+}
+#[test]
+fn native_socket_recheck_detects_same_target_link_recreation() {
+    let f = SocketFixture::new();
+    let before = f.pin().unwrap();
+    fs::rename(&f.link, f.root.join("old.link")).unwrap();
+    std::os::unix::fs::symlink(&f.target, &f.link).unwrap();
+    assert!(before.recheck().is_err());
+    assert_ne!(before, f.pin().unwrap());
+    // Receipt hash input changes, even though owner/thread and destination match.
+    assert_ne!(
+        serde_json::to_vec(&before).unwrap(),
+        serde_json::to_vec(&f.pin().unwrap()).unwrap()
+    );
+}
+#[test]
+fn native_socket_recheck_detects_leaf_and_directory_replacement() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let f = SocketFixture::new();
+    let before = f.pin().unwrap();
+    fs::rename(&f.target, f.root.join("old.sock")).unwrap();
+    let _other = UnixListener::bind(&f.target).unwrap();
+    fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(before.recheck().is_err());
+    assert_ne!(before, f.pin().unwrap());
+    let before = f.pin().unwrap();
+    fs::rename(&f.daemon, f.root.join("old-dir")).unwrap();
+    fs::create_dir(&f.daemon).unwrap();
+    fs::set_permissions(&f.daemon, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(f.root.join("old-dir").join("a".repeat(64)), &f.target).unwrap();
+    assert!(before.recheck().is_err());
+    assert_ne!(before, f.pin().unwrap());
+}
+#[test]
+#[cfg(target_os = "macos")]
+fn native_socket_peer_and_post_connect_drift_are_enforced() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = SocketFixture::new();
+    let resolve = |p: &Path| pin_socket(p, &f.daemon, unsafe { libc::geteuid() });
+    assert!(verify_socket_with(&f.link, std::process::id(), resolve, socket_peer).is_ok());
+    assert!(verify_socket_with(&f.link, std::process::id() + 1, resolve, socket_peer).is_err());
+    assert!(
+        verify_socket_with(&f.link, std::process::id(), resolve, |p, pid| {
+            socket_peer(p, pid)?;
+            fs::set_permissions(&f.target, fs::Permissions::from_mode(0o660)).unwrap();
+            Ok(())
+        })
+        .is_err()
+    );
+    fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        verify_socket_with(&f.link, std::process::id(), resolve, |_, _| {
+            fs::rename(&f.link, f.root.join("old.link")).unwrap();
+            std::os::unix::fs::symlink(&f.target, &f.link).unwrap();
+            Ok(())
+        })
+        .is_err()
+    );
 }
