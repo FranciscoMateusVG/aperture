@@ -1951,12 +1951,37 @@ struct ArchiveInspection {
     state: TeamStateFile,
 }
 
+// Diagnostic retirement proves managed teardown, not mission/epic success.
+fn diagnostic_archive_checks() -> ArchiveChecks {
+    ArchiveChecks {
+        reconciliation: RuntimeCheckState::Unknown, reviews: RuntimeCheckState::Unknown,
+        metrics: RuntimeCheckState::Unknown, process_stop: RuntimeCheckState::Verified,
+        revocation: RuntimeCheckState::Verified, remote_effects: RuntimeCheckState::Unknown,
+        worktrees: RuntimeCheckState::Unknown,
+    }
+}
+
 fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveInspection> {
     validate_team_name(&input.team)?;
     if input.expected_generation == 0 { return Err(TeamError::new("E_GENERATION_MISMATCH", "archive generation is invalid")); }
     let view = engine.read_team_view(&input.team)?;
     if view.state.state != TeamLifecycle::Active || view.state.generation != input.expected_generation {
         return Err(TeamError::new("E_GENERATION_MISMATCH", "archive team generation changed"));
+    }
+    // A Quarantined owner selects a verification path, never grants authority.
+    // Mixed/normal teams fail there; no caller can select diagnostic retirement.
+    let owners = OwnerStore::new(engine.paths.owners.clone());
+    let quarantined = view.snapshot.seats.iter().map(|s| owners.read_owner(&s.name))
+        .collect::<Result<Vec<_>, _>>().map_err(TeamError::from_message)?
+        .iter().any(|o| o.state == OwnerState::Quarantined);
+    if quarantined {
+        let approval = crate::team_archive::diagnostic::inspect(&engine.paths.home, &view.snapshot, &view.state)
+            .map_err(TeamError::from_message)?;
+        return Ok(ArchiveInspection {
+            view: ArchiveView {team: input.team.clone(), generation: input.expected_generation,
+                state: "pending".into(), checks: diagnostic_archive_checks(), blockers: vec![]},
+            approval, snapshot: view.snapshot, state: view.state,
+        });
     }
     let epic = view.state.epic_id.as_deref().ok_or_else(|| TeamError::new("E_RECONCILIATION_INCOMPLETE", "active team epic is unavailable"))?;
     let seats: Vec<_> = view.snapshot.seats.iter().map(|s| s.name.clone()).collect();
@@ -1996,6 +2021,7 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
     Ok(ArchiveInspection {
         view: public,
         approval: crate::journal::ArchiveJournalApproval {
+            category: crate::journal::ArchiveCategory::Mission,
             generation: input.expected_generation,
             epic_id: epic.into(),
             record_sha256: beads.record_sha256,
@@ -2465,12 +2491,16 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
         }
         TeamControlRequest::Archive(input) => {
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
+            let category;
             if crate::team_archive_finalize::has_journal(&engine.paths.home, &input.team) {
+                category = crate::team_archive_finalize::recover_approval(&engine.paths.home, &input.team, input.expected_generation)
+                    .map_err(TeamError::from_message)?.category;
                 crate::team_archive_finalize::finalize(
                     &engine.paths.home, &actor, &input.team, input.expected_generation, None,
                 ).map_err(TeamError::from_message)?;
             } else {
                 let inspection = collect_archive(&engine, &input)?;
+                category = inspection.approval.category;
                 if !inspection.view.blockers.is_empty() {
                     return Ok(TeamControlResponse::Archive(inspection.view));
                 }
@@ -2485,12 +2515,14 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             }
             Ok(TeamControlResponse::Archive(ArchiveView {
                 team: input.team, generation: input.expected_generation, state: "archived".into(),
-                checks: ArchiveChecks {
+                checks: if category == crate::journal::ArchiveCategory::DiagnosticRetirement {
+                    diagnostic_archive_checks()
+                } else { ArchiveChecks {
                     reconciliation: RuntimeCheckState::Verified, reviews: RuntimeCheckState::Verified,
                     metrics: RuntimeCheckState::Verified, process_stop: RuntimeCheckState::Verified,
                     revocation: RuntimeCheckState::Verified, remote_effects: RuntimeCheckState::Verified,
                     worktrees: RuntimeCheckState::Verified,
-                }, blockers: vec![],
+                } }, blockers: vec![],
             }))
         }
         TeamControlRequest::RollbackArchive(input) => {

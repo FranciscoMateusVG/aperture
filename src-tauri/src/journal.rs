@@ -80,8 +80,21 @@ pub struct ArchiveMutableFile {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveCategory {
+    #[default]
+    Mission,
+    DiagnosticRetirement,
+}
+impl ArchiveCategory {
+    fn is_mission(&self) -> bool { *self == Self::Mission }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveJournalApproval {
+    #[serde(default, skip_serializing_if = "ArchiveCategory::is_mission")]
+    pub category: ArchiveCategory,
     pub generation: u64,
     pub epic_id: String,
     pub record_sha256: String,
@@ -575,7 +588,10 @@ fn valid_journal(journal: &Journal) -> bool {
                 && approval.owner_states.len() == approval.owner_sha256.len()
                 && approval.owner_post_sha256.len() == approval.owner_sha256.len()
                 && approval.owner_states.iter().all(|(seat, state)| {
-                    !seat.is_empty() && matches!(state.as_str(), "active" | "stale")
+                    !seat.is_empty() && match approval.category {
+                        ArchiveCategory::Mission => matches!(state.as_str(), "active" | "stale"),
+                        ArchiveCategory::DiagnosticRetirement => state == "quarantined",
+                    }
                 })
                 && approval
                     .owner_post_sha256

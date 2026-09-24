@@ -249,3 +249,6 @@ pub(crate) mod record;
 
 #[path = "team_archive_native.rs"]
 pub(crate) mod native;
+
+#[path = "team_archive_diagnostic.rs"]
+pub(crate) mod diagnostic;

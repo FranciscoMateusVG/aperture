@@ -38,7 +38,8 @@ fn validate_owner_binding(
 ) -> Result<(), String> {
     let actual = owner_hash(owner)?;
     match (recovering, expected_state, &owner.state) {
-        (false, Some("active"), OwnerState::Active) | (false, Some("stale"), OwnerState::Stale) => {
+        (false, Some("active"), OwnerState::Active) | (false, Some("stale"), OwnerState::Stale)
+        | (false, Some("quarantined"), OwnerState::Quarantined) => {
             if pre_sha256 != Some(&actual) {
                 return Err("E_ARCHIVE_APPROVAL_STALE: owner changed".into());
             }
@@ -53,7 +54,7 @@ fn validate_owner_binding(
                 return Err("E_ARCHIVE_APPROVAL_STALE: owner postimage changed".into());
             }
         }
-        (true, Some("stale"), OwnerState::Stale) => {
+        (true, Some("stale"), OwnerState::Stale) | (true, Some("quarantined"), OwnerState::Quarantined) => {
             if pre_sha256 != Some(&actual) || post_sha256 != Some(&actual) {
                 return Err("E_ARCHIVE_APPROVAL_STALE: stale owner changed".into());
             }
@@ -241,6 +242,14 @@ fn revalidate_evidence_locked(
     team_lock: &crate::owner::AdvisoryLock,
     seat_locks: &[crate::owner::AdvisoryLock],
 ) -> Result<(), String> {
+    if approval.category == crate::journal::ArchiveCategory::DiagnosticRetirement {
+        let fresh = crate::team_archive::diagnostic::inspect_locked(home, snapshot, state, team_lock, seat_locks)?;
+        if fresh.generation != approval.generation || fresh.epic_id != approval.epic_id
+            || fresh.owner_sha256 != approval.owner_sha256 || fresh.owner_states != approval.owner_states {
+            return Err("E_ARCHIVE_APPROVAL_STALE: diagnostic bindings changed".into());
+        }
+        return validate_evidence_projection(approval, &fresh.record_sha256, &fresh.inventory_sha256, &fresh.native_sha256, true);
+    }
     let epic = state
         .epic_id
         .as_deref()
@@ -415,8 +424,12 @@ pub(crate) fn rollback(
             owner_post.get(seat),
             true,
         )?;
-        if owner.state != OwnerState::Stale {
-            return Err("E_ARCHIVE_OWNER_INVALID: rollback owner is not stale".into());
+        let expected = match approval.category {
+            crate::journal::ArchiveCategory::Mission => OwnerState::Stale,
+            crate::journal::ArchiveCategory::DiagnosticRetirement => OwnerState::Quarantined,
+        };
+        if owner.state != expected {
+            return Err("E_ARCHIVE_OWNER_INVALID: rollback owner category changed".into());
         }
     }
 
@@ -553,7 +566,11 @@ fn finalize_inner(
         approval.owner_states.iter().cloned().collect();
     let approved_post: std::collections::BTreeMap<_, _> =
         approval.owner_post_sha256.iter().cloned().collect();
-    if approved.len() != seats.len() || approved_states.len() != seats.len() {
+    let category_states_valid = approved_states.values().all(|s| match approval.category {
+        crate::journal::ArchiveCategory::Mission => matches!(s.as_str(), "active" | "stale"),
+        crate::journal::ArchiveCategory::DiagnosticRetirement => s == "quarantined",
+    });
+    if approved.len() != seats.len() || approved_states.len() != seats.len() || !category_states_valid {
         return Err("E_ARCHIVE_APPROVAL_INVALID: owner coverage mismatch".into());
     }
     let mut current_owners = std::collections::BTreeMap::new();
@@ -743,6 +760,7 @@ mod tests {
     #[test]
     fn archive_evidence_requires_all_exact_hashes_and_zero_blockers() {
         let approval = ArchiveJournalApproval {
+            category: crate::journal::ArchiveCategory::Mission,
             generation: 1,
             epic_id: "aperture-epic".into(),
             record_sha256: "a".repeat(64),
@@ -936,6 +954,7 @@ mod tests {
         )
         .unwrap();
         let approval = ArchiveJournalApproval {
+            category: crate::journal::ArchiveCategory::Mission,
             generation: 1,
             epic_id: "aperture-epic".into(),
             record_sha256: "a".repeat(64),
@@ -1035,6 +1054,7 @@ mod tests {
         std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
         let actor = crate::team_auth::authenticate_glados_control().unwrap();
         let approval = ArchiveJournalApproval {
+            category: crate::journal::ArchiveCategory::Mission,
             generation: 1,
             epic_id: "aperture-epic".into(),
             record_sha256: "a".repeat(64),
@@ -1113,6 +1133,7 @@ mod tests {
         std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
         let actor = crate::team_auth::authenticate_glados_control().unwrap();
         let approval = ArchiveJournalApproval {
+            category: crate::journal::ArchiveCategory::Mission,
             generation: 1,
             epic_id: "aperture-epic".into(),
             record_sha256: "a".repeat(64),
@@ -1168,6 +1189,7 @@ mod tests {
         std::env::set_var("APERTURE_AGENTS_DIR", home.join(".claude/aperture"));
         let actor = crate::team_auth::authenticate_glados_control().unwrap();
         let approval = ArchiveJournalApproval {
+            category: crate::journal::ArchiveCategory::Mission,
             generation: 1,
             epic_id: "aperture-epic".into(),
             record_sha256: "a".repeat(64),
