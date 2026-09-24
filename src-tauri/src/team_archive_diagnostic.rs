@@ -12,6 +12,7 @@ use crate::teams::{TeamLifecycle, TeamSnapshot, TeamStateFile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -192,12 +193,24 @@ fn inspect_with<F: FnMut(&ProcessIdentity) -> ProcessState>(
         return Err(fail());
     }
     let root = home.join(".aperture/teams").join(team);
-    if read::<TeamSnapshot>(&root.join("team.json"))? != *snapshot
-        || read::<TeamStateFile>(&root.join("state.json"))? != *state
-    {
+    // The observation producer binds the exact persisted bytes, while the
+    // launch producer binds typed serialization. They are distinct contracts.
+    let snapshot_file =
+        crate::journal::open_private_file_nofollow(&root.join("team.json")).map_err(|_| fail())?;
+    let mut snapshot_bytes = Vec::new();
+    snapshot_file
+        .take(1_048_577)
+        .read_to_end(&mut snapshot_bytes)
+        .map_err(|_| fail())?;
+    if snapshot_bytes.len() > 1_048_576 {
+        return Err(fail());
+    }
+    let persisted: TeamSnapshot = serde_json::from_slice(&snapshot_bytes).map_err(|_| fail())?;
+    if persisted != *snapshot || read::<TeamStateFile>(&root.join("state.json"))? != *state {
         return Err(fail());
     }
     let snapshot_hash = hash(snapshot)?;
+    let observation_snapshot_hash = format!("{:x}", Sha256::digest(&snapshot_bytes));
     let mut names: Vec<_> = snapshot.seats.iter().map(|s| s.name.clone()).collect();
     names.sort();
     if names.windows(2).any(|v| v[0] == v[1]) || !names.contains(&snapshot.lead) {
@@ -256,7 +269,7 @@ fn inspect_with<F: FnMut(&ProcessIdentity) -> ProcessState>(
             || a.seat != seat
             || a.generation != o.generation
             || a.team_generation != state.generation
-            || a.snapshot_sha256 != snapshot_hash
+            || a.snapshot_sha256 != observation_snapshot_hash
             || a.mode != ClaudeLaunchMode::DiagnosticPreinput
             || !canonical_uuid(&a.session_id)
             || !hex(&a.reservation_nonce_sha256)

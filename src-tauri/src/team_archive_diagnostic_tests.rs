@@ -84,7 +84,10 @@ impl Fixture {
             seat: "t1-worker".into(),
             generation: 1,
             reservation_nonce_sha256: "c".repeat(64),
-            snapshot_sha256: hash(&snapshot).unwrap(),
+            snapshot_sha256: format!(
+                "{:x}",
+                Sha256::digest(fs::read(home.join(".aperture/teams/t1/team.json")).unwrap())
+            ),
             team_generation: 1,
             token_id: "a".repeat(64),
             root_pid: pid,
@@ -653,4 +656,52 @@ fn diagnostic_journal_partial_inverse_and_owner_drift_are_bound() {
         hash(&read::<OwnerRecord>(&ownerpath).unwrap()).unwrap(),
         hash(&owner).unwrap()
     );
+}
+
+#[test]
+fn producer_snapshot_hashes_distinguish_raw_pretty_bytes_from_typed_launch() {
+    let f = Fixture::new(false, true);
+    let bytes = fs::read(f.home.join(".aperture/teams/t1/team.json")).unwrap();
+    let a: ClaudeAttempt = read(
+        &f.home
+            .join(".aperture/run/t1-worker.g1.claude-attempt.json"),
+    )
+    .unwrap();
+    let launch: Launch = read(
+        &f.home
+            .join(".aperture/run/managed/t1-worker/g1/claude-launch.json"),
+    )
+    .unwrap();
+    assert_ne!(bytes, serde_json::to_vec(&f.snapshot).unwrap());
+    assert_eq!(a.snapshot_sha256, format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(launch.snapshot_sha256, hash(&f.snapshot).unwrap());
+    assert_ne!(a.snapshot_sha256, launch.snapshot_sha256);
+    f.inspect().unwrap();
+}
+
+#[test]
+fn snapshot_reformat_semantic_drift_and_overcap_fail_without_rewriting_facts() {
+    for case in 0..3 {
+        let f = Fixture::new(false, true);
+        let p = f.home.join(".aperture/teams/t1/team.json");
+        let attempt_path = f
+            .home
+            .join(".aperture/run/t1-worker.g1.claude-attempt.json");
+        let before = fs::read(&attempt_path).unwrap();
+        let mut bytes = serde_json::to_vec(&f.snapshot).unwrap();
+        if case == 1 {
+            let mut changed = f.snapshot.clone();
+            changed.mission.push_str(" changed");
+            bytes = serde_json::to_vec(&changed).unwrap();
+        } else if case == 2 {
+            bytes.resize(1_048_577, b' ');
+        }
+        crate::journal::write_private_bytes_atomic(&p, &bytes, true).unwrap();
+        if case == 0 {
+            assert_eq!(read::<TeamSnapshot>(&p).unwrap(), f.snapshot);
+        }
+        assert!(f.inspect().is_err());
+        assert_eq!(fs::read(&attempt_path).unwrap(), before);
+        assert!(!crate::team_archive_finalize::has_journal(&f.home, "t1"));
+    }
 }
