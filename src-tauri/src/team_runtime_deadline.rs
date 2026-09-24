@@ -127,6 +127,26 @@ impl UnfinishedBootstrap {
         Ok(())
     }
 }
+/// Pre-reserve check for the explicit first-bootstrap recovery: the CURRENT
+/// attempt's `g1` admission is open (admitted and effects bound to exactly
+/// `attempt_id`, no terminal) and nothing else lives there. Another attempt,
+/// a finished one, or any prepared/retirement material refuses. Read-only.
+pub(crate) fn recovery_attempt_open_locked(home: &Path, team: &str, seat: &str, attempt_id: &str) -> Result<(), ReplacementError> {
+    let dir = home.join(".aperture/teams").join(team).join("runtime-attempts").join(seat).join("g1");
+    let a: Admission = read_private_json(&dir.join("admitted.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    let f: Fact = read_private_json(&dir.join("effects.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    if !crate::team_claude_launch::canonical_uuid(attempt_id)
+        || a.schema_version != 1 || a.attempt_id != attempt_id || a.team != team || a.seat != seat || a.old_generation != 1
+        || f.schema_version != 1 || f.attempt_id != attempt_id || f.kind != FactKind::EffectsMayHaveOccurred {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    for name in ["terminal.json", "reconciled.json", "prepared.json", "reprepare", "start", "retirement"] {
+        if !matches!(std::fs::symlink_metadata(dir.join(name)), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+    }
+    Ok(())
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Fact {

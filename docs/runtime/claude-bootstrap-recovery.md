@@ -17,9 +17,25 @@ Recovery is **GLaDOS-only** (`authorize_recovery`); the operator-UI arm that
 ## Native proof (`RecoveryAdmission`, `team_replacement_native.rs`)
 
 Issued under team lock then seat lock, GLaDOS capability revalidated before and
-inside the locks, and **re-run twice**: before the deadline admission and again
-under the same locks immediately before the only `reserve_start` this call may
-take. Nothing in it comes from the caller.
+inside the locks, and **re-run twice** in two phases. Nothing in it comes from
+the caller.
+
+- **Pre-admission** (at issue and again under team+seat locks right before the
+  deadline admission): `runtime-attempts/<seat>/g1` must be **absent** — one
+  admission ever.
+- **Pre-reserve** (inside `reserve_recovery`, team lock held by `start_native`,
+  seat lock taken for the proof): `runtime-attempts/<seat>/g1` must hold exactly
+  the **current** attempt — `admitted.json` and `effects.json` bound to its
+  attempt id, no `terminal.json`, no prepared/retirement material
+  (`recovery_attempt_open_locked`). Another attempt or a finished one refuses.
+
+The seat lock is **released** after the pre-reserve proof: `OwnerStore::reserve_start`
+re-acquires it and applies its own guarantees (expected generation 1,
+Stale|Quarantined, fresh nonce, incarnation cleared). The reservation is then
+bound to the proof by readback — generation 2, `starting`, the reservation's
+nonce digest, the selected tuple, no incarnation, no provisional id — or the
+call fails with an unknown outcome. There is no continuous seat lock across the
+reserve; the team lock is continuous.
 
 | Fact | Where it is read | Requirement |
 |---|---|---|
@@ -33,9 +49,9 @@ take. Nothing in it comes from the caller.
 | g0 attempt | `.aperture/teams/<team>/runtime-attempts/<seat>/g0/` | `UnfinishedBootstrap::read_locked`: `old_generation 0`, effects `effects_may_have_occurred`, terminal `unknown` or absent-expired, no `reconciled.json` |
 | g1 attempt | `.aperture/run/<seat>.g1.claude-attempt.json` (`ClaudeAttempt`) | generation 1, **`mode: normal_positional`**, team generation, raw snapshot digest, token id, root pid/birth, requested model, canonical session uuid |
 | g1 launch record | `.aperture/run/managed/<seat>/g1/claude-launch.json` (bounded projection) | generation 1, **`mode: normal_positional`**, session == attempt, token id, typed snapshot digest |
-| g1 release | `.aperture/run/managed/<seat>/g1/claude-release.json` | `attempt_sha256` == digest of the typed attempt, root pid/birth |
+| g1 release | `.aperture/run/managed/<seat>/g1/claude-release.json` | `attempt_sha256` == digest of the typed attempt, root pid/birth. Limit: `launch_sha256` (digest of the private `LaunchRecord` serialization) is not recomputed; the launch record is bound separately by session, token and typed snapshot digest |
 | Observation | `.aperture/run/<seat>.g1.claude-{observation,rejected}.json` | both absent (unobserved means neither a sample nor a proven rejection) |
-| Single admission | `<seat>.g2.claude-attempt.json`, `run/managed/<seat>/g2`, `runtime-attempts/<seat>/g1` | all absent |
+| Single admission | `<seat>.g2.claude-attempt.json`, `run/managed/<seat>/g2` | absent; `runtime-attempts/<seat>/g1` is phase-dependent (see above) |
 
 The **category** (normal bootstrap vs. retired diagnostic) comes from the launch
 record and the attempt both being `normal_positional`, never from the tuple or
