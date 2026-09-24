@@ -97,6 +97,38 @@ fn windows_are_exact_native_ids() {
     assert!(window_id("@123"))
 }
 #[test]
+fn private_chain_accepts_non_private_home_but_not_non_private_runtime() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let home = std::env::temp_dir().join(format!("aperture-terminal-home-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    journal::ensure_private_dir(&home.join(".aperture/run/managed/test-dev/g1")).unwrap();
+    for mode in [0o700, 0o750, 0o755] {
+        fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(private_chain(&home, ".aperture/run").is_ok(), "home mode {mode:o}");
+        assert!(private_chain(&home, ".aperture/run/managed/test-dev/g1").is_ok());
+        assert_eq!(fs::metadata(&home).unwrap().mode() & 0o777, mode);
+    }
+    for part in [".aperture", ".aperture/run", ".aperture/run/managed/test-dev/g1"] {
+        fs::set_permissions(home.join(part), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(private_chain(&home, ".aperture/run/managed/test-dev/g1").is_err());
+        fs::set_permissions(home.join(part), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for mode in [0o770, 0o707, 0o777] {
+        fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(private_chain(&home, ".aperture/run").is_err());
+    }
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o750)).unwrap();
+    for relative in ["../run", "run", ".aperture/../run", "/.aperture/run"] {
+        assert!(private_chain(&home, relative).is_err());
+    }
+    let linked_home = home.with_extension("symlink");
+    symlink(&home, &linked_home).unwrap();
+    assert!(private_chain(&linked_home, ".aperture/run").is_err());
+    fs::remove_file(linked_home).unwrap();
+    fs::remove_dir_all(home).unwrap();
+}
+#[test]
 fn private_socket_directory_chain_fails_on_symlink() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let home = std::env::temp_dir().join(format!("aperture-terminal-{}", uuid::Uuid::new_v4()));

@@ -246,7 +246,23 @@ fn owner_valid(input: &OpenSeatInput, r: &OwnerRecord) -> Result<()> {
     Ok(())
 }
 fn private_chain(home: &Path, relative: &str) -> Result<PathBuf> {
-    let path = journal::validate_component_path(home, relative, false)?;
+    // HOME is not Aperture's private storage root: ordinary macOS homes may
+    // allow group/world read or traversal. Never chmod it or require 0700.
+    // Private permissions remain mandatory from .aperture downwards.
+    let meta = fs::symlink_metadata(home).map_err(|_| ERROR)?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o022 != 0
+    {
+        return Err(ERROR.into());
+    }
+    let suffix = Path::new(relative)
+        .strip_prefix(".aperture")
+        .map_err(|_| ERROR)?
+        .to_str()
+        .ok_or(ERROR)?;
+    let path = journal::validate_component_path(&home.join(".aperture"), suffix, false)?;
     let mut p = home.to_path_buf();
     for c in Path::new(relative).components() {
         p.push(c);
