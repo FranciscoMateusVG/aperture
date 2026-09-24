@@ -349,7 +349,7 @@ pub fn prepare<R: ReplacementRuntime>(
     generation: u64,
     policy: &ReplacementPolicy,
 ) -> Result<PreparedReplacement, ReplacementError> {
-    prepare_checked(r, seat, generation, policy, false)
+    prepare_checked(r, seat, generation, policy, false, false)
 }
 
 /// Archival is not emergency recovery: lack of a valid checkpoint never grants
@@ -361,7 +361,16 @@ pub(crate) fn prepare_for_archive<R: ReplacementRuntime>(
     generation: u64,
     policy: &ReplacementPolicy,
 ) -> Result<PreparedReplacement, ReplacementError> {
-    prepare_checked(r, seat, generation, policy, true)
+    prepare_checked(r, seat, generation, policy, true, false)
+}
+
+/// Explicit withdrawal is not mission reconciliation and grants no start permit.
+pub(crate) fn prepare_for_retirement<R: ReplacementRuntime>(
+    r: &mut R, seat: &str, generation: u64, policy: &ReplacementPolicy,
+    accept_checkpoint_loss: bool,
+) -> Result<CheckpointRecovery, ReplacementError> {
+    prepare_checked(r, seat, generation, policy, !accept_checkpoint_loss, true)
+        .map(|prepared| prepared.recovery)
 }
 
 fn prepare_checked<R: ReplacementRuntime>(
@@ -370,6 +379,7 @@ fn prepare_checked<R: ReplacementRuntime>(
     generation: u64,
     policy: &ReplacementPolicy,
     require_valid_checkpoint: bool,
+    retirement: bool,
 ) -> Result<PreparedReplacement, ReplacementError> {
     let result = (|| {
         if policy.poll_ms == 0 {
@@ -389,7 +399,7 @@ fn prepare_checked<R: ReplacementRuntime>(
             .rate_limit_at_ms()
             .map(|at| at <= r.now_ms() && r.now_ms() - at <= 60_000)
             .unwrap_or(false);
-        if r.turn_state() != TurnState::Dead && (r.turn_state() == TurnState::Busy || recent_limit)
+        if !retirement && r.turn_state() != TurnState::Dead && (r.turn_state() == TurnState::Busy || recent_limit)
         {
             r.event(ReplacementPhase::CheckpointPending);
             // A missing/broken hook is not permission to hang recovery forever.
@@ -461,8 +471,10 @@ fn prepare_checked<R: ReplacementRuntime>(
         {
             return Err(ReplacementError::RevocationUnverified);
         }
-        r.event(ReplacementPhase::Reconciling);
-        reconcile(r, &snapshot)?;
+        if !retirement {
+            r.event(ReplacementPhase::Reconciling);
+            reconcile(r, &snapshot)?;
+        }
         r.event(ReplacementPhase::Ready);
         Ok(PreparedReplacement { snapshot, recovery })
     })();

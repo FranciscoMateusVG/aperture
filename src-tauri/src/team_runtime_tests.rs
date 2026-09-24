@@ -1179,3 +1179,36 @@ fn archive_stop_rechecks_checkpoint_before_first_signal() {
     assert!(!r.revoked);
     r.no_new();
 }
+
+#[test]
+fn retirement_is_explicit_loss_not_checkpoint_or_remote_completion() {
+    for recovery in [CheckpointRecovery::None, CheckpointRecovery::Stale, CheckpointRecovery::Valid] {
+        let mut r=Fake::new();r.turn=TurnState::Busy;r.checkpoint=recovery;r.remote_unknown=true;r.remote_complete=false;
+        assert_eq!(prepare_for_retirement(&mut r,"t1-backend",3,&ReplacementPolicy::default(),true).unwrap(),recovery);
+        assert!(r.revoked);assert_eq!(r.requested,0);assert_eq!(r.owner,3);r.no_new();
+        for phase in [ReplacementPhase::CheckpointPending,ReplacementPhase::Reconciling,ReplacementPhase::Starting] {assert!(!r.events.contains(&phase));}
+    }
+}
+#[test]
+fn retirement_without_loss_consent_retains_valid_checkpoint_gate() {
+    for recovery in [CheckpointRecovery::None, CheckpointRecovery::Stale] {
+        let mut r=Fake::new();r.checkpoint=recovery;
+        assert_eq!(prepare_for_retirement(&mut r,"t1-backend",3,&ReplacementPolicy::default(),false),Err(ReplacementError::CheckpointUnavailable));
+        assert!(r.signals.is_empty());assert!(!r.revoked);r.no_new();
+    }
+    let mut r=Fake::new();r.checkpoint=CheckpointRecovery::Valid;
+    assert_eq!(prepare_for_retirement(&mut r,"t1-backend",3,&ReplacementPolicy::default(),false).unwrap(),CheckpointRecovery::Valid);
+    r.no_new();assert!(r.revoked);
+    let mut r=Fake::new();r.checkpoint=CheckpointRecovery::Valid;r.checkpoint_after_first_read=Some(CheckpointRecovery::Stale);
+    assert_eq!(prepare_for_retirement(&mut r,"t1-backend",3,&ReplacementPolicy::default(),false),Err(ReplacementError::CheckpointUnavailable));
+    assert!(r.signals.is_empty());
+}
+#[test]
+fn retirement_loss_consent_never_waives_identity_or_revocation() {
+    for mode in 0..4 {
+        let mut r=Fake::new();
+        match mode {0=>r.unowned=true,1=>{r.states.insert(100,ProcessState::Recycled);},2=>r.owner=4,_=>r.revoke_valid=false};
+        assert!(prepare_for_retirement(&mut r,"t1-backend",3,&ReplacementPolicy::default(),true).is_err());r.no_new();
+        if mode<3 {assert!(r.signals.is_empty());assert!(!r.revoked);}
+    }
+}

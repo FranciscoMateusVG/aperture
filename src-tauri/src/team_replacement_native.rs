@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 enum NativePlan {
+    Retirement,
     Codex(launch::NativeLaunchBinding),
     Claude(crate::team_claude_launch::ClaudeBinding),
     ClaudeSmoke(crate::team_claude_launch::ClaudeBinding, SmokeAdmission),
@@ -61,16 +62,17 @@ impl NativePlan {
         }
     }
     fn revalidate(&self, budget: &deadline::Deadline) -> Result<(), ReplacementError> {
+        if matches!(self, Self::Retirement) { return Err(ReplacementError::AuthorizationRequired); }
         if let Self::ClaudeSmoke(binding, admission) = self {
             admission.revalidate()?;
             return binding.revalidate(budget).map_err(|_| ReplacementError::LaunchUnavailable);
         }
-        let harness = match self { Self::Codex(_) => Harness::Codex, Self::Claude(_) | Self::ClaudeSmoke(..) => Harness::Claude };
+        let harness = match self { Self::Retirement => return Err(ReplacementError::AuthorizationRequired), Self::Codex(_) => Harness::Codex, Self::Claude(_) | Self::ClaudeSmoke(..) => Harness::Claude };
         if !crate::teams::managed_launch_enabled(&harness) {
             return Err(ReplacementError::LaunchUnavailable);
         }
         match self {
-            Self::ClaudeSmoke(..) => Err(ReplacementError::AuthorizationRequired),
+            Self::Retirement | Self::ClaudeSmoke(..) => Err(ReplacementError::AuthorizationRequired),
             Self::Codex(p) => p.revalidate(budget),
             Self::Claude(p) => p
                 .revalidate(budget)
@@ -82,7 +84,7 @@ impl NativePlan {
         e: Option<&crate::team_checkpoint::CheckpointEntry>,
     ) -> Result<(), ReplacementError> {
         match self {
-            Self::ClaudeSmoke(..) => Err(ReplacementError::AuthorizationRequired),
+            Self::Retirement | Self::ClaudeSmoke(..) => Err(ReplacementError::AuthorizationRequired),
             Self::Codex(p) => p.bind_recovery(e),
             Self::Claude(p) => p
                 .bind_recovery(e)
@@ -629,6 +631,7 @@ fn start_native(
             .map_err(|_| ReplacementError::NativeFailure)?;
         let smoke_admission = match plan { NativePlan::ClaudeSmoke(_, a) => Some(a), _ => None };
         match plan {
+            NativePlan::Retirement => return Err(ReplacementError::AuthorizationRequired),
             NativePlan::Codex(plan) => {
                 let spec = plan.publish(&reservation, &token, attempt.budget())?;
                 attempt.budget().forward(Duration::from_secs(85))?;
@@ -1008,12 +1011,13 @@ pub(crate) enum ReplacementAuthority<'a> {
     Operator(&'a AuthenticatedActor),
     Lead(&'a AuthenticatedSeat),
     GladosArchive(&'a AuthenticatedActor),
+    GladosRetirement(&'a AuthenticatedActor),
 }
 impl ReplacementAuthority<'_> {
     fn revalidate(&self, target: &remote::RemoteTarget) -> Result<(), ReplacementError> {
         match self {
             Self::Operator(actor) if actor.principal() == "operator" => Ok(()),
-            Self::GladosArchive(actor) if actor.is_glados() => actor
+            Self::GladosArchive(actor) | Self::GladosRetirement(actor) if actor.is_glados() => actor
                 .revalidate_before_mutation()
                 .map_err(|_| ReplacementError::AuthorizationRequired),
             Self::Lead(actor) if actor.team() == target.team && actor.seat() != target.seat => {
@@ -1033,7 +1037,7 @@ impl ReplacementAuthority<'_> {
             Self::Lead(actor) => remote::inspect_authorized(home, remote::ResolutionAuthority::Lead(actor), target, sentinels),
             // Read only: GLaDOS archival authority does not become an operator
             // principal and cannot manufacture a remote-resolution decision.
-            Self::GladosArchive(_) => remote::inspect_native(home, target, sentinels),
+            Self::GladosArchive(_) | Self::GladosRetirement(_) => remote::inspect_native(home, target, sentinels),
         }?;
         self.revalidate(target).map_err(|_| remote::RemoteError::Authority)?;
         Ok(result)
@@ -1282,7 +1286,7 @@ pub(crate) fn replace_authorized(
     selection: &StartSelection,
     sentinels: &[String],
 ) -> Result<NativeReplacementResult, ReplacementError> {
-    if matches!(authority, ReplacementAuthority::GladosArchive(_)) {
+    if matches!(authority, ReplacementAuthority::GladosArchive(_) | ReplacementAuthority::GladosRetirement(_)) {
         return Err(ReplacementError::AuthorizationRequired);
     }
     let budget = deadline::Deadline::new();
@@ -1406,6 +1410,39 @@ pub(crate) fn stop_for_archive(
     // Ready evidence is durable. Drop the in-memory replacement permit: there
     // is no Start call and no automatic generation/model change.
     Ok(CheckpointRecovery::Valid)
+}
+
+/// Explicit, root-authorized retirement; no replacement, checkpoint, or mission PASS is invented.
+pub(crate) fn stop_for_retirement(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    expected_generation: u64, accept_checkpoint_loss: bool,
+) -> Result<CheckpointRecovery, ReplacementError> {
+    if !actor.is_glados() { return Err(ReplacementError::AuthorizationRequired); }
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)?;
+    let target = remote::RemoteTarget {team:team.into(), seat:seat.into(), expected_generation};
+    selectors(&target)?;
+    let budget = deadline::Deadline::new();
+    let binding = require_repository_binding(home, &target, &budget)?;
+    let authority = ReplacementAuthority::GladosRetirement(actor);
+    let checkpoint = if accept_checkpoint_loss {
+        RecoveryContext {worktree:String::new(), entry:None, recovery:CheckpointRecovery::None}
+    } else { checkpoint_for_target(home, &authority, &target, &binding.0, &[], &budget)? };
+    let mut runtime = NativeRuntime::new(home, authority, target, &[], binding, budget,
+        NativePlan::Retirement, checkpoint)?;
+    let result = prepare_for_retirement(&mut runtime, seat, expected_generation,
+        &ReplacementPolicy::default(), accept_checkpoint_loss);
+    let recovery = match result {
+        Ok(r) => r,
+        Err(e) => { let _ = runtime.attempt.finish_failed(); return Err(e); }
+    };
+    let proof = runtime.revoked.take().ok_or(ReplacementError::RevocationUnverified)?;
+    // Ready is factual stop/revocation evidence; no start permit leaves this function.
+    let _ready = runtime.attempt.finish_ready(&proof)?;
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::OutcomeUnknown)?;
+    crate::team_archive::retirement::record_stopped(home, actor, team, seat,
+        expected_generation, recovery.clone(), accept_checkpoint_loss)
+        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+    Ok(recovery)
 }
 
 fn prepare_authenticated(
@@ -1579,14 +1616,11 @@ impl<'a> NativeRuntime<'a> {
         authority.revalidate(&target)?;
         authority.inspect(home, &target, sentinels)
             .map_err(|_| ReplacementError::AuthorizationRequired)?;
-        let attempt = deadline::RuntimeAttempt::begin(
-            home,
-            &AuthenticatedActor::launcher(),
-            &target.team,
-            &target.seat,
-            target.expected_generation,
-            budget,
-        )?;
+        let begin = if matches!(authority, ReplacementAuthority::GladosRetirement(_)) {
+            deadline::RuntimeAttempt::begin_retirement
+        } else { deadline::RuntimeAttempt::begin };
+        let attempt = begin(home, &AuthenticatedActor::launcher(), &target.team,
+            &target.seat, target.expected_generation, budget)?;
         let runtime = Self {
             home,
             authority,
@@ -1741,7 +1775,8 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         Err(ReplacementError::CheckpointUnavailable)
     }
     fn checkpoint_recovery(&mut self) -> CheckpointRecovery {
-        if matches!(self.authority, ReplacementAuthority::GladosArchive(_)) {
+        if matches!(self.authority, ReplacementAuthority::GladosArchive(_))
+            || (matches!(self.authority, ReplacementAuthority::GladosRetirement(_)) && self.checkpoint.entry.is_some()) {
             return checkpoint_for_target(self.home, &self.authority, &self.target,
                 &self._binding.0, self.sentinels, self.attempt.budget())
                 .ok().filter(|fresh| fresh.worktree == self.checkpoint.worktree)
@@ -1757,7 +1792,8 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         process: &ProcessIdentity,
         signal: Signal,
     ) -> Result<(), ReplacementError> {
-        if matches!(self.authority, ReplacementAuthority::GladosArchive(_))
+        if (matches!(self.authority, ReplacementAuthority::GladosArchive(_))
+            || (matches!(self.authority, ReplacementAuthority::GladosRetirement(_)) && self.checkpoint.entry.is_some()))
             && !self.archival_signal_admitted
             && self.checkpoint_recovery() != CheckpointRecovery::Valid
         { return Err(ReplacementError::CheckpointUnavailable); }
@@ -1851,7 +1887,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
         snapshot: &OwnershipSnapshot,
         selection: &StartSelection,
     ) -> Result<(), ReplacementError> {
-        if matches!(self.authority, ReplacementAuthority::GladosArchive(_)) {
+        if matches!(self.authority, ReplacementAuthority::GladosArchive(_) | ReplacementAuthority::GladosRetirement(_)) {
             return Err(ReplacementError::AuthorizationRequired);
         }
         self.matches_target(snapshot)?;

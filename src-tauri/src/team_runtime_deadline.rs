@@ -289,7 +289,14 @@ impl RuntimeAttempt {
         if generation == 0 {
             return Err(ReplacementError::GenerationMismatch);
         }
-        Self::begin_checked(home, actor, team, seat, generation, budget, false)
+        Self::begin_checked(home, actor, team, seat, generation, budget, false, false)
+    }
+    pub(crate) fn begin_retirement(
+        home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+        generation: u64, budget: Deadline,
+    ) -> Result<Self, ReplacementError> {
+        if generation == 0 { return Err(ReplacementError::GenerationMismatch); }
+        Self::begin_checked(home, actor, team, seat, generation, budget, false, true)
     }
     pub(crate) fn begin_bootstrap(
         home: &Path,
@@ -298,7 +305,7 @@ impl RuntimeAttempt {
         seat: &str,
         budget: Deadline,
     ) -> Result<Self, ReplacementError> {
-        Self::begin_checked(home, actor, team, seat, 0, budget, true)
+        Self::begin_checked(home, actor, team, seat, 0, budget, true, false)
     }
     fn begin_checked(
         home: &Path,
@@ -308,6 +315,7 @@ impl RuntimeAttempt {
         generation: u64,
         budget: Deadline,
         bootstrap: bool,
+        retirement: bool,
     ) -> Result<Self, ReplacementError> {
         if !actor.is_launcher()
             || team.len() > 16
@@ -373,13 +381,36 @@ impl RuntimeAttempt {
         ensure_private_dir(&seat_dir).map_err(|_| ReplacementError::NativeFailure)?;
         let mut dir = validate_component_path(&seat_dir, &format!("g{generation}"), true)
             .map_err(|_| ReplacementError::NativeFailure)?;
+        if retirement {
+            // Never overlap a live/unknown replacement. A pre-effect Failed is
+            // not a retry: the explicit withdrawal gets its own one-shot child.
+            if std::fs::symlink_metadata(&dir).is_ok() {
+                let a: Admission = read_private_json(&dir.join("admitted.json"))
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                let f: Fact = read_private_json(&dir.join("terminal.json"))
+                    .map_err(|_| ReplacementError::OutcomeUnknown)?;
+                if a.schema_version != 1 || a.team != team || a.seat != seat
+                    || a.old_generation != generation || f.schema_version != 1
+                    || f.attempt_id != a.attempt_id || f.kind != FactKind::Failed
+                    || !matches!(std::fs::symlink_metadata(dir.join("effects.json")),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                    return Err(ReplacementError::OutcomeUnknown);
+                }
+            } else if !matches!(std::fs::symlink_metadata(&dir),
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound) {
+                return Err(ReplacementError::OutcomeUnknown);
+            }
+            ensure_private_dir(&dir).map_err(|_| ReplacementError::OutcomeUnknown)?;
+            dir = validate_component_path(&dir, "retirement", true)
+                .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        }
         let mut prior_ready = None;
         // Only a completed Ready can be superseded by a fresh preparation.
         // Unknown/active/pending/failed attempts never grant blind retry.
         for ordinal in 0..32 {
             match std::fs::symlink_metadata(&dir) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Ok(_) if !bootstrap && ordinal < 31 => {
+                Ok(_) if !bootstrap && !retirement && ordinal < 31 => {
                     validate_component_path(
                         &seat_dir,
                         dir.strip_prefix(&seat_dir)

@@ -658,6 +658,20 @@ fn archival_authority_cannot_enter_replacement_or_impersonate_operator() {
     assert_eq!(std::fs::read_dir(&f.0).unwrap().count(), 0);
 }
 
+#[test]
+fn retirement_authority_never_impersonates_operator_or_launches() {
+    let f=Fixture::new();
+    for actor in [AuthenticatedActor::operator_ui(),AuthenticatedActor::launcher()] {
+        let authority=ReplacementAuthority::GladosRetirement(&actor);
+        assert_eq!(authority.revalidate(&target()),Err(ReplacementError::AuthorizationRequired));
+        assert!(authority.inspect(&f.0,&target(),&[]).is_err());
+        assert_eq!(replace_authorized(&f.0,authority,target(),&selection(),&[]).unwrap_err(),ReplacementError::AuthorizationRequired);
+        assert_eq!(stop_for_retirement(&f.0,&actor,"t1","t1-worker",1,true).unwrap_err(),ReplacementError::AuthorizationRequired);
+    }
+    assert_eq!(NativePlan::Retirement.revalidate(&deadline::Deadline::new()).unwrap_err(),ReplacementError::AuthorizationRequired);
+    assert_eq!(std::fs::read_dir(&f.0).unwrap().count(),0);
+}
+
 // Startup-smoke tests use a fake private HOME, real capability validation and
 // synthetic owner/floor records. No harness, hub, signal, prompt or provider.
 struct SmokeEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);

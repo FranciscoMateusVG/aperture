@@ -86,6 +86,7 @@ pub enum ArchiveCategory {
     #[default]
     Mission,
     DiagnosticRetirement,
+    Retirement,
 }
 impl ArchiveCategory {
     fn is_mission(&self) -> bool { *self == Self::Mission }
@@ -589,7 +590,7 @@ fn valid_journal(journal: &Journal) -> bool {
                 && approval.owner_post_sha256.len() == approval.owner_sha256.len()
                 && approval.owner_states.iter().all(|(seat, state)| {
                     !seat.is_empty() && match approval.category {
-                        ArchiveCategory::Mission => matches!(state.as_str(), "active" | "stale"),
+                        ArchiveCategory::Mission | ArchiveCategory::Retirement => matches!(state.as_str(), "active" | "stale"),
                         ArchiveCategory::DiagnosticRetirement => state == "quarantined",
                     }
                 })

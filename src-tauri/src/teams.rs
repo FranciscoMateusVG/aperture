@@ -561,6 +561,20 @@ pub struct StopSeatInput {
     pub expected_generation: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetireSeatInput {
+    pub team:String, pub seat:String, pub expected_generation:u64,
+    pub accept_checkpoint_loss:bool,
+}
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RetireSeatView {
+    pub team:String, pub seat:String, pub generation:u64,
+    pub process_stop:RuntimeCheckState, pub revocation:RuntimeCheckState,
+    pub mission:RuntimeCheckState, pub owner_state:OwnerState,
+    pub checkpoint_recovery:CheckpointRecovery,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StopSeatView {
     pub team: String,
@@ -667,6 +681,7 @@ pub enum TeamControlRequest {
     ListTeams,
     BootstrapSeat(BootstrapSeatInput),
     StopSeat(StopSeatInput),
+    RetireSeat(RetireSeatInput),
     ValidateCheckpoint(ValidateCheckpointInput),
     ClaudeStartupSmoke(ClaudeStartupSmokeInput),
     ClaudeInboxProbe(ClaudeStartupSmokeInput),
@@ -692,6 +707,7 @@ pub enum TeamControlResponse {
     ListTeams(Vec<TeamView>),
     BootstrapSeat(BootstrapView),
     StopSeat(StopSeatView),
+    RetireSeat(RetireSeatView),
     ValidateCheckpoint(ValidateCheckpointView),
     ClaudeStartupSmoke(ClaudeStartupSmokeView),
     ClaudeInboxProbe(ClaudeInboxProbeView),
@@ -1983,6 +1999,12 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
             approval, snapshot: view.snapshot, state: view.state,
         });
     }
+    if crate::team_archive::retirement::has_facts(&engine.paths.home,&view.snapshot).map_err(TeamError::from_message)? {
+        let approval=crate::team_archive::retirement::inspect(&engine.paths.home,&view.snapshot,&view.state)
+            .map_err(TeamError::from_message)?;
+        return Ok(ArchiveInspection {view:ArchiveView {team:input.team.clone(),generation:input.expected_generation,
+            state:"pending".into(),checks:diagnostic_archive_checks(),blockers:vec![]},approval,snapshot:view.snapshot,state:view.state});
+    }
     let epic = view.state.epic_id.as_deref().ok_or_else(|| TeamError::new("E_RECONCILIATION_INCOMPLETE", "active team epic is unavailable"))?;
     let seats: Vec<_> = view.snapshot.seats.iter().map(|s| s.name.clone()).collect();
     let beads = crate::team_archive::beads::collect_native(&engine.paths.home, &input.team, input.expected_generation, epic, &[])
@@ -2162,6 +2184,21 @@ fn validate_checkpoint(engine: &TeamEngine, actor: &AuthenticatedActor, input: V
     };
     Ok(ValidateCheckpointView { team: input.team, seat: input.seat,
         generation: input.expected_generation, seq: input.seq, validation })
+}
+
+fn retire_seat(engine:&TeamEngine,actor:&AuthenticatedActor,input:RetireSeatInput)->TeamResult<RetireSeatView> {
+    if !actor.is_glados() {return Err(TeamError::new("E_CONTROL_UNAUTHORIZED","GLaDOS capability required"));}
+    actor.revalidate_before_mutation().map_err(TeamError::from_message)?;
+    validate_team_name(&input.team)?;
+    if !is_valid_seat_name(&input.seat) || input.expected_generation==0 {return Err(TeamError::new("E_GENERATION_MISMATCH","invalid retirement selector"));}
+    let view=engine.read_team_view(&input.team)?;
+    if view.state.state!=TeamLifecycle::Active || view.snapshot.seats.iter().filter(|s|s.name==input.seat).count()!=1 {return Err(TeamError::state("active team seat required"));}
+    let recovery=crate::team_replacement::native::stop_for_retirement(&engine.paths.home,actor,&input.team,&input.seat,
+        input.expected_generation,input.accept_checkpoint_loss).map_err(replacement_error)?;
+    let owner=owner_summary(&engine.paths.home,&input.seat)?;
+    if owner.generation!=input.expected_generation || owner.state!=OwnerState::Active {return Err(TeamError::new("E_CONTROL_UNKNOWN","retirement readback changed"));}
+    Ok(RetireSeatView {team:input.team,seat:input.seat,generation:owner.generation,owner_state:owner.state,
+        process_stop:RuntimeCheckState::Verified,revocation:RuntimeCheckState::Verified,mission:RuntimeCheckState::Unknown,checkpoint_recovery:recovery})
 }
 
 fn stop_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: StopSeatInput) -> TeamResult<StopSeatView> {
@@ -2372,6 +2409,10 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
             validate_checkpoint(&engine, &actor, input).map(TeamControlResponse::ValidateCheckpoint)
         }
+        TeamControlRequest::RetireSeat(input) => {
+            let actor=authenticate_glados_control().map_err(TeamError::from_message)?;
+            retire_seat(&engine,&actor,input).map(TeamControlResponse::RetireSeat)
+        }
         TeamControlRequest::StopSeat(input) => {
             let actor = authenticate_glados_control().map_err(|_| TeamError::new("E_CONTROL_UNAUTHORIZED", "GLaDOS capability required"))?;
             stop_seat(&engine, &actor, input).map(TeamControlResponse::StopSeat)
@@ -2515,7 +2556,7 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             }
             Ok(TeamControlResponse::Archive(ArchiveView {
                 team: input.team, generation: input.expected_generation, state: "archived".into(),
-                checks: if category == crate::journal::ArchiveCategory::DiagnosticRetirement {
+                checks: if category != crate::journal::ArchiveCategory::Mission {
                     diagnostic_archive_checks()
                 } else { ArchiveChecks {
                     reconciliation: RuntimeCheckState::Verified, reviews: RuntimeCheckState::Verified,
@@ -2719,6 +2760,24 @@ mod tests {
                 3=>p.actual.harness=Harness::Codex,4=>p.actual.model="sonnet".into(),_=>p.actual.reasoning=Some(ReasoningEffort::High)};
             assert_eq!(project_claude_inbox_probe(&input,p).unwrap_err().code,"E_CONTROL_UNKNOWN");
         }
+    }
+
+    #[test]
+    fn retirement_control_auth_precedes_selectors_and_never_accepts_proof() {
+        let _guard=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+        let home=temp_root("retirement-control");let _env=EnvRestore::set(&home);
+        let request=r#"{"action":"retire_seat","input":{"team":"t1","seat":"t1-qa","expected_generation":0,"accept_checkpoint_loss":true}}"#;
+        assert_eq!(team_control_headless(request).unwrap_err().code,"E_CONTROL_UNAUTHORIZED");
+        prepare_glados(&home);
+        assert_eq!(team_control_headless(request).unwrap_err().code,"E_GENERATION_MISMATCH");
+        for key in ["actor","pid","token","checkpoint","result","force","owner","model"] {
+            let mut v:serde_json::Value=serde_json::from_str(request).unwrap();v["input"][key]="forged".into();
+            assert!(serde_json::from_value::<TeamControlRequest>(v).is_err());
+        }
+        let mut v:serde_json::Value=serde_json::from_str(request).unwrap();v["input"].as_object_mut().unwrap().remove("accept_checkpoint_loss");
+        assert!(serde_json::from_value::<TeamControlRequest>(v).is_err());
+        assert!(!home.join(".aperture/run/owner/t1-qa.json").exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

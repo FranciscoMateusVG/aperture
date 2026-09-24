@@ -252,3 +252,6 @@ pub(crate) mod native;
 
 #[path = "team_archive_diagnostic.rs"]
 pub(crate) mod diagnostic;
+
+#[path = "team_archive_retirement.rs"]
+pub(crate) mod retirement;

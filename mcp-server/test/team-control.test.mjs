@@ -82,6 +82,7 @@ test("control watchdog is fixed by action and replacement timeout is unknown aft
   assert.equal(teamControlWatchdogMs("inspect_remote"), 15_000);
   assert.equal(teamControlWatchdogMs("resolve_remote"), 15_000);
   assert.equal(teamControlWatchdogMs("replace"), 180_000);
+  assert.equal(teamControlWatchdogMs("retire_seat"), 180_000);
   assert.equal(teamControlWatchdogMs("archive"), 90_000);
   assert.equal(teamControlWatchdogMs("rollback_archive"), 90_000);
 
@@ -116,6 +117,31 @@ sleep 999
     await assert.rejects(pending, /E_CONTROL_UNKNOWN: team control outcome is incomplete/);
   } finally {
     t.mock.timers.reset();
+    if (old === undefined) delete process.env.APERTURE_TEAM_CONTROL_BIN;
+    else process.env.APERTURE_TEAM_CONTROL_BIN = old;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("retirement transport uses existing isolated stdin control without start or retry", async () => {
+  assert.equal(teamControlWatchdogMs("retire_seat"), 180_000);
+  const root = mkdtempSync(join(tmpdir(), "aperture-retirement-wire-"));
+  const bin = join(root, "control");
+  writeFileSync(bin, `#!/bin/sh
+[ "$#" -eq 0 ] || exit 70
+IFS= read -r request
+pgid=$(/bin/ps -o pgid= -p $$ | /usr/bin/tr -d ' ')
+[ "$pgid" = "$$" ] || exit 72
+printf '%s\\n' "$request"
+`);
+  chmodSync(bin, 0o700);
+  const old = process.env.APERTURE_TEAM_CONTROL_BIN;
+  process.env.APERTURE_TEAM_CONTROL_BIN = bin;
+  try {
+    const request = { action: "retire_seat", input: { team: "t1", seat: "t1-worker", expected_generation: 1, accept_checkpoint_loss: true } };
+    assert.deepEqual(await invokeTeamControl(request), request);
+  } finally {
     if (old === undefined) delete process.env.APERTURE_TEAM_CONTROL_BIN;
     else process.env.APERTURE_TEAM_CONTROL_BIN = old;
     rmSync(root, { recursive: true, force: true });

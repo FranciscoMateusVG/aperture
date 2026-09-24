@@ -551,3 +551,20 @@ fn stopped_recovery_requires_expired_effectful_matching_unfinished_attempt() {
         assert_eq!(UnfinishedBootstrap::read_locked(&f.0,"t1","t1-worker").is_ok(),matches!(variant,"valid"|"unknown"),"{variant}");
     }
 }
+
+#[test]
+fn retirement_admission_is_one_shot_and_never_overlaps_an_uncertain_attempt() {
+    for mode in 0..6 {
+        let f=Fixture::new();f.managed();let actor=AuthenticatedActor::launcher();
+        if mode>0 {
+            let mut a=RuntimeAttempt::begin(&f.0,&actor,"t1","t1-worker",1,Deadline::new()).unwrap();
+            match mode {1=>a.finish_failed().unwrap(),2=>{a.admit_effects().unwrap();let _=a.finish_failed();},3=>{let _=a.finish_unknown();},4=>{},_=>{a.finish_failed().unwrap();let path=a.dir.join("terminal.json");let mut fact:Fact=read_private_json(&path).unwrap();fact.kind=FactKind::Ready;write_private_json_atomic(&path,&fact,true).unwrap();}}
+        }
+        let attempt=RuntimeAttempt::begin_retirement(&f.0,&actor,"t1","t1-worker",1,Deadline::new());
+        if mode<=1 {
+            let a=attempt.unwrap();assert!(a.dir.ends_with("g1/retirement"));
+            assert!(RuntimeAttempt::begin_retirement(&f.0,&actor,"t1","t1-worker",1,Deadline::new()).is_err());
+            assert!(RuntimeAttempt::begin(&f.0,&actor,"t1","t1-worker",1,Deadline::new()).is_err());
+        } else {assert!(attempt.is_err());}
+    }
+}

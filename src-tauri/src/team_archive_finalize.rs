@@ -242,6 +242,14 @@ fn revalidate_evidence_locked(
     team_lock: &crate::owner::AdvisoryLock,
     seat_locks: &[crate::owner::AdvisoryLock],
 ) -> Result<(), String> {
+    if approval.category == crate::journal::ArchiveCategory::Retirement {
+        let fresh = crate::team_archive::retirement::inspect_locked(home,snapshot,state,team_lock,seat_locks)?;
+        if fresh.generation != approval.generation || fresh.epic_id != approval.epic_id
+            || fresh.owner_sha256 != approval.owner_sha256 || fresh.owner_states != approval.owner_states {
+            return Err("E_ARCHIVE_APPROVAL_STALE: retirement bindings changed".into());
+        }
+        return validate_evidence_projection(approval,&fresh.record_sha256,&fresh.inventory_sha256,&fresh.native_sha256,true);
+    }
     if approval.category == crate::journal::ArchiveCategory::DiagnosticRetirement {
         let fresh = crate::team_archive::diagnostic::inspect_locked(home, snapshot, state, team_lock, seat_locks)?;
         if fresh.generation != approval.generation || fresh.epic_id != approval.epic_id
@@ -425,7 +433,7 @@ pub(crate) fn rollback(
             true,
         )?;
         let expected = match approval.category {
-            crate::journal::ArchiveCategory::Mission => OwnerState::Stale,
+            crate::journal::ArchiveCategory::Mission | crate::journal::ArchiveCategory::Retirement => OwnerState::Stale,
             crate::journal::ArchiveCategory::DiagnosticRetirement => OwnerState::Quarantined,
         };
         if owner.state != expected {
@@ -567,7 +575,7 @@ fn finalize_inner(
     let approved_post: std::collections::BTreeMap<_, _> =
         approval.owner_post_sha256.iter().cloned().collect();
     let category_states_valid = approved_states.values().all(|s| match approval.category {
-        crate::journal::ArchiveCategory::Mission => matches!(s.as_str(), "active" | "stale"),
+        crate::journal::ArchiveCategory::Mission | crate::journal::ArchiveCategory::Retirement => matches!(s.as_str(), "active" | "stale"),
         crate::journal::ArchiveCategory::DiagnosticRetirement => s == "quarantined",
     });
     if approved.len() != seats.len() || approved_states.len() != seats.len() || !category_states_valid {
