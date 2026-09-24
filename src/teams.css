@@ -92,13 +92,18 @@
 .v4-seat-facts dd { margin: 0; overflow-wrap: anywhere; }
 .v4-status { color: var(--v4-accent); }
 /* Compact team card: one-line header, one-line seat rows, everything else behind native details. */
-.v4-team__head { align-items: flex-start; }
-.v4-team__state { display: grid; justify-items: end; gap: 4px; }
+.v4-team__head { flex-wrap: nowrap; align-items: center; gap: 12px; }
+.v4-team__title { flex: 1 1 auto; min-width: 0; }
+.v4-team__title h2, .v4-team__title .v4-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
+.v4-team__state { flex: 0 0 auto; display: grid; justify-items: end; gap: 4px; }
 .v4-seats { list-style: none; display: grid; gap: 8px; margin: 12px 0; padding: 0; }
 .v4-seat { padding: 8px 12px; background: var(--v4-panel); border: 1px solid var(--v4-divider); border-radius: 6px; }
-.v4-seat__row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
-.v4-seat__name { font-weight: 600; }
-.v4-seat__row .v4-meta { flex: 1; min-width: 0; }
+/* One visible line per seat: status · name · role · Abrir. Long names truncate with an ellipsis (title keeps the full name);
+   nothing wraps into a narrow column. Technical identity lives inside the details below. */
+.v4-seat__row { display: flex; flex-wrap: nowrap; align-items: center; gap: 12px; min-width: 0; }
+.v4-seat__name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; font-weight: 600; }
+.v4-seat__role { flex: 0 1 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; color: var(--v4-muted); font: var(--v4-type-small)/var(--v4-leading) var(--v4-font); }
+.v4-seat__row .v4-seat-status, .v4-seat__row .v4-button { flex: 0 0 auto; }
 .v4-button--small { min-height: var(--v4-target); padding: 4px 10px; } /* Compact padding; touch target stays at the 44px guard. */
 .v4-details { margin: 8px 0; }
 .v4-details > summary { cursor: pointer; color: var(--v4-muted); font: var(--v4-type-small) var(--v4-font); min-height: var(--v4-target); display: flex; align-items: center; }
@@ -120,6 +125,11 @@
  .v4-dialog .v4-pair, .v4-seat-facts { grid-template-columns: 1fr; }
  .v4-seat-edit { grid-template-columns: 68px minmax(0, 1fr) 80px; }
  .v4-seat-edit .v4-execution { grid-column: 1 / -1; }
+ /* Narrow: name keeps its own full line; role and Abrir share the next line, still 44px targets. */
+ .v4-seat__row { flex-wrap: wrap; gap: 8px 12px; }
+ .v4-seat__name { flex: 1 1 100%; }
+ .v4-seat__role { flex: 1 1 auto; max-width: none; }
+ .v4-team__head { flex-wrap: wrap; }
 }
 
 .v4 #sidebar-agents { margin-bottom: 24px; }
