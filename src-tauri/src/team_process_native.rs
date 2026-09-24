@@ -5,7 +5,8 @@ use crate::owner::{OwnerRecord, OwnerStore};
 use crate::state::OwnerState;
 use crate::teams::{classify_managed_seat, ManagedSeatState};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::time::{Duration, Instant};
 const MAX_PIDS: usize = 65536;
 const MAX_OWNED: usize = 256;
@@ -105,12 +106,9 @@ pub(crate) fn collect_native_until(
     {
         return Err(ReplacementError::GenerationMismatch);
     }
-    collect(
-        &record,
-        &mut NativeSource {
-            deadline: until.min(Instant::now() + Duration::from_secs(10)),
-        },
-    )
+    let deadline = until.min(Instant::now() + Duration::from_secs(10));
+    let peers = PeerBindings::load(home, &record, deadline)?;
+    collect_with_peers(&record, &mut NativeSource { deadline }, Some(&peers))
 }
 
 /// Read-only process observation when the archive finalizer already holds the
@@ -233,10 +231,260 @@ fn validate_table(table: &[ProcessMetadata]) -> Result<(), ReplacementError> {
     }
     Ok(())
 }
-fn collect<S: ProcessSource>(
-    record: &OwnerRecord,
-    source: &mut S,
-) -> Result<OwnershipSnapshot, ReplacementError> {
+// A peer binding can classify an outsider, never extend the target's process
+// set or authorize a signal. Only the home-aware Stop collector uses it; the
+// locked archive seam intentionally retains the previous conservative behavior.
+struct PeerBinding {
+    owner: OwnerRecord,
+    team: String,
+    team_generation: u64,
+}
+struct PeerBindings {
+    home: PathBuf,
+    peers: Vec<PeerBinding>,
+    files: std::collections::BTreeMap<PathBuf, String>,
+    owner_names: Vec<String>,
+}
+fn peer_bytes(path: &Path) -> Result<Vec<u8>, ReplacementError> {
+    let file = crate::journal::open_private_file_nofollow(path)
+        .map_err(|_| ReplacementError::StopUnverified)?;
+    let mut bytes = Vec::new();
+    file.take(1_048_577)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReplacementError::StopUnverified)?;
+    if bytes.len() > 1_048_576 {
+        return Err(ReplacementError::StopUnverified);
+    }
+    Ok(bytes)
+}
+fn peer_names(root: &Path) -> Result<Vec<String>, ReplacementError> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|_| ReplacementError::StopUnverified)? {
+        let name = entry
+            .map_err(|_| ReplacementError::StopUnverified)?
+            .file_name()
+            .into_string()
+            .map_err(|_| ReplacementError::StopUnverified)?;
+        if name == "locks" {
+            continue;
+        }
+        let seat = name
+            .strip_suffix(".json")
+            .filter(|s| crate::agent_loader::is_valid_seat_name(s))
+            .ok_or(ReplacementError::StopUnverified)?;
+        names.push(seat.to_string());
+        if names.len() > 128 {
+            return Err(ReplacementError::StopUnverified);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+impl PeerBindings {
+    fn bind_file(&mut self, path: PathBuf, bytes: &[u8]) -> Result<(), ReplacementError> {
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        if self.files.get(&path).is_some_and(|old| old != &hash) {
+            return Err(ReplacementError::StopUnverified);
+        }
+        self.files.insert(path, hash);
+        Ok(())
+    }
+    fn load(home: &Path, target: &OwnerRecord, until: Instant) -> Result<Self, ReplacementError> {
+        let mut result = Self {
+            home: home.into(),
+            peers: vec![],
+            files: Default::default(),
+            owner_names: vec![],
+        };
+        let root = home.join(".aperture/run/owner");
+        // Validate the canonical private root through its fd-bound target file
+        // before enumeration. No creation, repair or token contents are used.
+        let target_bytes = peer_bytes(&root.join(format!("{}.json", target.seat)))?;
+        if serde_json::from_slice::<OwnerRecord>(&target_bytes)
+            .map_err(|_| ReplacementError::StopUnverified)?
+            != *target
+        {
+            return Err(ReplacementError::StopUnverified);
+        }
+        let names = peer_names(&root)?;
+        result.owner_names = names.clone();
+        let mut total = 0usize;
+        for seat in names {
+            if Instant::now() >= until {
+                return Err(ReplacementError::StopUnverified);
+            }
+            let path = root.join(format!("{seat}.json"));
+            let bytes = peer_bytes(&path)?;
+            total += bytes.len();
+            if total > 4 * 1024 * 1024 {
+                return Err(ReplacementError::StopUnverified);
+            }
+            let owner: OwnerRecord =
+                serde_json::from_slice(&bytes).map_err(|_| ReplacementError::StopUnverified)?;
+            if owner.schema_version != 1 || owner.seat != seat {
+                return Err(ReplacementError::StopUnverified);
+            }
+            result.bind_file(path, &bytes)?;
+            if seat == target.seat {
+                if owner != *target {
+                    return Err(ReplacementError::StopUnverified);
+                }
+                continue;
+            }
+            if owner.state != OwnerState::Active {
+                continue;
+            }
+            let inc = owner
+                .incarnation
+                .as_ref()
+                .ok_or(ReplacementError::StopUnverified)?;
+            if owner.generation == 0
+                || owner.reservation_nonce_sha256.is_some()
+                || owner.provisional_token_id.is_some()
+                || !inc.observed
+                || inc.thread_id.is_empty()
+                || inc.token_id.len() != 64
+                || !inc.token_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || inc.harness != owner.requested.harness
+                || inc.model != owner.requested.model
+                || inc.reasoning != owner.requested.reasoning
+            {
+                return Err(ReplacementError::StopUnverified);
+            }
+            let (team, team_generation) = match classify_managed_seat(home, &seat)
+                .map_err(|_| ReplacementError::StopUnverified)?
+            {
+                Some(ManagedSeatState::Active { team, generation }) => (team, generation),
+                _ => return Err(ReplacementError::StopUnverified),
+            };
+            let team_root = home.join(".aperture/teams").join(&team);
+            let snapshot_bytes = peer_bytes(&team_root.join("team.json"))?;
+            let state_bytes = peer_bytes(&team_root.join("state.json"))?;
+            total += snapshot_bytes.len() + state_bytes.len();
+            if total > 4 * 1024 * 1024 {
+                return Err(ReplacementError::StopUnverified);
+            }
+            let snapshot: crate::teams::TeamSnapshot = serde_json::from_slice(&snapshot_bytes)
+                .map_err(|_| ReplacementError::StopUnverified)?;
+            let state: crate::teams::TeamStateFile = serde_json::from_slice(&state_bytes)
+                .map_err(|_| ReplacementError::StopUnverified)?;
+            let configured = snapshot
+                .seats
+                .iter()
+                .find(|s| s.name == seat)
+                .ok_or(ReplacementError::StopUnverified)?;
+            let tuple = crate::state::ExecutionTuple {
+                harness: configured.harness.clone(),
+                model: configured.model.clone(),
+                reasoning: configured.reasoning.clone(),
+            };
+            if snapshot.team != team
+                || state.state != crate::teams::TeamLifecycle::Active
+                || state.generation != team_generation
+                || (owner.requested != tuple && !snapshot.fallbacks.contains(&owner.requested))
+            {
+                return Err(ReplacementError::StopUnverified);
+            }
+            result.bind_file(team_root.join("team.json"), &snapshot_bytes)?;
+            result.bind_file(team_root.join("state.json"), &state_bytes)?;
+            result.peers.push(PeerBinding {
+                owner,
+                team,
+                team_generation,
+            });
+        }
+        if !result
+            .files
+            .contains_key(&root.join(format!("{}.json", target.seat)))
+        {
+            return Err(ReplacementError::StopUnverified);
+        }
+        Ok(result)
+    }
+    fn revalidate(&self) -> Result<(), ReplacementError> {
+        if peer_names(&self.home.join(".aperture/run/owner"))? != self.owner_names {
+            return Err(ReplacementError::StopUnverified);
+        }
+        for (path, expected) in &self.files {
+            if format!("{:x}", Sha256::digest(peer_bytes(path)?)) != *expected {
+                return Err(ReplacementError::StopUnverified);
+            }
+        }
+        for peer in &self.peers {
+            match classify_managed_seat(&self.home, &peer.owner.seat)
+                .map_err(|_| ReplacementError::StopUnverified)?
+            {
+                Some(ManagedSeatState::Active { team, generation })
+                    if team == peer.team && generation == peer.team_generation => {}
+                _ => return Err(ReplacementError::StopUnverified),
+            }
+        }
+        Ok(())
+    }
+    fn closures<S: ProcessSource>(
+        &self,
+        table: &[ProcessMetadata],
+        target: &OwnershipSnapshot,
+        source: &mut S,
+    ) -> Result<Vec<(String, Vec<(ProcessIdentity, u32, u32)>)>, ReplacementError> {
+        let mut result = Vec::new();
+        // Include persisted target identities: overlap never enlarges authority.
+        let mut attributed: HashSet<u32> =
+            target.processes.iter().map(|p| p.identity.pid).collect();
+        for peer in &self.peers {
+            source.deadline()?;
+            let (root, persisted) = seeded(&peer.owner)?;
+            let Some(actual) = table.iter().find(|p| p.identity.pid == root.pid) else {
+                if source.observe(&root) != ProcessState::Gone {
+                    return Err(ReplacementError::StopUnverified);
+                }
+                // A stopped Active owner is not a living peer exemption. Its
+                // remaining orphaned children, if any, remain unowned matches.
+                continue;
+            };
+            if actual.identity != root
+                || actual.uid != unsafe { libc::geteuid() }
+                || source.observe(&root) != ProcessState::Same
+            {
+                return Err(ReplacementError::StopUnverified);
+            }
+            let captured = capture_owned(
+                &peer.owner.seat,
+                peer.owner.generation,
+                &peer.owner.incarnation.as_ref().unwrap().thread_id,
+                &root,
+                table,
+                &persisted,
+                &[],
+                true,
+            )?;
+            if captured.processes.len() > MAX_OWNED {
+                return Err(ReplacementError::StopUnverified);
+            }
+            let mut nodes = Vec::new();
+            for p in captured.processes {
+                if !attributed.insert(p.identity.pid) {
+                    return Err(ReplacementError::UnownedProcess);
+                }
+                if let Some(live) = table.iter().find(|m| m.identity == p.identity) {
+                    if source.observe(&p.identity) != ProcessState::Same {
+                        return Err(ReplacementError::StopUnverified);
+                    }
+                    nodes.push((p.identity, live.ppid, live.pgid));
+                } else if source.observe(&p.identity) != ProcessState::Gone {
+                    return Err(ReplacementError::StopUnverified);
+                }
+            }
+            result.push((peer.owner.seat.clone(), nodes));
+        }
+        Ok(result)
+    }
+}
+fn collect<S: ProcessSource>(record: &OwnerRecord, source: &mut S) -> Result<OwnershipSnapshot, ReplacementError> {
+    collect_with_peers(record,source,None)
+}
+fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:Option<&PeerBindings>)
+    -> Result<OwnershipSnapshot,ReplacementError> {
     let (root, persisted) = seeded(record)?;
     let inc = record.incarnation.as_ref().unwrap();
     let control = source.control()?;
@@ -259,6 +507,7 @@ fn collect<S: ProcessSource>(
     if snapshot.processes.iter().any(|p| p.identity == control) {
         return Err(ReplacementError::UnownedProcess);
     }
+    let peer_closures = peers.map(|p|p.closures(&first,&snapshot,source)).transpose()?.unwrap_or_default();
     // Refresh currently-live metadata privately; preserve captured metadata of
     // gone/reparented descendants, never erase their identity from stop evidence.
     for p in &mut snapshot.processes {
@@ -312,7 +561,8 @@ fn collect<S: ProcessSource>(
             .iter()
             .any(|p| p.cmdline_sha256 == hash || p.cwd == cwd)
         {
-            snapshot.unowned_matches.push(other.identity.clone());
+            let attributed_to_peer = peer_closures.iter().any(|(_,nodes)|nodes.iter().any(|(id,_,_)|*id==other.identity));
+            if !attributed_to_peer {snapshot.unowned_matches.push(other.identity.clone());}
         }
     }
     // Fresh topology check is not another collection attempt. Any newly seen
@@ -357,6 +607,10 @@ fn collect<S: ProcessSource>(
             ProcessState::Gone => {}
             _ => return Err(ReplacementError::StopUnverified),
         }
+    }
+    if let Some(peers) = peers {
+        if peers.closures(&second,&snapshot,source)? != peer_closures {return Err(ReplacementError::StopUnverified);}
+        peers.revalidate()?;
     }
     if source.observe(&control) != ProcessState::Same {
         return Err(ReplacementError::StopUnverified);

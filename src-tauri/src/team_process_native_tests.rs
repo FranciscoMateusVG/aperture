@@ -24,6 +24,7 @@ struct Fake {
     reads: Vec<u32>,
     expired: bool,
     recycle_after_details: Option<u32>,
+    on_details: Option<Box<dyn FnOnce()>>,
 }
 impl Fake {
     fn new(table: Vec<ProcessMetadata>) -> Self {
@@ -35,6 +36,7 @@ impl Fake {
             reads: vec![],
             expired: false,
             recycle_after_details: None,
+            on_details: None,
         }
     }
 }
@@ -44,6 +46,7 @@ impl ProcessSource for Fake {
     }
     fn details(&mut self, id: &ProcessIdentity) -> Result<(String, String), ReplacementError> {
         self.reads.push(id.pid);
+        if let Some(effect) = self.on_details.take() {effect();}
         if self.recycle_after_details == Some(id.pid) {
             self.states.insert(id.pid, ProcessState::Recycled);
         }
@@ -384,4 +387,265 @@ fn sonnet_diagnostic_collect_readonly_once() {
             panic!("read-only collector returned fixed error {}", error.code());
         }
     }
+}
+
+
+// Native private-file/classifier composition, fake process metadata only.
+// No real HOME, process enumeration, argv/env, signals or provider calls.
+struct PeerFixture {
+    home: std::path::PathBuf,
+    target: OwnerRecord,
+    peer: OwnerRecord,
+}
+fn peer_write<T: serde::Serialize>(path: &Path, value: &T) {
+    crate::journal::ensure_private_dir(path.parent().unwrap()).unwrap();
+    crate::journal::write_private_json_atomic(path, value, true).unwrap();
+}
+impl Drop for PeerFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+impl PeerFixture {
+    fn new() -> Self {
+        let home =
+            std::env::temp_dir().join(format!("aperture-peer-process-{}", uuid::Uuid::new_v4()));
+        let mut target = owner();
+        target.requested.reasoning = Some(crate::state::ReasoningEffort::High);
+        target.incarnation.as_mut().unwrap().reasoning = target.requested.reasoning.clone();
+        target.incarnation.as_mut().unwrap().token_id = "a".repeat(64);
+        let mut peer = target.clone();
+        peer.seat = "t1-other".into();
+        let inc = peer.incarnation.as_mut().unwrap();
+        inc.pid = 200;
+        inc.processes[0].pid = 200;
+        inc.thread_id = "other-thread".into();
+        inc.token_id = "b".repeat(64);
+        for o in [&target, &peer] {
+            peer_write(
+                &home
+                    .join(".aperture/run/owner")
+                    .join(format!("{}.json", o.seat)),
+                o,
+            );
+        }
+        let snapshot = serde_json::json!({"schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"fixture","acceptance":"fixture","preset":{"id":null,"sha256":null},"lead":"t1-worker","seats":[{"name":"t1-worker","role":"qa","harness":"codex","model":"gpt-6-astra","reasoning":"high"},{"name":"t1-other","role":"frontend","harness":"codex","model":"gpt-6-astra","reasoning":"high"}],"fallbacks":[],"grants":[],"created_at":"2026-09-20T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()});
+        peer_write(&home.join(".aperture/teams/t1/team.json"), &snapshot);
+        peer_write(
+            &home.join(".aperture/teams/t1/state.json"),
+            &serde_json::json!({"schema_version":1,"state":"active","generation":1,"epic_id":"aperture-fixture","failure":null,"updated_at":"2026-09-20T00:00:00Z"}),
+        );
+        for name in [&target.seat, &peer.seat] {
+            for leaf in ["TEAM", ".complete"] {
+                let p = home.join(".claude/aperture").join(name).join(leaf);
+                crate::journal::ensure_private_dir(p.parent().unwrap()).unwrap();
+                crate::journal::write_private_bytes_atomic(&p, b"fixture", false).unwrap();
+            }
+        }
+        Self { home, target, peer }
+    }
+    fn load(&self) -> Result<PeerBindings, ReplacementError> {
+        PeerBindings::load(
+            &self.home,
+            &self.target,
+            Instant::now() + Duration::from_secs(10),
+        )
+    }
+    fn save_peer(&self) {
+        peer_write(
+            &self.home.join(".aperture/run/owner/t1-other.json"),
+            &self.peer,
+        );
+    }
+}
+fn sibling_table() -> Vec<ProcessMetadata> {
+    vec![
+        meta(100, 50),
+        meta(101, 100),
+        meta(200, 1),
+        meta(201, 200),
+        meta(202, 201),
+    ]
+}
+
+#[test]
+fn peer_native_binding_removes_only_proven_sibling_matches_never_target_authority() {
+    let f = PeerFixture::new();
+    let peers = f.load().unwrap();
+    let old = collect(&f.target, &mut Fake::new(sibling_table())).unwrap();
+    let new = collect_with_peers(&f.target, &mut Fake::new(sibling_table()), Some(&peers)).unwrap();
+    assert_eq!(old.processes, new.processes);
+    assert_eq!(old.unowned_matches, vec![id(200), id(201), id(202)]);
+    assert!(new.unowned_matches.is_empty());
+    let mut table = sibling_table();
+    table.push(meta(300, 1));
+    let snapshot = collect_with_peers(&f.target, &mut Fake::new(table), Some(&peers)).unwrap();
+    assert_eq!(snapshot.processes, new.processes);
+    assert_eq!(snapshot.unowned_matches, vec![id(300)]);
+    // No-home/locked caller remains conservative by construction.
+    assert_eq!(
+        collect(&f.target, &mut Fake::new(sibling_table()))
+            .unwrap()
+            .unowned_matches,
+        old.unowned_matches
+    );
+}
+
+#[test]
+fn peer_root_reuse_or_topology_drift_is_not_an_exemption() {
+    for case in 0..5 {
+        let f = PeerFixture::new();
+        let peers = f.load().unwrap();
+        let mut source = Fake::new(sibling_table());
+        match case {
+            0 => source.tables[0][2].identity.start_time = "2.000001".into(),
+            1 => source.tables[1][3].ppid = 1,
+            2 => {
+                source.states.insert(200, ProcessState::Unreadable);
+            }
+            3 => {
+                source.tables[1].retain(|p| p.identity.pid != 200);
+                source.states.insert(200, ProcessState::Gone);
+            }
+            _ => source.tables[1].push(meta(203, 200)),
+        }
+        assert!(collect_with_peers(&f.target, &mut source, Some(&peers)).is_err());
+    }
+}
+
+#[test]
+fn peer_target_or_peer_peer_overlap_is_denied() {
+    let f = PeerFixture::new();
+    let peers = f.load().unwrap();
+    let mut table = sibling_table();
+    table[2].ppid = 100;
+    assert!(matches!(
+        collect_with_peers(&f.target, &mut Fake::new(table), Some(&peers)),
+        Err(ReplacementError::UnownedProcess)
+    ));
+    let mut f = PeerFixture::new();
+    f.peer
+        .incarnation
+        .as_mut()
+        .unwrap()
+        .processes
+        .push(f.target.incarnation.as_ref().unwrap().processes[0].clone());
+    f.save_peer();
+    let peers = f.load().unwrap();
+    assert!(collect_with_peers(&f.target, &mut Fake::new(sibling_table()), Some(&peers)).is_err());
+    let f = PeerFixture::new();
+    let mut peers = f.load().unwrap();
+    let mut duplicate = f.peer.clone();
+    duplicate.seat = "t1-third".into();
+    peers.peers.push(PeerBinding {
+        owner: duplicate,
+        team: "t1".into(),
+        team_generation: 1,
+    });
+    assert!(collect_with_peers(&f.target, &mut Fake::new(sibling_table()), Some(&peers)).is_err());
+}
+
+#[test]
+fn peer_owner_snapshot_marker_or_directory_drift_during_collection_denies() {
+    for case in 0..5 {
+        let f = PeerFixture::new();
+        let peers = f.load().unwrap();
+        let home = f.home.clone();
+        let mut source = Fake::new(sibling_table());
+        source.on_details = Some(Box::new(move || {
+            let ownerpath = home.join(".aperture/run/owner/t1-other.json");
+            match case {
+                0 => {
+                    let mut owner: OwnerRecord =
+                        crate::journal::read_private_json(&ownerpath).unwrap();
+                    owner.generation += 1;
+                    peer_write(&ownerpath, &owner);
+                }
+                1 => {
+                    let p = home.join(".aperture/teams/t1/team.json");
+                    let mut v: serde_json::Value = crate::journal::read_private_json(&p).unwrap();
+                    v["mission"] = "changed".into();
+                    peer_write(&p, &v);
+                }
+                2 => {
+                    let p = home.join(".aperture/teams/t1/state.json");
+                    let mut v: serde_json::Value = crate::journal::read_private_json(&p).unwrap();
+                    v["state"] = "failed".into();
+                    peer_write(&p, &v);
+                }
+                3 => {
+                    std::fs::remove_file(home.join(".claude/aperture/t1-other/TEAM")).unwrap();
+                }
+                _ => {
+                    let mut owner: OwnerRecord =
+                        crate::journal::read_private_json(&ownerpath).unwrap();
+                    owner.seat = "new-owner".into();
+                    peer_write(&home.join(".aperture/run/owner/new-owner.json"), &owner);
+                }
+            }
+        }));
+        assert!(collect_with_peers(&f.target, &mut source, Some(&peers)).is_err());
+    }
+}
+
+#[test]
+fn peer_unobserved_wrong_tuple_and_corrupt_or_unsafe_files_fail_closed() {
+    for case in 0..5 {
+        let mut f = PeerFixture::new();
+        match case {
+            0 => {
+                f.peer.incarnation.as_mut().unwrap().observed = false;
+                f.save_peer();
+            }
+            1 => {
+                f.peer.incarnation.as_mut().unwrap().model = "other".into();
+                f.save_peer();
+            }
+            2 => {
+                std::fs::write(f.home.join(".aperture/run/owner/t1-other.json"), b"{").unwrap();
+            }
+            3 => {
+                let p = f.home.join(".aperture/run/owner/t1-other.json");
+                std::fs::rename(&p, p.with_extension("saved")).unwrap();
+                std::os::unix::fs::symlink(p.with_extension("saved"), &p).unwrap();
+            }
+            _ => {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    f.home.join(".aperture/run/owner/t1-other.json"),
+                    std::fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+        }
+        assert!(f.load().is_err());
+    }
+}
+
+#[test]
+fn peer_stopped_active_or_nonactive_does_not_erase_unknown_children() {
+    let f = PeerFixture::new();
+    let peers = f.load().unwrap();
+    let mut source = Fake::new(vec![meta(100, 50), meta(201, 1)]);
+    source.states.insert(200, ProcessState::Gone);
+    let snapshot = collect_with_peers(&f.target, &mut source, Some(&peers)).unwrap();
+    assert_eq!(snapshot.unowned_matches, vec![id(201)]);
+    let mut f = PeerFixture::new();
+    f.peer.state = OwnerState::Quarantined;
+    f.save_peer();
+    let peers = f.load().unwrap();
+    let snapshot =
+        collect_with_peers(&f.target, &mut Fake::new(sibling_table()), Some(&peers)).unwrap();
+    assert_eq!(snapshot.unowned_matches, vec![id(200), id(201), id(202)]);
+}
+
+#[test]
+fn peer_repeated_snapshot_binding_cannot_hide_mid_load_change() {
+    let f = PeerFixture::new();
+    let mut peers = f.load().unwrap();
+    let path = f.home.join(".aperture/teams/t1/team.json");
+    let bytes = peer_bytes(&path).unwrap();
+    peers.bind_file(path.clone(), &bytes).unwrap();
+    let mut changed = bytes.clone(); changed.push(b' ');
+    assert!(peers.bind_file(path, &changed).is_err());
 }
