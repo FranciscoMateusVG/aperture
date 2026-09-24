@@ -741,8 +741,9 @@ impl ClaudeWindowIo for NativeClaude<'_> {
         tmux(&args(&["select-window", "-t", window])).map(|_| ())
     }
 }
-/// Exact Active Claude owner: approved Sonnet 5 / reasoning None, observed
-/// session id, no pending reservation, and the pane root process recorded.
+/// Exact Active Claude owner: approved exact Claude literal / reasoning None
+/// (see `team_claude_launch::CLAUDE_MODELS`), observed session id equal to the
+/// requested one, no pending reservation, and the pane root process recorded.
 fn claude_owner_valid(input: &OpenSeatInput, r: &OwnerRecord) -> Result<()> {
     let i = r.incarnation.as_ref().ok_or(ERROR)?;
     if r.schema_version != 1
@@ -751,7 +752,7 @@ fn claude_owner_valid(input: &OpenSeatInput, r: &OwnerRecord) -> Result<()> {
         || r.generation == 0
         || r.state != OwnerState::Active
         || r.requested.harness != Harness::Claude
-        || r.requested.model != crate::team_claude_launch::MODEL
+        || !crate::team_claude_launch::is_exact_claude_model(&r.requested.model)
         || r.requested.reasoning.is_some()
         || r.reservation_nonce_sha256.is_some()
         || r.provisional_token_id.is_some()

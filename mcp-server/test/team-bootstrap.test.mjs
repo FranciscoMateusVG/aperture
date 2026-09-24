@@ -1,7 +1,7 @@
 import test from 'node:test';
 import {readFileSync} from 'node:fs';
 import assert from 'node:assert/strict';
-import {bootstrapSeatSchema, bootstrapSelection, parseBootstrapStarted, parseTeamList} from '../dist/team-bootstrap.js';
+import {CLAUDE_EXACT_MODELS, bootstrapSeatSchema, bootstrapSelection, parseBootstrapStarted, parseTeamList} from '../dist/team-bootstrap.js';
 import {teamControlWatchdogMs} from '../dist/team-control.js';
 import {projectLabelSchema, saveRepositorySchema} from '../dist/team-repositories.js';
 import {createTeamSchema} from '../dist/team-create.js';
@@ -51,7 +51,9 @@ test('normal Claude admission is exact Sonnet/None, still requires native capabi
   return v;
  }
  assert.deepEqual(bootstrapSelection(claudeList(),input),claude);
- for(const t of [{...claude,model:'sonnet'},{...claude,model:'claude-other'},{...claude,reasoning:'high'}])
+ assert.deepEqual([...CLAUDE_EXACT_MODELS],['claude-sonnet-5','claude-fable-5-1','claude-opus-5']);
+ for(const model of CLAUDE_EXACT_MODELS){const t={...claude,model};assert.deepEqual(bootstrapSelection(claudeList(t),input),t);assert.throws(()=>bootstrapSelection(claudeList({...t,reasoning:'low'}),input));}
+ for(const t of [{...claude,model:'sonnet'},{...claude,model:'fable'},{...claude,model:'claude-other'},{...claude,model:'claude-fable-5'},{...claude,model:'claude-opus-5-5'},{...claude,model:'claude-fable-5-1[1m]'},{...claude,reasoning:'high'}])
   assert.throws(()=>bootstrapSelection(claudeList(t),input));
  const disabled=claudeList();disabled.result[0].capabilities.start=false;
  assert.throws(()=>bootstrapSelection(disabled,input));

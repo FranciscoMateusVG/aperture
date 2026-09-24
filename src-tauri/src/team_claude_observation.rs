@@ -1,7 +1,7 @@
 //! Claude real model/session observation boundary (diagnostic pre-input by default). Status-line stdin contributes only the
 //! documented model/session/pre-input fields; all runtime authority is native.
 use crate::state::{ExecutionTuple, Harness};
-use crate::team_claude_launch::{canonical_uuid, ClaudeAttempt, ClaudeError, ClaudeLaunchMode, MODEL, WINDOW_MS};
+use crate::team_claude_launch::{canonical_uuid, is_exact_claude_model, ClaudeAttempt, ClaudeError, ClaudeLaunchMode, WINDOW_MS};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
@@ -88,7 +88,8 @@ fn sample(reader: impl Read) -> Result<StartupSample, ClaudeError> {
     if !canonical_uuid(session) {
         return Err(ClaudeError::Invalid);
     }
-    if model != MODEL {
+    // Allowlisted exact literal only; the attempt then pins it to the requested one.
+    if !is_exact_claude_model(model) {
         return Err(ClaudeError::Model);
     }
     Ok(StartupSample {
@@ -124,13 +125,18 @@ fn project(
         return Err(ClaudeError::PostInput);
     }
     if attempt.schema_version != 1
-        || attempt.requested_model != MODEL
+        || !is_exact_claude_model(&attempt.requested_model)
         || attempt.session_id != input.session_id
         || attempt.created_at_ms <= 0
         || now < attempt.created_at_ms
         || now - attempt.created_at_ms > WINDOW_MS
     {
         return Err(ClaudeError::Invalid);
+    }
+    // Observed id must equal the requested literal of this attempt: a different
+    // allowlisted model is still E_MODEL_UNVERIFIED, never a substitution.
+    if input.model != attempt.requested_model {
+        return Err(ClaudeError::Model);
     }
     Ok(ClaudeReceipt {
         schema_version: 1,
@@ -148,7 +154,7 @@ fn project(
 }
 impl ClaudeReceipt {
     fn actual(&self) -> Result<ExecutionTuple, ClaudeError> {
-        if self.actual_model != MODEL || self.reasoning_observation != "not_observed" {
+        if !is_exact_claude_model(&self.actual_model) || self.reasoning_observation != "not_observed" {
             return Err(ClaudeError::Model);
         }
         Ok(ExecutionTuple {
@@ -163,6 +169,7 @@ impl ClaudeReceipt {
 mod tests {
     use super::*;
     use crate::state::ReasoningEffort;
+    use crate::team_claude_launch::{CLAUDE_MODELS, MODEL};
     fn input() -> serde_json::Value {
         serde_json::json!({"version":"2.1.263","session_id":uuid::Uuid::new_v4().to_string(),"model":{"id":MODEL},"context_window":{"current_usage":null,"total_input_tokens":0,"total_output_tokens":0}})
     }
@@ -243,9 +250,11 @@ mod tests {
     }
     #[test]
     fn rejects_unknown_model_alias_session_drift_and_stale_window() {
-        let mut v = input();
-        v["model"]["id"] = "sonnet".into();
-        assert!(matches!(parse(&v), Err(ClaudeError::Model)));
+        for id in ["sonnet", "fable", "claude-fable-5", "claude-opus-5-5", "claude-fable-5-1[1m]", "claude-sonnet-5 "] {
+            let mut v = input();
+            v["model"]["id"] = id.into();
+            assert!(matches!(parse(&v), Err(ClaudeError::Model)), "{id}");
+        }
         let v = input();
         let mut a = attempt(&v);
         a.session_id = uuid::Uuid::new_v4().to_string();
@@ -253,6 +262,25 @@ mod tests {
         let a = attempt(&v);
         assert!(project(&a, parse(&v).unwrap(), 999).is_err());
         assert!(project(&a, parse(&v).unwrap(), 1001 + WINDOW_MS).is_err());
+    }
+    #[test]
+    fn every_exact_model_is_observed_only_against_its_own_request() {
+        for model in CLAUDE_MODELS {
+            let mut v = input();
+            v["model"]["id"] = serde_json::json!(model);
+            let mut a = attempt(&v);
+            a.requested_model = model.into();
+            let receipt = project(&a, parse(&v).unwrap(), 1001).unwrap();
+            assert_eq!(receipt.actual().unwrap(), ExecutionTuple { harness: Harness::Claude, model: model.into(), reasoning: None });
+            for other in CLAUDE_MODELS.iter().filter(|o| **o != model) {
+                let mut cross = attempt(&v);
+                cross.requested_model = (*other).into();
+                assert!(matches!(project(&cross, parse(&v).unwrap(), 1001), Err(ClaudeError::Model)), "{other} requested, {model} observed");
+            }
+            let mut bad = attempt(&v);
+            bad.requested_model = "claude-opus-5-5".into();
+            assert!(matches!(project(&bad, parse(&v).unwrap(), 1001), Err(ClaudeError::Invalid)));
+        }
     }
     #[test]
     fn arbitrary_metadata_never_becomes_runtime_authority() {
@@ -763,6 +791,7 @@ fn read_checked(
 #[cfg(test)]
 mod native_tests {
     use super::*;
+    use crate::team_claude_launch::MODEL;
     use crate::journal::{ensure_private_dir, write_private_bytes_atomic};
     use crate::owner::{Incarnation, ProcessIdentity as StoredProcess};
     use crate::team_auth::AuthenticatedActor;

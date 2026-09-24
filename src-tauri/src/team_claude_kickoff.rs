@@ -294,7 +294,7 @@ impl KickoffIo for Native<'_> {
             || attempt.root_start_time_us != inc.start_time
             || attempt.session_id != inc.thread_id
             || attempt.token_id != inc.token_id
-            || attempt.requested_model != launch::MODEL
+            || attempt.requested_model != owner.requested.model
             || attempt.created_at_ms <= 0
             || now < attempt.created_at_ms
             || now - attempt.created_at_ms > launch::WINDOW_MS

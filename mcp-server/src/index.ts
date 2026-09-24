@@ -512,7 +512,7 @@ server.tool(
 
 server.tool(
   "team_bootstrap_seat",
-  "GLaDOS-only: start one eligible Codex or exact Claude Sonnet 5/None seat of an already approved team through native ownership, fresh session and real exact model observation. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. Started is not messaging readiness: require a real BEADS reply/read acknowledgment before business dispatch. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
+  "GLaDOS-only: start one eligible Codex or exact Claude (claude-sonnet-5, claude-fable-5-1 or claude-opus-5) / reasoning None seat of an already approved team through native ownership, fresh session and real exact model observation. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. Started is not messaging readiness: require a real BEADS reply/read acknowledgment before business dispatch. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
   { input: bootstrapSeatSchema },
   async ({ input }) => {
     const denied = gladosControlDenied();

@@ -5,7 +5,18 @@ use crate::state::{ExecutionTuple, Harness};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Sonnet 5 literal. The retired startup/inbox diagnostics stay pinned to it;
+/// normal admission uses `CLAUDE_MODELS` through `is_exact_claude_model`.
 pub(crate) const MODEL: &str = "claude-sonnet-5";
+/// Exact Claude model literals admitted for managed seats (operator-authorized
+/// 2026-09-24, aperture-wzayo). Reasoning is always None. No alias (`opus`,
+/// `sonnet`, `fable`), no context suffix (`[1m]`), no prefix/substring match,
+/// no fallback resolution: the observed status-line id must equal one of these
+/// AND equal the requested literal of the same attempt.
+pub(crate) const CLAUDE_MODELS: [&str; 3] = [MODEL, "claude-fable-5-1", "claude-opus-5"];
+pub(crate) fn is_exact_claude_model(model: &str) -> bool {
+    CLAUDE_MODELS.contains(&model)
+}
 pub(crate) const WINDOW_MS: i64 = 85_000;
 /// Native plan policy, never a DTO/env/stdin override. Omitted old records remain
 /// diagnostic/pre-input and serialize identically, preserving historical hashes.
@@ -52,7 +63,10 @@ impl ClaudeError {
 }
 
 pub(crate) fn exact_tuple(tuple: &ExecutionTuple) -> Result<(), ClaudeError> {
-    if tuple.harness != Harness::Claude || tuple.model != MODEL || tuple.reasoning.is_some() {
+    if tuple.harness != Harness::Claude
+        || !is_exact_claude_model(&tuple.model)
+        || tuple.reasoning.is_some()
+    {
         return Err(ClaudeError::Model);
     }
     Ok(())
@@ -141,7 +155,7 @@ impl ClaudeLaunchPlan {
         // settings and strict MCP list are native generated files, not caller paths.
         let argv = vec![
             "--model".into(),
-            MODEL.into(),
+            tuple.model.clone(),
             "--session-id".into(),
             session_id.clone(),
             "--settings".into(),
@@ -218,6 +232,12 @@ mod tests {
         assert!(canonical_uuid(&a.session_id));
         assert_eq!(a.argv.len(), 9);
         assert_eq!(a.argv[1], MODEL);
+        for model in CLAUDE_MODELS {
+            let mut t = tuple();
+            t.model = model.into();
+            let p = ClaudeLaunchPlan::new(Path::new("/fixture"), "t1", "t1-lead", 1, &t, Path::new("/installed/aperture-boot")).unwrap();
+            assert_eq!(p.argv[0..2], ["--model".to_string(), model.to_string()]);
+        }
         for forbidden in [
             "--resume",
             "--continue",
@@ -259,11 +279,57 @@ mod tests {
         assert!(!diagnostic.argv.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
     #[test]
+    fn exact_model_literals_agree_across_rust_mcp_and_frontend() {
+        fn literals(src: &str, marker: &str) -> Vec<String> {
+            let start = src.find(marker).expect(marker);
+            let body = &src[start + marker.len()..];
+            let end = body.find(']').expect("literal not closed");
+            body[..end].split('"').skip(1).step_by(2).map(str::to_string).collect()
+        }
+        let mut rust: Vec<String> = CLAUDE_MODELS.iter().map(|m| m.to_string()).collect();
+        rust.sort();
+        for (src, marker) in [
+            (include_str!("../../mcp-server/src/team-bootstrap.ts"), "CLAUDE_EXACT_MODELS = ["),
+            (include_str!("../../src/services/team-terminal.ts"), "CLAUDE_EXACT_MODELS: readonly string[] = ["),
+        ] {
+            let mut found = literals(src, marker);
+            found.sort();
+            assert_eq!(found, rust, "{marker} drifted from team_claude_launch::CLAUDE_MODELS");
+        }
+        for m in CLAUDE_MODELS {
+            assert!(m.starts_with("claude-") && !m.contains('[') && m != "claude-opus-5-5", "{m}");
+        }
+    }
+    #[test]
+    fn gate_rederives_requested_model_from_sealed_snapshot_not_argv() {
+        let snapshot: TeamSnapshot = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"team":"t1","project":"project:aperture","repo":"aperture","mission":"f","acceptance":"f",
+            "preset":{"id":null,"sha256":null},"lead":"t1-worker",
+            "seats":[{"name":"t1-worker","role":"lead","harness":"claude","model":"claude-fable-5-1","reasoning":null}],
+            "fallbacks":[{"harness":"claude","model":"claude-opus-5","reasoning":null},{"harness":"codex","model":"gpt-6-astra","reasoning":"high"}],
+            "grants":[],"created_at":"2026-09-24T00:00:00Z","creation_request_id":uuid::Uuid::new_v4().to_string(),"staging_uuid":uuid::Uuid::new_v4().to_string()
+        })).unwrap();
+        assert_eq!(snapshot_claude_tuple(&snapshot, "t1-worker", Some("claude-fable-5-1")).unwrap().model, "claude-fable-5-1");
+        assert_eq!(snapshot_claude_tuple(&snapshot, "t1-worker", Some("claude-opus-5")).unwrap().model, "claude-opus-5");
+        for model in [MODEL, "claude-opus-5-5", "gpt-6-astra", "fable", "claude-fable-5-1[1m]"] {
+            assert!(matches!(snapshot_claude_tuple(&snapshot, "t1-worker", Some(model)), Err(ClaudeError::Model)), "{model}");
+        }
+        assert!(matches!(snapshot_claude_tuple(&snapshot, "t1-worker", None), Err(ClaudeError::Invalid)));
+        assert!(matches!(snapshot_claude_tuple(&snapshot, "absent", Some("claude-fable-5-1")), Err(ClaudeError::Owner)));
+    }
+    #[test]
     fn alias_codex_reasoning_and_bad_selectors_are_not_authority() {
-        for model in ["sonnet", "opus", "claude-fable-5", "unknown"] {
+        for model in ["sonnet", "opus", "fable", "claude-fable-5", "claude-opus-5-5", "claude-fable-5-1[1m]", "unknown"] {
             let mut t = tuple();
             t.model = model.into();
-            assert!(exact_tuple(&t).is_err());
+            assert!(exact_tuple(&t).is_err(), "{model} is not an exact literal");
+        }
+        for model in CLAUDE_MODELS {
+            let mut t = tuple();
+            t.model = model.into();
+            assert!(exact_tuple(&t).is_ok(), "{model}");
+            t.reasoning = Some(ReasoningEffort::Low);
+            assert!(exact_tuple(&t).is_err(), "{model} with reasoning");
         }
         let mut t = tuple();
         t.reasoning = Some(ReasoningEffort::High);
@@ -368,6 +434,37 @@ fn generation_dir(home: &Path, seat: &str, generation: u64) -> PathBuf {
     home.join(".aperture/run/managed")
         .join(seat)
         .join(format!("g{generation}"))
+}
+/// Exact Claude tuple a sealed snapshot authorizes for `seat`: its configured
+/// tuple, or a declared fallback when `model` names one. Any other literal,
+/// alias, reasoning or harness is `Model`; a missing/duplicate seat is `Owner`.
+fn snapshot_claude_tuple(
+    snapshot: &TeamSnapshot,
+    seat: &str,
+    model: Option<&str>,
+) -> Result<ExecutionTuple, ClaudeError> {
+    let seats: Vec<_> = snapshot.seats.iter().filter(|s| s.name == seat).collect();
+    if seats.len() != 1 {
+        return Err(ClaudeError::Owner);
+    }
+    let configured = ExecutionTuple {
+        harness: seats[0].harness.clone(),
+        model: seats[0].model.clone(),
+        reasoning: seats[0].reasoning.clone(),
+    };
+    let model = model.ok_or(ClaudeError::Invalid)?;
+    let selected = if configured.model == model {
+        configured
+    } else {
+        snapshot
+            .fallbacks
+            .iter()
+            .find(|t| t.harness == Harness::Claude && t.model == model && t.reasoning.is_none())
+            .cloned()
+            .ok_or(ClaudeError::Model)?
+    };
+    exact_tuple(&selected)?;
+    Ok(selected)
 }
 fn active_team(home: &Path, team: &str, seat: &str) -> Result<TeamSnapshot, ClaudeError> {
     match classify_managed_seat(home, seat).map_err(|_| ClaudeError::Owner)? {
@@ -732,7 +829,7 @@ impl ClaudeBinding {
         {
             return Err(ClaudeError::Unsafe);
         }
-        let mut env = serde_json::json!({"HOME":self.home,"AGENT_NAME":self.seat,"AGENT_ROLE":self.role,"AGENT_MODEL":MODEL,"APERTURE_TEAM_GENERATION":res.generation.to_string(),"APERTURE_HUB_TOKEN_FILE":token.path(),"BEADS_DIR":self.home.join(".aperture/.beads"),"BD_ACTOR":self.seat,"BEADS_DOLT_PASSWORD":password,"APERTURE_MAILBOX":self.home.join(".aperture/mailbox")});
+        let mut env = serde_json::json!({"HOME":self.home,"AGENT_NAME":self.seat,"AGENT_ROLE":self.role,"AGENT_MODEL":self.tuple.model,"APERTURE_TEAM_GENERATION":res.generation.to_string(),"APERTURE_HUB_TOKEN_FILE":token.path(),"BEADS_DIR":self.home.join(".aperture/.beads"),"BD_ACTOR":self.seat,"BEADS_DOLT_PASSWORD":password,"APERTURE_MAILBOX":self.home.join(".aperture/mailbox")});
         let mut mcp = serde_json::json!({"mcpServers":{"aperture-bus":{"command":self.node,"args":[self.infra.join("mcp-server/dist/index.js")],"env":env},"sentry":{"command":self.node,"args":[self.infra.join("mcp-server-sentry/dist/index.js")],"env":env}}});
         let config = PrivateBytes(serde_json::to_vec(&mcp).map_err(|_| ClaudeError::Invalid)?);
         if config.0.len() > PRIVATE_CAP {
@@ -1112,16 +1209,16 @@ fn validate_record_at(
         return Err(ClaudeError::Owner);
     }
     let base = generation_dir(home, &r.seat, r.generation);
+    // The requested model is rederived from the hash-verified snapshot (the
+    // seat's configured tuple or a declared fallback), never from the record's
+    // own argv or any env/DTO. It must be an exact allowlisted Claude literal.
+    let requested = snapshot_claude_tuple(&snapshot, &r.seat, r.args.get(1).map(String::as_str))?;
     let mut plan = ClaudeLaunchPlan::for_mode(
         home,
         &r.team,
         &r.seat,
         r.generation,
-        &ExecutionTuple {
-            harness: Harness::Claude,
-            model: MODEL.into(),
-            reasoning: None,
-        },
+        &requested,
         &r.helper,
         r.mode,
     )?;
