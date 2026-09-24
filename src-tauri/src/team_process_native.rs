@@ -534,6 +534,7 @@ fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:O
     refresh_depths(&mut snapshot, &root)?;
     snapshot = complete_metadata(snapshot, |_| Err(ReplacementError::StopUnverified))?;
     let owned: HashSet<_> = snapshot.processes.iter().map(|p| p.identity.pid).collect();
+    let root_birth = birth_micros(&root)?;
     let uid = unsafe { libc::geteuid() };
     let mut reads = 0;
     for other in first
@@ -549,6 +550,13 @@ fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:O
             ProcessState::Gone => continue,
             ProcessState::Same => {}
             _ => return Err(ReplacementError::StopUnverified),
+        }
+        // An exact, currently observed identity born before this root cannot
+        // have been created by it. This only removes an outsider heuristic;
+        // persisted/captured ownership and signal authority are unchanged.
+        // Equal birth remains ambiguous; unknown/recycled identities deny above.
+        if birth_micros(&other.identity)? < root_birth {
+            continue;
         }
         let (hash, cwd) = source.details(&other.identity)?;
         match source.observe(&other.identity) {

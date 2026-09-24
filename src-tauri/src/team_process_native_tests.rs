@@ -649,3 +649,66 @@ fn peer_repeated_snapshot_binding_cannot_hide_mid_load_change() {
     let mut changed = bytes.clone(); changed.push(b' ');
     assert!(peers.bind_file(path, &changed).is_err());
 }
+
+#[test]
+fn older_outsider_only_strictly_earlier_native_birth_exempts_or_match() {
+    let baseline = collect(&owner(), &mut Fake::new(vec![meta(100, 50)])).unwrap();
+    let bytes = serde_json::to_vec(&baseline.processes).unwrap();
+    for birth in [1_000_000, 1_000_001, 1_000_002] {
+        // Same hash/different cwd, different hash/same cwd, and both matching.
+        for (hash, cwd) in [
+            ("a".repeat(64), "/different"),
+            ("b".repeat(64), "/fixture/owned"),
+            ("a".repeat(64), "/fixture/owned"),
+        ] {
+            let mut other = meta(200, 1);
+            other.identity = identity_from_owner(200, birth).unwrap();
+            let mut f = Fake::new(vec![meta(100, 50), other.clone()]);
+            f.details.insert(200, (hash, cwd.into()));
+            let actual = collect(&owner(), &mut f).unwrap();
+            assert_eq!(serde_json::to_vec(&actual.processes).unwrap(), bytes);
+            assert!(actual.complete);
+            if birth < 1_000_001 {
+                assert!(actual.unowned_matches.is_empty());
+                assert!(!f.reads.contains(&200));
+            } else {
+                assert_eq!(actual.unowned_matches, vec![other.identity]);
+                assert!(f.reads.contains(&200));
+            }
+        }
+    }
+}
+#[test]
+fn older_outsider_unreadable_recycled_or_malformed_is_not_exempt() {
+    for state in [ProcessState::Unreadable, ProcessState::Recycled] {
+        let mut other = meta(200, 1);
+        other.identity = identity_from_owner(200, 1_000_000).unwrap();
+        let mut f = Fake::new(vec![meta(100, 50), other]);
+        f.states.insert(200, state);
+        assert!(matches!(collect(&owner(), &mut f), Err(ReplacementError::StopUnverified)));
+    }
+    let mut other = meta(200, 1);
+    other.identity.start_time = "unknown".into();
+    assert!(collect(&owner(), &mut Fake::new(vec![meta(100, 50), other])).is_err());
+}
+#[test]
+fn older_outsider_exemption_does_not_filter_persisted_owned_identity() {
+    let mut o = owner();
+    o.incarnation.as_mut().unwrap().processes.push(StoredProcess {
+        pid: 101, start_time: 1_000_000, ppid: 100, pgid: 50,
+        cmdline_sha256: "a".repeat(64), cwd: "/fixture/owned".into(),
+    });
+    let mut persisted = meta(101, 1);
+    persisted.identity = identity_from_owner(101, 1_000_000).unwrap();
+    let table = vec![meta(100, 50), persisted.clone()];
+    let baseline = collect(&o, &mut Fake::new(table.clone())).unwrap();
+    let mut with_outsider = table;
+    let mut other = meta(200, 1);
+    other.identity = identity_from_owner(200, 1_000_000).unwrap();
+    with_outsider.push(other);
+    let actual = collect(&o, &mut Fake::new(with_outsider)).unwrap();
+    assert_eq!(serde_json::to_vec(&baseline.processes).unwrap(), serde_json::to_vec(&actual.processes).unwrap());
+    assert!(actual.processes.iter().any(|p| p.identity == persisted.identity));
+    assert_eq!(actual.processes.len(), 2);
+    assert!(actual.unowned_matches.is_empty());
+}
