@@ -95,7 +95,7 @@ test("no manual start control exists for any seat state; start is coordinated by
   const t = startableTeam(); mutate(t);
   await setup({ api: { list: async () => [t] } }, async f => {
    assert.doesNotMatch(f.teams.innerHTML, /data-action="bootstrap"|Bootstrap worker/);
-   assert.match(f.teams.innerHTML, /coordinated by GLaDOS/);
+   assert.match(f.teams.innerHTML, /Inicialização coordenada por GLaDOS/);
    assert.doesNotMatch(f.teams.innerHTML, /click .*start|start (the|a) worker|press .*start/i);
   });
  }
@@ -112,20 +112,20 @@ test("active card is compact by default: one row per seat, diagnostics and advan
  const t = startableTeam();
  await setup({ api: { list: async () => [t] } }, async f => {
   const html = f.teams.innerHTML;
-  assert.equal((html.match(/<details class="v4-details" data-details="/g) ?? []).length, t.seats.length + 1, "one details per seat plus one for mission/actions");
+  assert.equal((html.match(/<details class="v4-details[^\"]*" data-details="/g) ?? []).length, t.seats.length + 1, "one details per seat plus one for mission/actions");
   assert.doesNotMatch(html, /<details[^>]*\sopen/);
   for (const inside of ["Thread binding", "Checkpoint / context", "Replace worker", "Archive checklist", "Acceptance:"]) {
    const at = html.indexOf(inside); assert.ok(at > 0, inside);
    assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
   }
-  assert.match(html, /2 seats · 0 trabalhando · 0 aguardando/); assert.match(html, /t1-backend · LEAD/); assert.match(html, /data-action="open-seat" data-team="t1" data-seat="t1-backend"/);
+  assert.match(html, /2 agentes · 0 trabalhando · 0 aguardando/); assert.match(html, /backend · líder/); assert.match(html, /data-action="open-seat" data-team="t1" data-seat="t1-backend"/);
   const openAt = html.indexOf('data-action="open-seat"'); assert.ok(html.lastIndexOf("<details", openAt) < html.lastIndexOf("</details>", openAt) || html.lastIndexOf("<details", openAt) === -1, "Open stays on the seat row, outside details");
  });
 });
 test("pending card keeps cancel visible and hides worker rows and worker actions", async () => {
  await setup({}, async f => {
   const html = f.teams.innerHTML;
-  assert.match(html, /data-action="cancel-pending"/); assert.match(html, /1 seats|2 seats/);
+  assert.match(html, /data-action="cancel-pending"/); assert.match(html, /1 agentes|2 agentes/);
   assert.doesNotMatch(html, /data-action="open-seat"|data-action="replace"|Bootstrap/);
   assert.match(html, /start is coordinated by GLaDOS after approval/);
  });
@@ -139,7 +139,7 @@ test("Refresh renders a presetless native active team through the real command p
  await setup({api}, async f => {
   assert.match(f.status.textContent,/Atualizado \d\d:\d\d:\d\d/);
   assert.match(f.teams.innerHTML,/t1-backend/);
-  assert.match(f.teams.innerHTML,/coordinated by GLaDOS/); assert.doesNotMatch(f.teams.innerHTML,/Bootstrap worker/);
+  assert.match(f.teams.innerHTML,/Inicialização coordenada por GLaDOS/); assert.doesNotMatch(f.teams.innerHTML,/Bootstrap worker/);
   assert.doesNotMatch(f.teams.innerHTML,/No teams registered/);
  });
 });
@@ -159,7 +159,7 @@ test("rendered badges carry text labels, and the seat count follows human status
  const t = team("active"); t.seats[0].observed_owner = ownerIn("active", 1); t.seats[1].observed_owner = ownerIn("active", 1);
  const html = renderTeamGroup(t, [{ name: "t1-backend", turn_state: "busy" }, { name: "t1-qa", status: "running" }]);
  assert.match(html, /data-status="working">Trabalhando</); assert.match(html, /data-status="unknown">Sem informação</);
- assert.match(html, /2 seats · 1 trabalhando · 0 aguardando/); assert.doesNotMatch(html, /2 active/);
+ assert.match(html, /2 agentes · 1 trabalhando · 0 aguardando/); assert.doesNotMatch(html, /2 active/);
  const idle = renderTeamGroup(t, [{ name: "t1-backend", turn_state: "idle" }]); assert.match(idle, /data-status="waiting">Aguardando</);
  assert.match(renderTeamGroup(team("active")), /data-status="unknown">Sem informação</);
 });
@@ -290,34 +290,44 @@ test("Claude seat Open is enabled only for an exact observed Sonnet 5/None owner
  }
 });
 
-test("seat row is clean: status badge, name, role and Abrir only; model, generation, repo and epic live inside details", () => {
+test("compact seat row keeps short identity, honest status and Open; full facts remain in details", () => {
  const t = team("active"); t.state.epic_id = "aperture-epic1";
  t.seats[0].observed_owner = { ...ownerIn("active", 1), actual: { harness: "codex", model: "gpt-6-astra", reasoning: "high" }, process_count: 1, thread_bound: true };
- t.seats[1].observed_owner = ownerIn("active", 1);
+ t.seats[1].observed_owner = ownerIn("quarantined", 1);
  const html = renderTeamGroup(t, [{ name: "t1-backend", turn_state: "busy" }]);
  const rows = [...html.matchAll(/<div class="v4-seat__row">(.*?)<\/div>/g)].map(m => m[1]);
- assert.equal(rows.length, 2, "one visible row per seat");
- assert.match(rows[0], /^<span class="v4-badge v4-seat-status v4-seat-status--working" data-status="working">Trabalhando<\/span><span class="v4-seat__name" title="t1-backend">t1-backend · LEAD<\/span><span class="v4-seat__role">backend<\/span><button class="v4-button v4-button--small" data-action="open-seat" data-team="t1" data-seat="t1-backend">Abrir<\/button>$/);
- assert.match(rows[1], /<span class="v4-seat__role">qa<\/span><button[^>]*data-seat="t1-qa" disabled title="Agente não disponível para abrir">Abrir<\/button>$/);
- for (const row of rows) assert.doesNotMatch(row, /gpt-6-astra|sonnet|codex|claude|· g1|v4-meta|repository|epic|v4-seat__noterm/, "row carries no technical metadata");
+ assert.equal(rows.length, 2);
+ assert.match(rows[0], /title="t1-backend">backend · líder<\/span>/);
+ assert.match(rows[0], /data-status="working">Trabalhando/);
+ assert.match(rows[0], /data-action="open-seat" data-team="t1" data-seat="t1-backend">Abrir<\/button>$/);
+ assert.match(rows[1], /data-status="quarantined">Quarentena/);
+ assert.match(rows[1], /data-seat="t1-qa" disabled title="Agente não disponível para abrir">Abrir<\/button>$/);
+ for (const row of rows) assert.doesNotMatch(row, /gpt-6-astra|sonnet|codex|claude|· g1|v4-meta|repository|epic|v4-seat__role/);
  const head = html.slice(0, html.indexOf("</div></div>"));
- assert.match(head, /<h2 title="t1">t1<\/h2><p class="v4-meta">2 seats · 1 trabalhando · 0 aguardando<\/p>/);
- assert.match(head, /v4-status">active<\/span>/); assert.doesNotMatch(head, /repository|epic|lead:|· g1|gpt-6-astra/, "header is team + count + lifecycle only");
- for (const inside of ["repository: aperture (immutable)", "lead: t1-backend", "generation: g1", "epic: aperture-epic1", "codex · gpt-6-astra · high", "active · g1", "<dt>Terminal</dt><dd>Agente não disponível para abrir</dd>"]) {
+ assert.match(head, /<h2 title="t1">t1<\/h2><p class="v4-meta">2 agentes · 1 trabalhando · 0 aguardando<\/p>/);
+ assert.match(head, /v4-status">active<\/span>/); assert.doesNotMatch(head, /repository|epic|lead:|· g1|gpt-6-astra/);
+ for (const inside of ["repository: aperture (immutable)", "lead: t1-backend", "generation: g1", "epic: aperture-epic1", "codex · gpt-6-astra · high", "active · g1", "<dt>Agente / função</dt><dd>t1-backend · backend</dd>", "Inicialização coordenada por GLaDOS"]) {
   const at = html.indexOf(inside); assert.ok(at > 0, inside);
-  assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
+  assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside details`);
  }
- assert.equal((html.match(/<details class="v4-details" data-details="/g) ?? []).length, 3); assert.doesNotMatch(html, /<details[^>]*\sopen/);
+ assert.equal((html.match(/<details class="v4-details[^"]*" data-details="/g) ?? []).length, 3);
+ assert.doesNotMatch(html, /<details[^>]*\sopen/);
+ assert.match(html, /<summary aria-label="Detalhes de t1-qa" title="Detalhes de t1-qa"><span aria-hidden="true">⌄<\/span><\/summary>/);
+ assert.doesNotMatch(html, /<summary[^>]*>[^<]*<button/);
 });
-test("long seat names keep a title for the ellipsis and the stylesheet forbids the wrapped metadata column", async () => {
+test("long and repeated-role names stay distinct with full identity available and no forced mobile rows", async () => {
  const t = team("active"); const long = "t1-" + "x".repeat(120);
  t.snapshot.seats[0].name = long; t.seats[0].configured.name = long; t.snapshot.lead = long;
- assert.match(renderTeamGroup(t), new RegExp(`<span class="v4-seat__name" title="${long}">${long} · LEAD</span><span class="v4-seat__role">backend</span>`));
+ const html = renderTeamGroup(t);
+ assert.ok(html.includes(`title="${long}">${"x".repeat(120)} · líder</span>`));
+ t.snapshot.seats[1].name = "t1-qa-2"; t.seats[1].configured.name = "t1-qa-2";
+ assert.match(renderTeamGroup(t), /title="t1-qa-2">qa-2<\/span>/);
  const css = await readFile(new URL("../src/teams.css", import.meta.url), "utf8");
  const rule = sel => { const at = css.indexOf(`\n${sel} {`); assert.ok(at >= 0, sel); return css.slice(at, css.indexOf("}", at)); };
- for (const sel of [".v4-seat__name", ".v4-seat__role", ".v4-team__title h2, .v4-team__title .v4-meta"]) { assert.match(rule(sel), /text-overflow: ellipsis/, sel); assert.match(rule(sel), /white-space: nowrap/, sel); assert.match(rule(sel), /overflow-wrap: normal/, sel); }
+ for (const sel of [".v4-seat__name", ".v4-team__title h2, .v4-team__title .v4-meta"]) { assert.match(rule(sel), /text-overflow: ellipsis/); assert.match(rule(sel), /white-space: nowrap/); assert.match(rule(sel), /overflow-wrap: normal/); }
  assert.match(rule(".v4-seat__name"), /min-width: 0/); assert.match(rule(".v4-seat__row"), /flex-wrap: nowrap/);
- assert.doesNotMatch(css, /\.v4-seat__row \.v4-meta/, "no flexible metadata span in the row");
+ assert.doesNotMatch(css, /\.v4-seat__row \.v4-meta|\.v4-seat__name \{ flex: 1 1 100%/);
  assert.match(rule(".v4-button--small"), /min-height: var\(--v4-target\)/); assert.match(css, /--v4-target: 44px/);
- const narrow = css.slice(css.indexOf("@media (max-width: 700px)")); assert.match(narrow, /\.v4-seat__name \{ flex: 1 1 100%; \}/); assert.match(narrow, /\.v4-seat__row \{ flex-wrap: wrap/);
+ assert.match(rule(".v4-seat > .v4-seat__details > summary"), /width: 44px/);
+ assert.match(rule(".v4-seat > .v4-seat__details > summary"), /height: 44px/);
 });
