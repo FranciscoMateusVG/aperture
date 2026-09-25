@@ -16,9 +16,10 @@ enum NativePlan {
     Codex(launch::NativeLaunchBinding),
     Claude(crate::team_claude_launch::ClaudeBinding),
     ClaudeSmoke(crate::team_claude_launch::ClaudeBinding, SmokeAdmission),
-    /// Explicit recovery of the first normal Claude bootstrap that ended
-    /// Quarantined g1 unobserved. Same normal binding; admission is a native
-    /// proof, never a caller field, and never a retry.
+    /// Explicit recovery of a normal Claude bootstrap that ended Quarantined
+    /// unobserved at g1, or at g2 after one such recovery failed the same way.
+    /// Same normal binding; admission is a native proof, never a caller field,
+    /// and never a retry. Nothing later than g2 is recoverable.
     ClaudeRecovery(crate::team_claude_launch::ClaudeBinding, RecoveryAdmission),
 }
 impl NativePlan {
@@ -191,45 +192,56 @@ fn absent(path: &Path) -> Result<(), ReplacementError> {
         _ => Err(ReplacementError::OutcomeUnknown),
     }
 }
-/// Native proof that one seat is exactly the recoverable failure: the FIRST
-/// normal Claude bootstrap (LaunchRecord AND ClaudeAttempt NormalPositional)
-/// that ended Quarantined g1 with an unobserved incarnation, every recorded
-/// process Gone, no hub token, revocation floor exactly g1 for the same token
-/// digest, no reservation nonce, an expired/Unknown g0 attempt, and no g2 or
-/// runtime-attempt g1 artefact yet. Issued only by the GLaDOS-authenticated
-/// recovery entry under team then seat locks; never deserialized, never a
-/// caller field, and it does not grant a second attempt.
+/// Native proof that one seat is exactly the recoverable failure at
+/// `generation` (1 = the first normal Claude bootstrap, 2 = its first explicit
+/// recovery; nothing later): LaunchRecord AND ClaudeAttempt NormalPositional at
+/// that generation, owner Quarantined there with an unobserved incarnation,
+/// every recorded process Gone, no hub token, revocation floor exactly that
+/// generation for the same token digest, no reservation nonce, the previous
+/// bootstrap admission (g0, or the g1 recovery admission) expired/Unknown, and
+/// no next-generation or same-generation runtime-attempt artefact yet. Issued
+/// only by the GLaDOS-authenticated recovery entry under team then seat locks;
+/// never deserialized, never a caller field, and it does not grant a second
+/// attempt.
 pub(crate) struct RecoveryAdmission {
     home: std::path::PathBuf,
     team: String,
     seat: String,
+    /// The quarantined generation being recovered (1 or 2); the reserve mints
+    /// exactly `generation + 1`.
+    generation: u64,
     snapshot_sha256: String,
     token_id: String,
     /// Set once the deadline admission for THIS recovery exists; the
     /// pre-reserve proof accepts only that attempt's open `g1`.
     attempt_id: Option<String>,
 }
-/// Which `runtime-attempts/<seat>/g1` state the proof must find. Before the
-/// deadline admission nothing may exist there (one admission ever); before
-/// the reserve exactly the current attempt must be open (admitted + effects,
-/// no terminal). Neither phase accepts another attempt.
+/// Which `runtime-attempts/<seat>/g<generation>` state the proof must find.
+/// Before the deadline admission nothing may exist there (one admission ever);
+/// before the reserve exactly the current attempt must be open (admitted +
+/// effects, no terminal). Neither phase accepts another attempt.
 #[derive(Clone, Copy)]
 pub(crate) enum RecoveryPhase<'a> {
     PreAdmission,
     PreReserve { attempt_id: &'a str },
 }
 impl RecoveryAdmission {
-    fn issue(home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str)
+    fn issue(home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str, generation: u64)
         -> Result<Self, ReplacementError> {
         authorize_recovery(actor)?;
-        let admission = Self::issue_checked(home, team, seat, || authorize_recovery(actor))?;
+        let admission = Self::issue_checked(home, team, seat, generation, || authorize_recovery(actor))?;
         authorize_recovery(actor)?;
         Ok(admission)
     }
     /// Locked proof without the caller's authority: `authorize` runs again
     /// inside the locks. Used by `issue` and, in tests, with an inert authority.
-    fn issue_checked(home: &Path, team: &str, seat: &str,
+    /// Only generations 1 and 2 are recoverable; anything else is refused
+    /// before any lock or read (no generic restart).
+    fn issue_checked(home: &Path, team: &str, seat: &str, generation: u64,
         authorize: impl Fn() -> Result<(), ReplacementError>) -> Result<Self, ReplacementError> {
+        if generation != 1 && generation != 2 {
+            return Err(ReplacementError::GenerationMismatch);
+        }
         if !crate::teams::managed_launch_enabled(&Harness::Claude) {
             return Err(ReplacementError::LaunchUnavailable);
         }
@@ -243,20 +255,25 @@ impl RecoveryAdmission {
         let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
         authorize()?;
         let owner = store.read_owner_locked(seat).map_err(|_| ReplacementError::GenerationMismatch)?;
-        let (snapshot_sha256, token_id) = Self::proof_locked(home, team, seat, &owner, RecoveryPhase::PreAdmission)?;
-        Ok(Self { home: home.into(), team: team.into(), seat: seat.into(), snapshot_sha256, token_id, attempt_id: None })
+        let (snapshot_sha256, token_id) = Self::proof_locked(home, team, seat, &owner, generation, RecoveryPhase::PreAdmission)?;
+        Ok(Self { home: home.into(), team: team.into(), seat: seat.into(), generation, snapshot_sha256, token_id, attempt_id: None })
     }
     /// Bind this admission to the deadline attempt just admitted for it.
     fn bind_attempt(mut self, attempt_id: &str) -> Self {
         self.attempt_id = Some(attempt_id.into());
         self
     }
-    /// Full owner proof against the locked owner for one phase. Returns the
-    /// typed snapshot digest and the incarnation token id it was proved for.
-    fn proof_locked(home: &Path, team: &str, seat: &str, owner: &OwnerRecord, phase: RecoveryPhase<'_>)
+    /// Full owner proof against the locked owner for one phase at the
+    /// quarantined `generation` (1 or 2). Returns the typed snapshot digest and
+    /// the incarnation token id it was proved for.
+    fn proof_locked(home: &Path, team: &str, seat: &str, owner: &OwnerRecord, generation: u64, phase: RecoveryPhase<'_>)
         -> Result<(String, String), ReplacementError> {
         use sha2::{Digest, Sha256};
         use std::io::Read;
+        if generation != 1 && generation != 2 {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        let next = generation + 1;
         match crate::teams::classify_managed_seat(home, seat)
             .map_err(|_| ReplacementError::AuthorizationRequired)? {
             Some(crate::teams::ManagedSeatState::Active { team: t, .. }) if t == team => {},
@@ -285,9 +302,9 @@ impl RecoveryAdmission {
             (Some("active"), Some(g)) if g > 0 => g,
             _ => return Err(ReplacementError::AuthorizationRequired),
         };
-        // Owner: exactly the quarantined, unobserved first generation.
+        // Owner: exactly the quarantined, unobserved recovered generation.
         let inc = owner.incarnation.as_ref().ok_or(ReplacementError::GenerationMismatch)?;
-        if owner.schema_version != 1 || owner.seat != seat || owner.generation != 1
+        if owner.schema_version != 1 || owner.seat != seat || owner.generation != generation
             || owner.state != OwnerState::Quarantined
             || owner.reservation_nonce_sha256.is_some()
             || owner.requested != tuple
@@ -306,21 +323,23 @@ impl RecoveryAdmission {
                 return Err(ReplacementError::StopUnverified);
             }
         }
-        // Token gone, floor exactly g1 for this incarnation's token digest.
+        // Token gone, floor exactly this generation for this incarnation's token digest.
         absent(&home.join(".aperture/run/hub-tokens").join(format!("{seat}.token")))
             .map_err(|_| ReplacementError::RevocationUnverified)?;
-        crate::ws_hub::managed_control::verify_floor(home, seat, 1, &inc.token_id)
+        crate::ws_hub::managed_control::verify_floor(home, seat, generation, &inc.token_id)
             .map_err(|_| ReplacementError::RevocationUnverified)?;
-        // g0: expired normal bootstrap with effects and an Unknown/absent terminal,
-        // never reconciled. Read-only; the handle is dropped, not renewed.
-        deadline::UnfinishedBootstrap::read_locked(home, team, seat)?;
-        // g1 facts: the category comes from BOTH the attempt and the launch record
-        // being NormalPositional and bound to this owner, never from the tuple.
+        // Previous admission (g0 for a g1 recovery, the g1 recovery admission for
+        // a g2 recovery): expired bootstrap with effects and an Unknown/absent
+        // terminal, never reconciled. Read-only; no handle is kept or renewed.
+        deadline::expired_bootstrap_locked(home, team, seat, generation - 1)?;
+        // Same-generation facts: the category comes from BOTH the attempt and the
+        // launch record being NormalPositional and bound to this owner, never
+        // from the tuple.
         let run = home.join(".aperture/run");
         let attempt: crate::team_claude_launch::ClaudeAttempt =
-            read_private_json(&run.join(format!("{seat}.g1.claude-attempt.json")))
+            read_private_json(&run.join(format!("{seat}.g{generation}.claude-attempt.json")))
                 .map_err(|_| ReplacementError::OutcomeUnknown)?;
-        if attempt.schema_version != 1 || attempt.team != team || attempt.seat != seat || attempt.generation != 1
+        if attempt.schema_version != 1 || attempt.team != team || attempt.seat != seat || attempt.generation != generation
             || attempt.mode != crate::team_claude_launch::ClaudeLaunchMode::NormalPositional
             || attempt.team_generation != team_generation || attempt.snapshot_sha256 != raw_sha
             || attempt.token_id != inc.token_id || attempt.root_pid != inc.pid || attempt.root_start_time_us != inc.start_time
@@ -328,10 +347,10 @@ impl RecoveryAdmission {
             || !crate::team_claude_launch::canonical_uuid(&attempt.session_id) {
             return Err(ReplacementError::OutcomeUnknown);
         }
-        let managed = run.join("managed").join(seat).join("g1");
+        let managed = run.join("managed").join(seat).join(format!("g{generation}"));
         let launch: LaunchFacts = read_private_json(&managed.join("claude-launch.json"))
             .map_err(|_| ReplacementError::OutcomeUnknown)?;
-        if launch.schema_version != 1 || launch.team != team || launch.seat != seat || launch.generation != 1
+        if launch.schema_version != 1 || launch.team != team || launch.seat != seat || launch.generation != generation
             || launch.mode != crate::team_claude_launch::ClaudeLaunchMode::NormalPositional
             || launch.session_id != attempt.session_id || launch.token_id != inc.token_id
             || launch.snapshot_sha256 != typed_sha {
@@ -344,16 +363,17 @@ impl RecoveryAdmission {
             return Err(ReplacementError::OutcomeUnknown);
         }
         // Unobserved means neither an observation nor a proven rejection exists.
-        absent(&run.join(format!("{seat}.g1.claude-observation.json")))?;
-        absent(&run.join(format!("{seat}.g1.claude-rejected.json")))?;
-        // Nothing of g2 may exist. The runtime-attempt g1 is phase-dependent:
-        // absent before the deadline admission (one admission ever), exactly the
-        // current attempt (admitted + effects, no terminal) before the reserve.
-        absent(&run.join(format!("{seat}.g2.claude-attempt.json")))?;
-        absent(&run.join("managed").join(seat).join("g2"))?;
+        absent(&run.join(format!("{seat}.g{generation}.claude-observation.json")))?;
+        absent(&run.join(format!("{seat}.g{generation}.claude-rejected.json")))?;
+        // Nothing of the next generation may exist. The same-generation
+        // runtime-attempt is phase-dependent: absent before the deadline
+        // admission (one admission ever), exactly the current attempt (admitted
+        // + effects, no terminal) before the reserve.
+        absent(&run.join(format!("{seat}.g{next}.claude-attempt.json")))?;
+        absent(&run.join("managed").join(seat).join(format!("g{next}")))?;
         match phase {
-            RecoveryPhase::PreAdmission => absent(&team_dir.join("runtime-attempts").join(seat).join("g1"))?,
-            RecoveryPhase::PreReserve { attempt_id } => deadline::recovery_attempt_open_locked(home, team, seat, attempt_id)?,
+            RecoveryPhase::PreAdmission => absent(&team_dir.join("runtime-attempts").join(seat).join(format!("g{generation}")))?,
+            RecoveryPhase::PreReserve { attempt_id } => deadline::recovery_attempt_open_locked(home, team, seat, generation, attempt_id)?,
         }
         Ok((typed_sha, inc.token_id.clone()))
     }
@@ -361,14 +381,14 @@ impl RecoveryAdmission {
     /// owner must still be the proved one (same snapshot, same token digest).
     fn reprove_locked(&self, store: &OwnerStore, phase: RecoveryPhase<'_>) -> Result<(), ReplacementError> {
         let owner = store.read_owner_locked(&self.seat).map_err(|_| ReplacementError::GenerationMismatch)?;
-        let (snapshot_sha256, token_id) = Self::proof_locked(&self.home, &self.team, &self.seat, &owner, phase)?;
+        let (snapshot_sha256, token_id) = Self::proof_locked(&self.home, &self.team, &self.seat, &owner, self.generation, phase)?;
         if snapshot_sha256 != self.snapshot_sha256 || token_id != self.token_id {
             return Err(ReplacementError::GenerationMismatch);
         }
         Ok(())
     }
     fn matches_target(&self, home: &Path, team: &str, seat: &str, old_generation: u64) -> Result<(), ReplacementError> {
-        if self.home != home || self.team != team || self.seat != seat || old_generation != 1 {
+        if self.home != home || self.team != team || self.seat != seat || old_generation != self.generation {
             return Err(ReplacementError::AuthorizationRequired);
         }
         Ok(())
@@ -780,9 +800,12 @@ pub(crate) fn bootstrap_authorized(
 ) -> Result<StartedReplacement, ReplacementError> {
     let budget = deadline::Deadline::new();
     authorize_bootstrap(actor)?;
+    // 0 = first start. 1 | 2 = explicit recovery of the quarantined, unobserved
+    // owner at that generation (a first bootstrap, or one recovery that failed
+    // the same way). 3 and above are never selectors: no generic restart.
     match expected_generation {
         0 => {}
-        1 => return bootstrap_recovery_authorized(home, actor, team, seat, budget),
+        1 | 2 => return bootstrap_recovery_authorized(home, actor, team, seat, expected_generation, budget),
         _ => return Err(ReplacementError::GenerationMismatch),
     }
     let repo =
@@ -852,19 +875,21 @@ pub(crate) fn bootstrap_authorized(
     Ok(started.candidate.observed)
 }
 
-/// Explicit recovery of the first normal Claude bootstrap (Quarantined g1,
-/// unobserved). GLaDOS-only. The proof is issued under locks before anything,
-/// re-run before the deadline admission and again before the effective g2
+/// Explicit recovery of a normal Claude bootstrap that ended Quarantined and
+/// unobserved at `generation` (1, or 2 after one recovery failed the same way).
+/// GLaDOS-only. The proof is issued under locks before anything, re-run before
+/// the deadline admission and again before the effective `generation + 1`
 /// reserve. Existing native start/activation/observation/cleanup follow; all
-/// g0/g1 facts stay; a second call finds the new attempt and is refused.
+/// earlier facts stay; a second call finds the new attempt and is refused.
 fn bootstrap_recovery_authorized(
     home: &Path,
     actor: &AuthenticatedActor,
     team: &str,
     seat: &str,
+    generation: u64,
     budget: deadline::Deadline,
 ) -> Result<StartedReplacement, ReplacementError> {
-    let admission = RecoveryAdmission::issue(home, actor, team, seat)?;
+    let admission = RecoveryAdmission::issue(home, actor, team, seat, generation)?;
     let repo =
         repository::resolve_native(home, team, budget.forward_until(Duration::from_secs(10))?)
             .map_err(|_| ReplacementError::RepoBindingUnavailable)?;
@@ -885,9 +910,10 @@ fn bootstrap_recovery_authorized(
         _ => return Err(ReplacementError::LaunchUnavailable),
     };
     authorize_recovery(actor)?;
-    // Re-prove (pre-admission phase: no runtime-attempt g1 yet) under team then
-    // seat locks immediately before the deadline admission, which re-checks the
-    // owner itself and creates runtime-attempts/<seat>/g1 for THIS recovery.
+    // Re-prove (pre-admission phase: no same-generation runtime-attempt yet)
+    // under team then seat locks immediately before the deadline admission,
+    // which re-checks the owner itself and creates
+    // runtime-attempts/<seat>/g<generation> for THIS recovery.
     {
         let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), team)
             .map_err(|_| ReplacementError::NativeFailure)?;
@@ -901,12 +927,13 @@ fn bootstrap_recovery_authorized(
         &AuthenticatedActor::launcher(),
         team,
         seat,
+        generation,
         budget,
     )?;
     attempt.admit_effects()?;
-    // From here the proof is pre-reserve: exactly this attempt's open g1.
+    // From here the proof is pre-reserve: exactly this attempt's open admission.
     let plan = NativePlan::ClaudeRecovery(binding, admission.bind_attempt(attempt.id()));
-    let mut started = match start_native(home, team, seat, 1, selected, &plan, &attempt, Some(actor)) {
+    let mut started = match start_native(home, team, seat, generation, selected, &plan, &attempt, Some(actor)) {
         Ok(v) => v,
         Err(e) => {
             let _ = attempt.finish_unknown();
@@ -951,8 +978,9 @@ fn bootstrap_recovery_authorized(
 /// released: `OwnerStore::reserve_start` re-acquires it and applies its own
 /// guarantees (expected generation, Stale|Quarantined, fresh nonce, no
 /// incarnation). The reservation is then bound to that proof by readback:
-/// generation 2, Starting, the reservation's nonce digest, the selected tuple,
-/// no incarnation, no provisional id. Anything else is not the proved owner.
+/// exactly the proved generation + 1, Starting, the reservation's nonce digest,
+/// the selected tuple, no incarnation, no provisional id. Anything else is not
+/// the proved owner.
 fn reserve_recovery(
     store: &OwnerStore,
     admission: &RecoveryAdmission,
@@ -965,13 +993,14 @@ fn reserve_recovery(
         let _seat = store.lock(seat).map_err(|_| ReplacementError::NativeFailure)?;
         admission.reprove_locked(store, RecoveryPhase::PreReserve { attempt_id })?;
     }
+    let next = admission.generation.checked_add(1).ok_or(ReplacementError::OutcomeUnknown)?;
     let reservation = store
-        .reserve_start(&AuthenticatedActor::launcher(), seat, 1, selected.clone())
+        .reserve_start(&AuthenticatedActor::launcher(), seat, admission.generation, selected.clone())
         .map_err(|_| ReplacementError::GenerationMismatch)?;
     let owner = store.read_owner(seat).map_err(|_| ReplacementError::OutcomeUnknown)?;
     let nonce_sha256 = format!("{:x}", Sha256::digest(reservation.nonce().as_bytes()));
-    if reservation.seat != seat || reservation.generation != 2
-        || owner.seat != seat || owner.generation != 2 || owner.state != OwnerState::Starting
+    if reservation.seat != seat || reservation.generation != next
+        || owner.seat != seat || owner.generation != next || owner.state != OwnerState::Starting
         || owner.incarnation.is_some() || owner.provisional_token_id.is_some()
         || owner.reservation_nonce_sha256.as_deref() != Some(nonce_sha256.as_str())
         || owner.requested != *selected {

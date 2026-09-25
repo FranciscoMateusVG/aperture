@@ -87,12 +87,21 @@ enum FactKind {
 /// mint an observation PASS or another start permit.
 pub(crate) struct UnfinishedBootstrap { dir: PathBuf, admission: Admission }
 impl UnfinishedBootstrap {
+    /// The historical smoke/reconcile handle: g0 ONLY. Diagnostic recovery
+    /// (`reconcile_stopped_claude_smoke`) is never widened to a later generation.
     pub(crate) fn read_locked(home: &Path, team: &str, seat: &str) -> Result<Self, ReplacementError> {
-        let dir = home.join(".aperture/teams").join(team).join("runtime-attempts").join(seat).join("g0");
+        Self::read_locked_at(home, team, seat, 0)
+    }
+    /// Private parameterized reader: the expired bootstrap admission at
+    /// `runtime-attempts/<seat>/g<old_generation>` (a first start at g0, or the
+    /// explicit recovery admission at g1). Same facts for both: bootstrap
+    /// budget, effects, terminal `unknown` or absent-expired, never reconciled.
+    fn read_locked_at(home: &Path, team: &str, seat: &str, old_generation: u64) -> Result<Self, ReplacementError> {
+        let dir = home.join(".aperture/teams").join(team).join("runtime-attempts").join(seat).join(format!("g{old_generation}"));
         let a: Admission = read_private_json(&dir.join("admitted.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
         let f: Fact = read_private_json(&dir.join("effects.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
         let now = chrono::Utc::now().timestamp_millis();
-        if a.schema_version != 1 || a.team != team || a.seat != seat || a.old_generation != 0
+        if a.schema_version != 1 || a.team != team || a.seat != seat || a.old_generation != old_generation
             || !crate::team_claude_launch::canonical_uuid(&a.attempt_id)
             || a.native_budget_ms != 170_000 || a.cleanup_reserve_ms != 40_000
             || a.admitted_at_ms <= 0 || a.admitted_at_ms.checked_add(180_000).is_none_or(|end| now <= end)
@@ -127,16 +136,27 @@ impl UnfinishedBootstrap {
         Ok(())
     }
 }
-/// Pre-reserve check for the explicit first-bootstrap recovery: the CURRENT
-/// attempt's `g1` admission is open (admitted and effects bound to exactly
-/// `attempt_id`, no terminal) and nothing else lives there. Another attempt,
-/// a finished one, or any prepared/retirement material refuses. Read-only.
-pub(crate) fn recovery_attempt_open_locked(home: &Path, team: &str, seat: &str, attempt_id: &str) -> Result<(), ReplacementError> {
-    let dir = home.join(".aperture/teams").join(team).join("runtime-attempts").join(seat).join("g1");
+/// Read-only proof that the PREVIOUS bootstrap admission of an explicit
+/// recovery expired without a verdict: `old_generation` 0 (the first start,
+/// before a g1 recovery) or 1 (the g1 recovery admission, before a g2
+/// recovery). No handle is returned, so nothing can be recorded or reconciled
+/// through it; the smoke/reconcile handle above stays g0-only.
+pub(crate) fn expired_bootstrap_locked(home: &Path, team: &str, seat: &str, old_generation: u64) -> Result<(), ReplacementError> {
+    if old_generation > 1 { return Err(ReplacementError::GenerationMismatch); }
+    UnfinishedBootstrap::read_locked_at(home, team, seat, old_generation).map(|_| ())
+}
+/// Pre-reserve check for the explicit bootstrap recovery: the CURRENT
+/// attempt's `g<old_generation>` admission is open (admitted and effects bound
+/// to exactly `attempt_id`, no terminal) and nothing else lives there. Another
+/// attempt, a finished one, or any prepared/retirement material refuses.
+/// Read-only; `old_generation` is the quarantined generation being recovered.
+pub(crate) fn recovery_attempt_open_locked(home: &Path, team: &str, seat: &str, old_generation: u64, attempt_id: &str) -> Result<(), ReplacementError> {
+    if old_generation != 1 && old_generation != 2 { return Err(ReplacementError::GenerationMismatch); }
+    let dir = home.join(".aperture/teams").join(team).join("runtime-attempts").join(seat).join(format!("g{old_generation}"));
     let a: Admission = read_private_json(&dir.join("admitted.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
     let f: Fact = read_private_json(&dir.join("effects.json")).map_err(|_| ReplacementError::OutcomeUnknown)?;
     if !crate::team_claude_launch::canonical_uuid(attempt_id)
-        || a.schema_version != 1 || a.attempt_id != attempt_id || a.team != team || a.seat != seat || a.old_generation != 1
+        || a.schema_version != 1 || a.attempt_id != attempt_id || a.team != team || a.seat != seat || a.old_generation != old_generation
         || f.schema_version != 1 || f.attempt_id != attempt_id || f.kind != FactKind::EffectsMayHaveOccurred {
         return Err(ReplacementError::OutcomeUnknown);
     }
@@ -340,18 +360,21 @@ impl RuntimeAttempt {
     ) -> Result<Self, ReplacementError> {
         Self::begin_checked(home, actor, team, seat, 0, budget, true, false)
     }
-    /// Explicit recovery of the first bootstrap: the owner must be exactly the
-    /// quarantined, unobserved g1. The attempt lands in `runtime-attempts/<seat>/g1`;
-    /// the historical `g0` facts are never opened for writing, and an existing
-    /// `g1` refuses (one admission, no retry).
+    /// Explicit bootstrap recovery: the owner must be exactly the quarantined,
+    /// unobserved `generation` (1 = the first bootstrap, 2 = a first recovery
+    /// that failed the same way; nothing later). The attempt lands in
+    /// `runtime-attempts/<seat>/g<generation>`; earlier facts are never opened
+    /// for writing, and an existing directory refuses (one admission, no retry).
     pub(crate) fn begin_bootstrap_recovery(
         home: &Path,
         actor: &AuthenticatedActor,
         team: &str,
         seat: &str,
+        generation: u64,
         budget: Deadline,
     ) -> Result<Self, ReplacementError> {
-        Self::begin_checked(home, actor, team, seat, 1, budget, true, false)
+        if generation != 1 && generation != 2 { return Err(ReplacementError::GenerationMismatch); }
+        Self::begin_checked(home, actor, team, seat, generation, budget, true, false)
     }
     fn begin_checked(
         home: &Path,
@@ -385,10 +408,10 @@ impl RuntimeAttempt {
             .map_err(|_| ReplacementError::NativeFailure)?;
         let owner: OwnerRecord = read_private_json(&store.record_path(seat))
             .map_err(|_| ReplacementError::GenerationMismatch)?;
-        let state_ok = if bootstrap && generation == 1 {
-            // Recovery of the first bootstrap: quarantined, never observed, thread
-            // never bound, no nonce; a retained provisional id must be the
-            // incarnation's own token id (nothing is cleaned to fit).
+        let state_ok = if bootstrap && (generation == 1 || generation == 2) {
+            // Explicit recovery (g1, or a g2 that failed the same way): quarantined,
+            // never observed, thread never bound, no nonce; a retained provisional
+            // id must be the incarnation's own token id (nothing is cleaned to fit).
             owner.state == OwnerState::Quarantined
                 && owner.reservation_nonce_sha256.is_none()
                 && owner.incarnation.as_ref().is_some_and(|i| {

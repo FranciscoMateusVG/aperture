@@ -13,8 +13,8 @@ const list = () => ({action:'list_teams',result:[{snapshot:{team:'mural',project
 const started = () => ({action:'bootstrap_seat',result:{team:'mural',seat:seat.name,generation:1,phase:'started',owner:{...owner(),generation:1,state:'active',actual:tuple,process_count:1,thread_bound:true},blockers:[]}});
 test('GLaDOS bootstrap selectors carry no caller authority and each start has lifecycle watchdog',()=>{
  assert.deepEqual(bootstrapSeatSchema.parse(input),input);
- assert.deepEqual(bootstrapSeatSchema.parse({...input,expected_generation:1}),{...input,expected_generation:1});
- for(const extra of [{actor:'glados'},{model:'other'},{timeout:999},{expected_generation:2},{expected_generation:-1},{expected_generation:'1'},{seat:'../x'}]) assert.equal(bootstrapSeatSchema.safeParse({...input,...extra}).success,false);
+ for(const g of [1,2]) assert.deepEqual(bootstrapSeatSchema.parse({...input,expected_generation:g}),{...input,expected_generation:g});
+ for(const extra of [{actor:'glados'},{model:'other'},{timeout:999},{expected_generation:3},{expected_generation:4},{expected_generation:-1},{expected_generation:'1'},{seat:'../x'}]) assert.equal(bootstrapSeatSchema.safeParse({...input,...extra}).success,false);
  assert.equal(teamControlWatchdogMs('bootstrap_seat'),180000);
  assert.equal(teamControlWatchdogMs('list_teams'),15000);
 });
@@ -90,4 +90,36 @@ test('recovery selector 1 admits only the quarantined unobserved first Claude bo
  for(const g of [1,3]){const w=started();w.result.generation=g;w.result.owner={...w.result.owner,generation:g,configured:claude,actual:claude};assert.throws(()=>parseBootstrapStarted(w,recovery,claude),/E_CONTROL_UNKNOWN/);}
  const first=started();first.result.generation=2;first.result.owner.generation=2;
  assert.throws(()=>parseBootstrapStarted(first,input,tuple),/E_CONTROL_UNKNOWN/);
+});
+
+test('recovery selector 2 admits only the quarantined unobserved g2 Claude owner (one failed recovery) and proves generation 3',()=>{
+ const claude={harness:'claude',model:'claude-sonnet-5',reasoning:null};
+ const recovery=g=>({team:'mural',seat:seat.name,expected_generation:g});
+ // Factual shape of the QA seat after its one g1→g2 recovery failed the same way: quarantined g2,
+ // never observed, thread never bound, process_count 1 for the Gone root still recorded.
+ const quarantined=g=>({generation:g,state:'quarantined',configured:claude,actual:null,process_count:1,thread_bound:false});
+ function claudeList(o,t=claude){
+  const v=list(), row=v.result[0], s={...seat,...t};
+  row.snapshot.seats=[s]; row.seats[0].configured=s; row.seats[0].observed_owner=o;
+  return v;
+ }
+ assert.deepEqual(bootstrapSelection(claudeList(quarantined(2)),recovery(2)),claude);
+ assert.deepEqual(bootstrapSelection(claudeList({...quarantined(2),process_count:0}),recovery(2)),claude);
+ // Exactly the selected generation: g1 is not a selector-2 target, g2 is not a selector-1 target,
+ // and a quarantined g3 has no selector at all (3 fails the schema; 1 and 2 refuse it).
+ assert.throws(()=>bootstrapSelection(claudeList(quarantined(1)),recovery(2)),/generation 2/);
+ assert.throws(()=>bootstrapSelection(claudeList(quarantined(2)),recovery(1)),/generation 1/);
+ for(const g of [1,2]) assert.throws(()=>bootstrapSelection(claudeList(quarantined(3)),recovery(g)),/recoverable/);
+ for(const o of [{...quarantined(2),state:'stale'},{...quarantined(2),state:'active'},{...quarantined(2),state:'starting'},{...quarantined(2),actual:claude},{...quarantined(2),thread_bound:true}])
+  assert.throws(()=>bootstrapSelection(claudeList(o),recovery(2)),/recoverable/);
+ assert.throws(()=>bootstrapSelection(claudeList(quarantined(2)),input));
+ assert.throws(()=>bootstrapSelection(claudeList({...quarantined(2),configured:tuple},tuple),recovery(2)));
+ const disabled=claudeList(quarantined(2));disabled.result[0].capabilities.start=false;
+ assert.throws(()=>bootstrapSelection(disabled,recovery(2)));
+ // The receipt of a selector-2 recovery proves exactly generation 3, and only that.
+ const wire=started();wire.result.generation=3;wire.result.owner={...wire.result.owner,generation:3,configured:claude,actual:claude};
+ assert.equal(parseBootstrapStarted(wire,recovery(2),claude).result.generation,3);
+ for(const g of [1,2,4]){const w=started();w.result.generation=g;w.result.owner={...w.result.owner,generation:g,configured:claude,actual:claude};assert.throws(()=>parseBootstrapStarted(w,recovery(2),claude),/E_CONTROL_UNKNOWN/);}
+ const asOne=started();asOne.result.generation=3;asOne.result.owner={...asOne.result.owner,generation:3,configured:claude,actual:claude};
+ assert.throws(()=>parseBootstrapStarted(asOne,recovery(1),claude),/E_CONTROL_UNKNOWN/);
 });

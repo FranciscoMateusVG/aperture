@@ -312,19 +312,24 @@ fn bootstrap_is_operator_g0_only_and_never_creates_state_for_bad_selector() {
             .unwrap_err(),
         ReplacementError::AuthorizationRequired
     );
-    // Selector 1 is the GLaDOS-only recovery entry: the operator UI and the
-    // launcher are refused before any native proof; 2 is never a selector.
+    // Selectors 1 and 2 are the GLaDOS-only recovery entries: the operator UI
+    // and the launcher are refused before any native proof; 3 and above are
+    // never selectors and fail at selection even for an actor the g0 arm accepts.
     for actor in [AuthenticatedActor::operator_ui(), AuthenticatedActor::launcher()] {
+        for generation in [1, 2] {
+            assert_eq!(
+                bootstrap_authorized(&home, &actor, "t1", "t1-worker", generation).unwrap_err(),
+                ReplacementError::AuthorizationRequired
+            );
+        }
+    }
+    for generation in [3, 4] {
         assert_eq!(
-            bootstrap_authorized(&home, &actor, "t1", "t1-worker", 1).unwrap_err(),
-            ReplacementError::AuthorizationRequired
+            bootstrap_authorized(&home, &AuthenticatedActor::operator_ui(), "t1", "t1-worker", generation)
+                .unwrap_err(),
+            ReplacementError::GenerationMismatch
         );
     }
-    assert_eq!(
-        bootstrap_authorized(&home, &AuthenticatedActor::operator_ui(), "t1", "t1-worker", 2)
-            .unwrap_err(),
-        ReplacementError::GenerationMismatch
-    );
     assert!(!home.exists());
 }
 
@@ -333,13 +338,30 @@ fn bootstrap_is_operator_g0_only_and_never_creates_state_for_bad_selector() {
 /// and Gone, provisional token id retained and equal to the incarnation token,
 /// no hub token, revocation floor exactly g1 for that digest, normal launch and
 /// attempt records, g0 attempt expired with an Unknown terminal.
-struct Recovery { f: Fixture, attempt: crate::team_claude_launch::ClaudeAttempt, raw_sha: String, typed_sha: String }
+/// Factual shape of the recoverable failure at `generation` (1 = the first
+/// normal Claude bootstrap, 2 = its one explicit recovery that failed the same
+/// way; nothing later): every earlier generation keeps its normal records and
+/// its expired Unknown bootstrap admission; the recovered generation has its
+/// own normal attempt/launch/release, a Quarantined unobserved owner with the
+/// provisional id retained, a Gone root, no token and a revocation floor
+/// exactly there. Mirrors the two real QA readbacks (g1 and g2).
+struct Recovery { f: Fixture, generation: u64, attempt: crate::team_claude_launch::ClaudeAttempt, raw_sha: String, typed_sha: String }
 impl Recovery {
     const TEAM: &'static str = "t1";
     const SEAT: &'static str = "t1-qa";
-    fn token() -> String { "a".repeat(64) }
-    fn new() -> Self {
+    /// Incarnation token id of generation `g`: valid 64-hex ids that sort in
+    /// generation order, so the revocation list stays sorted as the hub writes it.
+    fn token_at(g: u64) -> String { if g == 1 { "a".repeat(64) } else { "b".repeat(64) } }
+    fn pid_at(g: u64) -> u32 { 900_000 + g as u32 }
+    fn token(&self) -> String { Self::token_at(self.generation) }
+    fn pid(&self) -> u32 { Self::pid_at(self.generation) }
+    fn runtime_dir(g: u64) -> String { format!(".aperture/teams/t1/runtime-attempts/t1-qa/g{g}") }
+    fn attempt_path(g: u64) -> String { format!(".aperture/run/t1-qa.g{g}.claude-attempt.json") }
+    fn managed_dir(g: u64) -> String { format!(".aperture/run/managed/t1-qa/g{g}") }
+    fn new() -> Self { Self::at(1) }
+    fn at(generation: u64) -> Self {
         use sha2::{Digest, Sha256};
+        assert!(generation == 1 || generation == 2, "fixture models the two recoverable generations only");
         let f = Fixture::new();
         let home = f.0.clone();
         let agent = home.join(".claude/aperture").join(Self::SEAT);
@@ -358,18 +380,19 @@ impl Recovery {
         let typed: TeamSnapshot = serde_json::from_slice(&raw).unwrap();
         let typed_sha = smoke_hash(&typed).unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        let g0 = uuid::Uuid::new_v4().to_string();
-        f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/admitted.json", &serde_json::json!({"schema_version":1,"attempt_id":g0,"team":Self::TEAM,"seat":Self::SEAT,"old_generation":0,"admitted_at_ms":now-300_000,"native_budget_ms":170000,"cleanup_reserve_ms":40000}));
-        f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/effects.json", &serde_json::json!({"schema_version":1,"attempt_id":g0,"kind":"effects_may_have_occurred"}));
-        f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/terminal.json", &serde_json::json!({"schema_version":1,"attempt_id":g0,"kind":"unknown"}));
-        let attempt = crate::team_claude_launch::ClaudeAttempt {
-            schema_version: 1, team: Self::TEAM.into(), seat: Self::SEAT.into(), generation: 1,
-            reservation_nonce_sha256: "c".repeat(64), snapshot_sha256: raw_sha.clone(), team_generation: 1,
-            token_id: Self::token(), root_pid: 900001, root_start_time_us: 42,
-            session_id: uuid::Uuid::new_v4().to_string(), requested_model: crate::team_claude_launch::MODEL.into(),
-            created_at_ms: now - 200_000, mode: crate::team_claude_launch::ClaudeLaunchMode::NormalPositional,
-        };
-        let r = Self { f, attempt, raw_sha, typed_sha };
+        // Every bootstrap admission before the recovered generation expired
+        // Unknown and was never reconciled: g0 (the first start) and, for a g2
+        // recovery, the g1 recovery admission.
+        for old in 0..generation { Self::write_expired_admission(&f, old, now); }
+        let r = Self { f, generation, attempt: Self::attempt_at(generation, &raw_sha, now - 200_000), raw_sha, typed_sha };
+        // Earlier generations' normal records stay as history (their own token,
+        // root and session), exactly as the g2 readback found the g1 facts.
+        for g in 1..generation {
+            let attempt = Self::attempt_at(g, &r.raw_sha, now - 400_000);
+            r.f.write(&Self::attempt_path(g), &serde_json::to_value(&attempt).unwrap());
+            r.f.write(&format!("{}/claude-launch.json", Self::managed_dir(g)), &r.launch_value(&attempt));
+            r.f.write(&format!("{}/claude-release.json", Self::managed_dir(g)), &Self::release_value(&attempt));
+        }
         r.owner(|_| {});
         r.attempt_file(|_| {});
         r.launch(|_| {});
@@ -378,13 +401,36 @@ impl Recovery {
         ensure_private_dir(&home.join(".aperture/run/hub-tokens")).unwrap();
         r
     }
+    fn write_expired_admission(f: &Fixture, old: u64, now: i64) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = Self::runtime_dir(old);
+        f.write(&format!("{dir}/admitted.json"), &serde_json::json!({"schema_version":1,"attempt_id":id,"team":Self::TEAM,"seat":Self::SEAT,"old_generation":old,"admitted_at_ms":now-300_000-(old as i64)*100_000,"native_budget_ms":170000,"cleanup_reserve_ms":40000}));
+        f.write(&format!("{dir}/effects.json"), &serde_json::json!({"schema_version":1,"attempt_id":id,"kind":"effects_may_have_occurred"}));
+        f.write(&format!("{dir}/terminal.json"), &serde_json::json!({"schema_version":1,"attempt_id":id,"kind":"unknown"}));
+    }
+    fn attempt_at(g: u64, raw_sha: &str, created_at_ms: i64) -> crate::team_claude_launch::ClaudeAttempt {
+        crate::team_claude_launch::ClaudeAttempt {
+            schema_version: 1, team: Self::TEAM.into(), seat: Self::SEAT.into(), generation: g,
+            reservation_nonce_sha256: "c".repeat(64), snapshot_sha256: raw_sha.into(), team_generation: 1,
+            token_id: Self::token_at(g), root_pid: Self::pid_at(g), root_start_time_us: 42,
+            session_id: uuid::Uuid::new_v4().to_string(), requested_model: crate::team_claude_launch::MODEL.into(),
+            created_at_ms, mode: crate::team_claude_launch::ClaudeLaunchMode::NormalPositional,
+        }
+    }
+    fn launch_value(&self, attempt: &crate::team_claude_launch::ClaudeAttempt) -> serde_json::Value {
+        serde_json::json!({"schema_version":1,"team":Self::TEAM,"seat":Self::SEAT,"generation":attempt.generation,"session_id":attempt.session_id,
+            "token_id":attempt.token_id,"snapshot_sha256":self.typed_sha,"mode":"normal_positional","args":["--model",crate::team_claude_launch::MODEL]})
+    }
+    fn release_value(attempt: &crate::team_claude_launch::ClaudeAttempt) -> serde_json::Value {
+        serde_json::json!({"schema_version":1,"attempt_sha256":smoke_hash(attempt).unwrap(),"launch_sha256":"d".repeat(64),"root_pid":attempt.root_pid,"root_start_time_us":attempt.root_start_time_us})
+    }
     fn home(&self) -> std::path::PathBuf { self.f.0.clone() }
     fn owner_value(&self) -> serde_json::Value {
-        serde_json::json!({"schema_version":1,"seat":Self::SEAT,"generation":1,"state":"quarantined",
-            "reservation_nonce_sha256":null,"provisional_token_id":Self::token(),
+        serde_json::json!({"schema_version":1,"seat":Self::SEAT,"generation":self.generation,"state":"quarantined",
+            "reservation_nonce_sha256":null,"provisional_token_id":self.token(),
             "requested":{"harness":"claude","model":crate::team_claude_launch::MODEL,"reasoning":null},
-            "incarnation":{"pid":900001,"start_time":42,"thread_id":"","token_id":Self::token(),"harness":"claude","model":crate::team_claude_launch::MODEL,"reasoning":null,"observed":false,
-                "processes":[{"pid":900001,"start_time":42,"ppid":1,"pgid":900001,"cmdline_sha256":"b".repeat(64),"cwd":"/fixture"}]},
+            "incarnation":{"pid":self.pid(),"start_time":42,"thread_id":"","token_id":self.token(),"harness":"claude","model":crate::team_claude_launch::MODEL,"reasoning":null,"observed":false,
+                "processes":[{"pid":self.pid(),"start_time":42,"ppid":1,"pgid":self.pid(),"cmdline_sha256":"e".repeat(64),"cwd":"/fixture"}]},
             "since":"2026-09-24T00:00:00Z","writer":"launcher"})
     }
     fn owner(&self, mutate: impl Fn(&mut serde_json::Value)) {
@@ -393,254 +439,373 @@ impl Recovery {
     }
     fn attempt_file(&self, mutate: impl Fn(&mut serde_json::Value)) {
         let mut v = serde_json::to_value(&self.attempt).unwrap(); mutate(&mut v);
-        self.f.write(".aperture/run/t1-qa.g1.claude-attempt.json", &v);
+        self.f.write(&Self::attempt_path(self.generation), &v);
     }
     fn launch(&self, mutate: impl Fn(&mut serde_json::Value)) {
-        let mut v = serde_json::json!({"schema_version":1,"team":Self::TEAM,"seat":Self::SEAT,"generation":1,"session_id":self.attempt.session_id,
-            "token_id":Self::token(),"snapshot_sha256":self.typed_sha,"mode":"normal_positional","args":["--model",crate::team_claude_launch::MODEL]});
+        let mut v = self.launch_value(&self.attempt);
         mutate(&mut v);
-        self.f.write(".aperture/run/managed/t1-qa/g1/claude-launch.json", &v);
+        self.f.write(&format!("{}/claude-launch.json", Self::managed_dir(self.generation)), &v);
     }
     fn release(&self, mutate: impl Fn(&mut serde_json::Value)) {
-        let mut v = serde_json::json!({"schema_version":1,"attempt_sha256":smoke_hash(&self.attempt).unwrap(),"launch_sha256":"d".repeat(64),"root_pid":900001,"root_start_time_us":42});
+        let mut v = Self::release_value(&self.attempt);
         mutate(&mut v);
-        self.f.write(".aperture/run/managed/t1-qa/g1/claude-release.json", &v);
+        self.f.write(&format!("{}/claude-release.json", Self::managed_dir(self.generation)), &v);
     }
+    /// Floor exactly at the recovered generation; every incarnation token so
+    /// far is listed (sorted), as the hub leaves it after each revocation.
     fn revocations(&self, mutate: impl Fn(&mut serde_json::Value)) {
-        let mut v = serde_json::json!({"schema_version":1,"seat":Self::SEAT,"revoked_through_generation":1,"revoked_token_ids":[Self::token()]});
+        let tokens: Vec<String> = (1..=self.generation).map(Self::token_at).collect();
+        let mut v = serde_json::json!({"schema_version":1,"seat":Self::SEAT,"revoked_through_generation":self.generation,"revoked_token_ids":tokens});
         mutate(&mut v);
         self.f.write(".aperture/run/revocations/t1-qa.json", &v);
     }
     fn owner_record(&self) -> OwnerRecord { read_private_json(&self.home().join(".aperture/run/owner/t1-qa.json")).unwrap() }
     fn proof(&self) -> Result<(String, String), ReplacementError> {
-        RecoveryAdmission::proof_locked(&self.home(), Self::TEAM, Self::SEAT, &self.owner_record(), RecoveryPhase::PreAdmission)
+        self.proof_as(self.generation)
+    }
+    fn proof_as(&self, generation: u64) -> Result<(String, String), ReplacementError> {
+        RecoveryAdmission::proof_locked(&self.home(), Self::TEAM, Self::SEAT, &self.owner_record(), generation, RecoveryPhase::PreAdmission)
     }
     fn tuple() -> ExecutionTuple {
         ExecutionTuple { harness: Harness::Claude, model: crate::team_claude_launch::MODEL.into(), reasoning: None }
     }
     fn file_bytes(&self, relative: &str) -> Vec<u8> { std::fs::read(self.home().join(relative)).unwrap() }
-    fn g0_bytes(&self) -> Vec<Vec<u8>> {
-        ["admitted", "effects", "terminal"].iter()
-            .map(|n| std::fs::read(self.home().join(format!(".aperture/teams/t1/runtime-attempts/t1-qa/g0/{n}.json"))).unwrap())
-            .collect()
+    /// Every fact older than the recovered generation, in a fixed order: each
+    /// expired bootstrap admission and each earlier generation's normal records.
+    fn history_bytes(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for old in 0..self.generation {
+            for n in ["admitted", "effects", "terminal"] { out.push(self.file_bytes(&format!("{}/{n}.json", Self::runtime_dir(old)))); }
+        }
+        for g in 1..self.generation {
+            out.push(self.file_bytes(&Self::attempt_path(g)));
+            for n in ["claude-launch", "claude-release"] { out.push(self.file_bytes(&format!("{}/{n}.json", Self::managed_dir(g)))); }
+        }
+        out
+    }
+    /// The recovered generation's own records; recovery only adds the next
+    /// generation and never rewrites these.
+    fn current_bytes(&self) -> Vec<Vec<u8>> {
+        let mut out = vec![self.file_bytes(&Self::attempt_path(self.generation))];
+        for n in ["claude-launch", "claude-release"] { out.push(self.file_bytes(&format!("{}/{n}.json", Self::managed_dir(self.generation)))); }
+        out
     }
 }
 
 #[test]
-fn recovery_proof_accepts_only_the_factual_quarantined_first_claude_bootstrap() {
-    let r = Recovery::new();
-    let (typed, token) = r.proof().unwrap();
-    assert_eq!((typed, token), (r.typed_sha.clone(), Recovery::token()));
-    // Retained provisional equal to the incarnation token is the factual case;
-    // None is also accepted; anything else is not the proved incarnation.
-    r.owner(|o| o["provisional_token_id"] = serde_json::Value::Null);
-    assert!(r.proof().is_ok());
-    r.owner(|o| o["provisional_token_id"] = serde_json::json!("f".repeat(64)));
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch);
-    let owner_cases: [(&str, fn(&mut serde_json::Value)); 8] = [
-        ("active owner", |o| o["state"] = "active".into()),
-        ("starting owner", |o| o["state"] = "starting".into()),
-        ("generation 2", |o| o["generation"] = 2.into()),
-        ("observed", |o| o["incarnation"]["observed"] = true.into()),
-        ("thread bound", |o| o["incarnation"]["thread_id"] = uuid::Uuid::new_v4().to_string().into()),
-        ("nonce present", |o| o["reservation_nonce_sha256"] = "e".repeat(64).into()),
-        ("no recorded processes", |o| o["incarnation"]["processes"] = serde_json::json!([])),
-        ("root not recorded", |o| o["incarnation"]["processes"][0]["pid"] = 900002.into()),
-    ];
-    for (name, mutate) in owner_cases {
-        r.owner(mutate);
-        assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch, "{name}");
+fn recovery_proof_accepts_only_the_factual_quarantined_claude_bootstrap_at_g1_or_g2() {
+    for generation in [1u64, 2] {
+        let r = Recovery::at(generation);
+        let next = generation + 1;
+        let other = if generation == 1 { 2 } else { 1 };
+        let (typed, token) = r.proof().unwrap();
+        assert_eq!((typed, token), (r.typed_sha.clone(), r.token()), "g{generation}");
+        // The proof is for exactly the selected generation: the same owner never
+        // proves under another selector, and 0 or 3+ are refused before any read.
+        for wrong in [0, other, 3, 4] {
+            assert_eq!(r.proof_as(wrong).unwrap_err(), ReplacementError::GenerationMismatch, "g{generation} as {wrong}");
+        }
+        // Retained provisional equal to the incarnation token is the factual case;
+        // None is also accepted; anything else is not the proved incarnation.
+        r.owner(|o| o["provisional_token_id"] = serde_json::Value::Null);
+        assert!(r.proof().is_ok());
+        r.owner(|o| o["provisional_token_id"] = serde_json::json!("f".repeat(64)));
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch);
+        r.owner(|o| o["generation"] = other.into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch, "owner at the other generation");
+        let owner_cases: [(&str, fn(&mut serde_json::Value)); 7] = [
+            ("active owner", |o| o["state"] = "active".into()),
+            ("starting owner", |o| o["state"] = "starting".into()),
+            ("observed", |o| o["incarnation"]["observed"] = true.into()),
+            ("thread bound", |o| o["incarnation"]["thread_id"] = uuid::Uuid::new_v4().to_string().into()),
+            ("nonce present", |o| o["reservation_nonce_sha256"] = "e".repeat(64).into()),
+            ("no recorded processes", |o| o["incarnation"]["processes"] = serde_json::json!([])),
+            ("root not recorded", |o| o["incarnation"]["processes"][0]["pid"] = 900_009.into()),
+        ];
+        for (name, mutate) in owner_cases {
+            r.owner(mutate);
+            assert_eq!(r.proof().unwrap_err(), ReplacementError::GenerationMismatch, "g{generation} {name}");
+        }
+        // A recorded process that is not Gone (this test process, wrong birth) stops.
+        let pid = std::process::id();
+        r.owner(|o| {
+            o["incarnation"]["pid"] = pid.into();
+            o["incarnation"]["processes"][0]["pid"] = pid.into();
+        });
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::StopUnverified);
+        r.owner(|_| {});
+        assert!(r.proof().is_ok());
+        // Token/floor: the floor is exactly this generation and lists this
+        // incarnation's token; a stale floor (the previous generation's) or a
+        // list without this token proves nothing.
+        write_private_bytes_atomic(&r.home().join(".aperture/run/hub-tokens/t1-qa.token"), b"x", true).unwrap();
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
+        std::fs::remove_file(r.home().join(".aperture/run/hub-tokens/t1-qa.token")).unwrap();
+        r.revocations(|v| v["revoked_through_generation"] = next.into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified, "floor already past g{generation}");
+        r.revocations(|v| v["revoked_through_generation"] = (generation - 1).into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified, "floor still at g{}", generation - 1);
+        r.revocations(|v| v["revoked_token_ids"] = serde_json::json!(["9".repeat(64)]));
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
+        if generation == 2 {
+            r.revocations(|v| v["revoked_token_ids"] = serde_json::json!([Recovery::token_at(1)]));
+            assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified, "only the g1 token revoked");
+        }
+        r.revocations(|_| {});
+        // The previous bootstrap admission (g0, or the g1 recovery admission for
+        // g2) must be an expired normal bootstrap with an Unknown terminal, never
+        // reconciled.
+        let prev = Recovery::runtime_dir(generation - 1);
+        let prev_admitted: serde_json::Value = read_private_json(&r.home().join(format!("{prev}/admitted.json"))).unwrap();
+        r.f.write(&format!("{prev}/terminal.json"), &serde_json::json!({"schema_version":1,"attempt_id":"x","kind":"active"}));
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
+        r.f.write(&format!("{prev}/terminal.json"), &serde_json::json!({"schema_version":1,"attempt_id":prev_admitted["attempt_id"],"kind":"unknown"}));
+        assert!(r.proof().is_ok());
+        r.f.write(&format!("{prev}/reconciled.json"), &serde_json::json!({"schema_version":1,"attempt_id":prev_admitted["attempt_id"],"kind":"stopped_reconciled"}));
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
+        std::fs::remove_file(r.home().join(format!("{prev}/reconciled.json"))).unwrap();
+        if generation == 2 {
+            // A g2 recovery judges the g1 admission it follows; a missing g1
+            // admission (as if no recovery had ever run) is not the g2 failure.
+            let g1 = r.home().join(Recovery::runtime_dir(1));
+            let keep = r.file_bytes(&format!("{}/admitted.json", Recovery::runtime_dir(1)));
+            std::fs::remove_file(g1.join("admitted.json")).unwrap();
+            assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "no g1 admission behind a g2 owner");
+            write_private_bytes_atomic(&g1.join("admitted.json"), &keep, true).unwrap();
+            assert!(r.proof().is_ok());
+        }
+        // Category comes from BOTH records being normal_positional and bound to this owner.
+        r.attempt_file(|a| { a.as_object_mut().unwrap().remove("mode"); });
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "diagnostic attempt");
+        r.attempt_file(|a| a["token_id"] = "9".repeat(64).into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt of another token");
+        r.attempt_file(|a| a["generation"] = other.into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt of another generation");
+        r.attempt_file(|a| a["snapshot_sha256"] = r.typed_sha.clone().into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt binds the raw snapshot digest");
+        r.attempt_file(|_| {});
+        r.launch(|l| { l.as_object_mut().unwrap().remove("mode"); });
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "diagnostic launch record");
+        r.launch(|l| l["session_id"] = uuid::Uuid::new_v4().to_string().into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "launch of another session");
+        r.launch(|l| l["snapshot_sha256"] = r.raw_sha.clone().into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "launch binds the typed snapshot digest");
+        r.launch(|_| {});
+        r.release(|v| v["attempt_sha256"] = "9".repeat(64).into());
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "release of another attempt");
+        r.release(|_| {});
+        assert!(r.proof().is_ok());
+        // Unobserved means no sample and no proven rejection; one admission means
+        // nothing of the next generation and no same-generation runtime-attempt.
+        for (path, is_dir) in [
+            (format!(".aperture/run/t1-qa.g{generation}.claude-observation.json"), false),
+            (format!(".aperture/run/t1-qa.g{generation}.claude-rejected.json"), false),
+            (Recovery::attempt_path(next), false),
+            (Recovery::managed_dir(next), true),
+            (Recovery::runtime_dir(generation), true),
+        ] {
+            let p = r.home().join(&path);
+            if is_dir { ensure_private_dir(&p).unwrap(); } else { r.f.write(&path, &serde_json::json!({})); }
+            assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "{path}");
+            if is_dir { std::fs::remove_dir_all(&p).unwrap(); } else { std::fs::remove_file(&p).unwrap(); }
+        }
+        assert!(r.proof().is_ok());
+        // The tuple never decides the category, but recovery closes a Claude
+        // bootstrap only: the same sealed snapshot with a coherent Codex seat is not
+        // launchable here (a non-catalog literal is already rejected at parse time).
+        let mut snapshot: serde_json::Value = read_private_json(&r.home().join(".aperture/teams/t1/team.json")).unwrap();
+        snapshot["seats"][0]["harness"] = "codex".into();
+        snapshot["seats"][0]["model"] = "gpt-6-astra".into();
+        snapshot["seats"][0]["reasoning"] = "high".into();
+        r.f.write(".aperture/teams/t1/team.json", &snapshot);
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::LaunchUnavailable);
+        snapshot["seats"][0]["harness"] = "claude".into();
+        snapshot["seats"][0]["model"] = "claude-opus-5-5".into();
+        snapshot["seats"][0]["reasoning"] = serde_json::Value::Null;
+        r.f.write(".aperture/teams/t1/team.json", &snapshot);
+        assert!(r.proof().is_err(), "non-admitted literal never proves");
     }
-    // A recorded process that is not Gone (this test process, wrong birth) stops.
-    let pid = std::process::id();
-    r.owner(|o| {
-        o["incarnation"]["pid"] = pid.into();
-        o["incarnation"]["processes"][0]["pid"] = pid.into();
-    });
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::StopUnverified);
-    r.owner(|_| {});
-    assert!(r.proof().is_ok());
-    // Token/floor.
-    write_private_bytes_atomic(&r.home().join(".aperture/run/hub-tokens/t1-qa.token"), b"x", true).unwrap();
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
-    std::fs::remove_file(r.home().join(".aperture/run/hub-tokens/t1-qa.token")).unwrap();
-    r.revocations(|v| v["revoked_through_generation"] = 2.into());
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
-    r.revocations(|v| v["revoked_token_ids"] = serde_json::json!(["9".repeat(64)]));
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::RevocationUnverified);
-    r.revocations(|_| {});
-    // g0 must be an expired normal bootstrap with an Unknown terminal, never reconciled.
-    r.f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/terminal.json", &serde_json::json!({"schema_version":1,"attempt_id":"x","kind":"active"}));
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
-    let g0: serde_json::Value = read_private_json(&r.home().join(".aperture/teams/t1/runtime-attempts/t1-qa/g0/admitted.json")).unwrap();
-    r.f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/terminal.json", &serde_json::json!({"schema_version":1,"attempt_id":g0["attempt_id"],"kind":"unknown"}));
-    assert!(r.proof().is_ok());
-    r.f.write(".aperture/teams/t1/runtime-attempts/t1-qa/g0/reconciled.json", &serde_json::json!({"schema_version":1,"attempt_id":g0["attempt_id"],"kind":"stopped_reconciled"}));
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
-    std::fs::remove_file(r.home().join(".aperture/teams/t1/runtime-attempts/t1-qa/g0/reconciled.json")).unwrap();
-    // Category comes from BOTH records being normal_positional and bound to this owner.
-    r.attempt_file(|a| { a.as_object_mut().unwrap().remove("mode"); });
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "diagnostic attempt");
-    r.attempt_file(|a| a["token_id"] = "9".repeat(64).into());
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt of another token");
-    r.attempt_file(|a| a["snapshot_sha256"] = r.typed_sha.clone().into());
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "attempt binds the raw snapshot digest");
-    r.attempt_file(|_| {});
-    r.launch(|l| { l.as_object_mut().unwrap().remove("mode"); });
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "diagnostic launch record");
-    r.launch(|l| l["session_id"] = uuid::Uuid::new_v4().to_string().into());
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "launch of another session");
-    r.launch(|l| l["snapshot_sha256"] = r.raw_sha.clone().into());
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "launch binds the typed snapshot digest");
-    r.launch(|_| {});
-    r.release(|v| v["attempt_sha256"] = "9".repeat(64).into());
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "release of another attempt");
-    r.release(|_| {});
-    assert!(r.proof().is_ok());
-    // Unobserved means no sample and no proven rejection; one admission means no g2 and no attempt g1.
-    for (path, is_dir) in [
-        (".aperture/run/t1-qa.g1.claude-observation.json", false),
-        (".aperture/run/t1-qa.g1.claude-rejected.json", false),
-        (".aperture/run/t1-qa.g2.claude-attempt.json", false),
-        (".aperture/run/managed/t1-qa/g2", true),
-        (".aperture/teams/t1/runtime-attempts/t1-qa/g1", true),
-    ] {
-        let p = r.home().join(path);
-        if is_dir { ensure_private_dir(&p).unwrap(); } else { r.f.write(path, &serde_json::json!({})); }
-        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown, "{path}");
-        if is_dir { std::fs::remove_dir_all(&p).unwrap(); } else { std::fs::remove_file(&p).unwrap(); }
-    }
-    assert!(r.proof().is_ok());
-    // The tuple never decides the category, but recovery closes a Claude first
-    // bootstrap only: the same sealed snapshot with a coherent Codex seat is not
-    // launchable here (a non-catalog literal is already rejected at parse time).
-    let mut snapshot: serde_json::Value = read_private_json(&r.home().join(".aperture/teams/t1/team.json")).unwrap();
-    snapshot["seats"][0]["harness"] = "codex".into();
-    snapshot["seats"][0]["model"] = "gpt-6-astra".into();
-    snapshot["seats"][0]["reasoning"] = "high".into();
-    r.f.write(".aperture/teams/t1/team.json", &snapshot);
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::LaunchUnavailable);
-    snapshot["seats"][0]["harness"] = "claude".into();
-    snapshot["seats"][0]["model"] = "claude-opus-5-5".into();
-    snapshot["seats"][0]["reasoning"] = serde_json::Value::Null;
-    r.f.write(".aperture/teams/t1/team.json", &snapshot);
-    assert!(r.proof().is_err(), "non-admitted literal never proves");
 }
 
 #[test]
-fn recovery_deadline_admission_writes_only_runtime_attempt_g1_and_refuses_a_second() {
-    let r = Recovery::new();
-    let before = r.g0_bytes();
-    let launcher = AuthenticatedActor::launcher();
-    // The ordinary first-start admission never accepts the quarantined owner.
-    assert_eq!(
-        deadline::RuntimeAttempt::begin_bootstrap(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
-        ReplacementError::GenerationMismatch
-    );
-    let attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).unwrap();
-    let g1 = r.home().join(".aperture/teams/t1/runtime-attempts/t1-qa/g1");
-    let admitted: serde_json::Value = read_private_json(&g1.join("admitted.json")).unwrap();
-    assert_eq!(admitted["old_generation"], 1);
-    assert_eq!(admitted["seat"], "t1-qa");
-    assert_eq!(r.g0_bytes(), before, "g0 facts are never rewritten");
-    assert!(!g1.join("effects.json").exists());
-    drop(attempt);
-    // One admission only: the existing g1 refuses, and so does the proof afterwards.
-    assert_eq!(
-        deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
-        ReplacementError::OutcomeUnknown
-    );
-    assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
-    assert_eq!(r.g0_bytes(), before);
-    // The deadline arm also rejects an observed or thread-bound quarantined owner.
-    std::fs::remove_dir_all(&g1).unwrap();
-    r.owner(|o| o["incarnation"]["observed"] = true.into());
-    assert_eq!(
-        deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
-        ReplacementError::GenerationMismatch
-    );
-    r.owner(|o| o["provisional_token_id"] = "f".repeat(64).into());
-    assert_eq!(
-        deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
-        ReplacementError::GenerationMismatch
-    );
-    assert!(!g1.exists());
+fn recovery_deadline_admission_writes_only_the_recovered_generation_and_refuses_a_second() {
+    for generation in [1u64, 2] {
+        let r = Recovery::at(generation);
+        let before = r.history_bytes();
+        let launcher = AuthenticatedActor::launcher();
+        // The ordinary first-start admission never accepts the quarantined owner,
+        // and the recovery admission takes exactly this owner's generation: not
+        // 0, not the other recoverable one, never 3.
+        assert_eq!(
+            deadline::RuntimeAttempt::begin_bootstrap(&r.home(), &launcher, "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
+            ReplacementError::GenerationMismatch
+        );
+        for wrong in [0, if generation == 1 { 2 } else { 1 }, 3] {
+            assert_eq!(
+                deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", wrong, deadline::Deadline::new()).err().unwrap(),
+                ReplacementError::GenerationMismatch, "g{generation} admission as {wrong}"
+            );
+            assert!(!r.home().join(Recovery::runtime_dir(wrong)).exists() || wrong < generation, "nothing written for {wrong}");
+        }
+        let attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", generation, deadline::Deadline::new()).unwrap();
+        let dir = r.home().join(Recovery::runtime_dir(generation));
+        let admitted: serde_json::Value = read_private_json(&dir.join("admitted.json")).unwrap();
+        assert_eq!(admitted["old_generation"], generation);
+        assert_eq!(admitted["seat"], "t1-qa");
+        assert_eq!(r.history_bytes(), before, "earlier facts are never rewritten");
+        assert!(!dir.join("effects.json").exists());
+        drop(attempt);
+        // One admission only: the existing directory refuses, and so does the proof afterwards.
+        assert_eq!(
+            deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", generation, deadline::Deadline::new()).err().unwrap(),
+            ReplacementError::OutcomeUnknown
+        );
+        assert_eq!(r.proof().unwrap_err(), ReplacementError::OutcomeUnknown);
+        assert_eq!(r.history_bytes(), before);
+        // The deadline arm also rejects an observed or thread-bound quarantined owner.
+        std::fs::remove_dir_all(&dir).unwrap();
+        r.owner(|o| o["incarnation"]["observed"] = true.into());
+        assert_eq!(
+            deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", generation, deadline::Deadline::new()).err().unwrap(),
+            ReplacementError::GenerationMismatch
+        );
+        r.owner(|o| o["provisional_token_id"] = "f".repeat(64).into());
+        assert_eq!(
+            deadline::RuntimeAttempt::begin_bootstrap_recovery(&r.home(), &launcher, "t1", "t1-qa", generation, deadline::Deadline::new()).err().unwrap(),
+            ReplacementError::GenerationMismatch
+        );
+        assert!(!dir.exists());
+    }
 }
 
-/// The production order with an inert fixture: locked issue (pre-admission
-/// proof), deadline admission + effects, pre-reserve proof against THAT
-/// attempt, bound g2 reserve. No launch, gate, token, provider or process.
+/// The production order with an inert fixture, for g1→g2 and g2→g3: locked
+/// issue (pre-admission proof), deadline admission + effects, pre-reserve proof
+/// against THAT attempt, bound reserve of exactly the next generation. No
+/// launch, gate, token, provider or process.
 #[test]
-fn recovery_production_order_reaches_a_bound_g2_reservation_and_only_once() {
-    let r = Recovery::new();
+fn recovery_production_order_reaches_a_bound_next_generation_reservation_and_only_once() {
+    for generation in [1u64, 2] {
+        let next = generation + 1;
+        let other = if generation == 1 { 2 } else { 1 };
+        let r = Recovery::at(generation);
+        let home = r.home();
+        let store = OwnerStore::new(home.join(".aperture/run/owner"));
+        let history = r.history_bytes();
+        let current = r.current_bytes();
+        // 0, 3 and above are never selectors (refused before any lock or read);
+        // the other recoverable generation is not this owner.
+        for wrong in [0, 3, 4, other] {
+            assert_eq!(RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", wrong, || Ok(())).err().unwrap(), ReplacementError::GenerationMismatch, "issue as {wrong}");
+        }
+        let admission = RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", generation, || Ok(())).unwrap();
+        assert_eq!((admission.snapshot_sha256.clone(), admission.token_id.clone()), (r.typed_sha.clone(), r.token()));
+        assert!(admission.attempt_id.is_none());
+        assert_eq!(admission.generation, generation);
+        admission.matches_target(&home, "t1", "t1-qa", generation).unwrap();
+        assert_eq!(admission.matches_target(&home, "t1", "t1-qa", other).unwrap_err(), ReplacementError::AuthorizationRequired);
+        assert_eq!(admission.matches_target(&home, "t1", "t1-qa", next).unwrap_err(), ReplacementError::AuthorizationRequired);
+        // An unbound admission never reserves.
+        assert_eq!(reserve_recovery(&store, &admission, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::OutcomeUnknown);
+        // Pre-admission phase under the same locks production takes.
+        {
+            let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), "t1").unwrap();
+            let _seat = store.lock("t1-qa").unwrap();
+            admission.reprove_locked(&store, RecoveryPhase::PreAdmission).unwrap();
+        }
+        let mut attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", generation, deadline::Deadline::new()).unwrap();
+        attempt.admit_effects().unwrap();
+        let dir = home.join(Recovery::runtime_dir(generation));
+        assert!(dir.join("admitted.json").exists() && dir.join("effects.json").exists() && !dir.join("terminal.json").exists());
+        // After the admission the pre-admission phase must refuse, and the
+        // pre-reserve phase accepts exactly this attempt.
+        assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreAdmission).unwrap_err(), ReplacementError::OutcomeUnknown);
+        let foreign = uuid::Uuid::new_v4().to_string();
+        assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: &foreign }).unwrap_err(), ReplacementError::OutcomeUnknown);
+        assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: "not-a-uuid" }).unwrap_err(), ReplacementError::OutcomeUnknown);
+        let bound = admission.bind_attempt(attempt.id());
+        bound.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: attempt.id() }).unwrap();
+        // The bound reserve, with the team lock held as in start_native.
+        let reservation = {
+            let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), "t1").unwrap();
+            reserve_recovery(&store, &bound, "t1-qa", &Recovery::tuple()).unwrap()
+        };
+        assert_eq!(reservation.generation, next);
+        let owner = store.read_owner("t1-qa").unwrap();
+        assert_eq!(owner.generation, next);
+        assert_eq!(owner.state, OwnerState::Starting);
+        assert!(owner.incarnation.is_none() && owner.provisional_token_id.is_none());
+        assert!(owner.reservation_nonce_sha256.is_some());
+        assert_eq!(owner.requested, Recovery::tuple());
+        // Every historical fact and the recovered generation's own records are
+        // intact; only the owner and the new runtime-attempt moved, and nothing
+        // of the next generation was fabricated.
+        assert_eq!(r.history_bytes(), history);
+        assert_eq!(r.current_bytes(), current);
+        assert!(!home.join(Recovery::attempt_path(next)).exists());
+        assert!(!home.join(Recovery::managed_dir(next)).exists());
+        // Once: the proof is pre-reserve only, the admission is one-shot, and a
+        // second reserve or admission never happens, at this generation, the
+        // other, or the freshly reserved one (Starting is not a recoverable failure).
+        assert_eq!(bound.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: attempt.id() }).unwrap_err(), ReplacementError::GenerationMismatch);
+        bound.revalidate_locked().unwrap();
+        assert_eq!(reserve_recovery(&store, &bound, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::GenerationMismatch);
+        for g in [generation, other, next] {
+            assert_eq!(
+                deadline::RuntimeAttempt::begin_bootstrap_recovery(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", g, deadline::Deadline::new()).err().unwrap(),
+                ReplacementError::GenerationMismatch, "replay admission as {g}"
+            );
+            assert_eq!(RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", g, || Ok(())).err().unwrap(), ReplacementError::GenerationMismatch, "replay issue as {g}");
+        }
+        // A finished attempt (terminal written) is never a pre-reserve match.
+        let r2 = Recovery::at(generation);
+        let home2 = r2.home();
+        let store2 = OwnerStore::new(home2.join(".aperture/run/owner"));
+        let admission2 = RecoveryAdmission::issue_checked(&home2, "t1", "t1-qa", generation, || Ok(())).unwrap();
+        let mut attempt2 = deadline::RuntimeAttempt::begin_bootstrap_recovery(&home2, &AuthenticatedActor::launcher(), "t1", "t1-qa", generation, deadline::Deadline::new()).unwrap();
+        attempt2.admit_effects().unwrap();
+        let bound2 = admission2.bind_attempt(attempt2.id());
+        bound2.reprove_locked(&store2, RecoveryPhase::PreReserve { attempt_id: attempt2.id() }).unwrap();
+        assert_eq!(attempt2.finish_unknown().unwrap_err(), ReplacementError::OutcomeUnknown);
+        assert_eq!(bound2.reprove_locked(&store2, RecoveryPhase::PreReserve { attempt_id: attempt2.id() }).unwrap_err(), ReplacementError::OutcomeUnknown);
+        assert_eq!(reserve_recovery(&store2, &bound2, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::OutcomeUnknown);
+        assert_eq!(store2.read_owner("t1-qa").unwrap().state, OwnerState::Quarantined);
+        assert_eq!(store2.read_owner("t1-qa").unwrap().generation, generation);
+    }
+}
+
+/// Nothing later than g2 is recoverable, and the historical smoke/reconcile
+/// reader stays g0-only even on a seat that carries g1 and g2 admissions.
+#[test]
+fn recovery_never_widens_past_g2_and_the_smoke_reconciler_stays_g0_only() {
+    let r = Recovery::at(2);
     let home = r.home();
-    let store = OwnerStore::new(home.join(".aperture/run/owner"));
-    let g0_before = r.g0_bytes();
-    let attempt_bytes = r.file_bytes(".aperture/run/t1-qa.g1.claude-attempt.json");
-    let launch_bytes = r.file_bytes(".aperture/run/managed/t1-qa/g1/claude-launch.json");
-    let admission = RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", || Ok(())).unwrap();
-    assert_eq!((admission.snapshot_sha256.clone(), admission.token_id.clone()), (r.typed_sha.clone(), Recovery::token()));
-    assert!(admission.attempt_id.is_none());
-    // An unbound admission never reserves.
-    assert_eq!(reserve_recovery(&store, &admission, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::OutcomeUnknown);
-    // Pre-admission phase under the same locks production takes.
-    {
-        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), "t1").unwrap();
-        let _seat = store.lock("t1-qa").unwrap();
-        admission.reprove_locked(&store, RecoveryPhase::PreAdmission).unwrap();
+    let before = r.history_bytes();
+    // The g0-only handle reads g0 on a g2 seat; the recovery's previous-admission
+    // proof accepts 0 or 1 and refuses 2+ before any read (no g2 admission exists
+    // here, and none would be consulted).
+    assert!(deadline::UnfinishedBootstrap::read_locked(&home, "t1", "t1-qa").is_ok());
+    deadline::expired_bootstrap_locked(&home, "t1", "t1-qa", 0).unwrap();
+    deadline::expired_bootstrap_locked(&home, "t1", "t1-qa", 1).unwrap();
+    for g in [2, 3] {
+        assert_eq!(deadline::expired_bootstrap_locked(&home, "t1", "t1-qa", g).unwrap_err(), ReplacementError::GenerationMismatch);
     }
-    let mut attempt = deadline::RuntimeAttempt::begin_bootstrap_recovery(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", deadline::Deadline::new()).unwrap();
-    attempt.admit_effects().unwrap();
-    let g1 = home.join(".aperture/teams/t1/runtime-attempts/t1-qa/g1");
-    assert!(g1.join("admitted.json").exists() && g1.join("effects.json").exists() && !g1.join("terminal.json").exists());
-    // The regression GLaDOS found: after the admission the pre-admission phase
-    // must refuse, and the pre-reserve phase accepts exactly this attempt.
-    assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreAdmission).unwrap_err(), ReplacementError::OutcomeUnknown);
-    let other = uuid::Uuid::new_v4().to_string();
-    assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: &other }).unwrap_err(), ReplacementError::OutcomeUnknown);
-    assert_eq!(admission.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: "not-a-uuid" }).unwrap_err(), ReplacementError::OutcomeUnknown);
-    let bound = admission.bind_attempt(attempt.id());
-    bound.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: attempt.id() }).unwrap();
-    // The bound reserve, with the team lock held as in start_native.
-    let reservation = {
-        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), "t1").unwrap();
-        reserve_recovery(&store, &bound, "t1-qa", &Recovery::tuple()).unwrap()
-    };
-    assert_eq!(reservation.generation, 2);
-    let owner = store.read_owner("t1-qa").unwrap();
-    assert_eq!(owner.generation, 2);
-    assert_eq!(owner.state, OwnerState::Starting);
-    assert!(owner.incarnation.is_none() && owner.provisional_token_id.is_none());
-    assert!(owner.reservation_nonce_sha256.is_some());
-    assert_eq!(owner.requested, Recovery::tuple());
-    // Every historical fact is intact; only the owner and the new g1 attempt moved.
-    assert_eq!(r.g0_bytes(), g0_before);
-    assert_eq!(r.file_bytes(".aperture/run/t1-qa.g1.claude-attempt.json"), attempt_bytes);
-    assert_eq!(r.file_bytes(".aperture/run/managed/t1-qa/g1/claude-launch.json"), launch_bytes);
-    assert!(!home.join(".aperture/run/t1-qa.g2.claude-attempt.json").exists());
-    // Once: the proof is pre-reserve only, the admission is one-shot, and a
-    // second reserve or admission never happens.
-    assert_eq!(bound.reprove_locked(&store, RecoveryPhase::PreReserve { attempt_id: attempt.id() }).unwrap_err(), ReplacementError::GenerationMismatch);
-    bound.revalidate_locked().unwrap();
-    assert_eq!(reserve_recovery(&store, &bound, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::GenerationMismatch);
-    assert_eq!(
-        deadline::RuntimeAttempt::begin_bootstrap_recovery(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", deadline::Deadline::new()).err().unwrap(),
-        ReplacementError::GenerationMismatch
-    );
-    assert_eq!(RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", || Ok(())).err().unwrap(), ReplacementError::GenerationMismatch);
-    // A finished attempt (terminal written) is never a pre-reserve match.
-    let r2 = Recovery::new();
-    let home2 = r2.home();
-    let store2 = OwnerStore::new(home2.join(".aperture/run/owner"));
-    let admission2 = RecoveryAdmission::issue_checked(&home2, "t1", "t1-qa", || Ok(())).unwrap();
-    let mut attempt2 = deadline::RuntimeAttempt::begin_bootstrap_recovery(&home2, &AuthenticatedActor::launcher(), "t1", "t1-qa", deadline::Deadline::new()).unwrap();
-    attempt2.admit_effects().unwrap();
-    let bound2 = admission2.bind_attempt(attempt2.id());
-    bound2.reprove_locked(&store2, RecoveryPhase::PreReserve { attempt_id: attempt2.id() }).unwrap();
-    assert_eq!(attempt2.finish_unknown().unwrap_err(), ReplacementError::OutcomeUnknown);
-    assert_eq!(bound2.reprove_locked(&store2, RecoveryPhase::PreReserve { attempt_id: attempt2.id() }).unwrap_err(), ReplacementError::OutcomeUnknown);
-    assert_eq!(reserve_recovery(&store2, &bound2, "t1-qa", &Recovery::tuple()).unwrap_err(), ReplacementError::OutcomeUnknown);
-    assert_eq!(store2.read_owner("t1-qa").unwrap().state, OwnerState::Quarantined);
+    let id = uuid::Uuid::new_v4().to_string();
+    for g in [0, 3] {
+        assert_eq!(deadline::recovery_attempt_open_locked(&home, "t1", "t1-qa", g, &id).unwrap_err(), ReplacementError::GenerationMismatch);
+    }
+    // A perfect g2 seat never proves as g3, issue refuses 3 before the owner is
+    // read, and the retired diagnostic reconcile never reaches a recovered
+    // generation. Nothing is written by any refusal.
+    assert_eq!(r.proof_as(3).unwrap_err(), ReplacementError::GenerationMismatch);
+    assert_eq!(RecoveryAdmission::issue_checked(&home, "t1", "t1-qa", 3, || Ok(())).err().unwrap(), ReplacementError::GenerationMismatch);
+    for g in [2, 3] {
+        assert!(reconcile_stopped_claude_smoke(&home, &AuthenticatedActor::launcher(), "t1", "t1-qa", g).is_err());
+    }
+    assert!(!home.join(Recovery::runtime_dir(2)).exists());
+    assert!(!home.join(Recovery::runtime_dir(3)).exists());
+    assert_eq!(r.history_bytes(), before);
+    assert_eq!(r.owner_record().generation, 2);
+    assert_eq!(r.owner_record().state, OwnerState::Quarantined);
 }
 
 fn claude_candidate_fixture(f: &Fixture) -> (OwnerStore, StartReservation, Incarnation) {
