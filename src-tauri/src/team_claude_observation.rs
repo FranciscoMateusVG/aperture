@@ -1252,6 +1252,47 @@ pub(crate) fn with_gated_attempt<T>(
     f: impl FnOnce(&ClaudeAttempt) -> Result<T, ClaudeError>,
 ) -> Result<T, ClaudeError> {
     let ctx = locked(home, team, seat, Some(generation))?;
+    with_locked_attempt(home, team, seat, generation, ctx, f)
+}
+
+/// Exec gate only: wait for contention inside its original deadline. Retry
+/// acquisition, never the callback (which can exec or publish an effect).
+pub(crate) fn with_gated_attempt_until<T>(
+    home: &Path,
+    team: &str,
+    seat: &str,
+    generation: u64,
+    until: std::time::Instant,
+    f: impl FnOnce(&ClaudeAttempt) -> Result<T, ClaudeError>,
+) -> Result<T, ClaudeError> {
+    let ctx = wait_for_gate_lock(until, || locked(home, team, seat, Some(generation)))?;
+    with_locked_attempt(home, team, seat, generation, ctx, f)
+}
+
+fn wait_for_gate_lock<T>(
+    until: std::time::Instant,
+    mut acquire: impl FnMut() -> Result<T, ClaudeError>,
+) -> Result<T, ClaudeError> {
+    loop {
+        if std::time::Instant::now() >= until { return Err(ClaudeError::Closed); }
+        match acquire() {
+            Err(ClaudeError::Busy) => {
+                std::thread::sleep(std::time::Duration::from_millis(20)
+                    .min(until.saturating_duration_since(std::time::Instant::now())));
+            }
+            Ok(ctx) => {
+                if std::time::Instant::now() >= until { return Err(ClaudeError::Closed); }
+                return Ok(ctx);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn with_locked_attempt<T>(
+    home: &Path, team: &str, seat: &str, generation: u64, ctx: Locked,
+    f: impl FnOnce(&ClaudeAttempt) -> Result<T, ClaudeError>,
+) -> Result<T, ClaudeError> {
     if ctx.owner.incarnation.as_ref().is_some_and(|c| c.observed) {
         return Err(ClaudeError::Closed);
     }
@@ -1265,4 +1306,74 @@ pub(crate) fn with_gated_attempt<T>(
     }
     current(home, team, &ctx, &team_process::state)?;
     f(&a)
+}
+
+#[cfg(test)]
+mod gate_lock_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn gate_waits_for_real_contention_and_calls_effect_once_after_acquisition() {
+        let root = std::env::temp_dir().join(format!("aperture-gate-lock-{}", uuid::Uuid::new_v4()));
+        let held = try_lock(&root, "t1").unwrap();
+        let (notify, receive) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(held);
+        });
+        let mut first_busy = Some(notify);
+        let mut acquisitions = 0;
+        let result = wait_for_gate_lock(Instant::now() + Duration::from_secs(2), || {
+            acquisitions += 1;
+            let result = try_lock(&root, "t1").map_err(observation_lock_error);
+            if matches!(result, Err(ClaudeError::Busy)) {
+                if let Some(notify) = first_busy.take() { notify.send(()).unwrap(); }
+            }
+            result
+        });
+        release.join().unwrap();
+        let mut effects = 0;
+        let outcome: Result<(), ClaudeError> = result.and_then(|_lock| {
+            effects += 1;
+            // Even a callback error named Busy cannot retry the effect.
+            Err(ClaudeError::Busy)
+        });
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(acquisitions >= 2);
+        assert_eq!(effects, 1);
+        assert_eq!(outcome, Err(ClaudeError::Busy));
+    }
+
+    #[test]
+    fn gate_contention_timeout_never_calls_effect_or_restarts_budget() {
+        let started = Instant::now();
+        let mut attempts = 0;
+        let mut effects = 0;
+        let result: Result<(), ClaudeError> = wait_for_gate_lock(started + Duration::from_millis(40), || {
+            attempts += 1;
+            Err(ClaudeError::Busy)
+        }).map(|_: ()| effects += 1);
+        assert_eq!(result, Err(ClaudeError::Closed));
+        assert!(attempts >= 1);
+        assert_eq!(effects, 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let expired: Result<(), ClaudeError> = wait_for_gate_lock(started, || panic!("expired gate acquired"));
+        assert_eq!(expired, Err(ClaudeError::Closed));
+    }
+
+    #[test]
+    fn gate_non_contention_errors_remain_terminal_without_retry() {
+        for error in [ClaudeError::Owner, ClaudeError::Unsafe, ClaudeError::Revoked,
+            ClaudeError::Process, ClaudeError::Missing, ClaudeError::Invalid,
+            ClaudeError::Closed, ClaudeError::PostInput, ClaudeError::Model, ClaudeError::Io] {
+            let mut calls = 0;
+            let result: Result<(), ClaudeError> = wait_for_gate_lock(Instant::now() + Duration::from_secs(1), || {
+                calls += 1;
+                Err(error)
+            });
+            assert_eq!(result, Err(error));
+            assert_eq!(calls, 1);
+        }
+    }
 }

@@ -1540,7 +1540,7 @@ pub(crate) fn gate_native(
     validate_record(home, &r, &budget)?;
     let release: GateRelease = read_private_json(&path).map_err(|_| ClaudeError::Unsafe)?;
     let mut cmd = gate_command(home, &r)?;
-    crate::team_claude_observation::with_gated_attempt(home, team, seat, generation, |a| {
+    crate::team_claude_observation::with_gated_attempt_until(home, team, seat, generation, until, |a| {
         validate_release(&r, a, &release, std::process::id())?;
         if Instant::now() > until {
             return Err(ClaudeError::Closed);
