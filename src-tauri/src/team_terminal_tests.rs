@@ -672,3 +672,314 @@ fn native_socket_peer_and_post_connect_drift_are_enforced() {
         .is_err()
     );
 }
+
+// Hermetic HOME + kernel Unix peer fixture; never the installed coordination
+// sockets or application servers. Synthetic metadata negatives use this same
+// filesystem capture/recheck implementation, not a caller-created proof.
+struct CoordinationFixture {
+    home: PathBuf,
+    _listener: std::os::unix::net::UnixListener,
+}
+impl CoordinationFixture {
+    fn new() -> Self {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let home = PathBuf::from(format!(
+            "/private/tmp/ac-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..10]
+        ));
+        for part in [
+            "",
+            ".aperture",
+            ".aperture/run",
+            ".claude",
+            ".claude/aperture",
+            ".claude/aperture/glados",
+        ] {
+            fs::create_dir(home.join(part)).unwrap();
+            fs::set_permissions(home.join(part), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for part in [".claude", ".claude/aperture/glados"] {
+            fs::set_permissions(home.join(part), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(
+            home.join(".claude/aperture/glados/manifest.json"),
+            br#"{"name":"GLaDOS","enabled":true,"role":"orchestrator"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(
+            home.join(".claude/aperture/glados/manifest.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let socket = home.join(".aperture/run/glados.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        Self {
+            home,
+            _listener: listener,
+        }
+    }
+    fn manifest(&self) -> PathBuf {
+        self.home.join(".claude/aperture/glados/manifest.json")
+    }
+    fn socket(&self) -> PathBuf {
+        self.home.join(".aperture/run/glados.sock")
+    }
+    fn capture(&self) -> Result<CoordinationPeer> {
+        capture_coordination_peer(
+            &self.home,
+            "glados",
+            &resolve_socket,
+            &peer_pid,
+            &team_process::observe,
+        )?
+        .ok_or(ERROR.into())
+    }
+}
+impl Drop for CoordinationFixture {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.home).unwrap();
+    }
+}
+#[test]
+#[cfg(target_os = "macos")]
+fn coordination_kernel_peer_is_bound_and_only_fixed_missing_sockets_skip() {
+    let f = CoordinationFixture::new();
+    let peers = capture_coordination_peers(&f.home).unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].seat, "glados");
+    assert_eq!(
+        peers[0].identity,
+        team_process::observe(std::process::id())
+            .unwrap()
+            .unwrap()
+            .identity
+    );
+    peers[0].recheck().unwrap();
+    assert!(capture_coordination_peer(
+        &f.home,
+        "someone",
+        &resolve_socket,
+        &peer_pid,
+        &team_process::observe
+    )
+    .is_err());
+    fs::remove_file(f.socket()).unwrap();
+    assert!(peers[0].recheck().is_err());
+    assert!(capture_coordination_peers(&f.home).unwrap().is_empty());
+    std::os::unix::fs::symlink("missing", f.socket()).unwrap();
+    assert!(
+        capture_coordination_peers(&f.home).is_err(),
+        "dangling socket is invalid, not absent"
+    );
+}
+#[test]
+fn coordination_manifest_and_team_fail_closed() {
+    for bytes in [
+        r#"{"name":"GLaDOS","enabled":false}"#,
+        r#"{"name":"other","enabled":true}"#,
+        r#"{"name":"GLaDOS"}"#,
+        "{broken",
+        r#"{"name":"GLaDOS","enabled":true,"enabled":false}"#,
+    ] {
+        let f = CoordinationFixture::new();
+        fs::write(f.manifest(), bytes).unwrap();
+        assert!(f.capture().is_err());
+    }
+    let f = CoordinationFixture::new();
+    fs::write(f.home.join(".claude/aperture/glados/TEAM"), b"").unwrap();
+    assert!(f.capture().is_err());
+    fs::remove_file(f.home.join(".claude/aperture/glados/TEAM")).unwrap();
+    std::os::unix::fs::symlink("missing", f.home.join(".claude/aperture/glados/TEAM")).unwrap();
+    assert!(f.capture().is_err());
+}
+#[test]
+fn coordination_manifest_pins_reject_links_writes_and_replacement() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for mutation in 0..5 {
+        let f = CoordinationFixture::new();
+        let proof = f.capture().unwrap();
+        match mutation {
+            0 => fs::set_permissions(f.manifest(), fs::Permissions::from_mode(0o666)).unwrap(),
+            1 => fs::hard_link(f.manifest(), f.home.join("alias")).unwrap(),
+            2 => {
+                fs::rename(f.manifest(), f.home.join("original")).unwrap();
+                symlink(f.home.join("original"), f.manifest()).unwrap();
+            }
+            3 => {
+                let bytes = fs::read(f.manifest()).unwrap();
+                fs::rename(f.manifest(), f.home.join("old")).unwrap();
+                fs::write(f.manifest(), bytes).unwrap();
+            }
+            _ => fs::write(
+                f.manifest(),
+                br#"{"name":"GLaDOS","enabled":true,"role":"changed"}"#,
+            )
+            .unwrap(),
+        }
+        assert!(proof.recheck().is_err(), "mutation {mutation}");
+    }
+}
+#[test]
+fn coordination_parent_chain_and_socket_mode_are_pinned() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for relative in [
+        ".aperture",
+        ".aperture/run",
+        ".claude/aperture",
+        ".claude/aperture/glados",
+    ] {
+        let f = CoordinationFixture::new();
+        let proof = f.capture().unwrap();
+        fs::set_permissions(f.home.join(relative), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(proof.recheck().is_err(), "{relative}");
+        assert!(f.capture().is_err());
+    }
+    let f = CoordinationFixture::new();
+    let proof = f.capture().unwrap();
+    fs::rename(
+        f.home.join(".aperture/run"),
+        f.home.join(".aperture/old-run"),
+    )
+    .unwrap();
+    symlink("old-run", f.home.join(".aperture/run")).unwrap();
+    assert!(proof.recheck().is_err());
+    assert!(f.capture().is_err());
+    let f = CoordinationFixture::new();
+    fs::set_permissions(f.socket(), fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(f.capture().is_err());
+}
+#[test]
+fn coordination_process_uid_birth_peer_and_midcapture_drift_deny() {
+    use std::cell::Cell;
+    let f = CoordinationFixture::new();
+    let proof = f.capture().unwrap();
+    let original = team_process::observe(std::process::id()).unwrap().unwrap();
+    for mutation in 0..5 {
+        let observe = |_: u32| {
+            let mut p = original.clone();
+            match mutation {
+                0 => p.uid += 1,
+                1 => p.identity.start_time.push('0'),
+                2 => return Ok(None),
+                3 => return Err(crate::team_replacement::ReplacementError::StopUnverified),
+                _ => p.identity.pid += 1,
+            }
+            Ok(Some(p))
+        };
+        assert!(proof
+            .recheck_with(&resolve_socket, &peer_pid, &observe)
+            .is_err());
+    }
+    let calls = Cell::new(0);
+    let peer = |_: &Path| {
+        calls.set(calls.get() + 1);
+        Ok(original.identity.pid + u32::from(calls.get() > 1))
+    };
+    assert!(capture_coordination_peer(
+        &f.home,
+        "glados",
+        &resolve_socket,
+        &peer,
+        &team_process::observe
+    )
+    .is_err());
+    let calls = Cell::new(0);
+    let observe = |_: u32| {
+        calls.set(calls.get() + 1);
+        let mut p = original.clone();
+        if calls.get() > 1 {
+            p.identity.start_time.push('0');
+        }
+        Ok(Some(p))
+    };
+    assert!(
+        capture_coordination_peer(&f.home, "glados", &resolve_socket, &peer_pid, &observe).is_err()
+    );
+}
+#[test]
+fn coordination_symlink_binding_reuses_native_shape_and_rechecks_target() {
+    use std::os::unix::fs::symlink;
+    let f = CoordinationFixture::new();
+    let daemon = SocketFixture::new();
+    fs::remove_file(f.socket()).unwrap();
+    symlink(&daemon.target, f.socket()).unwrap();
+    let resolve = |p: &Path| pin_socket(p, &daemon.daemon, unsafe { libc::geteuid() });
+    let proof = capture_coordination_peer(
+        &f.home,
+        "glados",
+        &resolve,
+        &peer_pid,
+        &team_process::observe,
+    )
+    .unwrap()
+    .unwrap();
+    proof
+        .recheck_with(&resolve, &peer_pid, &team_process::observe)
+        .unwrap();
+    fs::remove_file(f.socket()).unwrap();
+    symlink(daemon.daemon.join("b".repeat(64)), f.socket()).unwrap();
+    assert!(proof
+        .recheck_with(&resolve, &peer_pid, &team_process::observe)
+        .is_err());
+}
+
+#[test]
+fn coordination_native_manifest_symlink_is_allowed_and_pinned() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let f = CoordinationFixture::new();
+    let target = f.home.join("source-manifest.json");
+    fs::rename(f.manifest(), &target).unwrap();
+    symlink(&target, f.manifest()).unwrap();
+    let proof = f.capture().unwrap();
+    proof.recheck().unwrap();
+    // Case-fold only for the fixed native display name, not a caller selector.
+    fs::write(&target, br#"{"name":"glados","enabled":true}"#).unwrap();
+    assert!(
+        proof.recheck().is_err(),
+        "changed bytes deny even with valid semantic name"
+    );
+    let proof = f.capture().unwrap();
+    let other = f.home.join("other-manifest.json");
+    fs::write(&other, fs::read(&target).unwrap()).unwrap();
+    fs::remove_file(f.manifest()).unwrap();
+    symlink(&other, f.manifest()).unwrap();
+    assert!(
+        proof.recheck().is_err(),
+        "identical bytes at a different target deny"
+    );
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(f.capture().is_err());
+}
+#[test]
+fn coordination_manifest_link_chain_unsafe_parent_and_uid_deny() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let f = CoordinationFixture::new();
+    let dir = f.home.join("source");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let target = dir.join("manifest.json");
+    fs::rename(f.manifest(), &target).unwrap();
+    symlink(&target, f.manifest()).unwrap();
+    assert!(f.capture().is_ok());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(f.capture().is_err());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let real = dir.join("real.json");
+    fs::rename(&target, &real).unwrap();
+    symlink(&real, &target).unwrap();
+    assert!(f.capture().is_err(), "secondary symlink denied");
+    // A resolver with a foreign socket UID cannot pass canonical pinning.
+    assert!(pin_socket(&f.socket(), &dir, unsafe { libc::geteuid() } + 1).is_err());
+}
+
+#[test]
+fn coordination_recheck_rejects_team_marker_and_mutated_public_identity() {
+    let f = CoordinationFixture::new();
+    let mut proof = f.capture().unwrap();
+    proof.identity.start_time.push('0');
+    assert!(proof.recheck().is_err());
+    let proof = f.capture().unwrap();
+    fs::write(f.home.join(".claude/aperture/glados/TEAM"), b"unexpected").unwrap();
+    assert!(proof.recheck().is_err());
+}

@@ -206,6 +206,291 @@ fn verify_socket_with(
 fn verified_socket(socket: &Path, pid: u32) -> Result<SocketBinding> {
     verify_socket_with(socket, pid, resolve_socket, socket_peer)
 }
+// Coordination peers are observations, never signal authority. The collector
+// must prove disjoint closures independently. No caller-selected socket/seat,
+// no registry override from env, no RPC, and no creation of missing paths.
+pub(crate) struct CoordinationPeer {
+    pub(crate) seat: String,
+    pub(crate) identity: crate::team_replacement::ProcessIdentity,
+    home: PathBuf,
+    proof: CoordinationProof,
+}
+#[derive(PartialEq, Eq)]
+struct CoordinationProof {
+    pins: Vec<PathPin>,
+    manifest: ManifestBinding,
+    socket: SocketBinding,
+    identity: crate::team_replacement::ProcessIdentity,
+}
+impl CoordinationPeer {
+    pub(crate) fn recheck(&self) -> Result<()> {
+        self.recheck_with(&resolve_socket, &peer_pid, &team_process::observe)
+    }
+    fn recheck_with(
+        &self,
+        resolve: &impl Fn(&Path) -> Result<SocketBinding>,
+        peer: &impl Fn(&Path) -> Result<u32>,
+        observe: &impl Fn(
+            u32,
+        ) -> std::result::Result<
+            Option<team_process::ProcessMetadata>,
+            crate::team_replacement::ReplacementError,
+        >,
+    ) -> Result<()> {
+        let current = capture_coordination_peer(&self.home, &self.seat, resolve, peer, observe)?
+            .ok_or(ERROR)?;
+        if current.proof != self.proof || self.identity != self.proof.identity {
+            return Err(ERROR.into());
+        }
+        Ok(())
+    }
+}
+fn coordination_name(seat: &str) -> Result<&'static str> {
+    match seat {
+        "glados" => Ok("GLaDOS"),
+        "peppy" => Ok("Peppy"),
+        "wheatley" => Ok("Wheatley"),
+        _ => Err(ERROR.into()),
+    }
+}
+fn absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(_) => Err(ERROR.into()),
+    }
+}
+fn coordination_runtime_dirs(home: &Path) -> Result<Vec<PathPin>> {
+    use std::path::Component;
+    if !home.is_absolute() {
+        return Err(ERROR.into());
+    }
+    let uid = unsafe { libc::geteuid() };
+    let mut path = PathBuf::new();
+    let mut pins = vec![];
+    for component in home.components() {
+        if !matches!(component, Component::RootDir | Component::Normal(_)) {
+            return Err(ERROR.into());
+        }
+        path.push(component);
+        let pin = PathPin::read(&path)?;
+        if !pin.kind(libc::S_IFDIR)
+            || ![0, uid].contains(&pin.uid)
+            || pin.mode & 0o022 != 0 && !(pin.uid == 0 && pin.mode & 0o1777 == 0o1777)
+        {
+            return Err(ERROR.into());
+        }
+        pins.push(pin);
+    }
+    if pins.last().ok_or(ERROR)?.uid != uid {
+        return Err(ERROR.into());
+    }
+    for relative in [".aperture", ".aperture/run"] {
+        let pin = PathPin::read(&home.join(relative))?;
+        if !pin.kind(libc::S_IFDIR) || pin.uid != uid || pin.mode & 0o077 != 0 {
+            return Err(ERROR.into());
+        }
+        pins.push(pin);
+    }
+    Ok(pins)
+}
+fn coordination_registry_dirs(home: &Path, seat: &str) -> Result<Vec<PathPin>> {
+    coordination_name(seat)?;
+    let mut pins = vec![];
+    // .claude is a user config ancestor, like HOME; dedicated Aperture
+    // storage remains private. No permission changes or mkdir here.
+    for (relative, private) in [
+        (".claude".to_string(), false),
+        (".claude/aperture".into(), true),
+        (format!(".claude/aperture/{seat}"), false),
+    ] {
+        let pin = PathPin::read(&home.join(relative))?;
+        if !pin.kind(libc::S_IFDIR)
+            || pin.uid != unsafe { libc::geteuid() }
+            || pin.mode & if private { 0o077 } else { 0o022 } != 0
+        {
+            return Err(ERROR.into());
+        }
+        pins.push(pin);
+    }
+    Ok(pins)
+}
+#[derive(PartialEq, Eq)]
+struct ManifestBinding {
+    pins: Vec<PathPin>,
+    link: Option<(PathBuf, PathBuf)>,
+    sha256: String,
+}
+fn coordination_manifest(path: &Path, seat: &str) -> Result<ManifestBinding> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt, path::Component};
+    let entry = PathPin::read(path)?;
+    let uid = unsafe { libc::geteuid() };
+    if entry.uid != uid || entry.links != 1 {
+        return Err(ERROR.into());
+    }
+    let mut pins = vec![];
+    let (target, link) = if entry.kind(libc::S_IFLNK) {
+        let raw = fs::read_link(path).map_err(|_| ERROR)?;
+        let target = if raw.is_absolute() {
+            raw.clone()
+        } else {
+            path.parent().ok_or(ERROR)?.join(&raw)
+        };
+        // Pin each config ancestor instead of canonicalize/following an
+        // arbitrary link chain. Setup's manifest symlink is explicitly allowed;
+        // secondary links, traversal and writable ancestors are not.
+        let mut parent = PathBuf::new();
+        for component in target.parent().ok_or(ERROR)?.components() {
+            if !matches!(component, Component::RootDir | Component::Normal(_)) {
+                return Err(ERROR.into());
+            }
+            parent.push(component);
+            let pin = PathPin::read(&parent)?;
+            if !pin.kind(libc::S_IFDIR)
+                || ![0, uid].contains(&pin.uid)
+                || pin.mode & 0o022 != 0 && !(pin.uid == 0 && pin.mode & 0o1777 == 0o1777)
+            {
+                return Err(ERROR.into());
+            }
+            pins.push(pin);
+        }
+        pins.push(entry);
+        (target, Some((path.into(), raw)))
+    } else {
+        (path.into(), None)
+    };
+    let pin = PathPin::read(&target)?;
+    if !pin.kind(libc::S_IFREG) || pin.uid != uid || pin.links != 1 || pin.mode & 0o022 != 0 {
+        return Err(ERROR.into());
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&target)
+        .map_err(|_| ERROR)?;
+    let meta = file.metadata().map_err(|_| ERROR)?;
+    if meta.dev() != pin.dev
+        || meta.ino() != pin.ino
+        || meta.uid() != pin.uid
+        || meta.mode() != pin.mode
+        || meta.nlink() != 1
+        || meta.len() > 65536
+    {
+        return Err(ERROR.into());
+    }
+    let mut bytes = vec![];
+    file.take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ERROR)?;
+    if bytes.len() > 65536 {
+        return Err(ERROR.into());
+    }
+    #[derive(Deserialize)]
+    struct Manifest {
+        name: String,
+        enabled: bool,
+    }
+    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
+    if !manifest.enabled || !manifest.name.eq_ignore_ascii_case(coordination_name(seat)?) {
+        return Err(ERROR.into());
+    }
+    pins.push(pin);
+    for pin in &pins {
+        pin.recheck()?;
+    }
+    if let Some((path, raw)) = &link {
+        if fs::read_link(path).map_err(|_| ERROR)? != *raw {
+            return Err(ERROR.into());
+        }
+    }
+    Ok(ManifestBinding {
+        pins,
+        link,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    })
+}
+fn capture_coordination_peer(
+    home: &Path,
+    seat: &str,
+    resolve: &impl Fn(&Path) -> Result<SocketBinding>,
+    peer: &impl Fn(&Path) -> Result<u32>,
+    observe: &impl Fn(
+        u32,
+    ) -> std::result::Result<
+        Option<team_process::ProcessMetadata>,
+        crate::team_replacement::ReplacementError,
+    >,
+) -> Result<Option<CoordinationPeer>> {
+    coordination_name(seat)?;
+    // Validate run before skipping a missing endpoint; a missing/unsafe parent
+    // is not proof of absence. Other registry paths are required for a peer.
+    let run = home.join(".aperture/run");
+    let socket_path = run.join(format!("{seat}.sock"));
+    // RO equivalent of private_chain; that helper may mkdir a missing root.
+    let mut pins = coordination_runtime_dirs(home)?;
+    if absent(&socket_path)? {
+        return Ok(None);
+    }
+    pins.extend(coordination_registry_dirs(home, seat)?);
+    let uid = unsafe { libc::geteuid() };
+    let agent = home.join(".claude/aperture").join(seat);
+    if !absent(&agent.join("TEAM"))? {
+        return Err(ERROR.into());
+    }
+    let manifest = agent.join("manifest.json");
+    let manifest_binding = coordination_manifest(&manifest, seat)?;
+    let socket = resolve(&socket_path)?;
+    let pid = peer(&socket.path)?;
+    let before = observe(pid).map_err(|_| ERROR)?.ok_or(ERROR)?;
+    if pid <= 1 || before.identity.pid != pid || before.uid != uid {
+        return Err(ERROR.into());
+    }
+    if peer(&socket.path)? != pid {
+        return Err(ERROR.into());
+    }
+    let after = observe(pid).map_err(|_| ERROR)?.ok_or(ERROR)?;
+    if before.identity != after.identity || after.uid != uid {
+        return Err(ERROR.into());
+    }
+    if resolve(&socket_path)? != socket
+        || !absent(&agent.join("TEAM"))?
+        || coordination_manifest(&manifest, seat)? != manifest_binding
+    {
+        return Err(ERROR.into());
+    }
+    for pin in &pins {
+        pin.recheck()?;
+    }
+    Ok(Some(CoordinationPeer {
+        seat: seat.into(),
+        identity: before.identity.clone(),
+        home: home.into(),
+        proof: CoordinationProof {
+            pins,
+            manifest: manifest_binding,
+            socket,
+            identity: before.identity,
+        },
+    }))
+}
+pub(crate) fn capture_coordination_peers(home: &Path) -> Result<Vec<CoordinationPeer>> {
+    let mut peers = vec![];
+    for seat in ["glados", "peppy", "wheatley"] {
+        if let Some(peer) = capture_coordination_peer(
+            home,
+            seat,
+            &resolve_socket,
+            &peer_pid,
+            &team_process::observe,
+        )? {
+            peers.push(peer);
+        }
+    }
+    for peer in &peers {
+        peer.recheck()?;
+    }
+    Ok(peers)
+}
 fn selectors(input: &OpenSeatInput) -> Result<()> {
     if input.team.len() > 16
         || !crate::agent_loader::is_valid_seat_name(&input.team)
@@ -320,7 +605,7 @@ fn live(pid: u32, birth: u64) -> Result<()> {
 /// Check the kernel's peer PID, not just the socket pathname. No RPC or prompt.
 /// Nonblocking connect/poll is bounded even if the listener is saturated.
 #[cfg(target_os = "macos")]
-fn socket_peer(path: &Path, expected_pid: u32) -> Result<()> {
+fn peer_pid(path: &Path) -> Result<u32> {
     use std::os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
@@ -394,15 +679,20 @@ fn socket_peer(path: &Path, expected_pid: u32) -> Result<()> {
     } != 0
         || len as usize != std::mem::size_of_val(&peer)
         || peer <= 1
-        || peer as u32 != expected_pid
     {
         return Err(ERROR.into());
     }
-    Ok(())
+    Ok(peer as u32)
 }
 #[cfg(not(target_os = "macos"))]
-fn socket_peer(_: &Path, _: u32) -> Result<()> {
+fn peer_pid(_: &Path) -> Result<u32> {
     Err(ERROR.into())
+}
+fn socket_peer(path: &Path, expected_pid: u32) -> Result<()> {
+    if peer_pid(path)? != expected_pid {
+        return Err(ERROR.into());
+    }
+    Ok(())
 }
 fn binding(home: &Path, input: &OpenSeatInput, store: &OwnerStore) -> Result<Binding> {
     match teams::classify_managed_seat(home, &input.seat).map_err(|_| ERROR)? {
