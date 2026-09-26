@@ -409,7 +409,7 @@ impl Drop for PeerFixture {
 impl PeerFixture {
     fn new() -> Self {
         let home =
-            std::env::temp_dir().join(format!("aperture-peer-process-{}", uuid::Uuid::new_v4()));
+            std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("aperture-peer-process-{}", uuid::Uuid::new_v4()));
         let mut target = owner();
         target.requested.reasoning = Some(crate::state::ReasoningEffort::High);
         target.incarnation.as_mut().unwrap().reasoning = target.requested.reasoning.clone();
