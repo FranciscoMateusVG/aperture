@@ -1869,6 +1869,36 @@ pub(crate) fn stop_for_retirement(
     Ok(recovery)
 }
 
+/// Reconcile a completed stop/revocation whose ordinary attempt ended UNKNOWN.
+/// Does not construct NativeRuntime or another attempt: no signal, revoke,
+/// replacement permit or restart is possible through this entrypoint.
+pub(crate) fn reconcile_stopped_retirement(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    expected_generation: u64, accept_checkpoint_loss: bool,
+) -> Result<CheckpointRecovery, ReplacementError> {
+    if !actor.is_glados() { return Err(ReplacementError::AuthorizationRequired); }
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)?;
+    let target = remote::RemoteTarget {team:team.into(), seat:seat.into(), expected_generation};
+    selectors(&target)?;
+    let budget = deadline::Deadline::new();
+    let binding = require_repository_binding(home, &target, &budget)?;
+    let authority = ReplacementAuthority::GladosRetirement(actor);
+    let recovery = if accept_checkpoint_loss { CheckpointRecovery::None } else {
+        let checkpoint = checkpoint_for_target(home, &authority, &target, &binding.0, &[], &budget)?;
+        if checkpoint.recovery != CheckpointRecovery::Valid {
+            return Err(ReplacementError::CheckpointUnavailable);
+        }
+        checkpoint.recovery
+    };
+    actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)?;
+    // The writer rechecks the exact UNKNOWN admission and all native process,
+    // token, revocation and owner bindings under team -> seat locks.
+    crate::team_archive::retirement::reconcile_stopped(home, actor, team, seat,
+        expected_generation, recovery.clone(), accept_checkpoint_loss)
+        .map_err(|_| ReplacementError::OutcomeUnknown)?;
+    Ok(recovery)
+}
+
 fn prepare_authenticated(
     home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
     expected_generation: u64, sentinels: &[String], archive: bool,

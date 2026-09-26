@@ -11,3 +11,11 @@ Native stop publishes retired.json only after stop/revocation readback under tea
 Retirement reports process_stop and revocation Verified; mission reconciliation, reviews, metrics, worktrees and remote effects remain Unknown. No BEADS task or epic is changed. The existing journal disables manifests, marks stopped owners Stale and moves the team/history to archive. Rollback restores registry/history but leaves revoked owners Stale: it does not resurrect processes or credentials. The updated control binary must be retained for inverse operations; older readers reject the new category.
 
 Live verification remains separate from source tests. UI/Open improvements are not prerequisites for retiring a stopped team.
+
+## Already stopped, ordinary UNKNOWN attempt
+
+`reconcile_stopped_retirement` is an explicit GLaDOS-only headless action with the same selector-only input as `retire_seat`. It does not retry the ordinary attempt or construct a runtime: no signals, revocation writes, start permits, replacement, or remote-effect resolution. With `accept_checkpoint_loss=false`, it requires the existing native checkpoint collector to yield Valid.
+
+Under team/seat locks, it admits only the exact-generation ordinary directory containing exactly its bound admission, EffectsMayHaveOccurred, and terminal Unknown, after the original 170-second budget plus 10 seconds has elapsed. All recorded processes must be Gone, the exact token must be revoked and absent, and the current observed Active owner must still match the team. Only then can the existing writer append retired.json, no-replace. A second call fails without changing the earlier fact. Missing, malformed, symlinked, unfinished, nested-retirement or mismatched evidence is denied.
+
+The original UNKNOWN and incomplete remote observation remain unchanged; neither becomes a remote PASS. Once every seat has a factual retirement record, the existing Retirement archive journal applies. This is operational retirement, not an assertion of complete external-effect inventory. The operator's acceptance is recorded separately in BEADS. No GUI reinstall is required to invoke the reviewed native control binary for this bounded operation; retain that exact binary and source for the native inverse.

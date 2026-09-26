@@ -355,3 +355,105 @@ fn retirement_prejournal_recheck_denies_changed_facts_without_journal() {
         .join(".aperture/run/team-journals/t1.archive.json")
         .exists());
 }
+
+fn ordinary_unknown_g3(f: &Fixture) -> PathBuf {
+    for name in ["TEAM", "prompt.md"] {
+        write_private_bytes_atomic(&f.home.join(".claude/aperture/t1-worker").join(name), b"fixture", false).unwrap();
+    }
+    f.mutate(".aperture/run/owner/t1-worker.json", |v| v["generation"] = 3.into());
+    f.mutate(".aperture/run/revocations/t1-worker.json", |v| v["revoked_through_generation"] = 3.into());
+    let dir = f.home.join(".aperture/teams/t1/runtime-attempts/t1-worker/g3");
+    let id = uuid::Uuid::new_v4().to_string();
+    write(&dir.join("admitted.json"), &serde_json::json!({"schema_version":1,"attempt_id":id,"team":"t1","seat":"t1-worker","old_generation":3,"admitted_at_ms":chrono::Utc::now().timestamp_millis()-181_000,"native_budget_ms":170_000,"cleanup_reserve_ms":40_000}));
+    write(&dir.join("effects.json"), &serde_json::json!({"schema_version":1,"attempt_id":id,"kind":"effects_may_have_occurred"}));
+    write(&dir.join("terminal.json"), &serde_json::json!({"schema_version":1,"attempt_id":id,"kind":"unknown"}));
+    dir
+}
+fn reconcile_g3(f: &Fixture, actor: &AuthenticatedActor) -> Result<(), String> {
+    reconcile_stopped(&f.home, actor, "t1", "t1-worker", 3, CheckpointRecovery::Valid, false)
+}
+
+#[test]
+fn retirement_reconcile_g3_preserves_unknown_and_archives_without_new_attempt() {
+    let _lock = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    let f = Fixture::new();
+    let (_env, actor) = auth(&f);
+    let dir = ordinary_unknown_g3(&f);
+    let before: Vec<_> = ["admitted.json", "effects.json", "terminal.json"].iter()
+        .map(|name| (*name, fs::read(dir.join(name)).unwrap())).collect();
+    let owner_path = f.home.join(".aperture/run/owner/t1-worker.json");
+    let owner_before = fs::read(&owner_path).unwrap();
+    // Reproduce the old path's refusal: UNKNOWN with effects is not retryable.
+    assert!(matches!(crate::team_replacement::deadline::RuntimeAttempt::begin_retirement(
+        &f.home, &AuthenticatedActor::launcher(), "t1", "t1-worker", 3, crate::team_replacement::deadline::Deadline::new()
+    ), Err(crate::team_replacement::ReplacementError::OutcomeUnknown)));
+    reconcile_g3(&f, &actor).unwrap();
+    assert_eq!(fs::read(&owner_path).unwrap(), owner_before);
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+    let fact_before = fs::read(fact_path(&f.home, "t1-worker", 3)).unwrap();
+    assert!(reconcile_g3(&f, &actor).is_err());
+    assert_eq!(fs::read(fact_path(&f.home, "t1-worker", 3)).unwrap(), fact_before);
+    let approval = f.inspect().unwrap();
+    assert_eq!(approval.category, ArchiveCategory::Retirement);
+    crate::team_archive_finalize::finalize(&f.home, &actor, "t1", 1,
+        Some(crate::team_archive_finalize::FreshArchive { snapshot: &f.snapshot, state: &f.state, approval: &approval })).unwrap();
+    for (name, bytes) in before {
+        assert_eq!(fs::read(f.home.join(".aperture/teams/archive/t1/runtime-attempts/t1-worker/g3").join(name)).unwrap(), bytes);
+    }
+    assert_eq!(read_private_json::<OwnerRecord>(&owner_path).unwrap().state, OwnerState::Stale);
+    assert!(!f.home.join(".beads").exists());
+}
+
+#[test]
+fn retirement_reconcile_rejects_unbound_or_unfinished_history_without_writing() {
+    let _lock = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for mode in 0..17 {
+        let f = Fixture::new();
+        let (_env, actor) = auth(&f);
+        let dir = ordinary_unknown_g3(&f);
+        let mutate = |name: &str, field: &str, value: serde_json::Value| {
+            let p = dir.join(name);
+            let mut v: serde_json::Value = read_private_json(&p).unwrap();
+            v[field] = value; write(&p, &v);
+        };
+        match mode {
+            0 => { fs::remove_file(dir.join("terminal.json")).unwrap(); }
+            1 => { fs::remove_file(dir.join("effects.json")).unwrap(); }
+            2 => mutate("terminal.json", "kind", "failed".into()),
+            3 => mutate("terminal.json", "attempt_id", uuid::Uuid::new_v4().to_string().into()),
+            4 => mutate("effects.json", "kind", "ready".into()),
+            5 => mutate("admitted.json", "old_generation", 2.into()),
+            6 => mutate("admitted.json", "admitted_at_ms", chrono::Utc::now().timestamp_millis().into()),
+            7 => mutate("admitted.json", "native_budget_ms", 1.into()),
+            8 => mutate("admitted.json", "attempt_id", "not-a-uuid".into()),
+            9 => { ensure_private_dir(&dir.join("retirement")).unwrap(); }
+            10 => { let p=dir.join("terminal.json"); fs::rename(&p, dir.join("original.json")).unwrap(); std::os::unix::fs::symlink("original.json", p).unwrap(); }
+            11 => f.mutate(".aperture/run/owner/t1-worker.json", |v| v["generation"] = 2.into()),
+            12 => f.mutate(".aperture/run/owner/t1-worker.json", |v| v["state"] = "quarantined".into()),
+            13 => f.mutate(".aperture/run/revocations/t1-worker.json", |v| v["revoked_token_ids"] = serde_json::json!(["b".repeat(64)])),
+            14 => { write_private_bytes_atomic(&f.home.join(".aperture/run/hub-tokens/t1-worker.token"), b"fixture-only", false).unwrap(); }
+            15 => { fs::remove_file(f.home.join(".aperture/run/hub-tokens/glados.token")).unwrap(); }
+            _ => mutate("admitted.json", "team", "other".into()),
+        }
+        assert!(reconcile_g3(&f, &actor).is_err(), "mode {mode}");
+        assert!(!fact_path(&f.home, "t1-worker", 3).exists(), "mode {mode}");
+    }
+}
+
+#[test]
+fn retirement_reconcile_requires_root_checkpoint_and_every_process_gone() {
+    let _lock = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    let f = Fixture::new();
+    let (_env, actor) = auth(&f);
+    ordinary_unknown_g3(&f);
+    for other in [AuthenticatedActor::operator_ui(), AuthenticatedActor::launcher()] {
+        assert!(reconcile_g3(&f, &other).is_err());
+    }
+    assert!(reconcile_stopped(&f.home, &actor, "t1", "t1-worker", 3, CheckpointRecovery::None, false).is_err());
+    let owner: OwnerRecord = read_private_json(&f.home.join(".aperture/run/owner/t1-worker.json")).unwrap();
+    for state in [ProcessState::Same, ProcessState::Recycled, ProcessState::Unreadable] {
+        assert!(stopped(&f.home, &owner, |_| state).is_err());
+    }
+    assert!(!fact_path(&f.home, "t1-worker", 3).exists());
+    reconcile_g3(&f, &actor).unwrap();
+}

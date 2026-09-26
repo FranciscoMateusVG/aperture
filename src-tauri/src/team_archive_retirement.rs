@@ -132,6 +132,23 @@ pub(crate) fn record_stopped(
     recovery: CheckpointRecovery,
     accepted_checkpoint_loss: bool,
 ) -> Result<(), String> {
+    record_stopped_checked(home, actor, team, seat, generation, recovery, accepted_checkpoint_loss, false)
+}
+
+/// Explicit post-stop reconciliation. No signals, start permit, attempt retry,
+/// owner edit or remote-resolution authority is introduced here.
+pub(crate) fn reconcile_stopped(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    generation: u64, recovery: CheckpointRecovery, accepted_checkpoint_loss: bool,
+) -> Result<(), String> {
+    record_stopped_checked(home, actor, team, seat, generation, recovery, accepted_checkpoint_loss, true)
+}
+
+fn record_stopped_checked(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
+    generation: u64, recovery: CheckpointRecovery, accepted_checkpoint_loss: bool,
+    reconcile: bool,
+) -> Result<(), String> {
     if !actor.is_glados() {
         return Err(fail());
     }
@@ -157,6 +174,10 @@ pub(crate) fn record_stopped(
         return Err(fail());
     }
     bound_owner(&snapshot, &state, &owner)?;
+    if reconcile {
+        crate::team_replacement::deadline::expired_unknown_stop_locked(home, team, seat, generation)
+            .map_err(|_| fail())?;
+    }
     stopped(home, &owner, crate::team_process::state)?;
     let fact = RetirementFact {
         schema_version: 1,

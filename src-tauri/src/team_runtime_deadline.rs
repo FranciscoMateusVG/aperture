@@ -82,6 +82,39 @@ enum FactKind {
     StoppedReconciled,
 }
 
+/// Read-only admission for reconciling an already stopped ordinary attempt.
+/// This grants no renewed RuntimeAttempt and never rewrites UNKNOWN. Call only
+/// under the target's team/seat locks; stopped/revoked proof is separate.
+pub(crate) fn expired_unknown_stop_locked(
+    home: &Path, team: &str, seat: &str, generation: u64,
+) -> Result<(), ReplacementError> {
+    let deny = || ReplacementError::OutcomeUnknown;
+    if generation == 0 { return Err(deny()); }
+    let dir = home.join(".aperture/teams").join(team).join("runtime-attempts")
+        .join(seat).join(format!("g{generation}"));
+    let a: Admission = read_private_json(&dir.join("admitted.json")).map_err(|_| deny())?;
+    let e: Fact = read_private_json(&dir.join("effects.json")).map_err(|_| deny())?;
+    let t: Fact = read_private_json(&dir.join("terminal.json")).map_err(|_| deny())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    if a.schema_version != 1 || a.team != team || a.seat != seat || a.old_generation != generation
+        || !crate::team_claude_launch::canonical_uuid(&a.attempt_id)
+        || a.native_budget_ms != TOTAL.as_millis() as u64
+        || a.cleanup_reserve_ms != CLEANUP.as_millis() as u64
+        || a.admitted_at_ms <= 0
+        || a.admitted_at_ms.checked_add(TOTAL.as_millis() as i64 + 10_000).is_none_or(|end| now <= end)
+        || e.schema_version != 1 || e.attempt_id != a.attempt_id || e.kind != FactKind::EffectsMayHaveOccurred
+        || t.schema_version != 1 || t.attempt_id != a.attempt_id || t.kind != FactKind::Unknown
+    { return Err(deny()); }
+    // Do not reinterpret prepared, nested/retried, bootstrap reconciliation or
+    // retirement state. The narrow ordinary UNKNOWN case has these three files.
+    let names = std::fs::read_dir(&dir).map_err(|_| deny())?.take(4)
+        .map(|entry| entry.map(|entry| entry.file_name()).map_err(|_| deny()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if names.len() != 3 || names.iter().any(|name| !["admitted.json", "effects.json", "terminal.json"]
+        .iter().any(|expected| name == expected)) { return Err(deny()); }
+    Ok(())
+}
+
 /// Read-only handle to an EXPIRED bootstrap, never a renewed RuntimeAttempt.
 /// Recovery preserves the original terminal (including UNKNOWN) and cannot
 /// mint an observation PASS or another start permit.
