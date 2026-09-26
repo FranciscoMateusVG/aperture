@@ -727,3 +727,18 @@ fn retirement_lead_unowned_ro_once() {
             snapshot.processes.iter().any(|p|p.cmdline_sha256==hash),snapshot.processes.iter().any(|p|p.cwd==cwd));
     }
 }
+
+#[test]
+#[ignore = "operator-authorized single read-only retirement diagnosis; never routine"]
+fn convites_lead_unowned_ro_once() {
+    let home=std::path::Path::new("/Users/franciscomateus");
+    std::env::set_current_dir("/").unwrap();
+    let snapshot=collect_native(home,"eunenem-convites","eunenem-convites-frontend",1).unwrap();
+    println!("RO complete={} owned={} unowned={}",snapshot.complete,snapshot.processes.len(),snapshot.unowned_matches.len());
+    for id in &snapshot.unowned_matches {
+        let meta=observe(id.pid).unwrap().unwrap();assert_eq!(meta.identity,*id);
+        let (hash,cwd)=native_details(id).unwrap();
+        println!("unowned pid={} birth={} ppid={} pgid={} uid={} hash_match={} cwd_match={}",id.pid,id.start_time,meta.ppid,meta.pgid,meta.uid,
+            snapshot.processes.iter().any(|p|p.cmdline_sha256==hash),snapshot.processes.iter().any(|p|p.cwd==cwd));
+    }
+}
