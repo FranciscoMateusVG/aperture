@@ -244,6 +244,7 @@ struct PeerBindings {
     peers: Vec<PeerBinding>,
     files: std::collections::BTreeMap<PathBuf, String>,
     owner_names: Vec<String>,
+    coordination: Vec<crate::team_terminal::CoordinationPeer>,
 }
 fn peer_bytes(path: &Path) -> Result<Vec<u8>, ReplacementError> {
     let file = crate::journal::open_private_file_nofollow(path)
@@ -295,6 +296,8 @@ impl PeerBindings {
             peers: vec![],
             files: Default::default(),
             owner_names: vec![],
+            coordination: crate::team_terminal::capture_coordination_peers(home)
+                .map_err(|_| ReplacementError::StopUnverified)?,
         };
         let root = home.join(".aperture/run/owner");
         // Validate the canonical private root through its fd-bound target file
@@ -402,6 +405,9 @@ impl PeerBindings {
         Ok(result)
     }
     fn revalidate(&self) -> Result<(), ReplacementError> {
+        for peer in &self.coordination {
+            peer.recheck().map_err(|_| ReplacementError::StopUnverified)?;
+        }
         if peer_names(&self.home.join(".aperture/run/owner"))? != self.owner_names {
             return Err(ReplacementError::StopUnverified);
         }
@@ -480,11 +486,54 @@ impl PeerBindings {
         Ok(result)
     }
 }
+// Attribution only: this result never enters the target snapshot or ledger.
+fn coordination_closures<S: ProcessSource>(
+    roots: &[(String, ProcessIdentity)], table: &[ProcessMetadata],
+    target: &OwnershipSnapshot,
+    peers: &[(String, Vec<(ProcessIdentity, u32, u32)>)], source: &mut S,
+) -> Result<Vec<(String, Vec<(ProcessIdentity, u32, u32)>)>, ReplacementError> {
+    let mut used: HashSet<_> = target.processes.iter().map(|p| p.identity.pid).collect();
+    used.extend(peers.iter().flat_map(|(_, nodes)| nodes.iter().map(|(id, _, _)| id.pid)));
+    let mut result = Vec::new();
+    if roots.len() > 3 { return Err(ReplacementError::StopUnverified); }
+    for (name, root) in roots {
+        source.deadline()?;
+        let actual = table.iter().find(|p| p.identity.pid == root.pid)
+            .ok_or(ReplacementError::StopUnverified)?;
+        if actual.identity != *root || actual.uid != unsafe { libc::geteuid() }
+            || source.observe(root) != ProcessState::Same {
+            return Err(ReplacementError::StopUnverified);
+        }
+        let captured = capture_owned(name, 0, "native-coordination-peer", root, table, &[], &[], true)?;
+        if captured.processes.len() > MAX_OWNED { return Err(ReplacementError::StopUnverified); }
+        let mut nodes = Vec::new();
+        for p in captured.processes {
+            if !used.insert(p.identity.pid) { return Err(ReplacementError::UnownedProcess); }
+            let live = table.iter().find(|m| m.identity == p.identity)
+                .ok_or(ReplacementError::StopUnverified)?;
+            if live.uid != unsafe { libc::geteuid() } || source.observe(&p.identity) != ProcessState::Same {
+                return Err(ReplacementError::StopUnverified);
+            }
+            nodes.push((p.identity, live.ppid, live.pgid));
+        }
+        result.push((name.clone(), nodes));
+    }
+    Ok(result)
+}
 fn collect<S: ProcessSource>(record: &OwnerRecord, source: &mut S) -> Result<OwnershipSnapshot, ReplacementError> {
     collect_with_peers(record,source,None)
 }
 fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:Option<&PeerBindings>)
     -> Result<OwnershipSnapshot,ReplacementError> {
+    let roots: Vec<_> = peers.into_iter().flat_map(|p| p.coordination.iter())
+        .map(|p| (p.seat.clone(), p.identity.clone())).collect();
+    collect_with_roots(record, source, peers, &roots)
+}
+// Private synthetic-test seam. Production roots only come from canonical
+// socket + kernel-peer proofs above, never a DTO, env PID or process name.
+fn collect_with_roots<S: ProcessSource>(record: &OwnerRecord, source: &mut S,
+    peers: Option<&PeerBindings>, roots: &[(String, ProcessIdentity)])
+    -> Result<OwnershipSnapshot, ReplacementError> {
     let (root, persisted) = seeded(record)?;
     let inc = record.incarnation.as_ref().unwrap();
     let control = source.control()?;
@@ -508,6 +557,7 @@ fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:O
         return Err(ReplacementError::UnownedProcess);
     }
     let peer_closures = peers.map(|p|p.closures(&first,&snapshot,source)).transpose()?.unwrap_or_default();
+    let coordination = coordination_closures(roots, &first, &snapshot, &peer_closures, source)?;
     // Refresh currently-live metadata privately; preserve captured metadata of
     // gone/reparented descendants, never erase their identity from stop evidence.
     for p in &mut snapshot.processes {
@@ -570,7 +620,8 @@ fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:O
             .any(|p| p.cmdline_sha256 == hash || p.cwd == cwd)
         {
             let attributed_to_peer = peer_closures.iter().any(|(_,nodes)|nodes.iter().any(|(id,_,_)|*id==other.identity));
-            if !attributed_to_peer {snapshot.unowned_matches.push(other.identity.clone());}
+            let attributed_to_coordination = coordination.iter().any(|(_, nodes)| nodes.iter().any(|(id, _, _)| *id == other.identity));
+            if !attributed_to_peer && !attributed_to_coordination {snapshot.unowned_matches.push(other.identity.clone());}
         }
     }
     // Fresh topology check is not another collection attempt. Any newly seen
@@ -615,6 +666,9 @@ fn collect_with_peers<S:ProcessSource>(record:&OwnerRecord,source:&mut S,peers:O
             ProcessState::Gone => {}
             _ => return Err(ReplacementError::StopUnverified),
         }
+    }
+    if coordination_closures(roots, &second, &snapshot, &peer_closures, source)? != coordination {
+        return Err(ReplacementError::StopUnverified);
     }
     if let Some(peers) = peers {
         if peers.closures(&second,&snapshot,source)? != peer_closures {return Err(ReplacementError::StopUnverified);}

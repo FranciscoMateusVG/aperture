@@ -742,3 +742,49 @@ fn convites_lead_unowned_ro_once() {
             snapshot.processes.iter().any(|p|p.cmdline_sha256==hash),snapshot.processes.iter().any(|p|p.cwd==cwd));
     }
 }
+
+#[test]
+fn coordination_socket_root_attribution_never_expands_target_and_keeps_unknown_match() {
+    let o = owner();
+    let table = sibling_table();
+    let roots = vec![("glados".to_string(), id(200))];
+    let old = collect(&o, &mut Fake::new(table.clone())).unwrap();
+    let new = collect_with_roots(&o, &mut Fake::new(table.clone()), None, &roots).unwrap();
+    assert_eq!(old.processes, new.processes);
+    assert!(!old.unowned_matches.is_empty());
+    assert!(new.unowned_matches.is_empty());
+    let mut unknown = table;
+    unknown.push(meta(300, 1));
+    let still_denied = collect_with_roots(&o, &mut Fake::new(unknown), None, &roots).unwrap();
+    assert_eq!(still_denied.processes, new.processes);
+    assert_eq!(still_denied.unowned_matches, vec![id(300)]);
+}
+
+#[test]
+fn coordination_root_overlap_recycle_topology_or_identity_drift_never_exempts() {
+    let o = owner();
+    for mode in 0..9 {
+        let mut roots = vec![("glados".to_string(), id(200))];
+        let mut f = Fake::new(sibling_table());
+        match mode {
+            0 => roots[0].1 = id(100), // target overlap
+            1 => roots.push(("peppy".into(), id(200))), // peer overlap
+            2 => { f.states.insert(200, ProcessState::Recycled); }
+            3 => { f.states.insert(201, ProcessState::Unreadable); }
+            4 => { f.tables[1].iter_mut().find(|m| m.identity.pid==201).unwrap().ppid=1; }
+            5 => { f.tables[1].iter_mut().find(|m| m.identity.pid==200).unwrap().identity.start_time="2.000001".into(); }
+            6 => { f.tables[0].iter_mut().find(|m| m.identity.pid==200).unwrap().uid+=1; }
+            7 => { f.tables[1].retain(|m| m.identity.pid!=200); }
+            _ => { f.tables[0].iter_mut().find(|m| m.identity.pid==202).unwrap().uid+=1; }
+        }
+        assert!(collect_with_roots(&o, &mut f, None, &roots).is_err(), "mode {mode}");
+    }
+}
+
+#[test]
+fn coordination_root_cannot_overlap_a_managed_peer() {
+    let f = PeerFixture::new();
+    let peers = f.load().unwrap();
+    assert!(matches!(collect_with_roots(&f.target, &mut Fake::new(sibling_table()),
+        Some(&peers), &[("glados".into(), id(200))]), Err(ReplacementError::UnownedProcess)));
+}
