@@ -1584,3 +1584,28 @@ async fn c3_http_codex_mutators_reach_fenced_shared_ingress_without_effects() {
     let (code,_,_)=f.api("POST","/api/agents/fixture/model",&session,&json!({"name":"fixture","model":"codex/test"}).to_string()).await;
     assert_eq!(code,200);assert_eq!(tree(&f.root),before);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d_cancelled_http_body_remains_admitted_until_real_exit() {
+    let f=Fixture::new().await;
+    let session=f.session().await;
+    let (arrived,notice)=std::sync::mpsc::sync_channel(1);
+    let (resume,go)=std::sync::mpsc::sync_channel(1);
+    f.state.runtime.fixture_pause(arrived,go);
+    // The actual authenticated TCP ingress queues the real blocking closure.
+    let mut stream=tokio::net::TcpStream::connect(&f.state.authority).await.unwrap();
+    let request=format!("GET /api/agents HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",f.state.authority,f.state.origin,session);
+    stream.write_all(request.as_bytes()).await.unwrap();
+    tokio::task::spawn_blocking(move || notice.recv_timeout(Duration::from_secs(3)).unwrap()).await.unwrap();
+    drop(stream); // cancel the client, never the already-admitted body
+    let owner=f.state.runtime.clone();
+    let error=tokio::task::spawn_blocking(move || owner.fixture_close_short()).await.unwrap().unwrap_err();
+    assert_eq!(error,"E_RUNTIME_DRAIN_INCOMPLETE");
+    assert!(crate::controller::ControllerLock::acquire(&f.root).is_err());
+    assert_eq!(f.api("GET","/api/agents",&session,"").await.0,409);
+    resume.send(()).unwrap();
+    let owner=f.state.runtime.clone();
+    tokio::task::spawn_blocking(move || owner.close()).await.unwrap().unwrap();
+    assert!(f.state.runtime.admit(None).is_err());
+    assert_eq!(std::fs::read(f.root.join(".aperture/run/owner/sentinel")).unwrap(),b"unchanged");
+}

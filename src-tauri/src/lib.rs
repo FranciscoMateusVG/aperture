@@ -97,10 +97,16 @@ pub(crate) fn boot_agent_headless_external(
     }
     let lease = controller::ControllerLock::acquire(home)?;
     let runtime = daemons::RuntimeOwner::new(lease);
-    let context = runtime.lifecycle()?;
-    agents::start_agent_shared(name.to_string(), state, &context)?;
-    state.lock().map_err(|e| e.to_string())?.agents.get(name)
-        .and_then(|v| v.tmux_window_id.clone()).ok_or_else(|| "boot has no window".into())
+    let result = {
+        let work = runtime.admit(Some(name))?;
+        let _body = work.body()?;
+        let context = work.lifecycle(name)?;
+        agents::start_agent_shared(name.to_string(), state, &context)?;
+        state.lock().map_err(|e| e.to_string())?.agents.get(name)
+            .and_then(|v| v.tmux_window_id.clone()).ok_or_else(|| "boot has no window".into())
+    };
+    runtime.close()?;
+    result
 }
 
 /// Authenticated, headless V4 team activation. The request carries selectors
@@ -276,10 +282,18 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             // Detach only; D still owes admission closure and task joins.
             // No daemon/port kill or unlink is authority granted by GUI exit.
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                use tauri::Manager;
+                let runtime = app_handle.state::<Arc<daemons::RuntimeOwner>>();
+                if runtime.close().is_err() { api.prevent_exit(); }
+            }
             if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                let runtime = app_handle.state::<Arc<daemons::RuntimeOwner>>();
+                if let Err(error) = runtime.close() { eprintln!("[aperture] runtime drain incomplete: {error}"); }
                 ws_hub::shutdown();
                 codex_appserver::shutdown();
             }

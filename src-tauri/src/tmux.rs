@@ -24,7 +24,14 @@ pub struct WindowInfo {
 }
 
 #[tauri::command]
-pub fn tmux_create_session(session_name: String) -> Result<String, String> {
+pub fn tmux_create_session(session_name: String, runtime: tauri::State<'_, std::sync::Arc<crate::daemons::RuntimeOwner>>) -> Result<String, String> {
+    let work = runtime.admit(None)?;
+    let _body = work.body()?;
+    tmux_create_session_shared(session_name, &work)
+}
+pub(crate) fn tmux_create_session_shared(session_name: String, work: &crate::daemons::RuntimeWork) -> Result<String, String> {
+    work.check_open()?;
+    work.require_tools()?;
     let check = cmd("tmux")
         .args(["has-session", "-t", &session_name])
         .output()
@@ -126,7 +133,14 @@ pub fn tmux_kill_window(window_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn tmux_select_window(window_id: String) -> Result<(), String> {
+pub fn tmux_select_window(window_id: String, runtime: tauri::State<'_, std::sync::Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(None)?;
+    let _body = work.body()?;
+    tmux_select_window_shared(window_id, &work)
+}
+pub(crate) fn tmux_select_window_shared(window_id: String, work: &crate::daemons::RuntimeWork) -> Result<(), String> {
+    work.check_open()?;
+    work.require_tools()?;
     let output = cmd("tmux")
         .args(["select-window", "-t", &window_id])
         .output()

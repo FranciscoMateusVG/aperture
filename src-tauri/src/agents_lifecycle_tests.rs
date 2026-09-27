@@ -231,3 +231,19 @@ fn c3_watchdog_claude_pristine_respawn_denied_before_all_effects() {
     assert_eq!(tree(&h.0), before);
     assert_eq!(serde_json::to_value(&app.lock().unwrap().agents["fixture"]).unwrap(), state_before);
 }
+
+#[test]
+fn d_accounted_context_is_same_seat_and_stops_before_later_mutation() {
+    let h=Home::new();
+    let owner=crate::daemons::RuntimeOwner::new(ControllerLock::acquire(&h.0).unwrap());
+    let work=owner.admit(Some("fixture")).unwrap();
+    let context=work.lifecycle("fixture").unwrap();
+    let app=state("fixture","opus");
+    let before=tree(&h.0);
+    assert_eq!(context.classify("other").unwrap_err(),"E_RUNTIME_SELECTOR");
+    assert_eq!(owner.fixture_close_short().unwrap_err(),"E_RUNTIME_DRAIN_INCOMPLETE");
+    assert_eq!(update_agent_model_shared("fixture".into(),"sonnet".into(),&app,&context).unwrap_err(),"E_RUNTIME_CLOSING");
+    assert_eq!(app.lock().unwrap().agents["fixture"].model,"opus");
+    assert_eq!(tree(&h.0),before);
+    drop(context);drop(work);owner.close().unwrap();
+}

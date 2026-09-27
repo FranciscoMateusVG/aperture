@@ -448,6 +448,23 @@ fn inert_process_entry() {
                     .open(run.join("fixture-hello-count"))
                     .unwrap();
                 file.write_all(b"1\n").unwrap();
+                if mode == "d-auth-reject" {
+                    let _ = ws.send(text(serde_json::json!({"type":"error","code":"unauthorized"})));
+                    return;
+                }
+                if mode == "d-truncated" {
+                    let _ = ws.send(presence("fixture")); return;
+                }
+                if mode == "d-live" {
+                    final_msg["snapshot_count"] = serde_json::json!(1);
+                    ws.write(presence("fixture")).unwrap();
+                    ws.write(Message::Text(final_msg.to_string())).unwrap();
+                    ws.write(text(serde_json::json!({"type":"presence","agent":"fixture","event":"busy","ts":"2026-09-27T12:00:00Z"}))).unwrap();
+                    ws.flush().unwrap();
+                    let _ = ws.read();
+                    std::thread::sleep(Duration::from_secs(60));
+                    return;
+                }
                 if mode == "wrongpid" {
                     final_msg["hub_pid"] = serde_json::json!(1);
                 }
@@ -939,4 +956,48 @@ fn c3_hub_reconcile_accepts_unrelated_v2_structure_not_readiness() {
         assert_eq!(crate::agents::lifecycle_tests::tree(&f.home.join(".aperture/run/daemons")),malformed);
         assert_eq!(team_process::state(&expected),ProcessState::Same);
     }
+}
+
+#[test]
+fn d_owned_subscriber_uses_same_native_bound_stream_initial_and_buffered_live() {
+    for mode in ["normal","d-live"] {
+        let mut f=NativeFixture::new(); let identity=f.launch(mode); f.wait_file("fixture-ready");
+        let lease=ControllerLock::acquire(&f.home).unwrap(); f.published(&lease,&identity);
+        let mut stream=registered_subscriber(&lease).unwrap();
+        assert!(stream.next(&lease).is_err()); // initial snapshot must be consumed first
+        let initial=stream.take_initial().unwrap();
+        if mode=="d-live" {
+            assert_eq!(initial.len(),1); assert_eq!(initial[0].agent,"fixture");
+            let update=stream.next(&lease).unwrap().unwrap();
+            assert_eq!(update.agent,"fixture"); assert_eq!(update.event,"busy");
+        } else { assert!(initial.is_empty()); }
+        assert!(stream.take_initial().is_err());
+        assert_eq!(f.wait_file("fixture-hello-count"),b"1\n"); // exactly this connection
+        let at=Instant::now(); assert!(stream.next(&lease).unwrap().is_none());
+        assert!(at.elapsed()<Duration::from_secs(2));
+        // Fresh post-frame/read verification, not the old PID claim.
+        crate::journal::write_private_json_atomic(&lease.run_dir().unwrap().join("presence.json"),
+            &serde_json::json!({"hub_pid":1,"updated_at":"2026-09-27T12:00:00Z","agents":{}}),true).unwrap();
+        assert!(stream.next(&lease).is_err());
+        drop(stream); drop(lease);
+    }
+}
+#[test]
+fn d_subscriber_auth_truncation_duplicate_timeout_and_impostor_never_trusted() {
+    for mode in ["d-auth-reject","d-truncated","duplicate","silent","presence-drift","oversize","badcount"] {
+        let mut f=NativeFixture::new(); let identity=f.launch(mode); f.wait_file("fixture-ready");
+        let lease=ControllerLock::acquire(&f.home).unwrap(); f.published(&lease,&identity);
+        let at=Instant::now(); assert!(registered_subscriber(&lease).is_err(),"{mode}");
+        assert!(at.elapsed()<Duration::from_secs(4));
+    }
+    let mut f=NativeFixture::new(); let impostor=f.launch("impostor"); f.wait_file("fixture-ready");
+    let lease=ControllerLock::acquire(&f.home).unwrap();
+    let expected=team_process::observe(std::process::id()).unwrap().unwrap().identity;
+    crate::journal::write_private_json_atomic(&lease.run_dir().unwrap().join("presence.json"),
+        &serde_json::json!({"hub_pid":expected.pid,"updated_at":"2026-09-27T12:00:00Z","agents":{}}),true).unwrap();
+    f.published(&lease,&expected);
+    assert_eq!(team_process::state(&expected),ProcessState::Same);
+    assert!(registered_subscriber(&lease).is_err());
+    assert!(!f.home.join(".aperture/run/fixture-hello-count").exists());
+    assert_eq!(team_process::state(&impostor),ProcessState::Same); // no signal/spawn
 }

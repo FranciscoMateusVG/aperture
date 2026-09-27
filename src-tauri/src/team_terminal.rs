@@ -1410,14 +1410,19 @@ pub fn attach_existing(
 #[tauri::command]
 pub async fn team_open_seat(
     input: OpenSeatInput,
+    runtime: tauri::State<'_, std::sync::Arc<crate::daemons::RuntimeOwner>>,
 ) -> std::result::Result<OpenSeatView, teams::TeamError> {
+    let work = runtime.admit(None).map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| teams::TeamError {
             code: "E_TERMINAL_UNAVAILABLE".into(),
             message: "Home unavailable".into(),
         })?;
-    tauri::async_runtime::spawn_blocking(move || open_shared(&home, input))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _body = work.body().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
+        open_shared(&home, input)
+    })
         .await
         .map_err(|_| teams::TeamError {
             code: "E_TERMINAL_UNKNOWN".into(),

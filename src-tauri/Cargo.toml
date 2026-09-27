@@ -35,4 +35,5 @@ base64 = "=0.22.1"
 subtle = "=2.6.1"
 
 [dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 toml = "0.8"

@@ -1885,32 +1885,44 @@ fn engine_from_state(state: &tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResu
 }
 
 #[tauri::command]
-pub fn team_get_catalog(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<TeamCatalog> {
+pub fn team_get_catalog(state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<TeamCatalog> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     engine_from_state(&state)?.catalog()
 }
 
 #[tauri::command]
-pub fn team_list_presets(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<Vec<TeamPreset>> {
+pub fn team_list_presets(state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<Vec<TeamPreset>> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     engine_from_state(&state)?.list_presets()
 }
 
 #[tauri::command]
-pub fn team_save_preset(input: SavePresetInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<TeamPreset> {
+pub fn team_save_preset(input: SavePresetInput, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<TeamPreset> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     engine_from_state(&state)?.save_preset(&AuthenticatedActor::operator_ui(), input)
 }
 
 #[tauri::command]
-pub fn team_create(input: CreateTeamInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<CreateTeamResult> {
+pub fn team_create(input: CreateTeamInput, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<CreateTeamResult> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     engine_from_state(&state)?.create_team(&AuthenticatedActor::operator_ui(), input)
 }
 
 #[tauri::command]
-pub fn team_list(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<Vec<TeamView>> {
+pub fn team_list(state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<Vec<TeamView>> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     engine_from_state(&state)?.list_teams()
 }
 
 #[tauri::command]
-pub fn team_cancel_pending(input: CancelPendingInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<CancelPendingResult> {
+pub fn team_cancel_pending(input: CancelPendingInput, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<CancelPendingResult> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     engine_from_state(&state)?.cancel_pending(&AuthenticatedActor::operator_ui(), input)
 }
 
@@ -2090,7 +2102,10 @@ fn permit_store(
 pub fn team_bootstrap_seat(
     input: BootstrapSeatInput,
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>,
 ) -> TeamResult<BootstrapView> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     bootstrap_seat(&engine_from_state(&state)?, &AuthenticatedActor::operator_ui(), input)
 }
 
@@ -2275,7 +2290,9 @@ fn bootstrap_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: Bootst
 }
 
 #[tauri::command]
-pub fn team_prepare_replacement(input: PrepareReplacementInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<PreparedReplacementView> {
+pub fn team_prepare_replacement(input: PrepareReplacementInput, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<PreparedReplacementView> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     team_prepare_replacement_shared(input, &engine_from_state(&state)?, &permit_store(&state)?, &AuthenticatedActor::operator_ui())
 }
 
@@ -2336,7 +2353,9 @@ pub(crate) fn team_prepare_replacement_shared(input: PrepareReplacementInput, en
 }
 
 #[tauri::command]
-pub fn team_start_replacement(input: StartReplacementInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<ReplacementView> {
+pub fn team_start_replacement(input: StartReplacementInput, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<ReplacementView> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     team_start_replacement_shared(input, &engine_from_state(&state)?, &permit_store(&state)?, &AuthenticatedActor::operator_ui())
 }
 
@@ -2384,7 +2403,9 @@ pub(crate) fn team_start_replacement_shared(input: StartReplacementInput, engine
 /// Read-only archive checklist. Mutation remains disabled until the
 /// authenticated GLaDOS finalizer and rollback journal are composed.
 #[tauri::command]
-pub fn team_archive(input: ArchiveTeamInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<ArchiveView> {
+pub fn team_archive(input: ArchiveTeamInput, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> TeamResult<ArchiveView> {
+    let work = runtime.admit(None).map_err(TeamError::from_message)?;
+    let _body = work.body().map_err(TeamError::from_message)?;
     inspect_archive(&engine_from_state(&state)?, &input)
 }
 

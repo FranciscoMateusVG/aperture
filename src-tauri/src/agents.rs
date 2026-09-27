@@ -53,6 +53,7 @@ impl LifecycleRefusal {
 }
 pub(crate) struct LifecycleContext<'a> {
     lease: &'a crate::controller::ControllerLock,
+    work: Option<&'a crate::daemons::RuntimeWork>,
     home: std::path::PathBuf,
     roots: std::path::PathBuf,
     #[cfg(test)] pub(crate) fixture: Option<&'a LifecycleFixture>,
@@ -63,7 +64,7 @@ impl<'a> LifecycleContext<'a> {
             .ok_or(LifecycleRefusal::ContextMismatch.code())?.to_path_buf();
         let roots = std::env::var_os("APERTURE_AGENTS_DIR").filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".claude/aperture"));
-        Ok(Self { roots, home, lease,
+        Ok(Self { roots, home, lease, work: None,
             #[cfg(test)] fixture: None })
     }
     #[cfg(test)]
@@ -72,8 +73,21 @@ impl<'a> LifecycleContext<'a> {
         context.roots = context.home.join(".claude/aperture");
         Ok(context)
     }
-    fn classify(&self, name: &str) -> Result<(), String> {
+    fn require_tools(&self) -> Result<(), String> {
+        #[cfg(test)] if self.fixture.is_some() { return Ok(()); }
+        Err("E_RUNTIME_TOOLS_UNVERIFIED".into())
+    }
+    pub(crate) fn accounted(mut self, work: &'a crate::daemons::RuntimeWork) -> Self {
+        self.work = Some(work); self
+    }
+    fn check_open(&self) -> Result<(), String> {
         self.lease.verify_live()?;
+        if let Some(work) = self.work { work.check_open()?; }
+        Ok(())
+    }
+    fn classify(&self, name: &str) -> Result<(), String> {
+        self.check_open()?;
+        if let Some(work) = self.work { work.check_seat(name)?; }
         require_legacy_lifecycle_at(&self.home, &self.roots, name)
     }
     fn has_codex_history(&self, name: &str) -> Result<bool, String> {
@@ -283,8 +297,10 @@ fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
 
 #[tauri::command]
 pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
-    start_agent_shared(name, state.inner(), &runtime.lifecycle()?)
+    start_agent_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)
 }
 
 pub(crate) fn start_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
@@ -380,6 +396,7 @@ fn boot_agent_process_held(
         f.effects.lock().unwrap().push("legacy-boot");
         return Ok("fixture-pane".into());
     }
+    context.require_tools()?;
     let name = agent.name.clone();
 
     // Create a dedicated tmux window for this agent
@@ -636,32 +653,8 @@ fn boot_agent_process_held(
     // codex-bridge via the app-server socket. (Historical: the pre-v2
     // codex_harness pane-scraping monitor was deleted in Phase 3.)
 
-    // Auto-confirm the workspace trust prompt — but ONLY when the dialog is
-    // actually visible. Sending Enter blindly at fixed intervals would stomp
-    // on whatever the user is typing in the terminal (the agent window is
-    // focused right after creation). Instead, poll pane content every 500ms
-    // and send Enter exactly once when the trust prompt appears.
-    let window_id_clone = window_id.clone();
-    std::thread::spawn(move || {
-        // Max 30 polls × 500ms = 15 seconds total timeout
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Ok(content) = tmux::tmux_capture_pane(&window_id_clone) {
-                // Match the actual Claude workspace trust dialog text
-                if content.contains("Do you trust the files")
-                    || content.contains("Trust workspace")
-                    || content.contains("trust the files in")
-                {
-                    let _ = tmux::tmux_send_keys(window_id_clone.clone(), "".into());
-                    break; // sent exactly once — done
-                }
-                // Claude is already past the trust step — stop polling
-                if content.contains("> ") || content.contains("claude>") || content.contains("✓") {
-                    break;
-                }
-            }
-        }
-    });
+    // D: no detached capture/Enter worker. Trust approval is not automatic
+    // lifecycle authority; it requires separately approved operator interaction.
 
     Ok(window_id.clone())
     })();
@@ -708,8 +701,10 @@ fn teardown_agent(name: &str, window_id: Option<String>, context: &LifecycleCont
 
 #[tauri::command]
 pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
-    stop_agent_shared(name, state.inner(), &runtime.lifecycle()?)
+    stop_agent_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)
 }
 
 pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
@@ -735,6 +730,7 @@ fn stop_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &Lifecyc
         return Err(format!("Agent '{}' is not running", name));
     }
 
+    context.require_tools()?;
     teardown_agent(&name, window_id_opt, context);
 
     // Re-acquire to update status
@@ -766,8 +762,10 @@ fn stop_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &Lifecyc
 /// write the outcome.
 #[tauri::command]
 pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
-    restart_agent_shared(name, state.inner(), &runtime.lifecycle()?)
+    restart_agent_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)
 }
 
 pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
@@ -778,6 +776,7 @@ pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>, c
 }
 fn restart_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
     context.classify(&name)?;
+    context.require_tools()?;
     let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         let agent = app_state
@@ -885,7 +884,10 @@ fn merge_fresh_registry(
 }
 
 #[tauri::command]
-pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<AgentDef>, String> {
+pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<Vec<AgentDef>, String> {
+    let work = runtime.admit(None)?;
+    let _body = work.body()?;
+    work.require_tools()?;
     list_agents_shared(state.inner())
 }
 
@@ -996,12 +998,15 @@ pub fn light_attention(agent: &mut AgentDef, reason: AttentionReason) {
 }
 
 #[tauri::command]
-pub fn clear_attention(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
-    clear_attention_shared(name, state.inner())
+pub fn clear_attention(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(None)?;
+    let _body = work.body()?;
+    clear_attention_shared(name, state.inner(), &work)
 }
 
-pub(crate) fn clear_attention_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
+pub(crate) fn clear_attention_shared(name: String, state: &Arc<Mutex<AppState>>, work: &crate::daemons::RuntimeWork) -> Result<(), String> {
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    work.check_open()?;
     if let Some(agent) = app_state.agents.get_mut(&name) {
         agent.attention = false;
         agent.attention_reason = None;
@@ -1025,8 +1030,10 @@ pub fn is_valid_model(model: &str) -> bool {
 
 #[tauri::command]
 pub fn update_agent_model(name: String, model: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
-    update_agent_model_shared(name, model, state.inner(), &runtime.lifecycle()?)
+    update_agent_model_shared(name.clone(), model, state.inner(), &work.lifecycle(&name)?)
 }
 
 pub(crate) fn update_agent_model_shared(name: String, model: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
@@ -1062,6 +1069,7 @@ fn update_agent_model_held(name: String, model: String, state: &Arc<Mutex<AppSta
         f.effects.lock().unwrap().push("legacy-model");
         return Ok(());
     }
+    context.check_open()?;
     agent.model = model.clone();
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());

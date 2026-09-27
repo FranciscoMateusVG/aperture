@@ -429,11 +429,12 @@ fn no_pending_bytes(stream: &TcpStream) -> Result<(), String> {
         Err(UNVERIFIED.into())
     }
 }
-fn probe(
-    lease: &ControllerLock,
-    endpoint: SocketAddr,
-    expected: &ProcessIdentity,
-) -> Result<(), String> {
+fn probe(lease: &ControllerLock, endpoint: SocketAddr, expected: &ProcessIdentity) -> Result<(), String> {
+    connect_subscriber(lease, endpoint, expected, false).map(|_| ())
+}
+fn connect_subscriber(
+    lease: &ControllerLock, endpoint: SocketAddr, expected: &ProcessIdentity, allow_live: bool,
+) -> Result<BoundSubscriber, String> {
     presence(lease, expected).map_err(|_| "E_HUB_PRESENCE")?;
     let started = Instant::now();
     let tcp =
@@ -476,35 +477,103 @@ fn probe(
     ws.send(tungstenite::Message::Text(hello.to_string()))
         .map_err(|_| UNVERIFIED)?;
     let mut decoder = SnapshotDecoder::new(started);
+    let mut initial = Vec::new();
     loop {
         decoder
             .check_deadline(Instant::now())
             .map_err(|_| UNVERIFIED)?;
         let frame = ws.read().map_err(|_| "E_HUB_SNAPSHOT_READ")?;
-        if let Some(done) = decoder
-            .feed(&frame, Instant::now())
-            .map_err(|_| UNVERIFIED)?
-        {
+        let completed = decoder.feed(&frame, Instant::now()).map_err(|_| UNVERIFIED)?;
+        if completed.is_none() {
+            if let tungstenite::Message::Text(_) = &frame { initial.push(decode_presence(&frame)?); }
+        }
+        if let Some(done) = completed {
             if done.claimed_hub_pid != expected.pid {
                 return Err(UNVERIFIED.into());
             }
             break;
         }
     }
-    // Reject buffered duplicate/unsolicited frames and close before post-check.
-    // Live presence racing here is conservatively Unverified, never authority.
-    ws.get_mut()
-        .tcp
-        .set_nonblocking(true)
-        .map_err(|_| UNVERIFIED)?;
-    match ws.read() {
-        Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        _ => return Err("E_HUB_POST_FRAME_OR_CLOSED".into()),
+    // B2 probe still rejects unsolicited frames. The D subscriber retains valid
+    // buffered presence on THIS stream, but exposes none before post-binding.
+    ws.get_mut().tcp.set_nonblocking(true).map_err(|_| UNVERIFIED)?;
+    let mut pending = std::collections::VecDeque::new();
+    loop {
+        match ws.read() {
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Ok(frame) if allow_live && pending.len() < 256 => pending.push_back(decode_presence(&frame)?),
+            _ => return Err("E_HUB_POST_FRAME_OR_CLOSED".into()),
+        }
     }
     team_process::verify_tcp_server_binding(expected, endpoint, &ws.get_ref().tcp)?;
     presence(lease, expected).map_err(|_| "E_HUB_PRESENCE")?;
     lease.verify_live()?;
-    Ok(())
+    ws.get_mut().tcp.set_nonblocking(false).map_err(|_| UNVERIFIED)?;
+    Ok(BoundSubscriber { ws, expected: expected.clone(), endpoint, initial: Some(initial), pending, rate: Default::default() })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PresenceUpdate { pub agent: String, pub event: String }
+fn decode_presence(frame: &tungstenite::Message) -> Result<PresenceUpdate, String> {
+    let tungstenite::Message::Text(text) = frame else { return Err(UNVERIFIED.into()); };
+    if text.len() > SNAPSHOT_FRAME_BYTES { return Err(UNVERIFIED.into()); }
+    let SnapshotFrame::Presence { agent, event, ts } =
+        serde_json::from_str(text).map_err(|_| UNVERIFIED)? else { return Err(UNVERIFIED.into()); };
+    if agent.is_empty() || agent.len() > 128 || agent.chars().any(char::is_control)
+        || !matches!(event.as_str(), "join" | "busy" | "idle" | "leave")
+        || ts.len() > 64 || chrono::DateTime::parse_from_rfc3339(&ts).is_err() {
+        return Err(UNVERIFIED.into());
+    }
+    Ok(PresenceUpdate { agent, event })
+}
+// No raw socket, send, frame, bearer, lease or callback is exposed.
+pub(crate) struct BoundSubscriber {
+    ws: tungstenite::WebSocket<BoundedIo>,
+    expected: ProcessIdentity,
+    endpoint: SocketAddr,
+    initial: Option<Vec<PresenceUpdate>>,
+    pending: std::collections::VecDeque<PresenceUpdate>,
+    rate: std::collections::VecDeque<Instant>,
+}
+impl BoundSubscriber {
+    pub(crate) fn take_initial(&mut self) -> Result<Vec<PresenceUpdate>, String> {
+        self.initial.take().ok_or_else(|| UNVERIFIED.into())
+    }
+    fn verify(&self, lease: &ControllerLock) -> Result<(), String> {
+        lease.verify_live()?;
+        presence(lease, &self.expected)?;
+        team_process::verify_tcp_server_binding(&self.expected, self.endpoint, &self.ws.get_ref().tcp).map_err(str::to_owned)
+    }
+    pub(crate) fn next(&mut self, lease: &ControllerLock) -> Result<Option<PresenceUpdate>, String> {
+        if self.initial.is_some() { return Err(UNVERIFIED.into()); }
+        self.verify(lease)?;
+        let value = if let Some(value) = self.pending.pop_front() { value } else {
+            self.ws.get_mut().until = Instant::now() + Duration::from_secs(1);
+            self.ws.get_mut().remaining = SNAPSHOT_FRAME_BYTES + 14;
+            match self.ws.read() {
+                Ok(frame) => decode_presence(&frame)?,
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    self.verify(lease)?;
+                    return Ok(None);
+                }
+                _ => return Err(UNVERIFIED.into()),
+            }
+        };
+        self.verify(lease)?;
+        let now = Instant::now();
+        while self.rate.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) { self.rate.pop_front(); }
+        if self.rate.len() >= 256 { return Err(UNVERIFIED.into()); }
+        self.rate.push_back(now);
+        Ok(Some(value))
+    }
+}
+pub(crate) fn registered_subscriber(lease: &ControllerLock) -> Result<BoundSubscriber, String> {
+    let registry = Registry::open(lease)?;
+    registry.validate_namespace()?;
+    let current = registry.current("hub")?.ok_or(UNVERIFIED)?;
+    let Endpoint::Hub { port } = current.endpoint() else { return Err(UNVERIFIED.into()); };
+    let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, *port));
+    connect_subscriber(lease, endpoint, &current.identity(), true)
 }
 
 // Native replacement consumes the existing watchdog control seam only.

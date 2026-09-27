@@ -273,7 +273,9 @@ fn execute(
     actor: &AuthenticatedActor,
     command: Command,
     value: Value,
+    work: &crate::daemons::RuntimeWork,
 ) -> Result<Value, teams::TeamError> {
+    work.check_open().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
     if value
         .get("selection")
         .is_some_and(|v| !exact(v, &["harness", "model", "reasoning"]))
@@ -309,17 +311,20 @@ fn execute(
     let engine = teams::TeamEngine::new(s.home.clone(), s.project.clone());
     match command {
         Command::Version => Ok(crate::get_version()),
-        Command::Agents => legacy(crate::agents::list_agents_shared(&s.app)),
+        Command::Agents => {
+            work.require_tools().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
+            legacy(crate::agents::list_agents_shared(&s.app))
+        },
         Command::Start | Command::Stop | Command::Restart | Command::Attention => {
             let n: Name = decode(value)?;
             if !short_selector(&n.name) {
                 return Err(wire_error());
             }
             legacy(match command {
-                Command::Start => crate::agents::start_agent_shared(n.name, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?),
-                Command::Stop => crate::agents::stop_agent_shared(n.name, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?),
-                Command::Restart => crate::agents::restart_agent_shared(n.name, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?),
-                _ => crate::agents::clear_attention_shared(n.name, &s.app),
+                Command::Start => crate::agents::start_agent_shared(n.name.clone(), &s.app, &work.lifecycle(&n.name).map_err(|_| wire_error())?),
+                Command::Stop => crate::agents::stop_agent_shared(n.name.clone(), &s.app, &work.lifecycle(&n.name).map_err(|_| wire_error())?),
+                Command::Restart => crate::agents::restart_agent_shared(n.name.clone(), &s.app, &work.lifecycle(&n.name).map_err(|_| wire_error())?),
+                _ => crate::agents::clear_attention_shared(n.name, &s.app, work),
             })
         }
         Command::Model => {
@@ -328,7 +333,7 @@ fn execute(
                 return Err(wire_error());
             }
             legacy(crate::agents::update_agent_model_shared(
-                m.name, m.model, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?,
+                m.name.clone(), m.model, &s.app, &work.lifecycle(&m.name).map_err(|_| wire_error())?,
             ))
         }
         Command::TmuxSession => {
@@ -336,7 +341,7 @@ fn execute(
             if v.session_name != "aperture" {
                 return Err(wire_error());
             }
-            legacy(crate::tmux::tmux_create_session(v.session_name))
+            legacy(crate::tmux::tmux_create_session_shared(v.session_name, work))
         }
         Command::TmuxSelect => {
             let v: Window = decode(value)?;
@@ -347,7 +352,7 @@ fn execute(
             {
                 return Err(wire_error());
             }
-            legacy(crate::tmux::tmux_select_window(v.window_id))
+            legacy(crate::tmux::tmux_select_window_shared(v.window_id, work))
         }
         Command::Catalog => engine.catalog().and_then(serialize),
         Command::Presets => engine.list_presets().and_then(serialize),
@@ -435,7 +440,17 @@ async fn command(s: WebState, actor: Operator, cmd: Command, request: Request) -
             .unwrap()
             .insert(key.into(), Value::String(value.into()));
     }
-    match tokio::task::spawn_blocking(move || execute(&s, &actor.0, cmd, input)).await {
+    let seat = if matches!(cmd, Command::Start | Command::Stop | Command::Restart | Command::Model) {
+        input.get("name").and_then(Value::as_str)
+    } else { None };
+    let work = match s.runtime.admit(seat) {
+        Ok(work) => work,
+        Err(_) => return error(409, "E_RUNTIME_UNAVAILABLE", "runtime admission refused"),
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _body = work.body().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
+        execute(&s, &actor.0, cmd, input, &work)
+    }).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => {
             let safe = e.code.starts_with("E_")
@@ -591,12 +606,19 @@ pub async fn serve() -> Result<(), String> {
         .await
         .map_err(|_| "local address unavailable")?;
     runtime.start(app)?;
-    axum::serve(listener, router(s))
-        .with_graceful_shutdown(async {
+    let closing = runtime.clone();
+    let result = axum::serve(listener, router(s))
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Close admission before waiting for HTTP request futures. The
+            // synchronous collector must not occupy the async worker.
+            let _ = tokio::task::spawn_blocking(move || closing.close()).await;
         })
-        .await
-        .map_err(|_| "local server stopped unexpectedly")?;
+        .await;
+    let drain = runtime.clone();
+    tokio::task::spawn_blocking(move || drain.close()).await
+        .map_err(|_| "E_RUNTIME_DRAIN_INCOMPLETE")??;
+    result.map_err(|_| "local server stopped unexpectedly")?;
     // Detach only. This does NOT prove D close-admission/drain/join; startup remains fenced.
     crate::ws_hub::shutdown();
     crate::codex_appserver::shutdown();
