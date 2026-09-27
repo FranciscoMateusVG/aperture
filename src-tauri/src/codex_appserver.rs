@@ -17,6 +17,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+/// Identity-only C1 primitive. Registry construction is explicit caller setup;
+/// this probe neither opens a registry nor creates missing paths/facts. A unit
+/// result deliberately carries no reusable signal/unlink/adoption authority.
+/// Legacy lifecycle functions below remain untouched and MUST NOT call this
+/// observation as a substitute for the future C2/C3 operation contract.
+pub(crate) fn probe_registered(
+    registry: &crate::daemon_registry::Registry<'_>,
+    seat: &str,
+) -> Result<(), String> {
+    crate::team_terminal::verify_registered_legacy_socket(registry, seat)
+        .map_err(|_| "E_CODEX_UNVERIFIED: registered Unix identity could not be observed".into())
+}
+
+#[cfg(test)]
+#[path = "codex_appserver_tests.rs"]
+mod registered_tests;
+
 /// Set by `shutdown()`; tells every supervisor loop to stop respawning.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 

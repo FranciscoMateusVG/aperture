@@ -23,6 +23,18 @@ pub(crate) struct ControllerLock {
     run: PathBuf,
     identity: crate::team_replacement::ProcessIdentity,
 }
+/// Validation only: unlike journal::ensure_private_dir, never repairs absence.
+pub(crate) fn private_dir_readonly(path: &Path) -> Result<(), String> {
+    let m = std::fs::symlink_metadata(path).map_err(|_| "E_PATH_UNSAFE: missing directory")?;
+    if !m.is_dir()
+        || m.file_type().is_symlink()
+        || m.uid() != unsafe { libc::geteuid() }
+        || m.mode() & 0o077 != 0
+    {
+        return Err("E_PATH_UNSAFE: unsafe directory".into());
+    }
+    Ok(())
+}
 impl ControllerLock {
     pub fn acquire(home: &Path) -> Result<Self, String> {
         let root = home.join(".aperture");
@@ -102,10 +114,8 @@ impl ControllerLock {
         {
             return Err("E_CONTROLLER_LEASE: holder identity changed".into());
         }
-        crate::journal::ensure_private_dir(
-            self.run.parent().ok_or("controller root unavailable")?,
-        )?;
-        crate::journal::ensure_private_dir(&self.run)?;
+        private_dir_readonly(self.run.parent().ok_or("controller root unavailable")?)?;
+        private_dir_readonly(&self.run)?;
         let held = self
             ._file
             .metadata()

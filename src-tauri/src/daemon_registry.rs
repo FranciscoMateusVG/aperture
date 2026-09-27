@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -215,20 +216,30 @@ impl<'a> Registry<'a> {
         journal::ensure_private_dir(&root).map_err(|_| fail("E_DAEMON_PATH"))?;
         Ok(Self { lease, root })
     }
-    fn checked_root(&self) -> Result<()> {
+    /// The only authority for registry consumers; never accept a second home/lease.
+    pub(crate) fn lease(&self) -> Result<&ControllerLock> {
         self.lease.verify_live()?;
-        let root = journal::validate_component_path(self.lease.run_dir()?, "daemons", false)
-            .map_err(|_| fail("E_DAEMON_PATH"))?;
-        journal::ensure_private_dir(&root).map_err(|_| fail("E_DAEMON_PATH"))
+        Ok(self.lease)
+    }
+    fn checked_root(&self) -> Result<()> {
+        let expected = self.lease.run_dir()?.join("daemons");
+        if expected != self.root {
+            return Err(fail("E_DAEMON_PATH"));
+        }
+        crate::controller::private_dir_readonly(&self.root).map_err(|_| fail("E_DAEMON_PATH"))
     }
     fn slot_path(&self, slot: &str, create: bool) -> Result<PathBuf> {
         self.checked_root()?;
         if !valid_slot(slot) {
             return Err(fail("E_DAEMON_PATH"));
         }
-        let path = journal::validate_component_path(&self.root, slot, create)
-            .map_err(|_| fail("E_DAEMON_PATH"))?;
-        journal::ensure_private_dir(&path).map_err(|_| fail("E_DAEMON_PATH"))?;
+        let path = self.root.join(slot);
+        if create {
+            // Explicit reserve writer only. Read paths below never repair dirs.
+            journal::ensure_private_dir(&path).map_err(|_| fail("E_DAEMON_PATH"))?;
+        } else {
+            crate::controller::private_dir_readonly(&path).map_err(|_| fail("E_DAEMON_PATH"))?;
+        }
         Ok(path)
     }
     fn history(&self, slot: &str) -> Result<History> {
@@ -250,8 +261,13 @@ impl<'a> Registry<'a> {
                 .file_name()
                 .into_string()
                 .map_err(|_| fail("E_DAEMON_PATH"))?;
-            let file = journal::validate_component_path(&path, &name, false)
-                .map_err(|_| fail("E_DAEMON_PATH"))?;
+            // read_dir supplies a single basename. No creating path validator
+            // on a read: a concurrently missing parent must stay missing.
+            let file = path.join(&name);
+            let meta = fs::symlink_metadata(&file).map_err(|_| fail("E_DAEMON_PATH"))?;
+            if meta.file_type().is_symlink() || meta.uid() != unsafe { libc::geteuid() } {
+                return Err(fail("E_DAEMON_PATH"));
+            }
             if name == "current" {
                 let id: String = read(&file)?;
                 if !uuid(&id) {

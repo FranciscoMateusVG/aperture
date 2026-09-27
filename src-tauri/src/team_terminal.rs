@@ -206,6 +206,87 @@ fn verify_socket_with(
 fn verified_socket(socket: &Path, pid: u32) -> Result<SocketBinding> {
     verify_socket_with(socket, pid, resolve_socket, socket_peer)
 }
+/// C1 only: registered legacy Unix observation. The native peer FD closes
+/// inside verified_socket; success is NOT a retained grant to signal or unlink.
+/// No caller-selected home/path/PID, no registry enrollment, no protocol bytes.
+pub(crate) fn verify_registered_legacy_socket(
+    registry: &crate::daemon_registry::Registry<'_>,
+    seat: &str,
+) -> Result<()> {
+    registered_socket_observation(registry, seat, team_process::state, || {})
+}
+fn legacy_probe_pins(home: &Path, seat: &str) -> Result<Vec<PathPin>> {
+    use crate::agents::legacy_lifecycle_guard::{ensure_legacy, Membership};
+    if !crate::agent_loader::is_valid_seat_name(seat) {
+        return Err(ERROR.into());
+    }
+    let mut pins = coordination_runtime_dirs(home)?;
+    for relative in [".claude".to_string(), ".claude/aperture".into(), format!(".claude/aperture/{seat}")] {
+        let pin = PathPin::read(&home.join(relative))?;
+        if !pin.kind(libc::S_IFDIR) || pin.uid != unsafe { libc::geteuid() }
+            || pin.mode & 0o022 != 0
+        {
+            return Err(ERROR.into());
+        }
+        pins.push(pin);
+    }
+    let membership = match teams::classify_managed_seat(home, seat) {
+        Ok(None) => Membership::Standing,
+        Ok(Some(_)) => Membership::Team,
+        Err(_) => Membership::Unknown,
+    };
+    ensure_legacy(&home.join(".claude/aperture"), seat, membership).map_err(|_| ERROR)?;
+    Ok(pins)
+}
+fn registered_socket_observation(
+    registry: &crate::daemon_registry::Registry<'_>,
+    seat: &str,
+    mut state: impl FnMut(&crate::team_replacement::ProcessIdentity) -> crate::team_replacement::ProcessState,
+    after_peer: impl FnOnce(),
+) -> Result<()> {
+    use crate::{daemon_registry::Endpoint, team_replacement::ProcessState};
+    let lease = registry.lease()?;
+    let run = lease.run_dir()?;
+    let home = run.parent().and_then(Path::parent).ok_or(ERROR)?;
+    let pins = legacy_probe_pins(home, seat)?;
+    let slot = format!("codex-{seat}");
+    let record = registry.current(&slot)?.ok_or(ERROR)?;
+    if record.endpoint() != &(Endpoint::CodexAppServer { seat: seat.into() }) {
+        return Err(ERROR.into());
+    }
+    let identity = record.identity();
+    if state(&identity) != ProcessState::Same {
+        return Err(ERROR.into());
+    }
+    let socket = run.join(format!("{seat}.sock"));
+    let binding = verified_socket(&socket, identity.pid)?;
+    after_peer();
+    if state(&identity) != ProcessState::Same
+        || legacy_probe_pins(home, seat)? != pins
+        || registry.current(&slot)?.as_ref() != Some(&record)
+    {
+        return Err(ERROR.into());
+    }
+    // Recheck again after the registry/classification reads, without reopening
+    // or granting future authority. Same-UID concurrent replacement is not atomic.
+    binding.recheck()?;
+    if resolve_socket(&socket)? != binding {
+        return Err(ERROR.into());
+    }
+    for pin in pins { pin.recheck()?; }
+    lease.verify_live()?;
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) fn registered_socket_test_observation(
+    registry: &crate::daemon_registry::Registry<'_>,
+    seat: &str,
+    state: impl FnMut(&crate::team_replacement::ProcessIdentity) -> crate::team_replacement::ProcessState,
+    after_peer: impl FnOnce(),
+) -> Result<()> {
+    // Faults around a REAL native peer lookup, not an alternate fake algorithm.
+    registered_socket_observation(registry, seat, state, after_peer)
+}
 // Coordination peers are observations, never signal authority. The collector
 // must prove disjoint closures independently. No caller-selected socket/seat,
 // no registry override from env, no RPC, and no creation of missing paths.
