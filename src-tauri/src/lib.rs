@@ -1,4 +1,5 @@
 mod controller;
+mod daemon_registry;
 mod daemons;
 mod web_auth;
 pub mod web_server;
@@ -224,8 +225,8 @@ pub fn run() {
         }
     }
 
-    if daemons::start(&_controller, Arc::clone(&app_state)).is_err() {
-        eprintln!("[aperture] daemon startup failed");
+    if let Err(error) = daemons::start(&_controller, Arc::clone(&app_state)) {
+        eprintln!("[aperture] daemon startup refused: {error}");
         return;
     }
 

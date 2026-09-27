@@ -19,6 +19,7 @@ struct Holder {
 pub(crate) struct ControllerLock {
     _file: File,
     run: PathBuf,
+    identity: crate::team_replacement::ProcessIdentity,
 }
 impl ControllerLock {
     pub fn acquire(home: &Path) -> Result<Self, String> {
@@ -73,7 +74,7 @@ impl ControllerLock {
             .ok_or("controller identity unavailable")?;
         let bytes = serde_json::to_vec(&Holder {
             pid: process.identity.pid,
-            start_time: process.identity.start_time,
+            start_time: process.identity.start_time.clone(),
         })
         .map_err(|_| "controller identity unavailable")?;
         file.set_len(0)
@@ -81,9 +82,54 @@ impl ControllerLock {
             .and_then(|_| file.write_all(&bytes))
             .and_then(|_| file.sync_all())
             .map_err(|_| "controller lock write failed")?;
-        Ok(Self { _file: file, run })
+        Ok(Self {
+            _file: file,
+            run,
+            identity: process.identity,
+        })
+    }
+    /// A borrowed lease cannot outlive its file. Also reject a forked holder or
+    /// replaced lock path before registry mutation; possession of a pathname is
+    /// not controller authority.
+    pub(crate) fn verify_live(&self) -> Result<(), String> {
+        use crate::team_replacement::ProcessState;
+        if self.identity.pid != std::process::id()
+            || crate::team_process::state(&self.identity) != ProcessState::Same
+        {
+            return Err("E_CONTROLLER_LEASE: holder identity changed".into());
+        }
+        crate::journal::ensure_private_dir(
+            self.run.parent().ok_or("controller root unavailable")?,
+        )?;
+        crate::journal::ensure_private_dir(&self.run)?;
+        let held = self
+            ._file
+            .metadata()
+            .map_err(|_| "controller lock unavailable")?;
+        let path = std::fs::symlink_metadata(self.run.join("daemons.lock"))
+            .map_err(|_| "controller lock unavailable")?;
+        if !path.is_file()
+            || path.file_type().is_symlink()
+            || path.dev() != held.dev()
+            || path.ino() != held.ino()
+            || path.nlink() != 1
+            || path.uid() != unsafe { libc::geteuid() }
+            || path.mode() & 0o777 != 0o600
+        {
+            return Err("E_CONTROLLER_LEASE: lock path changed".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn run_dir(&self) -> Result<&Path, String> {
+        self.verify_live()?;
+        Ok(&self.run)
+    }
+    pub(crate) fn identity(&self) -> Result<&crate::team_replacement::ProcessIdentity, String> {
+        self.verify_live()?;
+        Ok(&self.identity)
     }
     pub fn rotate_open_capability(&self, value: &str) -> Result<(), String> {
+        self.verify_live()?;
         crate::journal::write_private_bytes_atomic(
             &self.run.join("operator.token"),
             value.as_bytes(),
