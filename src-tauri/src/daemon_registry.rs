@@ -216,10 +216,15 @@ impl<'a> Registry<'a> {
         journal::ensure_private_dir(&root).map_err(|_| fail("E_DAEMON_PATH"))?;
         Ok(Self { lease, root })
     }
-    /// The only authority for registry consumers; never accept a second home/lease.
-    pub(crate) fn lease(&self) -> Result<&ControllerLock> {
-        self.lease.verify_live()?;
-        Ok(self.lease)
+    /// Read-only projection of this registry's own verified root. Never expose
+    /// ControllerLock: its shared reference carries capability-rotation and
+    /// mutable child authority, which an observation consumer must not recover.
+    pub(crate) fn verified_run_dir(&self) -> Result<&Path> {
+        self.verify_read_context()?;
+        self.lease.run_dir()
+    }
+    pub(crate) fn verify_read_context(&self) -> Result<()> {
+        self.checked_root()
     }
     fn checked_root(&self) -> Result<()> {
         let expected = self.lease.run_dir()?.join("daemons");

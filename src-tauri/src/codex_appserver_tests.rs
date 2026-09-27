@@ -554,3 +554,27 @@ fn c1_lease_replaced_lock_and_unsafe_or_symlinked_run_deny_without_repair() {
         assert_eq!(snapshot(&f.home), before);
     }
 }
+
+#[test]
+fn c1_registry_read_projection_revalidates_lost_context_without_repair() {
+    for relative in [".aperture/run/daemons", ".aperture/run"] {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        publish(&registry, lease.identity().unwrap());
+        let before = snapshot(&f.home);
+        // The projection contains only a path, not the controller, child guard,
+        // mutation closure or reusable process authority. Source/API review is
+        // paired with these real functional read-context drift assertions.
+        let path: &Path = registry.verified_run_dir().unwrap();
+        assert_eq!(path, f.home.join(".aperture/run"));
+        registry.verify_read_context().unwrap();
+        assert_eq!(snapshot(&f.home), before);
+        fs::remove_dir_all(f.home.join(relative)).unwrap();
+        let after_loss = snapshot(&f.home);
+        assert!(registry.verified_run_dir().is_err());
+        assert!(registry.verify_read_context().is_err());
+        assert!(probe_registered(&registry, "fixture").is_err());
+        assert_eq!(snapshot(&f.home), after_loss);
+    }
+}

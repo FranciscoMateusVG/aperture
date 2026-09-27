@@ -245,8 +245,7 @@ fn registered_socket_observation(
     after_peer: impl FnOnce(),
 ) -> Result<()> {
     use crate::{daemon_registry::Endpoint, team_replacement::ProcessState};
-    let lease = registry.lease()?;
-    let run = lease.run_dir()?;
+    let run = registry.verified_run_dir()?;
     let home = run.parent().and_then(Path::parent).ok_or(ERROR)?;
     let pins = legacy_probe_pins(home, seat)?;
     let slot = format!("codex-{seat}");
@@ -274,7 +273,7 @@ fn registered_socket_observation(
         return Err(ERROR.into());
     }
     for pin in pins { pin.recheck()?; }
-    lease.verify_live()?;
+    registry.verify_read_context()?;
     Ok(())
 }
 #[cfg(test)]
