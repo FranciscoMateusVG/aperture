@@ -250,6 +250,7 @@ fn coordination_name(seat: &str) -> Result<&'static str> {
         "glados" => Ok("GLaDOS"),
         "peppy" => Ok("Peppy"),
         "wheatley" => Ok("Wheatley"),
+        "cipher" => Ok("Cipher"),
         _ => Err(ERROR.into()),
     }
 }
@@ -475,7 +476,7 @@ fn capture_coordination_peer(
 }
 pub(crate) fn capture_coordination_peers(home: &Path) -> Result<Vec<CoordinationPeer>> {
     let mut peers = vec![];
-    for seat in ["glados", "peppy", "wheatley"] {
+    for seat in ["glados", "peppy", "wheatley", "cipher"] {
         if let Some(peer) = capture_coordination_peer(
             home,
             seat,
