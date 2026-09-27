@@ -479,3 +479,84 @@ fn selectors_and_record_binding_are_strict() {
         Some(&original)
     );
 }
+
+#[test]
+fn b2_capacity_accounts_for_new_pair_and_current_without_pruning_history() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let registry = Registry::open(&lease).unwrap();
+    let first = published(&registry);
+    let dir = registry.slot_path("hub", false).unwrap();
+    let mut previous = first.reservation.incarnation.clone();
+    // 255 complete incarnations => 511 facts including current. Adding the
+    // next reservation+record would exceed512, even though a reservation alone
+    // would fit. Build valid history directly, without any spawn authority.
+    for _ in 1..255 {
+        let mut r = first.clone();
+        r.reservation.incarnation = Uuid::new_v4().to_string();
+        r.reservation.previous = Some(previous);
+        journal::write_private_json_atomic(
+            &dir.join(format!("reservation-{}.json", r.reservation.incarnation)),
+            &r.reservation,
+            false,
+        )
+        .unwrap();
+        journal::write_private_json_atomic(
+            &dir.join(format!("{}.json", r.reservation.incarnation)),
+            &r,
+            false,
+        )
+        .unwrap();
+        previous = r.reservation.incarnation;
+    }
+    journal::write_private_json_atomic(&dir.join("current"), &previous, true).unwrap();
+    assert!(registry.inspect().is_ok());
+    error(registry.capacity("hub"), "E_DAEMON_CAPACITY");
+    error(
+        registry.reserve(
+            Endpoint::Hub { port: 4517 },
+            Provenance::LegacyUnknown,
+            1002,
+        ),
+        "E_DAEMON_CAPACITY",
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 511);
+    assert_eq!(
+        registry
+            .current("hub")
+            .unwrap()
+            .unwrap()
+            .reservation
+            .incarnation,
+        previous
+    );
+}
+
+#[test]
+fn b2_slot_capacity_denies_new_slot_without_erasing_existing_history() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let registry = Registry::open(&lease).unwrap();
+    for n in 0..MAX_SLOTS {
+        let reservation = registry
+            .reserve(
+                Endpoint::CodexAppServer {
+                    seat: format!("fixture-{n}"),
+                },
+                Provenance::LegacyUnknown,
+                1,
+            )
+            .unwrap();
+        let r = registry
+            .record(&reservation, lease.identity().unwrap(), 2)
+            .unwrap();
+        registry.publish_current(&r).unwrap();
+    }
+    error(registry.capacity("hub"), "E_DAEMON_CAPACITY");
+    error(
+        registry.reserve(Endpoint::Hub { port: 4517 }, Provenance::LegacyUnknown, 1),
+        "E_DAEMON_CAPACITY",
+    );
+    assert_eq!(registry.inspect().unwrap().len(), MAX_SLOTS);
+    assert!(registry.current("hub").unwrap().is_none());
+}

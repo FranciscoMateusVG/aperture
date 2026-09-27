@@ -15,7 +15,7 @@ pub(crate) fn start(lease: &ControllerLock, state: Arc<Mutex<AppState>>) -> Resu
             .clone();
         let poller = Arc::clone(&state);
         std::thread::spawn(move || crate::poller::run_message_poller(poller));
-        crate::ws_hub::spawn_ws_hub(project);
+        crate::ws_hub::spawn_ws_hub(lease, project)?;
         crate::watchdog::spawn_watchdog(state);
         Ok(())
     })

@@ -85,7 +85,7 @@ impl Identity {
         }
         Ok(())
     }
-    fn native(self) -> ProcessIdentity {
+    pub(crate) fn native(self) -> ProcessIdentity {
         ProcessIdentity {
             pid: self.pid,
             start_time: format!(
@@ -167,6 +167,13 @@ impl Reservation {
     }
 }
 impl Record {
+    pub(crate) fn identity(&self) -> ProcessIdentity {
+        self.process.native()
+    }
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.reservation.endpoint
+    }
+
     fn validate(&self, slot: &str) -> Result<()> {
         if self.schema_version != SCHEMA {
             return Err(fail("E_DAEMON_SCHEMA"));
@@ -341,6 +348,44 @@ impl<'a> Registry<'a> {
         out.sort_by(|a, b| a.slot.cmp(&b.slot));
         Ok(out)
     }
+    /// Complete current metadata only; never protocol/adoption authority.
+    pub(crate) fn current(&self, slot: &str) -> Result<Option<Record>> {
+        self.checked_root()?;
+        if !valid_slot(slot) {
+            return Err(fail("E_DAEMON_PATH"));
+        }
+        match fs::symlink_metadata(self.root.join(slot)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(fail("E_DAEMON_PATH")),
+            Ok(_) => Ok(Some(self.complete(&self.history(slot)?)?.clone())),
+        }
+    }
+    /// Account for both immutable facts and initial current BEFORE reserve or
+    /// spawn. No history pruning/UUID rollover is a way around this limit.
+    pub(crate) fn capacity(&self, slot: &str) -> Result<()> {
+        self.inspect()?;
+        let slots = fs::read_dir(&self.root)
+            .map_err(|_| fail("E_DAEMON_PATH"))?
+            .count();
+        let facts = match fs::symlink_metadata(self.root.join(slot)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if slots >= MAX_SLOTS {
+                    return Err(fail("E_DAEMON_CAPACITY"));
+                }
+                0
+            }
+            Err(_) => return Err(fail("E_DAEMON_PATH")),
+            Ok(_) => {
+                let h = self.history(slot)?;
+                self.complete(&h)?;
+                h.reservations.len() + h.records.len() + 1
+            }
+        };
+        if facts + if facts == 0 { 3 } else { 2 } > MAX_FACTS {
+            return Err(fail("E_DAEMON_CAPACITY"));
+        }
+        Ok(())
+    }
     /// Metadata mutation only, not a spawn permission. An unresolved previous
     /// reservation blocks a new UUID, even if its endpoint happens to be free.
     pub(crate) fn reserve(
@@ -352,6 +397,7 @@ impl<'a> Registry<'a> {
         self.checked_root()?;
         let slot = endpoint.slot()?;
         provenance.validate()?;
+        self.capacity(&slot)?;
         let path = self.root.join(&slot);
         let previous = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

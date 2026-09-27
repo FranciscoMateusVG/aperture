@@ -460,3 +460,265 @@ mod persisted_tests;
 
 #[path = "team_process_native.rs"]
 pub(crate) mod native;
+
+/// Bind one still-open TCP conversation to a recorded macOS birth identity.
+/// Client authentication is deliberately NOT part of this primitive. Call before
+/// sending a bearer, and again after the authenticated snapshot on the same
+/// stream. This is bounded observation, not an atomic kernel capability: root /
+/// kernel compromise and a compromised recorded process deliberately handing
+/// off its accepted FD are outside this guarantee. Localhost alone is no trust.
+pub(crate) fn verify_tcp_server_binding(
+    expected: &ProcessIdentity,
+    endpoint: std::net::SocketAddr,
+    stream: &std::net::TcpStream,
+) -> Result<(), &'static str> {
+    tcp_binding::verify(expected, endpoint, stream)
+}
+
+pub(crate) mod tcp_binding {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+    const ERROR: &str = "E_HUB_BINDING_UNVERIFIED";
+    const FD_CAP: usize = 4096;
+    // Darwin sys/proc_info.h LP64 ABI (arm64/x86_64). Full socket_fdinfo is
+    // required, even though only its TCP prefix is decoded. Offsets verified
+    // against the native SDK record layout, not guessed from netstat output.
+    const SOCKET_BYTES: usize = 792;
+    #[repr(C, align(8))]
+    struct SocketBytes([u8; SOCKET_BYTES]);
+    const _: () = assert!(std::mem::size_of::<SocketBytes>() == 792);
+    const _: () = assert!(std::mem::align_of::<SocketBytes>() == 8);
+    #[derive(Debug, Clone)]
+    pub(super) struct Row {
+        local: SocketAddr,
+        remote: SocketAddr,
+        state: i32,
+    }
+    fn int(raw: &[u8], offset: usize) -> Result<i32, &'static str> {
+        Ok(i32::from_ne_bytes(
+            raw.get(offset..offset + 4)
+                .ok_or(ERROR)?
+                .try_into()
+                .map_err(|_| ERROR)?,
+        ))
+    }
+    // Pure decoder used by the syscall path and truncation/ABI negative tests.
+    pub(super) fn decode(raw: &[u8], returned: i32) -> Result<Option<Row>, &'static str> {
+        if raw.len() != SOCKET_BYTES || returned != SOCKET_BYTES as i32 {
+            return Err(ERROR);
+        }
+        if int(raw, 176)? != libc::SOCK_STREAM
+            || int(raw, 180)? != libc::IPPROTO_TCP
+            || int(raw, 184)? != libc::AF_INET
+            || int(raw, 256)? != 2
+        {
+            return Ok(None);
+        }
+        if raw[288] != 1 {
+            return Err(ERROR);
+        } // INI_IPV4, not dual-stack
+        let addr = |port_at, ip_at| -> Result<SocketAddr, &'static str> {
+            let port = u16::try_from(int(raw, port_at)?).map_err(|_| ERROR)?;
+            let ip: [u8; 4] = raw
+                .get(ip_at..ip_at + 4)
+                .ok_or(ERROR)?
+                .try_into()
+                .map_err(|_| ERROR)?;
+            Ok(SocketAddrV4::new(Ipv4Addr::from(ip), u16::from_be(port)).into())
+        };
+        Ok(Some(Row {
+            local: addr(268, 324)?,
+            remote: addr(264, 308)?,
+            state: int(raw, 344)?,
+        }))
+    }
+    pub(super) fn match_rows(
+        rows: &[Row],
+        endpoint: SocketAddr,
+        client: SocketAddr,
+    ) -> Result<(), &'static str> {
+        if endpoint.ip() != Ipv4Addr::LOCALHOST
+            || endpoint.port() == 0
+            || client.ip() != Ipv4Addr::LOCALHOST
+            || client.port() == 0
+        {
+            return Err(ERROR);
+        }
+        let listeners = rows
+            .iter()
+            .filter(|r| r.state == 1 && r.local == endpoint)
+            .count();
+        let accepted = rows
+            .iter()
+            .filter(|r| r.state == 4 && r.local == endpoint && r.remote == client)
+            .count();
+        if listeners != 1 || accepted != 1 {
+            return Err(ERROR);
+        }
+        Ok(())
+    }
+    pub(super) fn list_count(returned: i32, capacity: usize) -> Result<usize, &'static str> {
+        if returned <= 0 || returned as usize >= capacity || returned as usize % 8 != 0 {
+            return Err(ERROR);
+        }
+        Ok(returned as usize / 8)
+    }
+    #[cfg(all(
+        target_os = "macos",
+        target_pointer_width = "64",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    fn rows(pid: u32) -> Result<Vec<Row>, &'static str> {
+        const _: () = assert!(std::mem::size_of::<libc::proc_fdinfo>() == 8);
+        const _: () = assert!(std::mem::offset_of!(libc::proc_fdinfo, proc_fdtype) == 4);
+        const _: () = assert!(std::mem::size_of::<libc::vinfo_stat>() == 136);
+        let bytes = FD_CAP * 8;
+        // Null size query first, then a bounded buffer with room for growth.
+        // A full/unaligned/failed return is not a complete enumeration.
+        let needed = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        list_count(needed, bytes)?;
+        let mut fds: Vec<libc::proc_fdinfo> = (0..FD_CAP)
+            .map(|_| libc::proc_fdinfo {
+                proc_fd: -1,
+                proc_fdtype: 0,
+            })
+            .collect();
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                bytes as i32,
+            )
+        };
+        let count = list_count(n, bytes)?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for fd in &fds[..count] {
+            if fd.proc_fd < 0 || !seen.insert(fd.proc_fd) {
+                return Err(ERROR);
+            }
+            if fd.proc_fdtype != 2 {
+                continue;
+            } // PROX_FDTYPE_SOCKET
+            let mut raw = SocketBytes([0; SOCKET_BYTES]);
+            // SAFETY: aligned writable full-size ABI buffer; never transmute or
+            // dereference kernel pointers. Parse only after full return check.
+            let n = unsafe {
+                libc::proc_pidfdinfo(
+                    pid as i32,
+                    fd.proc_fd,
+                    3,
+                    raw.0.as_mut_ptr().cast(),
+                    SOCKET_BYTES as i32,
+                )
+            };
+            if let Some(row) = decode(&raw.0, n)? {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+    #[cfg(not(all(
+        target_os = "macos",
+        target_pointer_width = "64",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )))]
+    fn rows(_: u32) -> Result<Vec<Row>, &'static str> {
+        Err(ERROR)
+    }
+    pub(super) fn verify(
+        expected: &ProcessIdentity,
+        endpoint: SocketAddr,
+        stream: &TcpStream,
+    ) -> Result<(), &'static str> {
+        verify_observed(expected, endpoint, stream, state)
+    }
+    #[cfg(test)]
+    pub(crate) fn post_identity_oracle(
+        expected: &ProcessIdentity,
+        endpoint: SocketAddr,
+        stream: &TcpStream,
+        after: ProcessState,
+    ) -> Result<(), &'static str> {
+        let calls = std::cell::Cell::new(0);
+        let result = verify_observed(expected, endpoint, stream, |id| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                state(id)
+            } else {
+                after.clone()
+            }
+        });
+        assert_eq!(
+            calls.get(),
+            2,
+            "must traverse real kernel binding before injected post-observation"
+        );
+        result
+    }
+    fn verify_observed(
+        expected: &ProcessIdentity,
+        endpoint: SocketAddr,
+        stream: &TcpStream,
+        observe: impl Fn(&ProcessIdentity) -> ProcessState,
+    ) -> Result<(), &'static str> {
+        if observe(expected) != ProcessState::Same
+            || stream.peer_addr().map_err(|_| ERROR)? != endpoint
+        {
+            return Err(ERROR);
+        }
+        let client = stream.local_addr().map_err(|_| ERROR)?;
+        let rows = rows(expected.pid).map_err(|_| "E_HUB_BINDING_ENUMERATION")?;
+        match_rows(&rows, endpoint, client).map_err(|_| "E_HUB_BINDING_TUPLE")?;
+        if observe(expected) != ProcessState::Same
+            || stream.take_error().map_err(|_| ERROR)?.is_some()
+        {
+            return Err(ERROR);
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn abi_negative_oracles() {
+        assert!(decode(&[0; 791], 791).is_err());
+        assert!(decode(&[0; 792], 791).is_err());
+        assert!(decode(&[0; 792], -1).is_err());
+        for n in [-1, 0, 7, (FD_CAP * 8) as i32, (FD_CAP * 8 + 8) as i32] {
+            assert!(list_count(n, FD_CAP * 8).is_err());
+        }
+        let endpoint: SocketAddr = "127.0.0.1:4517".parse().unwrap();
+        let client: SocketAddr = "127.0.0.1:60000".parse().unwrap();
+        let listener = Row {
+            local: endpoint,
+            remote: "0.0.0.0:0".parse().unwrap(),
+            state: 1,
+        };
+        let accepted = Row {
+            local: endpoint,
+            remote: client,
+            state: 4,
+        };
+        assert!(match_rows(&[listener.clone(), accepted.clone()], endpoint, client).is_ok());
+        assert!(match_rows(&[listener.clone()], endpoint, client).is_err());
+        for bad in ["127.0.0.1:60001", "127.0.0.2:60000", "[::1]:60000"] {
+            let mut r = accepted.clone();
+            r.remote = bad.parse().unwrap();
+            assert!(match_rows(&[listener.clone(), r], endpoint, client).is_err());
+        }
+        for bad in ["0.0.0.0:4517", "127.0.0.1:4518", "[::1]:4517"] {
+            let mut r = listener.clone();
+            r.local = bad.parse().unwrap();
+            assert!(match_rows(&[r, accepted.clone()], endpoint, client).is_err());
+        }
+        assert!(match_rows(&[listener.clone(), listener, accepted], endpoint, client).is_err());
+    }
+}

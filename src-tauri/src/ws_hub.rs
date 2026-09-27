@@ -1,44 +1,30 @@
-//! WS hub daemon supervisor — Comms Layer v2, Phase 1.
-//!
-//! Spec: docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md
-//!
-//! The aperture-bus WS hub (`mcp-server/dist/ws-hub.js`) is the delivery
-//! transport for Claude agents: it pushes unread BEADS message rows over
-//! WebSocket (ws://127.0.0.1:4517) and replays them on reconnect. Tauri is
-//! the process supervisor (spec §Architecture): we spawn `node ws-hub.js` at
-//! app startup and respawn it 2s after any exit. On app exit `shutdown()`
-//! kills the child (wired to `tauri::RunEvent::Exit` in lib.rs) so a stale
-//! hub never squats on port 4517 across launches.
+//! F2-B2 synchronous, lease-borrowed native hub supervisor. No kill-by-port,
+//! blind respawn loop or detached authority thread. Aggregate startup stays
+//! fenced in daemons.rs until C/D; protocol completion alone is not identity.
+use crate::{
+    controller::ControllerLock,
+    daemon_registry::{Endpoint, Provenance, Registry},
+    team_process,
+    team_replacement::{ProcessIdentity, ProcessState},
+};
+use std::os::{
+    fd::AsRawFd,
+    unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        process::CommandExt,
+    },
+};
+use std::{
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
-use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
-
-/// Set by `shutdown()`; tells the supervisor loop to stop respawning.
-static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
-
-/// Handle to the currently-running hub child, shared between the supervisor
-/// thread (which polls it via `try_wait`) and `shutdown()` (which kills it).
-static CHILD: Mutex<Option<Child>> = Mutex::new(None);
-
-/// The hub's listen port — kept in sync with `mcp-server/dist/ws-hub.js`.
 const HUB_PORT: u16 = 4517;
+const UNVERIFIED: &str = "E_HUB_UNVERIFIED";
 
-/// Resolve the REAL `node` binary (aperture-256ru).
-///
-/// On this machine `node` on PATH is the **Volta shim**, which execs real node
-/// as a CHILD and does NOT forward signals. So `Command::new("node")` +
-/// `child.kill()` kills the shim while the real hub orphans (reparented to
-/// PPID 1) and keeps squatting port 4517 — the next launch then hits
-/// EADDRINUSE and silently respawn-loops. This was empirically reproduced in
-/// prod (bead notes). Spawning the resolved real binary directly makes OUR
-/// child the actual listener, so `child.kill()` reaches it.
-///
-/// `node -e process.execPath` runs the shim but prints the real binary path it
-/// exec'd (e.g. `~/.volta/tools/image/node/<v>/bin/node`), which we spawn
-/// directly. `APERTURE_NODE_BIN` overrides everything (test/ops knob, empty
-/// ignored, same family as APERTURE_CODEX_BIN in codex_appserver.rs).
 fn resolve_node() -> String {
     if let Ok(bin) = std::env::var("APERTURE_NODE_BIN") {
         if !bin.is_empty() {
@@ -64,193 +50,461 @@ fn resolve_node() -> String {
     "node".to_string()
 }
 
-/// PID of the first process listening on `port`, via `lsof`. `None` when
-/// nothing is listening (lsof exits non-zero / empty stdout on no match).
-fn port_listener_pid(port: u16) -> Option<u32> {
-    let out = Command::new("lsof")
-        .args(["-ti", &format!("tcp:{}", port), "-sTCP:LISTEN"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u32>().ok())
+/// Fixed native launch parameters. Production and inert fixtures use the same
+/// supervisor, spawn/record and pre-bearer proof path, not copied algorithms.
+pub(crate) struct HubSpec {
+    pub command: PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+    pub endpoint: SocketAddr,
+    pub home: PathBuf,
+    pub provenance: Provenance,
+    #[cfg(test)]
+    pub fault: Option<String>,
+    #[cfg(test)]
+    pub fixture_mode: String,
 }
-
-/// Spawn the WS hub under a supervisor thread. Mirrors the poller-thread
-/// pattern in `lib.rs::run()`. If the compiled hub doesn't exist yet (e.g.
-/// `just build-mcp` hasn't been run since ws-hub.ts landed), log a warning
-/// and skip — the app must not crash over a missing optional daemon.
-pub fn spawn_ws_hub(project_dir: String) {
-    let hub_path = format!("{}/mcp-server/dist/ws-hub.js", project_dir);
-    if !std::path::Path::new(&hub_path).exists() {
-        eprintln!(
-            "[aperture] warn: WS hub not found at {} — skipping spawn. \
-             Run `just build-mcp` to compile mcp-server (including ws-hub.js).",
-            hub_path
-        );
-        return;
-    }
-
-    // Resolve the real node binary ONCE (aperture-256ru) — never spawn via the
-    // PATH shim, whose SIGKILL orphans the real hub onto port 4517.
-    let node_bin = resolve_node();
-    println!("[aperture] ws-hub: resolved node binary → {}", node_bin);
-
-    std::thread::spawn(move || loop {
-        if SHUTTING_DOWN.load(Ordering::SeqCst) {
-            break;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HubObservation {
+    pub identity: ProcessIdentity,
+    pub spawned: bool,
+    // Adoption has no waitpid authority/exit code. Never fabricate exit zero.
+    pub exit_observation: &'static str,
+}
+pub(crate) struct Supervisor<'a> {
+    lease: &'a ControllerLock,
+    spec: HubSpec,
+}
+impl<'a> Supervisor<'a> {
+    pub(crate) fn new(lease: &'a ControllerLock, spec: HubSpec) -> Result<Self, String> {
+        lease.verify_live()?;
+        if spec.endpoint.ip() != Ipv4Addr::LOCALHOST
+            || spec.endpoint.port() == 0
+            || spec.home.join(".aperture/run") != lease.run_dir()?
+            || !spec.command.is_absolute()
+        {
+            return Err(UNVERIFIED.into());
         }
-
-        // aperture-mler9: capture the hub's structured stderr/stdout to a log
-        // file. A GUI-launched app inherits /dev/null stdio, which silently
-        // discarded every hub diagnostic (notify_forwarded / notify_offline /
-        // bad_hello / replay …) — the 2026-07-19 comms investigation had to
-        // reconstruct hub behaviour from probes because the logs were gone.
-        let mut cmd = Command::new(&node_bin);
-        cmd.arg(&hub_path);
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let log_dir = format!("{}/.aperture/logs", home);
-        let _ = std::fs::create_dir_all(&log_dir);
-        if let Ok(log_file) = std::fs::OpenOptions::new()
+        Ok(Self { lease, spec })
+    }
+    fn edge(&self, point: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if self.spec.fault.as_deref() == Some(point) {
+            return Err("E_HUB_FIXTURE_CRASH_EDGE".into());
+        }
+        let _ = point;
+        Ok(())
+    }
+    pub(crate) fn reconcile(&mut self) -> Result<HubObservation, String> {
+        let _flight = self.lease.hub_transition()?;
+        let registry = Registry::open(self.lease)?;
+        registry.inspect()?;
+        // Reap only our direct child, without signals. Error is not Gone.
+        let mut held_child = self.lease.hub_child()?;
+        if let Some(child) = held_child.as_mut() {
+            if child.try_wait().map_err(|_| UNVERIFIED)?.is_some() {
+                *held_child = None;
+            }
+        }
+        if let Some(current) = registry.current("hub")? {
+            if current.endpoint()
+                != &(Endpoint::Hub {
+                    port: self.spec.endpoint.port(),
+                })
+            {
+                return Err(UNVERIFIED.into());
+            }
+            let expected = current.identity();
+            match team_process::state(&expected) {
+                ProcessState::Same => {
+                    probe(self.lease, self.spec.endpoint, &expected)?;
+                    return Ok(HubObservation {
+                        identity: expected,
+                        spawned: false,
+                        exit_observation: "NOT_OBSERVED",
+                    });
+                }
+                ProcessState::Gone => {} // Separate guarded transition below, never adoption.
+                _ => return Err(UNVERIFIED.into()),
+            }
+        }
+        if held_child.is_some() {
+            return Err("E_HUB_CHILD_UNRECONCILED".into());
+        }
+        registry.capacity("hub")?;
+        // Absence metadata is not absence of a listener. A bind without REUSE
+        // denies any occupant. Releasing it is NOT kill authority; a subsequent
+        // race leaves the durable reservation and cannot trigger a blind retry.
+        let free =
+            TcpListener::bind(self.spec.endpoint).map_err(|_| "E_HUB_OCCUPIED_OR_UNVERIFIED")?;
+        let reservation = registry.reserve(
+            Endpoint::Hub {
+                port: self.spec.endpoint.port(),
+            },
+            self.spec.provenance.clone(),
+            now_ms()?,
+        )?;
+        self.edge("reserved")?;
+        self.lease.verify_live()?;
+        let mut command = Command::new(&self.spec.command);
+        command
+            .args(&self.spec.args)
+            .env("HOME", &self.spec.home)
+            .env("APERTURE_RUN_DIR", self.lease.run_dir()?)
+            .env(
+                "APERTURE_HUB_TOKEN_DIR",
+                self.lease.run_dir()?.join("hub-tokens"),
+            )
+            .env("APERTURE_WS_PORT", self.spec.endpoint.port().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Retain the existing hub diagnostic destination, without inherited
+        // pipe handles that die with the controller. Failure stays Unknown;
+        // never silently discard daemon diagnostics or retry this reservation.
+        let log_dir = self.spec.home.join(".aperture/logs");
+        crate::journal::ensure_private_dir(&log_dir)?;
+        let log_path = crate::journal::validate_component_path(&log_dir, "ws-hub.log", true)?;
+        let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(format!("{}/ws-hub.log", log_dir))
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(log_path)
+            .map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
+        let meta = log.metadata().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o077 != 0
         {
-            if let Ok(clone) = log_file.try_clone() {
-                cmd.stdout(clone);
-            }
-            cmd.stderr(log_file);
-        } // else: fall back to inherited stdio — never block the spawn on logging.
-
-        match cmd.spawn() {
-            Ok(child) => {
-                let pid = child.id();
-                println!("[aperture] ws-hub started (pid {})", pid);
-                if let Ok(mut guard) = CHILD.lock() {
-                    *guard = Some(child);
-                }
-                // aperture-256ru: confirm OUR child actually owns the port. If
-                // a stale/orphan hub is squatting 4517, this spawn fails to bind
-                // while a DIFFERENT pid keeps serving (possibly stale) — turn
-                // that silent EADDRINUSE respawn into a loud error.
-                std::thread::sleep(Duration::from_millis(600));
-                match port_listener_pid(HUB_PORT) {
-                    Some(listener) if listener == pid => {
-                        println!("[aperture] ws-hub bound {} (pid {} verified)", HUB_PORT, pid);
-                    }
-                    Some(listener) => {
-                        // aperture-3x136: a DIFFERENT pid holds the port — a
-                        // stale/orphan hub (e.g. after a `tauri dev` hot-restart,
-                        // which re-execs the binary without firing the clean-exit
-                        // residual-kill sweep). Previously we only logged and told
-                        // the operator to kill it by hand. Since 4517 is OUR hub
-                        // port exclusively, any squatter is always a stale aperture
-                        // hub — kill it so the respawn loop can bind. Our own child
-                        // (which lost the bind race) already exited(1) on EADDRINUSE
-                        // (ws-hub.ts), so the next spawn 2s later takes the freed
-                        // port cleanly. Self-heals what used to need a manual kill.
-                        eprintln!(
-                            "[aperture] ws-hub: pid {} lost the bind race; port {} squatted by stale \
-                             hub pid {} (aperture-256ru) — killing the squatter so the respawn binds.",
-                            pid, HUB_PORT, listener
-                        );
-                        let _ = Command::new("kill").args(["-9", &listener.to_string()]).status();
-                    }
-                    None => {
-                        eprintln!(
-                            "[aperture] warn: ws-hub pid {} spawned but nothing is listening on {} yet",
-                            pid, HUB_PORT
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[aperture] warn: failed to spawn ws-hub ({})", e);
-            }
+            return Err("E_HUB_LOG_UNSAFE".into());
         }
-
-        // Poll the child until it exits (or is taken by shutdown()). We can't
-        // block in Child::wait() while the handle sits in the mutex, so we
-        // try_wait on a short interval instead.
-        loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let Ok(mut guard) = CHILD.lock() else { break };
-            match guard.as_mut() {
-                Some(child) => match child.try_wait() {
-                    Ok(Some(status)) => {
-                        eprintln!("[aperture] ws-hub exited ({}) — respawning in 2s", status);
-                        *guard = None;
-                        break;
-                    }
-                    Ok(None) => {} // still running
-                    Err(e) => {
-                        eprintln!("[aperture] ws-hub wait error ({}) — respawning in 2s", e);
-                        *guard = None;
-                        break;
-                    }
-                },
-                // shutdown() took and killed the child.
-                None => break,
-            }
+        command
+            .stdout(log.try_clone().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?)
+            .stderr(log);
+        #[cfg(test)]
+        command.env("APERTURE_FIXTURE_MODE", &self.spec.fixture_mode);
+        // SAFETY: only async-signal-safe setsid in the post-fork child. Failure
+        // aborts exec. No captured locks, allocations or parent signal groups.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
         }
+        drop(free);
+        let child = command.spawn().map_err(|_| "E_HUB_SPAWN_UNKNOWN")?;
+        let pid = child.id();
+        *held_child = Some(child); // Lease retains wait authority, never kill on error/drop.
+        self.edge("spawned")?;
+        let native = team_process::observe(pid)
+            .map_err(|_| UNVERIFIED)?
+            .ok_or(UNVERIFIED)?;
+        if native.pgid != pid {
+            return Err(UNVERIFIED.into());
+        }
+        let record = registry.record(&reservation, &native.identity, now_ms()?)?;
+        self.edge("recorded")?;
+        registry.publish_current(&record)?;
+        let until = Instant::now() + SNAPSHOT_DEADLINE;
+        // Bounded startup wait for this ONE recorded child, not spawn/protocol
+        // retries. Failure preserves all intent/history and never signals.
+        while presence(self.lease, &native.identity).is_err() {
+            if Instant::now() >= until
+                || team_process::state(&native.identity) != ProcessState::Same
+            {
+                return Err(UNVERIFIED.into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // No startup retry hides failed proof. Even if bind/presence is delayed,
+        // the next explicit reconciliation can only probe this recorded process.
+        probe(self.lease, self.spec.endpoint, &native.identity)?;
+        Ok(HubObservation {
+            identity: native.identity,
+            spawned: true,
+            exit_observation: "NOT_OBSERVED",
+        })
+    }
+}
+// No Supervisor Drop effect or detached authority thread. All mutations are
+// synchronous under the borrowed lease; direct-child handles live in that lease.
+fn now_ms() -> Result<u64, String> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| UNVERIFIED)?
+            .as_millis(),
+    )
+    .map_err(|_| UNVERIFIED.into())
+}
+/// Called only inside the still-fenced aggregate composition. Production uses
+/// the identical Supervisor implementation as the inert process fixtures.
+pub(crate) fn spawn_ws_hub(lease: &ControllerLock, project_dir: String) -> Result<(), String> {
+    let home = lease
+        .run_dir()?
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(UNVERIFIED)?
+        .to_path_buf();
+    let spec = HubSpec {
+        command: PathBuf::from(resolve_node()),
+        args: vec![Path::new(&project_dir)
+            .join("mcp-server/dist/ws-hub.js")
+            .into_os_string()],
+        endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, HUB_PORT)),
+        home,
+        provenance: Provenance::LegacyUnknown,
+        #[cfg(test)]
+        fault: None,
+        #[cfg(test)]
+        fixture_mode: String::new(),
+    };
+    Supervisor::new(lease, spec)?.reconcile().map(|_| ())
+}
+/// Kept for existing Tauri/server exit callers. No global child/authority thread
+/// remains, no daemon signal/unlink/port sweep occurs. Aggregate startup fenced.
+pub fn shutdown() {}
 
-        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+fn private_bytes(run: &Path, relative: &str, max: usize) -> Result<Vec<u8>, String> {
+    let path =
+        crate::journal::validate_component_path(run, relative, false).map_err(|_| UNVERIFIED)?;
+    crate::journal::validate_private_file(&path).map_err(|_| UNVERIFIED)?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| UNVERIFIED)?;
+    let m = f.metadata().map_err(|_| UNVERIFIED)?;
+    if !m.is_file()
+        || m.uid() != unsafe { libc::geteuid() }
+        || m.nlink() != 1
+        || m.mode() & 0o077 != 0
+        || m.len() > max as u64
+    {
+        return Err(UNVERIFIED.into());
+    }
+    let mut bytes = Vec::new();
+    f.take((max + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| UNVERIFIED)?;
+    if bytes.len() > max {
+        return Err(UNVERIFIED.into());
+    }
+    Ok(bytes)
+}
+fn presence(lease: &ControllerLock, expected: &ProcessIdentity) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Presence {
+        hub_pid: u32,
+        updated_at: String,
+        agents: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+    let p: Presence = serde_json::from_slice(&private_bytes(
+        lease.run_dir()?,
+        "presence.json",
+        SNAPSHOT_TOTAL_BYTES,
+    )?)
+    .map_err(|_| UNVERIFIED)?;
+    if p.hub_pid != expected.pid
+        || p.agents.len() > SNAPSHOT_ENTRIES
+        || chrono::DateTime::parse_from_rfc3339(&p.updated_at).is_err()
+        || team_process::state(expected) != ProcessState::Same
+    {
+        return Err(UNVERIFIED.into());
+    }
+    Ok(())
+}
+/// Caps bytes before tungstenite allocates handshake/frame storage and applies
+/// an absolute deadline to EVERY syscall (slow trickle cannot reset timeout).
+const HEADER_BYTES: usize = 8192;
+#[derive(Default)]
+struct HeaderBuffer {
+    bytes: Vec<u8>,
+    delivered: usize,
+    complete: bool,
+}
+impl HeaderBuffer {
+    // Framing only: tungstenite remains the sole HTTP/upgrade parser. Buffer
+    // one finite header so its small-packet AttackCheck stays enabled without
+    // mistaking our adapter's artificial one-byte reads for an attack.
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.complete || bytes.len() > HEADER_BYTES.saturating_sub(self.bytes.len()) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        self.bytes.extend_from_slice(bytes);
+        if let Some(at) = self.bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+            if at + 4 != self.bytes.len() {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            self.complete = true;
+        } else if self.bytes.len() == HEADER_BYTES {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(())
+    }
+    fn copy_to(&mut self, out: &mut [u8]) -> usize {
+        let n = out.len().min(self.bytes.len() - self.delivered);
+        out[..n].copy_from_slice(&self.bytes[self.delivered..self.delivered + n]);
+        self.delivered += n;
+        n
+    }
+}
+fn remaining_time(until: Instant, now: Instant) -> std::io::Result<Duration> {
+    until
+        .checked_duration_since(now)
+        .filter(|v| !v.is_zero())
+        .ok_or_else(|| std::io::ErrorKind::TimedOut.into())
+}
+struct BoundedIo {
+    tcp: TcpStream,
+    until: Instant,
+    remaining: usize,
+    handshake: bool,
+    header: HeaderBuffer,
+}
+impl BoundedIo {
+    fn timeout(&self) -> std::io::Result<()> {
+        let left = remaining_time(self.until, Instant::now())?;
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.set_write_timeout(Some(left))
+    }
+}
+impl Read for BoundedIo {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.timeout()?;
+        if b.is_empty() {
+            return Ok(0);
+        }
+        if self.handshake {
+            while !self.header.complete {
+                self.timeout()?; // The same absolute deadline, not a fresh one.
+                let mut chunk = [0; 4096];
+                let max = chunk.len().min(HEADER_BYTES - self.header.bytes.len());
+                let got = self.tcp.read(&mut chunk[..max])?;
+                if got == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                self.header.push(&chunk[..got])?;
+            }
+            self.timeout()?;
+            return Ok(self.header.copy_to(b));
+        }
+        if self.remaining == 0 {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let n = b.len().min(self.remaining);
+        let got = self.tcp.read(&mut b[..n])?;
+        self.remaining -= got;
+        Ok(got)
+    }
+}
+impl Write for BoundedIo {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.timeout()?;
+        self.tcp.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.timeout()?;
+        self.tcp.flush()
+    }
+}
+fn no_pending_bytes(stream: &TcpStream) -> Result<(), String> {
+    let mut b = 0u8;
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&mut b as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        Ok(())
+    } else {
+        Err(UNVERIFIED.into())
+    }
+}
+fn probe(
+    lease: &ControllerLock,
+    endpoint: SocketAddr,
+    expected: &ProcessIdentity,
+) -> Result<(), String> {
+    presence(lease, expected).map_err(|_| "E_HUB_PRESENCE")?;
+    let started = Instant::now();
+    let tcp =
+        TcpStream::connect_timeout(&endpoint, SNAPSHOT_DEADLINE).map_err(|_| "E_HUB_CONNECT")?;
+    let io = BoundedIo {
+        tcp,
+        until: started + SNAPSHOT_DEADLINE,
+        remaining: 8192,
+        handshake: true,
+        header: HeaderBuffer::default(),
+    };
+    // Fixed request without Authorization/cookie/query/hello. No redirect/TLS or
+    // HTTP client that might inject ambient credentials or follow a proxy.
+    let config = tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(SNAPSHOT_FRAME_BYTES),
+        max_frame_size: Some(SNAPSHOT_FRAME_BYTES),
+        write_buffer_size: 0,
+        max_write_buffer_size: 8192,
+        ..Default::default()
+    };
+    let (mut ws, _) =
+        tungstenite::client::client_with_config(format!("ws://{endpoint}/"), io, Some(config))
+            .map_err(|_| "E_HUB_UPGRADE")?;
+    if !ws.get_ref().header.complete
+        || ws.get_ref().header.delivered != ws.get_ref().header.bytes.len()
+    {
+        return Err("E_HUB_UPGRADE_BUFFER".into());
+    }
+    team_process::verify_tcp_server_binding(expected, endpoint, &ws.get_ref().tcp)?;
+    no_pending_bytes(&ws.get_ref().tcp).map_err(|_| "E_HUB_EARLY_OR_CLOSED")?;
+    // Gate above is before even reading the bearer, not only before sending it.
+    let token = private_bytes(lease.run_dir()?, "hub-tokens/watchdog.token", 64)
+        .map_err(|_| "E_HUB_TOKEN_UNAVAILABLE")?;
+    if token.len() != 64 || !token.iter().all(u8::is_ascii_hexdigit) {
+        return Err(UNVERIFIED.into());
+    }
+    let hello = serde_json::json!({"type":"hello","role":"subscriber","agent":"watchdog","token":String::from_utf8(token).map_err(|_| UNVERIFIED)?});
+    ws.get_mut().handshake = false;
+    ws.get_mut().remaining = SNAPSHOT_TOTAL_BYTES + SNAPSHOT_FRAMES * 14;
+    ws.send(tungstenite::Message::Text(hello.to_string()))
+        .map_err(|_| UNVERIFIED)?;
+    let mut decoder = SnapshotDecoder::new(started);
+    loop {
+        decoder
+            .check_deadline(Instant::now())
+            .map_err(|_| UNVERIFIED)?;
+        let frame = ws.read().map_err(|_| "E_HUB_SNAPSHOT_READ")?;
+        if let Some(done) = decoder
+            .feed(&frame, Instant::now())
+            .map_err(|_| UNVERIFIED)?
+        {
+            if done.claimed_hub_pid != expected.pid {
+                return Err(UNVERIFIED.into());
+            }
             break;
         }
-        std::thread::sleep(Duration::from_secs(2));
-    });
-}
-
-/// Kill the hub child and stop the supervisor loop. Called from the
-/// `tauri::RunEvent::Exit` handler in `lib.rs` so the hub doesn't outlive
-/// the app and hold port 4517 hostage for the next launch.
-pub fn shutdown() {
-    SHUTTING_DOWN.store(true, Ordering::SeqCst);
-    if let Ok(mut guard) = CHILD.lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
-    // aperture-256ru: belt-and-suspenders. With the resolved-real-node spawn,
-    // child.kill() already reaches the real listener — but a prior orphan (from
-    // a pre-fix launch) or a race could still squat the port. Kill whatever
-    // holds it so the next launch binds cleanly (lsof empty on 4517 post-exit).
-    if let Some(pid) = port_listener_pid(HUB_PORT) {
-        eprintln!(
-            "[aperture] ws-hub: killing residual listener on {} (pid {})",
-            HUB_PORT, pid
-        );
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    // Reject buffered duplicate/unsolicited frames and close before post-check.
+    // Live presence racing here is conservatively Unverified, never authority.
+    ws.get_mut()
+        .tcp
+        .set_nonblocking(true)
+        .map_err(|_| UNVERIFIED)?;
+    match ws.read() {
+        Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        _ => return Err("E_HUB_POST_FRAME_OR_CLOSED".into()),
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_node_avoids_the_volta_shim() {
-        let n = resolve_node();
-        assert!(!n.is_empty(), "resolve_node must never return empty");
-        // On a machine with node installed the resolved path must exist and must
-        // NOT be a Volta shim (shims live under `.volta/bin/`). On a CI box with
-        // no node, resolve_node falls back to the bare "node" string, which we
-        // can't validate — skip the existence/shim checks in that case.
-        if n != "node" {
-            assert!(
-                std::path::Path::new(&n).exists(),
-                "resolved node binary must exist: {}",
-                n
-            );
-            assert!(
-                !n.contains("/.volta/bin/"),
-                "resolved node must be the real binary, not the Volta shim: {}",
-                n
-            );
-        }
-    }
+    team_process::verify_tcp_server_binding(expected, endpoint, &ws.get_ref().tcp)?;
+    presence(lease, expected).map_err(|_| "E_HUB_PRESENCE")?;
+    lease.verify_live()?;
+    Ok(())
 }
 
 // Native replacement consumes the existing watchdog control seam only.

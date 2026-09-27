@@ -18,6 +18,8 @@ struct Holder {
 }
 pub(crate) struct ControllerLock {
     _file: File,
+    hub_gate: std::sync::Mutex<()>,
+    hub_child: std::sync::Mutex<Option<std::process::Child>>,
     run: PathBuf,
     identity: crate::team_replacement::ProcessIdentity,
 }
@@ -84,6 +86,8 @@ impl ControllerLock {
             .map_err(|_| "controller lock write failed")?;
         Ok(Self {
             _file: file,
+            hub_gate: std::sync::Mutex::new(()),
+            hub_child: std::sync::Mutex::new(None),
             run,
             identity: process.identity,
         })
@@ -119,6 +123,25 @@ impl ControllerLock {
             return Err("E_CONTROLLER_LEASE: lock path changed".into());
         }
         Ok(())
+    }
+    /// All hub supervisors borrowing this lease share one transition lock.
+    /// A synchronous borrower cannot outlive the lease; no authority thread is
+    /// detached or left to mutate after releasing the controller file lock.
+    pub(crate) fn hub_transition(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        let guard = self.hub_gate.lock().map_err(|_| "E_CONTROLLER_POISONED")?;
+        self.verify_live()?;
+        Ok(guard)
+    }
+    /// Retain direct-child wait authority across synchronous supervisors. A
+    /// dropped supervisor must not lose the handle and leave an unreapable
+    /// zombie misclassified as Same. Dropping the lease never signals the child.
+    pub(crate) fn hub_child(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<std::process::Child>>, String> {
+        self.verify_live()?;
+        self.hub_child
+            .lock()
+            .map_err(|_| "E_CONTROLLER_POISONED".into())
     }
     pub(crate) fn run_dir(&self) -> Result<&Path, String> {
         self.verify_live()?;
