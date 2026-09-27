@@ -178,10 +178,88 @@ fn iso8601(t: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-fn read_kickoff_millis(home: &std::path::Path, name: &str) -> Option<u64> {
-    if !crate::daemon_registry::valid_name(name) { return None; }
-    std::fs::read_to_string(home.join(".aperture/run").join(format!("{name}.kickoff")))
-        .ok().and_then(|s| s.trim().parse::<u64>().ok())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KickoffRead {
+    Absent,
+    Millis(u64),
+    Unverified,
+}
+
+fn read_kickoff_millis(home: &std::path::Path, name: &str) -> KickoffRead {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Both existing writers emit raw decimal digits, but do not guarantee0600.
+    // Reading0640/0644 under run0700 is compatible; writable-to-others is not.
+    fn leaf_safe(m: &std::fs::Metadata) -> bool {
+        m.is_file() && m.uid() == unsafe { libc::geteuid() } && m.nlink() == 1
+            && m.mode() & 0o400 != 0 && m.mode() & 0o7022 == 0
+            && (1..=20).contains(&m.len())
+    }
+    fn parent_pin(m: &std::fs::Metadata) -> Option<(u64, u64, u32, u32)> {
+        (m.is_dir() && m.uid() == unsafe { libc::geteuid() }
+            && m.mode() & 0o7777 == 0o700 && m.nlink() > 0)
+            .then_some((m.dev(), m.ino(), m.uid(), m.mode()))
+    }
+    fn leaf_pin(m: &std::fs::Metadata) -> (u64,u64,u32,u32,u64,u64,i64,i64,i64,i64) {
+        (m.dev(),m.ino(),m.uid(),m.mode(),m.nlink(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec())
+    }
+    let read = || -> Result<Option<u64>, ()> {
+        if !crate::daemon_registry::valid_name(name) { return Err(()); }
+        let root = home.join(".aperture");
+        let run = root.join("run");
+        crate::controller::private_dir_readonly(&root).map_err(|_| ())?;
+        let before_parent = std::fs::symlink_metadata(&run).map_err(|_| ())?;
+        let pin = parent_pin(&before_parent).ok_or(())?;
+        let parent = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&run).map_err(|_| ())?;
+        let verify_parent = || -> Result<(), ()> {
+            crate::controller::private_dir_readonly(&root).map_err(|_| ())?;
+            if parent_pin(&parent.metadata().map_err(|_| ())?) != Some(pin)
+                || parent_pin(&std::fs::symlink_metadata(&run).map_err(|_| ())?) != Some(pin) {
+                return Err(());
+            }
+            Ok(())
+        };
+        verify_parent()?;
+        let basename = format!("{name}.kickoff");
+        let c_name = std::ffi::CString::new(basename.as_bytes()).map_err(|_| ())?;
+        // Only the validated fixed basename is resolved under this owned FD.
+        // NONBLOCK prevents FIFO open from hanging before fstat can reject it.
+        let raw = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            verify_parent()?;
+            return if error.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(()) };
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let before = file.metadata().map_err(|_| ())?;
+        if !leaf_safe(&before) { return Err(()); }
+        let mut bytes = [0u8; 21];
+        let mut count = 0;
+        while count < bytes.len() {
+            let got = file.read(&mut bytes[count..]).map_err(|_| ())?;
+            if got == 0 { break; }
+            count += got;
+        }
+        let after = file.metadata().map_err(|_| ())?;
+        verify_parent()?;
+        let named = std::fs::symlink_metadata(run.join(&basename)).map_err(|_| ())?;
+        if !leaf_safe(&after) || !leaf_safe(&named)
+            || leaf_pin(&before) != leaf_pin(&after) || leaf_pin(&after) != leaf_pin(&named)
+            || count == 0 || count > 20 || count as u64 != before.len()
+            || !bytes[..count].iter().all(u8::is_ascii_digit) { return Err(()); }
+        let value = bytes[..count].iter().try_fold(0u64, |n, b|
+            n.checked_mul(10).and_then(|n| n.checked_add(u64::from(b - b'0')))).ok_or(())?;
+        Ok(Some(value))
+    };
+    match read() {
+        Ok(None) => KickoffRead::Absent,
+        Ok(Some(value)) => KickoffRead::Millis(value),
+        Err(()) => KickoffRead::Unverified,
+    }
 }
 
 /// The four presence-dot states (docs/presence-dots-spec.md). `stuck`/`online`
@@ -564,6 +642,20 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &
         }
     }).collect();
 
+    // Bounded filesystem reads happen before Shared is acquired. Invalid input
+    // is not absence: leave that seat's budgets/projection/effects untouched.
+    let mut kickoffs = HashMap::new();
+    for (name, _, running, _) in &roster {
+        if worker.stopped() { return; }
+        if managed.contains_key(name) { continue; }
+        let value = if *running {
+            home.as_deref().map(|home| read_kickoff_millis(home, name))
+                .unwrap_or(KickoffRead::Unverified)
+        } else { KickoffRead::Absent };
+        kickoffs.insert(name.clone(), value);
+    }
+    if worker.stopped() { return; }
+
     // Is presence trustworthy right now? (§5 subscriber-down pause + grace.)
     let (subscriber_ok, past_grace) = {
         let s = shared.lock().unwrap();
@@ -587,7 +679,11 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &
                 // Observation only: managed lifecycle is never a legacy watchdog action.
                 continue;
             }
-            let kickoff_millis = if *running { home.as_deref().and_then(|home| read_kickoff_millis(home, name)) } else { None };
+            let kickoff_millis = match kickoffs.get(name) {
+                Some(KickoffRead::Millis(value)) => Some(*value),
+                Some(KickoffRead::Absent) => None,
+                Some(KickoffRead::Unverified) | None => continue,
+            };
 
             // Reset the attempt counter when a newer kickoff appears (fresh boot
             // or a prior re-kick that took) — a new kickoff is a clean slate.
