@@ -133,6 +133,11 @@ fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
 #[tauri::command]
 pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
+    start_agent_shared(name, state.inner())
+}
+
+pub(crate) fn start_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
     // Extract all needed data while holding the lock briefly, then release it
     // before doing any expensive I/O (subprocess calls, file writes). This
     // prevents the global state mutex from blocking list_agents polling and
@@ -522,6 +527,11 @@ fn teardown_agent(name: &str, window_id: Option<String>) {
 #[tauri::command]
 pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
+    stop_agent_shared(name, state.inner())
+}
+
+pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
     // Extract needed data and release the lock before the blocking sleep calls
     let (window_id_opt, is_running) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
@@ -568,6 +578,11 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
 /// write the outcome.
 #[tauri::command]
 pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
+    restart_agent_shared(name, state.inner())
+}
+
+pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
     let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
@@ -676,6 +691,10 @@ fn merge_fresh_registry(
 
 #[tauri::command]
 pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<AgentDef>, String> {
+    list_agents_shared(state.inner())
+}
+
+pub(crate) fn list_agents_shared(state: &Arc<Mutex<AppState>>) -> Result<Vec<AgentDef>, String> {
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
 
     // V4 P0: the filesystem registry is authoritative and activation/archive
@@ -782,10 +801,11 @@ pub fn light_attention(agent: &mut AgentDef, reason: AttentionReason) {
 }
 
 #[tauri::command]
-pub fn clear_attention(
-    name: String,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+pub fn clear_attention(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    clear_attention_shared(name, state.inner())
+}
+
+pub(crate) fn clear_attention_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
     if let Some(agent) = app_state.agents.get_mut(&name) {
         agent.attention = false;
@@ -809,11 +829,12 @@ pub fn is_valid_model(model: &str) -> bool {
 }
 
 #[tauri::command]
-pub fn update_agent_model(
-    name: String,
-    model: String,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+pub fn update_agent_model(name: String, model: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    require_legacy_lifecycle(&name)?;
+    update_agent_model_shared(name, model, state.inner())
+}
+
+pub(crate) fn update_agent_model_shared(name: String, model: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
     if !is_valid_model(&model) {
         return Err(format!(

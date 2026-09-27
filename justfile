@@ -339,3 +339,7 @@ retention-gate:
 # §7 retrieval gate: golden set → recall@5 (aperture-trgpo)
 recall-gate *ARGS:
     @node scripts/recall-gate.mjs {{ARGS}}
+
+# Local UI contract/component suite; no server, deployment, or runtime bootstrap.
+test-ui:
+    pnpm test

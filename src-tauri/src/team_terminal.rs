@@ -964,12 +964,17 @@ pub async fn team_open_seat(
             code: "E_TERMINAL_UNAVAILABLE".into(),
             message: "Home unavailable".into(),
         })?;
-    tauri::async_runtime::spawn_blocking(move || open(&home, input))
+    tauri::async_runtime::spawn_blocking(move || open_shared(&home, input))
         .await
         .map_err(|_| teams::TeamError {
             code: "E_TERMINAL_UNKNOWN".into(),
             message: "Terminal operation interrupted".into(),
         })?
+}
+
+/// Mechanical headless seam; native Active/identity checks are unchanged.
+pub(crate) fn open_shared(home: &Path, input: OpenSeatInput) -> std::result::Result<OpenSeatView, teams::TeamError> {
+    open(home, input)
         .map_err(|e| teams::TeamError {
             code: e
                 .split(':')

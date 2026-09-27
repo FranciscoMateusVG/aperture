@@ -2073,7 +2073,7 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
     })
 }
 
-fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveView> {
+pub(crate) fn inspect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<ArchiveView> {
     collect_archive(engine, input).map(|result| result.view)
 }
 
@@ -2275,16 +2275,18 @@ fn bootstrap_seat(engine: &TeamEngine, actor: &AuthenticatedActor, input: Bootst
 }
 
 #[tauri::command]
-pub fn team_prepare_replacement(
-    input: PrepareReplacementInput,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+pub fn team_prepare_replacement(input: PrepareReplacementInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<PreparedReplacementView> {
+    team_prepare_replacement_shared(input, &engine_from_state(&state)?, &permit_store(&state)?, &AuthenticatedActor::operator_ui())
+}
+
+// Transport-only seam: authority is supplied by the trusted boundary, not JSON.
+pub(crate) fn team_prepare_replacement_shared(input: PrepareReplacementInput, engine: &TeamEngine,
+    permits: &Arc<Mutex<crate::state::RuntimePermitStore>>, actor: &AuthenticatedActor,
 ) -> TeamResult<PreparedReplacementView> {
     validate_team_name(&input.team)?;
     if !is_valid_seat_name(&input.seat) || input.expected_generation == 0 {
         return Err(TeamError::new("E_GENERATION_MISMATCH", "replacement selectors are invalid"));
     }
-    let engine = engine_from_state(&state)?;
-    let permits = permit_store(&state)?;
     {
         let mut permits = permits.lock().map_err(|_| TeamError::io("replacement permit store unavailable"))?;
         permits
@@ -2293,7 +2295,7 @@ pub fn team_prepare_replacement(
     }
     let prepared = prepare_operator(
         &engine.paths.home,
-        &AuthenticatedActor::operator_ui(),
+        actor,
         &input.team,
         &input.seat,
         input.expected_generation,
@@ -2334,9 +2336,13 @@ pub fn team_prepare_replacement(
 }
 
 #[tauri::command]
-pub fn team_start_replacement(
-    input: StartReplacementInput,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+pub fn team_start_replacement(input: StartReplacementInput, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> TeamResult<ReplacementView> {
+    team_start_replacement_shared(input, &engine_from_state(&state)?, &permit_store(&state)?, &AuthenticatedActor::operator_ui())
+}
+
+// Transport-only seam: authority is supplied by the trusted boundary, not JSON.
+pub(crate) fn team_start_replacement_shared(input: StartReplacementInput, engine: &TeamEngine,
+    permits: &Arc<Mutex<crate::state::RuntimePermitStore>>, actor: &AuthenticatedActor,
 ) -> TeamResult<ReplacementView> {
     validate_team_name(&input.team)?;
     if !is_valid_seat_name(&input.seat)
@@ -2345,8 +2351,6 @@ pub fn team_start_replacement(
     {
         return Err(TeamError::new("E_PREPARATION_EXPIRED", "replacement preparation selectors are invalid"));
     }
-    let engine = engine_from_state(&state)?;
-    let permits = permit_store(&state)?;
     let permit = permits
         .lock()
         .map_err(|_| TeamError::io("replacement permit store unavailable"))?
@@ -2359,7 +2363,7 @@ pub fn team_start_replacement(
         .map_err(TeamError::from_message)?;
     let recovery = permit.recovery();
     let selection = selection_from_tuple(&input.selection)?;
-    let started = start_operator(&AuthenticatedActor::operator_ui(), permit, &selection)
+    let started = start_operator(actor, permit, &selection)
         .map_err(replacement_error)?;
     let owner = owner_summary(&engine.paths.home, &input.seat)?;
     if owner.generation != started.generation || owner.state != crate::state::OwnerState::Active {

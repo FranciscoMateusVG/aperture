@@ -1,3 +1,7 @@
+mod controller;
+mod daemons;
+mod web_auth;
+pub mod web_server;
 mod team_claude_launch;
 mod team_claude_inbox;
 mod team_claude_kickoff;
@@ -164,6 +168,12 @@ fn repair_gui_path() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The fallback GUI must acquire the same lease before any initialization.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).expect("home unavailable");
+    let _controller = match controller::ControllerLock::acquire(&home) {
+        Ok(lease) => lease,
+        Err(error) => { eprintln!("[aperture] {error}"); return; }
+    };
     // Must run before anything that spawns subprocesses (BEADS init, poller,
     // WS hub, codex app-servers) — they all resolve binaries via PATH.
     repair_gui_path();
@@ -214,31 +224,10 @@ pub fn run() {
         }
     }
 
-    // Start the operator-mailbox sweep (attention badges only — agent
-    // message delivery is owned by the WS hub / codex-bridge, see poller.rs)
-    let poller_state = Arc::clone(&app_state);
-    std::thread::spawn(move || {
-        poller::run_message_poller(poller_state);
-    });
-
-    if let Err(e) = hub_auth::provision_token("watchdog") {
-        eprintln!("[aperture] fatal: cannot provision hub watchdog token: {e}");
+    if daemons::start(&_controller, Arc::clone(&app_state)).is_err() {
+        eprintln!("[aperture] daemon startup failed");
         return;
     }
-
-    // Start the aperture-bus WS hub daemon (Comms Layer v2, Phase 1 —
-    // docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md). Claude
-    // message delivery now flows through this hub instead of the poller's
-    // tmux injection. Skips with a warning if ws-hub.js isn't built yet.
-    let project_dir = app_state.lock().unwrap().project_dir.clone();
-    ws_hub::spawn_ws_hub(project_dir);
-
-    // Start the liveness watchdog (aperture-wul6m) — the agent-side half of
-    // comms-v2 reliability. Subscribes to the hub's presence stream and re-kicks
-    // any expected-present agent that goes silent past the 60s deadline (a hub
-    // bounce killed its exit-on-drop inbox monitor and it couldn't self-heal).
-    // Also computes the presence-dot state the launcher polls via list_agents.
-    watchdog::spawn_watchdog(Arc::clone(&app_state));
 
     tauri::Builder::default()
         .manage(app_state)

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./command-transport";
 import type { TeamView } from "../types";
 import { sameExecutionTuple } from "./team-contract";
 export function canOpenSeat(team: TeamView, seat: string): boolean {

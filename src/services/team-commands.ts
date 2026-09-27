@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./command-transport";
 import type { CancelPendingInput } from "../types";
 import { parseCancelled, parseTeams } from "./team-contract";
 

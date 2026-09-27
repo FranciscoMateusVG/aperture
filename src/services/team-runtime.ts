@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./command-transport";
 import type { BootstrapView, ArchiveView, ExecutionTuple, OwnerSummary, PreparedReplacementView, ReplacementView, RuntimeBlocker, TeamView } from "../types";
 import { isExecutionTuple, sameExecutionTuple } from "./team-contract";
 
