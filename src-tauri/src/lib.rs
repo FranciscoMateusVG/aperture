@@ -1,3 +1,4 @@
+mod runtime_release;
 mod controller;
 mod daemon_registry;
 mod daemons;
