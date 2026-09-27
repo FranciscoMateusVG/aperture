@@ -181,3 +181,33 @@ fn d_fact_capacity_shape_and_outcome_reservation_never_prune_or_dispatch() {
         assert_eq!(crate::agents::lifecycle_tests::tree(&h.0),before);
     }
 }
+
+#[test]
+fn d_final_audit_closing_badge_and_disconnected_unread_are_denied() {
+    let h=Home::new();let owner=h.owner();let s=state();
+    let worker=owner.fixture_worker();let work=owner.admit(None).unwrap();
+    let (started,notice)=std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let held_state=s.lock().unwrap();
+        let state=s.clone();
+        let task=scope.spawn(move || {
+            let _body=work.body().unwrap();started.send(()).unwrap();
+            ring_operator(&state,"fixture",&worker);
+        });
+        notice.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(owner.fixture_close_short().unwrap_err(),"E_RUNTIME_DRAIN_INCOMPLETE");
+        drop(held_state);task.join().unwrap();
+    });
+    owner.close().unwrap();
+    assert!(!s.lock().unwrap().agents["fixture"].attention);
+    let shared=Arc::new(Mutex::new(Shared::new()));
+    {
+        let mut value=shared.lock().unwrap();value.subscriber_connected=true;
+        apply_presence_event(&mut value.presence,"fixture","join",now());
+        assert!(unread_online(&value,"fixture"));
+    }
+    mark_disconnected(&shared);
+    let value=shared.lock().unwrap();
+    assert!(value.presence["fixture"].online); // retained observational flag is not trust
+    assert!(!unread_online(&value,"fixture"));
+}

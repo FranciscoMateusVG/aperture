@@ -343,6 +343,10 @@ fn query_oldest_unread(work: &crate::daemons::RuntimeWork) -> Option<HashMap<Str
     Some(oldest)
 }
 
+fn unread_online(shared: &Shared, name: &str) -> bool {
+    shared.subscriber_connected && shared.presence.get(name).is_some_and(|p| p.online)
+}
+
 fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>, worker: crate::daemons::WorkerContext) {
     let mut last_nudge: HashMap<String, SystemTime> = HashMap::new();
     loop {
@@ -379,7 +383,7 @@ fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>
             // and nudging an empty pane is pointless.
             let online = {
                 let Ok(s) = shared.lock() else { continue };
-                s.presence.get(&name).map(|p| p.online).unwrap_or(false)
+                unread_online(&s, &name)
             };
             if !online {
                 continue;
@@ -730,7 +734,7 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &
                 let Ok(_body) = work.body() else { continue; };
                 let _ = work.nudge(app_state, &name, NudgeProducer::RekickNudge, NudgeInputs::production());
             },
-            RekickOrder::RingOperator { name } => ring_operator(app_state, &name),
+            RekickOrder::RingOperator { name } => ring_operator(app_state, &name, worker),
         }
     }
 }
@@ -915,12 +919,13 @@ thread_local! {
 /// After the attempt budget is spent with no hub-join, escalate to the operator:
 /// light the attention badge on the stuck agent's card (the idiomatic operator
 /// alert) and log loudly. The red dot is already showing; this is the extra ring.
-fn ring_operator(app_state: &Arc<Mutex<AppState>>, name: &str) {
+fn ring_operator(app_state: &Arc<Mutex<AppState>>, name: &str, worker: &crate::daemons::WorkerContext) {
     eprintln!(
         "[watchdog] {name}: STUCK after {MAX_ATTEMPTS} re-kick attempts with no hub presence — \
          latching red + ringing operator. Manual intervention needed."
     );
     if let Ok(mut a) = app_state.lock() {
+        if worker.stopped() { return; }
         if let Some(agent) = a.agents.get_mut(name) {
             // attention_reason = "crash" (aperture-ull4y); overwrites a lit
             // "message" badge — see agents::light_attention for the precedence.
