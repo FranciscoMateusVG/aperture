@@ -20,6 +20,9 @@ pub(crate) struct ControllerLock {
     _file: File,
     hub_gate: std::sync::Mutex<()>,
     hub_child: std::sync::Mutex<Option<std::process::Child>>,
+    codex_slots: std::sync::Mutex<
+        std::collections::BTreeMap<String, std::sync::Arc<std::sync::Mutex<CodexSlotState>>>,
+    >,
     run: PathBuf,
     identity: crate::team_replacement::ProcessIdentity,
 }
@@ -100,6 +103,7 @@ impl ControllerLock {
             _file: file,
             hub_gate: std::sync::Mutex::new(()),
             hub_child: std::sync::Mutex::new(None),
+            codex_slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             run,
             identity: process.identity,
         })
@@ -153,6 +157,28 @@ impl ControllerLock {
             .lock()
             .map_err(|_| "E_CONTROLLER_POISONED".into())
     }
+    /// Operational lane only, never reachable through Registry's RO projection.
+    /// The slot handle and every operation borrow this lease; no eviction or
+    /// detached worker can escape its lifetime. Hub serialization is unchanged.
+    pub(crate) fn codex_slot(&self, seat: &str) -> Result<CodexSlot<'_>, String> {
+        self.verify_live()?;
+        if !crate::daemon_registry::valid_name(seat) {
+            return Err("E_CODEX_SLOT".into());
+        }
+        let mut slots = self
+            .codex_slots
+            .lock()
+            .map_err(|_| "E_CONTROLLER_POISONED")?;
+        if !slots.contains_key(seat) && slots.len() >= 128 {
+            return Err("E_DAEMON_CAPACITY".into());
+        }
+        let state = slots.entry(seat.into()).or_default().clone();
+        Ok(CodexSlot {
+            lease: self,
+            seat: seat.into(),
+            state,
+        })
+    }
     pub(crate) fn run_dir(&self) -> Result<&Path, String> {
         self.verify_live()?;
         Ok(&self.run)
@@ -171,6 +197,89 @@ impl ControllerLock {
         .map_err(|_| "operator capability publication failed".into())
     }
 }
+
+#[derive(Default)]
+struct CodexSlotState {
+    child: Option<std::process::Child>,
+    identity: Option<crate::team_replacement::ProcessIdentity>,
+}
+/// An operational handle, not a value returned by Registry observation.
+pub(crate) struct CodexSlot<'a> {
+    lease: &'a ControllerLock,
+    seat: String,
+    state: std::sync::Arc<std::sync::Mutex<CodexSlotState>>,
+}
+pub(crate) struct CodexOperation<'a> {
+    lease: &'a ControllerLock,
+    seat: &'a str,
+    nonce: String,
+    state: std::sync::MutexGuard<'a, CodexSlotState>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WaitObservation {
+    NotObserved,
+    Running,
+    Exited(std::process::ExitStatus),
+}
+impl CodexSlot<'_> {
+    pub(crate) fn enter(&self) -> Result<CodexOperation<'_>, String> {
+        // Map lock was released by codex_slot; unrelated slots can progress.
+        let state = self.state.lock().map_err(|_| "E_CONTROLLER_POISONED")?;
+        self.lease.verify_live()?;
+        Ok(CodexOperation {
+            lease: self.lease,
+            seat: &self.seat,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            state,
+        })
+    }
+}
+impl CodexOperation<'_> {
+    pub(crate) fn seat(&self) -> &str {
+        self.seat
+    }
+    pub(crate) fn nonce(&self) -> &str {
+        &self.nonce
+    }
+    pub(crate) fn verify_for(&self, lease: &ControllerLock) -> Result<(), String> {
+        if !std::ptr::eq(self.lease, lease) {
+            return Err("E_CONTROLLER_CONTEXT".into());
+        }
+        self.lease.verify_live()
+    }
+    /// Retain wait ownership without exporting Child or signal authority. On
+    /// rejection return ownership to the operational caller, never kill/drop it
+    /// silently. An occupied slot is never replaced, even after observed exit.
+    pub(crate) fn retain_child(
+        &mut self,
+        child: std::process::Child,
+    ) -> Result<(), std::process::Child> {
+        if self.lease.verify_live().is_err() || self.state.child.is_some() {
+            return Err(child);
+        }
+        let native = match crate::team_process::observe(child.id()) {
+            Ok(Some(p)) if p.ppid == std::process::id() && p.uid == unsafe { libc::geteuid() } => p,
+            _ => return Err(child),
+        };
+        self.state.identity = Some(native.identity);
+        self.state.child = Some(child);
+        Ok(())
+    }
+    pub(crate) fn try_wait(&mut self) -> Result<WaitObservation, String> {
+        self.lease.verify_live()?;
+        match self.state.child.as_mut() {
+            None => Ok(WaitObservation::NotObserved),
+            Some(child) => child
+                .try_wait()
+                .map(|s| {
+                    s.map(WaitObservation::Exited)
+                        .unwrap_or(WaitObservation::Running)
+                })
+                .map_err(|_| "E_CODEX_WAIT_UNKNOWN".into()),
+        }
+    }
+}
+// No Drop implementation: releasing a context/lease never signals the daemon.
 
 #[cfg(test)]
 mod tests {
@@ -193,5 +302,201 @@ mod tests {
         drop(first);
         drop(ControllerLock::acquire(&home).unwrap());
         std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn codex_same_slot_serializes_but_other_slots_progress() {
+        let home = std::env::temp_dir().join(format!("aperture-c2-lock-{}", uuid::Uuid::new_v4()));
+        let lease = ControllerLock::acquire(&home).unwrap();
+        let first = lease.codex_slot("one").unwrap();
+        let held = first.enter().unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let other = &lease;
+            scope.spawn(move || {
+                let slot = other.codex_slot("one").unwrap();
+                attempt_tx.send(()).unwrap();
+                let operation = slot.enter().unwrap();
+                operation.verify_for(other).unwrap();
+                entered_tx.send(()).unwrap();
+            });
+            attempt_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(entered_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let other = &lease;
+            scope.spawn(move || {
+                let slot = other.codex_slot("two").unwrap();
+                let operation = slot.enter().unwrap();
+                operation.verify_for(other).unwrap();
+                tx.send(()).unwrap();
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            drop(held);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        });
+        drop(first);
+        drop(lease);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn codex_slot_capacity_no_eviction_and_context_is_exact_lease() {
+        let home = std::env::temp_dir().join(format!("aperture-c2-map-{}", uuid::Uuid::new_v4()));
+        let lease = ControllerLock::acquire(&home).unwrap();
+        for i in 0..128 {
+            drop(lease.codex_slot(&format!("seat-{i}")).unwrap());
+        }
+        assert!(lease.codex_slot("overflow").is_err());
+        let slot = lease.codex_slot("seat-0").unwrap();
+        let context = slot.enter().unwrap();
+        let other_home = home.join("other");
+        let other = ControllerLock::acquire(&other_home).unwrap();
+        assert!(context.verify_for(&other).is_err());
+        assert_eq!(context.seat(), "seat-0");
+        drop(context);
+        drop(slot);
+        drop(other);
+        drop(lease);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    struct WaitFixture {
+        home: PathBuf,
+        identity: Option<crate::team_replacement::ProcessIdentity>,
+    }
+    impl WaitFixture {
+        fn new() -> Self {
+            let home =
+                std::env::temp_dir().join(format!("aperture-c2-wait-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&home).unwrap();
+            Self {
+                home,
+                identity: None,
+            }
+        }
+        fn child(&mut self) -> std::process::Child {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "controller::tests::codex_inert_wait_entry",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("APERTURE_CODEX_WAIT_FIXTURE", &self.home)
+                .env("HOME", &self.home)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            self.identity = Some(
+                crate::team_process::observe(child.id())
+                    .unwrap()
+                    .unwrap()
+                    .identity,
+            );
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !self.home.join("ready").exists() {
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            child
+        }
+    }
+    impl Drop for WaitFixture {
+        fn drop(&mut self) {
+            if let Some(identity) = &self.identity {
+                if crate::team_process::state(identity)
+                    == crate::team_replacement::ProcessState::Same
+                {
+                    assert_eq!(unsafe { libc::kill(identity.pid as i32, libc::SIGKILL) }, 0);
+                }
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    unsafe {
+                        libc::waitpid(identity.pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+                    }
+                    if crate::team_process::state(identity)
+                        == crate::team_replacement::ProcessState::Gone
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "own inert cleanup unverified"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                eprintln!("C2a own inert wait fixture reaped/Gone");
+            }
+            std::fs::remove_dir_all(&self.home).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "inert child entry; explicit owned wait fixtures only"]
+    fn codex_inert_wait_entry() {
+        let root = PathBuf::from(std::env::var_os("APERTURE_CODEX_WAIT_FIXTURE").unwrap());
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("aperture-c2-wait-"));
+        std::fs::write(root.join("ready"), b"ready").unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.join("finish").exists() {
+            assert!(
+                std::time::Instant::now() < until,
+                "inert wait fixture deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn codex_wait_handle_retained_across_operations_and_drop_never_kills() {
+        for detach in [false, true] {
+            let mut fixture = WaitFixture::new();
+            let lease = ControllerLock::acquire(&fixture.home).unwrap();
+            let slot = lease.codex_slot("fixture").unwrap();
+            let mut operation = slot.enter().unwrap();
+            assert_eq!(operation.try_wait().unwrap(), WaitObservation::NotObserved);
+            operation.retain_child(fixture.child()).unwrap();
+            drop(operation);
+            drop(slot);
+            let slot = lease.codex_slot("fixture").unwrap();
+            let mut operation = slot.enter().unwrap();
+            assert_eq!(operation.try_wait().unwrap(), WaitObservation::Running);
+            if !detach {
+                std::fs::write(fixture.home.join("finish"), b"finish").unwrap();
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    match operation.try_wait().unwrap() {
+                        WaitObservation::Exited(status) => {
+                            assert!(status.success());
+                            break;
+                        }
+                        WaitObservation::Running => {
+                            assert!(std::time::Instant::now() < until);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        _ => panic!("lost own wait handle"),
+                    }
+                }
+            }
+            drop(operation);
+            drop(slot);
+            drop(lease);
+            if detach {
+                assert_eq!(
+                    crate::team_process::state(fixture.identity.as_ref().unwrap()),
+                    crate::team_replacement::ProcessState::Same
+                );
+            }
+            drop(fixture); // Only this test owner signals/reaps; never lease Drop.
+        }
     }
 }

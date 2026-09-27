@@ -113,7 +113,7 @@ impl Endpoint {
         }
     }
 }
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 63
         && name.as_bytes()[0].is_ascii_lowercase()
@@ -197,6 +197,172 @@ pub(crate) struct Inspection {
     // Intentionally no `Adopted` state. B/C must supply authenticated protocol proof.
 }
 
+// C2a is metadata only. These claims are not syscall witnesses or capabilities.
+// Explicit wire v2 has NO previous/successor field and cannot enroll v1 slots.
+const CODEX_SCHEMA: u32 = 2;
+const CODEX_PLAN_ENTRIES: usize = 9; // eight immutable facts plus current
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NodePinV2 {
+    pub dev: u64,
+    pub ino: u64,
+    pub uid: u32,
+    pub mode: u32,
+    pub links: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTargetV2 {
+    pub basename: String,
+    pub parents: Vec<NodePinV2>,
+    pub leaf: NodePinV2,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SocketPinsV2 {
+    pub format_version: u32,
+    // Order is the fixed root's ancestor order; no stored arbitrary path.
+    // Future native conversion MUST compare every claim with existing pins.
+    pub parents: Vec<NodePinV2>,
+    pub entry: NodePinV2,
+    pub native_target: Option<NativeTargetV2>,
+}
+impl SocketPinsV2 {
+    fn validate(&self) -> Result<()> {
+        fn kind(pin: &NodePinV2, expected: u32) -> bool {
+            pin.ino != 0 && pin.mode & libc::S_IFMT as u32 == expected
+        }
+        fn parents(pins: &[NodePinV2]) -> bool {
+            !pins.is_empty()
+                && pins.len() <= 64
+                && pins.iter().all(|p| kind(p, libc::S_IFDIR as u32))
+        }
+        if self.format_version != 1 || !parents(&self.parents) {
+            return Err(fail("E_CODEX_PIN_METADATA"));
+        }
+        match &self.native_target {
+            None if kind(&self.entry, libc::S_IFSOCK as u32) => {}
+            Some(target)
+                if kind(&self.entry, libc::S_IFLNK as u32)
+                    && target.basename.len() == 64
+                    && target
+                        .basename
+                        .bytes()
+                        .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+                    && parents(&target.parents)
+                    && kind(&target.leaf, libc::S_IFSOCK as u32) => {}
+            _ => return Err(fail("E_CODEX_PIN_METADATA")),
+        }
+        // Structural metadata only; mode/uid/path policy conversion is C2b,
+        // not an adoption/deletion proof manufactured by this serializer.
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TermResultV2 {
+    ReturnedZero,
+    Esrch,
+    OtherError,
+    Unobserved,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StopOutcomeV2 {
+    TermSentThenDaemonGoneDescendantsUnverified,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CleanupOutcomeV2 {
+    FixedDirectEntryRemoved,
+    FixedLinkRemovedTargetRetained,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CodexEventV2 {
+    SpawnIntent {
+        endpoint: Endpoint,
+        provenance: Provenance,
+        budget_entries: usize,
+    },
+    Spawned {
+        process: Identity,
+    },
+    SocketReady {
+        pins: SocketPinsV2,
+    },
+    StopIntent {},
+    TermResult {
+        result: TermResultV2,
+    },
+    StopOutcome {
+        outcome: StopOutcomeV2,
+    },
+    CleanupIntent {},
+    CleanupOutcome {
+        outcome: CleanupOutcomeV2,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexFactV2 {
+    schema_version: u32,
+    incarnation: String,
+    sequence: usize,
+    operation: String,
+    authored_by: Identity,
+    at_ms: u64,
+    event: CodexEventV2,
+}
+impl CodexFactV2 {
+    fn filename(&self) -> String {
+        format!("v2-{:03}-{}.json", self.sequence, self.incarnation)
+    }
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != CODEX_SCHEMA {
+            return Err(fail("E_DAEMON_SCHEMA"));
+        }
+        if !uuid(&self.incarnation)
+            || !uuid(&self.operation)
+            || self.sequence >= 8
+            || self.at_ms == 0
+        {
+            return Err(fail("E_CODEX_METADATA"));
+        }
+        self.authored_by.validate()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodexPhaseV2 {
+    SpawnIntentUnknown,
+    SpawnedUnready,
+    PublicationIncomplete,
+    ReadyMetadataOnly,
+    StopIntentUnknown,
+    TermResultUnresolved,
+    Unknown,
+    TermSentThenDaemonGoneDescendantsUnverified,
+    CleanupIntentUnknown,
+    FixedDirectEntryRemoved,
+    FixedLinkRemovedTargetRetained,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexMetadataV2 {
+    pub incarnation: String,
+    pub process: Option<ProcessIdentity>,
+    pub phase: CodexPhaseV2,
+    pub entries: usize,
+}
+fn budget(used: usize, additional: usize) -> Result<()> {
+    if used.checked_add(additional).map_or(true, |n| n > MAX_FACTS) {
+        Err(fail("E_DAEMON_CAPACITY"))
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) struct Registry<'a> {
     lease: &'a ControllerLock,
     root: PathBuf,
@@ -205,6 +371,7 @@ struct History {
     reservations: BTreeMap<String, Reservation>,
     records: BTreeMap<String, Record>,
     current: Option<String>,
+    codex: BTreeMap<usize, CodexFactV2>,
 }
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     journal::read_private_json(path).map_err(|_| fail("E_DAEMON_RECORD"))
@@ -253,6 +420,7 @@ impl<'a> Registry<'a> {
             reservations: BTreeMap::new(),
             records: BTreeMap::new(),
             current: None,
+            codex: BTreeMap::new(),
         };
         for (index, entry) in fs::read_dir(&path)
             .map_err(|_| fail("E_DAEMON_PATH"))?
@@ -279,6 +447,12 @@ impl<'a> Registry<'a> {
                     return Err(fail("E_DAEMON_RECORD"));
                 }
                 h.current = Some(id);
+            } else if name.starts_with("v2-") {
+                let fact: CodexFactV2 = read(&file)?;
+                fact.validate()?;
+                if fact.filename() != name || h.codex.insert(fact.sequence, fact).is_some() {
+                    return Err(fail("E_CODEX_METADATA"));
+                }
             } else if let Some(id) = name
                 .strip_prefix("reservation-")
                 .and_then(|s| s.strip_suffix(".json"))
@@ -304,6 +478,9 @@ impl<'a> Registry<'a> {
         Ok(h)
     }
     fn complete<'h>(&self, h: &'h History) -> Result<&'h Record> {
+        if !h.codex.is_empty() {
+            return Err(fail("E_DAEMON_SCHEMA"));
+        }
         if h.reservations.is_empty() || h.records.len() != h.reservations.len() {
             return Err(fail("E_DAEMON_RESERVATION_INCOMPLETE"));
         }
@@ -358,6 +535,23 @@ impl<'a> Registry<'a> {
                 .into_string()
                 .map_err(|_| fail("E_DAEMON_PATH"))?;
             let h = self.history(&slot)?;
+            if !h.codex.is_empty() {
+                let view = self.codex_view(&slot, &h)?;
+                if view.phase != CodexPhaseV2::ReadyMetadataOnly {
+                    return Err(fail("E_CODEX_OPERATION_UNKNOWN"));
+                }
+                let provenance = match &h.codex[&0].event {
+                    CodexEventV2::SpawnIntent { provenance, .. } => provenance.clone(),
+                    _ => return Err(fail("E_CODEX_METADATA")),
+                };
+                out.push(Inspection {
+                    slot,
+                    incarnation: view.incarnation,
+                    identity: observe(&view.process.ok_or_else(|| fail("E_CODEX_METADATA"))?),
+                    provenance,
+                });
+                continue;
+            }
             let r = self.complete(&h)?;
             out.push(Inspection {
                 slot,
@@ -381,6 +575,267 @@ impl<'a> Registry<'a> {
             Ok(_) => Ok(Some(self.complete(&self.history(slot)?)?.clone())),
         }
     }
+    fn codex_view(&self, slot: &str, h: &History) -> Result<CodexMetadataV2> {
+        use CodexEventV2 as E;
+        use CodexPhaseV2 as P;
+        if !h.reservations.is_empty() || !h.records.is_empty() || h.codex.is_empty() {
+            return Err(fail("E_DAEMON_SCHEMA"));
+        }
+        let first = h.codex.get(&0).ok_or_else(|| fail("E_CODEX_METADATA"))?;
+        let (endpoint, provenance) = match &first.event {
+            E::SpawnIntent {
+                endpoint: Endpoint::CodexAppServer { .. },
+                ..
+            } => match &first.event {
+                E::SpawnIntent {
+                    endpoint,
+                    provenance,
+                    budget_entries,
+                } if *budget_entries == CODEX_PLAN_ENTRIES => (endpoint, provenance),
+                _ => return Err(fail("E_CODEX_METADATA")),
+            },
+            _ => return Err(fail("E_CODEX_METADATA")),
+        };
+        if endpoint.slot()? != slot {
+            return Err(fail("E_CODEX_METADATA"));
+        }
+        provenance.validate()?;
+        let mut time = 0;
+        let mut process = None;
+        let mut phase = P::SpawnIntentUnknown;
+        let mut target_retained = false;
+        for (index, (sequence, fact)) in h.codex.iter().enumerate() {
+            fact.validate()?;
+            if *sequence != index || fact.incarnation != first.incarnation || fact.at_ms < time {
+                return Err(fail("E_CODEX_METADATA"));
+            }
+            time = fact.at_ms;
+            // Continuations of an effect intent must belong to the same held
+            // operation; reacquiring a slot does not resume unknown effects.
+            let intent_index = match index {
+                1 | 2 => Some(0),
+                4 | 5 => Some(3),
+                7 => Some(6),
+                _ => None,
+            };
+            if let Some(i) = intent_index {
+                let intent = h.codex.get(&i).ok_or_else(|| fail("E_CODEX_METADATA"))?;
+                if fact.operation != intent.operation || fact.authored_by != intent.authored_by {
+                    return Err(fail("E_CODEX_OPERATION_UNKNOWN"));
+                }
+            }
+            match (index, &fact.event) {
+                (0, E::SpawnIntent { .. }) => {}
+                (1, E::Spawned { process: p }) => {
+                    p.validate()?;
+                    process = Some(p.native());
+                    phase = P::SpawnedUnready;
+                }
+                (2, E::SocketReady { pins }) => {
+                    pins.validate()?;
+                    target_retained = pins.native_target.is_some();
+                    phase = P::PublicationIncomplete;
+                }
+                (3, E::StopIntent {}) => phase = P::StopIntentUnknown,
+                (4, E::TermResult { result }) => {
+                    phase = if *result == TermResultV2::ReturnedZero {
+                        P::TermResultUnresolved
+                    } else {
+                        P::Unknown
+                    }
+                }
+                (
+                    5,
+                    E::StopOutcome {
+                        outcome: StopOutcomeV2::Unknown,
+                    },
+                ) => phase = P::Unknown,
+                (
+                    5,
+                    E::StopOutcome {
+                        outcome: StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified,
+                    },
+                ) if phase == P::TermResultUnresolved => {
+                    phase = P::TermSentThenDaemonGoneDescendantsUnverified
+                }
+                (6, E::CleanupIntent {})
+                    if phase == P::TermSentThenDaemonGoneDescendantsUnverified =>
+                {
+                    phase = P::CleanupIntentUnknown
+                }
+                (
+                    7,
+                    E::CleanupOutcome {
+                        outcome: CleanupOutcomeV2::Unknown,
+                    },
+                ) => phase = P::Unknown,
+                (
+                    7,
+                    E::CleanupOutcome {
+                        outcome: CleanupOutcomeV2::FixedDirectEntryRemoved,
+                    },
+                ) if !target_retained => phase = P::FixedDirectEntryRemoved,
+                (
+                    7,
+                    E::CleanupOutcome {
+                        outcome: CleanupOutcomeV2::FixedLinkRemovedTargetRetained,
+                    },
+                ) if target_retained => phase = P::FixedLinkRemovedTargetRetained,
+                _ => return Err(fail("E_CODEX_METADATA")),
+            }
+        }
+        if let Some(id) = &h.current {
+            if id != &first.incarnation || h.codex.len() < 3 {
+                return Err(fail("E_DAEMON_PUBLICATION_INCOMPLETE"));
+            }
+            if h.codex.len() == 3 {
+                phase = P::ReadyMetadataOnly;
+            }
+        } else if h.codex.len() > 3 {
+            return Err(fail("E_DAEMON_PUBLICATION_INCOMPLETE"));
+        }
+        let entries = h.codex.len() + usize::from(h.current.is_some());
+        budget(entries, 0)?;
+        Ok(CodexMetadataV2 {
+            incarnation: first.incarnation.clone(),
+            process,
+            phase,
+            entries,
+        })
+    }
+    /// Read metadata, not permission to adopt, replace, signal or unlink.
+    pub(crate) fn codex_metadata(&self, seat: &str) -> Result<Option<CodexMetadataV2>> {
+        self.checked_root()?;
+        let slot = Endpoint::CodexAppServer { seat: seat.into() }.slot()?;
+        match fs::symlink_metadata(self.root.join(&slot)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(fail("E_DAEMON_PATH")),
+            Ok(_) => self.codex_view(&slot, &self.history(&slot)?).map(Some),
+        }
+    }
+    /// Metadata intent only. First C2a writer: one pristine incarnation forever.
+    /// No external-effect callback exists; full future operation budget is paid
+    /// before this intent, including current and terminal outcome files.
+    pub(crate) fn begin_codex_v2(
+        &self,
+        operation: &crate::controller::CodexOperation<'_>,
+        provenance: Provenance,
+        at_ms: u64,
+    ) -> Result<String> {
+        operation.verify_for(self.lease)?;
+        self.checked_root()?;
+        let endpoint = Endpoint::CodexAppServer {
+            seat: operation.seat().into(),
+        };
+        let slot = endpoint.slot()?;
+        match fs::symlink_metadata(self.root.join(&slot)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(fail("E_CODEX_NOT_PRISTINE")),
+        }
+        self.inspect()?;
+        let slots = fs::read_dir(&self.root)
+            .map_err(|_| fail("E_DAEMON_PATH"))?
+            .count();
+        if slots >= MAX_SLOTS {
+            return Err(fail("E_DAEMON_CAPACITY"));
+        }
+        budget(0, CODEX_PLAN_ENTRIES)?;
+        provenance.validate()?;
+        let fact = CodexFactV2 {
+            schema_version: CODEX_SCHEMA,
+            incarnation: Uuid::new_v4().to_string(),
+            sequence: 0,
+            operation: operation.nonce().into(),
+            authored_by: Identity::from_native(self.lease.identity()?)?,
+            at_ms,
+            event: CodexEventV2::SpawnIntent {
+                endpoint,
+                provenance,
+                budget_entries: CODEX_PLAN_ENTRIES,
+            },
+        };
+        fact.validate()?;
+        let dir = self.slot_path(&slot, true)?;
+        operation.verify_for(self.lease)?;
+        journal::write_private_json_atomic(&dir.join(fact.filename()), &fact, false)?;
+        Ok(fact.incarnation)
+    }
+    pub(crate) fn append_codex_v2(
+        &self,
+        operation: &crate::controller::CodexOperation<'_>,
+        incarnation: &str,
+        event: CodexEventV2,
+        at_ms: u64,
+    ) -> Result<()> {
+        operation.verify_for(self.lease)?;
+        let slot = Endpoint::CodexAppServer {
+            seat: operation.seat().into(),
+        }
+        .slot()?;
+        let mut h = self.history(&slot)?;
+        let before = self.codex_view(&slot, &h)?;
+        if before.incarnation != incarnation {
+            return Err(fail("E_CODEX_OPERATION_UNKNOWN"));
+        }
+        // No successor, replay, new-UUID retry or post-Unknown reconciliation.
+        // Only completing the already-held syscall fact with Unknown is allowed.
+        if before.phase == CodexPhaseV2::Unknown
+            && !(h.codex.len() == 5
+                && matches!(
+                    event,
+                    CodexEventV2::StopOutcome {
+                        outcome: StopOutcomeV2::Unknown
+                    }
+                ))
+        {
+            return Err(fail("E_CODEX_OPERATION_UNKNOWN"));
+        }
+        budget(
+            before.entries,
+            CODEX_PLAN_ENTRIES.saturating_sub(before.entries),
+        )?;
+        let fact = CodexFactV2 {
+            schema_version: CODEX_SCHEMA,
+            incarnation: incarnation.into(),
+            sequence: h.codex.len(),
+            operation: operation.nonce().into(),
+            authored_by: Identity::from_native(self.lease.identity()?)?,
+            at_ms,
+            event,
+        };
+        h.codex.insert(fact.sequence, fact.clone());
+        self.codex_view(&slot, &h)?;
+        let dir = self.slot_path(&slot, false)?;
+        operation.verify_for(self.lease)?;
+        journal::write_private_json_atomic(&dir.join(fact.filename()), &fact, false)
+    }
+    pub(crate) fn publish_codex_v2(
+        &self,
+        operation: &crate::controller::CodexOperation<'_>,
+        incarnation: &str,
+    ) -> Result<()> {
+        operation.verify_for(self.lease)?;
+        let slot = Endpoint::CodexAppServer {
+            seat: operation.seat().into(),
+        }
+        .slot()?;
+        let mut h = self.history(&slot)?;
+        let view = self.codex_view(&slot, &h)?;
+        let intent = h.codex.get(&0).ok_or_else(|| fail("E_CODEX_METADATA"))?;
+        if view.incarnation != incarnation
+            || view.phase != CodexPhaseV2::PublicationIncomplete
+            || intent.operation != operation.nonce()
+            || intent.authored_by != Identity::from_native(self.lease.identity()?)?
+        {
+            return Err(fail("E_CODEX_OPERATION_UNKNOWN"));
+        }
+        h.current = Some(incarnation.into());
+        self.codex_view(&slot, &h)?;
+        let dir = self.slot_path(&slot, false)?;
+        operation.verify_for(self.lease)?;
+        journal::write_private_json_atomic(&dir.join("current"), &incarnation, false)
+    }
+
     /// Account for both immutable facts and initial current BEFORE reserve or
     /// spawn. No history pruning/UUID rollover is a way around this limit.
     pub(crate) fn capacity(&self, slot: &str) -> Result<()> {
@@ -424,6 +879,9 @@ impl<'a> Registry<'a> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(fail("E_DAEMON_PATH")),
             Ok(_) => {
+                if matches!(endpoint, Endpoint::CodexAppServer { .. }) {
+                    return Err(fail("E_CODEX_NO_SUCCESSOR"));
+                }
                 let h = self.history(&slot)?;
                 let r = self.complete(&h)?;
                 if team_process::state(&r.process.native()) != ProcessState::Gone {

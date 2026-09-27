@@ -560,3 +560,500 @@ fn b2_slot_capacity_denies_new_slot_without_erasing_existing_history() {
     assert_eq!(registry.inspect().unwrap().len(), MAX_SLOTS);
     assert!(registry.current("hub").unwrap().is_none());
 }
+
+// C2a claims below are synthetic metadata, NOT native socket/stop witnesses.
+fn v2_pins(link: bool) -> SocketPinsV2 {
+    let dir = NodePinV2 {
+        dev: 1,
+        ino: 2,
+        uid: unsafe { libc::geteuid() },
+        mode: libc::S_IFDIR as u32 | 0o700,
+        links: 0,
+    };
+    let socket = NodePinV2 {
+        dev: 1,
+        ino: 3,
+        uid: dir.uid,
+        mode: libc::S_IFSOCK as u32 | 0o600,
+        links: 1,
+    };
+    SocketPinsV2 {
+        format_version: 1,
+        parents: vec![dir.clone()],
+        entry: if link {
+            NodePinV2 {
+                mode: libc::S_IFLNK as u32 | 0o777,
+                ..socket.clone()
+            }
+        } else {
+            socket.clone()
+        },
+        native_target: if link {
+            Some(NativeTargetV2 {
+                basename: "a".repeat(64),
+                parents: vec![dir],
+                leaf: socket,
+            })
+        } else {
+            None
+        },
+    }
+}
+fn v2_ready(
+    registry: &Registry<'_>,
+    operation: &crate::controller::CodexOperation<'_>,
+    link: bool,
+) -> String {
+    let id = registry
+        .begin_codex_v2(operation, Provenance::LegacyUnknown, 10)
+        .unwrap();
+    registry
+        .append_codex_v2(
+            operation,
+            &id,
+            CodexEventV2::Spawned {
+                process: Identity::from_native(registry.lease.identity().unwrap()).unwrap(),
+            },
+            11,
+        )
+        .unwrap();
+    registry
+        .append_codex_v2(
+            operation,
+            &id,
+            CodexEventV2::SocketReady {
+                pins: v2_pins(link),
+            },
+            12,
+        )
+        .unwrap();
+    assert_eq!(
+        registry
+            .codex_metadata(operation.seat())
+            .unwrap()
+            .unwrap()
+            .phase,
+        CodexPhaseV2::PublicationIncomplete
+    );
+    registry.publish_codex_v2(operation, &id).unwrap();
+    id
+}
+#[test]
+fn c2_v2_explicit_roundtrip_keeps_v1_hub_bytes_and_denies_enrollment() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let registry = Registry::open(&lease).unwrap();
+    let hub = published(&registry);
+    let hub_before = snapshot(&registry.root.join("hub"));
+    let slot = lease.codex_slot("fixture").unwrap();
+    let operation = slot.enter().unwrap();
+    let id = v2_ready(&registry, &operation, false);
+    assert_eq!(
+        registry.codex_metadata("fixture").unwrap().unwrap(),
+        CodexMetadataV2 {
+            incarnation: id,
+            process: Some(lease.identity().unwrap().clone()),
+            phase: CodexPhaseV2::ReadyMetadataOnly,
+            entries: 4
+        }
+    );
+    assert_eq!(snapshot(&registry.root.join("hub")), hub_before);
+    assert_eq!(registry.current("hub").unwrap().unwrap(), hub);
+    assert_eq!(registry.inspect().unwrap().len(), 2);
+    // v1 observation API does not manufacture a v1 record from new v2 facts.
+    assert!(registry.current("codex-fixture").is_err());
+    let before = snapshot(&registry.root);
+    assert!(registry
+        .begin_codex_v2(&operation, Provenance::LegacyUnknown, 20)
+        .is_err());
+    assert_eq!(snapshot(&registry.root), before);
+    // Old strict v1 structs cannot silently consume the new wire format.
+    let h = registry.history("codex-fixture").unwrap();
+    assert!(
+        serde_json::from_value::<Reservation>(serde_json::to_value(&h.codex[&0]).unwrap()).is_err()
+    );
+    assert!(serde_json::from_value::<Record>(serde_json::to_value(&h.codex[&1]).unwrap()).is_err());
+}
+#[test]
+fn c2_v1_codex_stays_observable_but_never_becomes_v2_or_successor_authority() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let registry = Registry::open(&lease).unwrap();
+    let endpoint = Endpoint::CodexAppServer {
+        seat: "fixture".into(),
+    };
+    let intent = registry
+        .reserve(endpoint.clone(), Provenance::LegacyUnknown, 1)
+        .unwrap();
+    let r = registry
+        .record(&intent, lease.identity().unwrap(), 2)
+        .unwrap();
+    registry.publish_current(&r).unwrap();
+    let before = snapshot(&registry.root);
+    let slot = lease.codex_slot("fixture").unwrap();
+    let operation = slot.enter().unwrap();
+    assert!(registry.codex_metadata("fixture").is_err());
+    assert!(registry
+        .begin_codex_v2(&operation, Provenance::LegacyUnknown, 20)
+        .is_err());
+    assert!(registry
+        .reserve(endpoint, Provenance::LegacyUnknown, 21)
+        .is_err());
+    assert_eq!(registry.current("codex-fixture").unwrap().unwrap(), r);
+    assert_eq!(snapshot(&registry.root), before);
+}
+#[test]
+fn c2_dropped_operation_cannot_resume_unknown_with_new_nonce_or_controller() {
+    for stage in 0..3 {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("fixture").unwrap();
+        let operation = slot.enter().unwrap();
+        let id = registry
+            .begin_codex_v2(&operation, Provenance::LegacyUnknown, 10)
+            .unwrap();
+        if stage > 0 {
+            registry
+                .append_codex_v2(
+                    &operation,
+                    &id,
+                    CodexEventV2::Spawned {
+                        process: Identity::from_native(lease.identity().unwrap()).unwrap(),
+                    },
+                    11,
+                )
+                .unwrap();
+        }
+        if stage > 1 {
+            registry
+                .append_codex_v2(
+                    &operation,
+                    &id,
+                    CodexEventV2::SocketReady {
+                        pins: v2_pins(false),
+                    },
+                    12,
+                )
+                .unwrap();
+        }
+        drop(operation);
+        let new = slot.enter().unwrap();
+        let before = snapshot(&registry.root);
+        assert!(registry
+            .begin_codex_v2(&new, Provenance::LegacyUnknown, 20)
+            .is_err());
+        let event = if stage == 0 {
+            CodexEventV2::Spawned {
+                process: Identity::from_native(lease.identity().unwrap()).unwrap(),
+            }
+        } else {
+            CodexEventV2::SocketReady {
+                pins: v2_pins(false),
+            }
+        };
+        assert!(registry.append_codex_v2(&new, &id, event, 21).is_err());
+        assert!(registry.publish_codex_v2(&new, &id).is_err());
+        assert_eq!(snapshot(&registry.root), before);
+        drop(new);
+        drop(slot);
+        drop(registry);
+        drop(lease);
+        let restarted = f.lease();
+        let registry = Registry::open(&restarted).unwrap();
+        let slot = restarted.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        assert!(registry
+            .begin_codex_v2(&op, Provenance::LegacyUnknown, 22)
+            .is_err());
+        assert!(registry.publish_codex_v2(&op, &id).is_err());
+        assert_eq!(snapshot(&registry.root), before);
+    }
+}
+#[test]
+fn c2_stop_syscall_and_outcome_are_separate_unknown_never_reconciles() {
+    for result in [
+        TermResultV2::ReturnedZero,
+        TermResultV2::Esrch,
+        TermResultV2::OtherError,
+        TermResultV2::Unobserved,
+    ] {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        let id = v2_ready(&registry, &op, false);
+        registry
+            .append_codex_v2(&op, &id, CodexEventV2::StopIntent {}, 13)
+            .unwrap();
+        registry
+            .append_codex_v2(
+                &op,
+                &id,
+                CodexEventV2::TermResult {
+                    result: result.clone(),
+                },
+                14,
+            )
+            .unwrap();
+        if result != TermResultV2::ReturnedZero {
+            assert!(registry
+                .append_codex_v2(
+                    &op,
+                    &id,
+                    CodexEventV2::StopOutcome {
+                        outcome: StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified
+                    },
+                    15
+                )
+                .is_err());
+        }
+        registry
+            .append_codex_v2(
+                &op,
+                &id,
+                CodexEventV2::StopOutcome {
+                    outcome: StopOutcomeV2::Unknown,
+                },
+                15,
+            )
+            .unwrap();
+        let before = snapshot(&registry.root);
+        assert_eq!(
+            registry.codex_metadata("fixture").unwrap().unwrap().phase,
+            CodexPhaseV2::Unknown
+        );
+        for event in [
+            CodexEventV2::CleanupIntent {},
+            CodexEventV2::StopIntent {},
+            CodexEventV2::StopOutcome {
+                outcome: StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified,
+            },
+        ] {
+            assert!(registry.append_codex_v2(&op, &id, event, 16).is_err());
+        }
+        // Endpoint is absent and native process could later disappear: neither
+        // is consulted to erase Unknown or authorize another incarnation.
+        assert!(!lease.run_dir().unwrap().join("fixture.sock").exists());
+        assert!(registry
+            .begin_codex_v2(&op, Provenance::LegacyUnknown, 17)
+            .is_err());
+        assert_eq!(snapshot(&registry.root), before);
+    }
+}
+#[test]
+fn c2_represented_cleanup_is_narrow_and_never_unlocks_successor() {
+    for link in [false, true] {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        let id = v2_ready(&registry, &op, link);
+        for (time, event) in [
+            (13, CodexEventV2::StopIntent {}),
+            (
+                14,
+                CodexEventV2::TermResult {
+                    result: TermResultV2::ReturnedZero,
+                },
+            ),
+            (
+                15,
+                CodexEventV2::StopOutcome {
+                    outcome: StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified,
+                },
+            ),
+            (16, CodexEventV2::CleanupIntent {}),
+        ] {
+            registry.append_codex_v2(&op, &id, event, time).unwrap();
+        }
+        let wrong = if link {
+            CleanupOutcomeV2::FixedDirectEntryRemoved
+        } else {
+            CleanupOutcomeV2::FixedLinkRemovedTargetRetained
+        };
+        assert!(registry
+            .append_codex_v2(
+                &op,
+                &id,
+                CodexEventV2::CleanupOutcome { outcome: wrong },
+                17
+            )
+            .is_err());
+        let outcome = if link {
+            CleanupOutcomeV2::FixedLinkRemovedTargetRetained
+        } else {
+            CleanupOutcomeV2::FixedDirectEntryRemoved
+        };
+        registry
+            .append_codex_v2(&op, &id, CodexEventV2::CleanupOutcome { outcome }, 17)
+            .unwrap();
+        assert_eq!(
+            registry.codex_metadata("fixture").unwrap().unwrap().entries,
+            CODEX_PLAN_ENTRIES
+        );
+        let before = snapshot(&registry.root);
+        assert!(registry
+            .begin_codex_v2(&op, Provenance::LegacyUnknown, 18)
+            .is_err());
+        assert!(registry
+            .append_codex_v2(
+                &op,
+                &id,
+                CodexEventV2::Spawned {
+                    process: Identity::from_native(lease.identity().unwrap()).unwrap()
+                },
+                19
+            )
+            .is_err());
+        assert_eq!(snapshot(&registry.root), before);
+    }
+}
+#[test]
+fn c2_crashed_stop_and_cleanup_cannot_continue_from_new_operation() {
+    for last in 3..8 {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        let id = v2_ready(&registry, &op, false);
+        let events = [
+            CodexEventV2::StopIntent {},
+            CodexEventV2::TermResult {
+                result: TermResultV2::ReturnedZero,
+            },
+            CodexEventV2::StopOutcome {
+                outcome: StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified,
+            },
+            CodexEventV2::CleanupIntent {},
+            CodexEventV2::CleanupOutcome {
+                outcome: CleanupOutcomeV2::Unknown,
+            },
+        ];
+        for (i, event) in events.iter().enumerate().take(last - 2) {
+            registry
+                .append_codex_v2(&op, &id, event.clone(), 13 + i as u64)
+                .unwrap();
+        }
+        drop(op);
+        let fresh = slot.enter().unwrap();
+        let before = snapshot(&registry.root);
+        assert!(registry
+            .begin_codex_v2(&fresh, Provenance::LegacyUnknown, 30)
+            .is_err());
+        // Completed narrow stop may start a separate cleanup intent, but never
+        // resume the interrupted syscall/cleanup or proceed after Unknown.
+        if last != 5 {
+            let next = events
+                .get(last - 2)
+                .cloned()
+                .unwrap_or(CodexEventV2::StopIntent {});
+            assert!(registry.append_codex_v2(&fresh, &id, next, 31).is_err());
+        }
+        assert_eq!(snapshot(&registry.root), before);
+    }
+}
+#[test]
+fn c2_unknown_versions_mixed_orphan_holes_and_unsafe_facts_deny_without_repair() {
+    for case in [
+        "version",
+        "mixed",
+        "hole",
+        "orphan",
+        "duplicate",
+        "unsafe",
+        "new_incarnation",
+    ] {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        let id = v2_ready(&registry, &op, false);
+        let dir = registry.root.join("codex-fixture");
+        let h = registry.history("codex-fixture").unwrap();
+        let mut fact = h.codex[&1].clone();
+        match case {
+            "version" => {
+                fact.schema_version = 3;
+                journal::write_private_json_atomic(&dir.join(fact.filename()), &fact, true)
+                    .unwrap();
+            }
+            "mixed" => {
+                let hub_intent = Reservation {
+                    schema_version: 1,
+                    incarnation: id.clone(),
+                    previous: None,
+                    endpoint: Endpoint::CodexAppServer {
+                        seat: "fixture".into(),
+                    },
+                    spawned_by: Identity::from_native(lease.identity().unwrap()).unwrap(),
+                    provenance: Provenance::LegacyUnknown,
+                    reserved_at_ms: 1,
+                };
+                write(&dir.join(format!("reservation-{id}.json")), &hub_intent);
+            }
+            "hole" => fs::remove_file(dir.join(fact.filename())).unwrap(),
+            "orphan" => fs::write(dir.join(".atomic.tmp"), b"pending").unwrap(),
+            "duplicate" => fs::copy(dir.join(fact.filename()), dir.join("v2-duplicate.json"))
+                .map(|_| ())
+                .unwrap(),
+            "unsafe" => {
+                fs::set_permissions(dir.join(fact.filename()), fs::Permissions::from_mode(0o644))
+                    .unwrap()
+            }
+            "new_incarnation" => {
+                fs::remove_file(dir.join(fact.filename())).unwrap();
+                fact.incarnation = Uuid::new_v4().to_string();
+                write(&dir.join(fact.filename()), &fact);
+            }
+            _ => unreachable!(),
+        }
+        let before = snapshot(&registry.root);
+        assert!(registry.codex_metadata("fixture").is_err());
+        assert!(registry
+            .begin_codex_v2(&op, Provenance::LegacyUnknown, 30)
+            .is_err());
+        assert_eq!(snapshot(&registry.root), before);
+    }
+}
+#[test]
+fn c2_budget_counts_current_and_no_schema_fields_hide_extra_authority() {
+    assert_eq!(CODEX_PLAN_ENTRIES, 8 + 1);
+    assert!(budget(503, CODEX_PLAN_ENTRIES).is_ok());
+    assert!(budget(504, CODEX_PLAN_ENTRIES).is_err());
+    assert!(budget(512, 1).is_err());
+    assert!(budget(usize::MAX, 1).is_err());
+    let mut pins = v2_pins(false);
+    pins.parents.clear();
+    assert!(pins.validate().is_err());
+    let mut pins = v2_pins(true);
+    pins.native_target.as_mut().unwrap().basename = "../arbitrary".into();
+    assert!(pins.validate().is_err());
+    let mut event = serde_json::to_value(CodexEventV2::CleanupIntent {}).unwrap();
+    event["replacement"] = true.into();
+    assert!(serde_json::from_value::<CodexEventV2>(event).is_err());
+    assert!(serde_json::from_str::<StopOutcomeV2>("\"stopped\"").is_err());
+    assert!(serde_json::from_str::<CodexEventV2>("{\"kind\":\"restart\"}").is_err());
+}
+#[test]
+fn c2_operation_cannot_mutate_another_registry_and_read_projection_stays_narrow() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let lease_a = a.lease();
+    let lease_b = b.lease();
+    let registry = Registry::open(&lease_b).unwrap();
+    let slot = lease_a.codex_slot("fixture").unwrap();
+    let op = slot.enter().unwrap();
+    let before = snapshot(&registry.root);
+    assert!(registry
+        .begin_codex_v2(&op, Provenance::LegacyUnknown, 10)
+        .is_err());
+    let path: &Path = registry.verified_run_dir().unwrap();
+    assert_eq!(path, lease_b.run_dir().unwrap());
+    registry.verify_read_context().unwrap();
+    assert_eq!(snapshot(&registry.root), before);
+}
