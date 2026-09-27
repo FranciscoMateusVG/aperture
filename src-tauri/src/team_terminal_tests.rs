@@ -983,3 +983,27 @@ fn coordination_recheck_rejects_team_marker_and_mutated_public_identity() {
     fs::write(f.home.join(".claude/aperture/glados/TEAM"), b"unexpected").unwrap();
     assert!(proof.recheck().is_err());
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn coordination_cipher_requires_the_same_native_binding_and_recheck() {
+    let f = CoordinationFixture::new();
+    let agent = f.home.join(".claude/aperture/cipher");
+    fs::rename(f.home.join(".claude/aperture/glados"), &agent).unwrap();
+    fs::write(agent.join("manifest.json"), br#"{"name":"Cipher","enabled":true}"#).unwrap();
+    let socket = f.home.join(".aperture/run/cipher.sock");
+    fs::rename(f.socket(), &socket).unwrap();
+    let peers = capture_coordination_peers(&f.home).unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].seat, "cipher");
+    assert_eq!(peers[0].identity, team_process::observe(std::process::id()).unwrap().unwrap().identity);
+    peers[0].recheck().unwrap();
+    fs::write(agent.join("TEAM"), b"not-coordination").unwrap();
+    assert!(peers[0].recheck().is_err());
+    assert!(capture_coordination_peers(&f.home).is_err());
+    fs::remove_file(agent.join("TEAM")).unwrap();
+    fs::write(agent.join("manifest.json"), br#"{"name":"Other","enabled":true}"#).unwrap();
+    assert!(capture_coordination_peers(&f.home).is_err());
+    fs::remove_file(socket).unwrap();
+    assert!(capture_coordination_peers(&f.home).unwrap().is_empty());
+}
