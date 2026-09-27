@@ -512,6 +512,31 @@ impl<'a> Registry<'a> {
             .get(current)
             .ok_or_else(|| fail("E_DAEMON_PUBLICATION_INCOMPLETE"))
     }
+    /// Namespace validity is not adoption eligibility. Retain/count structurally
+    /// valid v2 prefixes, Unknown and terminal histories without granting them
+    /// readiness, reuse or successor authority. V1 incompleteness still denies.
+    fn namespace_slots(&self) -> Result<usize> {
+        self.checked_root()?;
+        let mut count = 0;
+        for entry in fs::read_dir(&self.root).map_err(|_| fail("E_DAEMON_PATH"))? {
+            if count >= MAX_SLOTS {
+                return Err(fail("E_DAEMON_RECORD"));
+            }
+            let slot = entry
+                .map_err(|_| fail("E_DAEMON_PATH"))?
+                .file_name()
+                .into_string()
+                .map_err(|_| fail("E_DAEMON_PATH"))?;
+            let h = self.history(&slot)?;
+            if h.codex.is_empty() {
+                self.complete(&h)?;
+            } else {
+                self.codex_view(&slot, &h)?;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
     /// Empty means only "no registry facts", NEVER "the endpoint is unoccupied".
     pub(crate) fn inspect(&self) -> Result<Vec<Inspection>> {
         self.inspect_with(team_process::state)
@@ -722,6 +747,7 @@ impl<'a> Registry<'a> {
         provenance: Provenance,
         at_ms: u64,
     ) -> Result<String> {
+        let _admission = self.lease.registry_admission()?;
         operation.verify_for(self.lease)?;
         self.checked_root()?;
         let endpoint = Endpoint::CodexAppServer {
@@ -732,14 +758,13 @@ impl<'a> Registry<'a> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             _ => return Err(fail("E_CODEX_NOT_PRISTINE")),
         }
-        self.inspect()?;
-        let slots = fs::read_dir(&self.root)
-            .map_err(|_| fail("E_DAEMON_PATH"))?
-            .count();
+        let slots = self.namespace_slots()?;
         if slots >= MAX_SLOTS {
             return Err(fail("E_DAEMON_CAPACITY"));
         }
         budget(0, CODEX_PLAN_ENTRIES)?;
+        #[cfg(test)]
+        self.lease.admission_after_capacity();
         provenance.validate()?;
         let fact = CodexFactV2 {
             schema_version: CODEX_SCHEMA,
@@ -838,11 +863,9 @@ impl<'a> Registry<'a> {
 
     /// Account for both immutable facts and initial current BEFORE reserve or
     /// spawn. No history pruning/UUID rollover is a way around this limit.
+    /// Observation only: writers must hold admission and revalidate this budget.
     pub(crate) fn capacity(&self, slot: &str) -> Result<()> {
-        self.inspect()?;
-        let slots = fs::read_dir(&self.root)
-            .map_err(|_| fail("E_DAEMON_PATH"))?
-            .count();
+        let slots = self.namespace_slots()?;
         let facts = match fs::symlink_metadata(self.root.join(slot)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if slots >= MAX_SLOTS {
@@ -870,10 +893,13 @@ impl<'a> Registry<'a> {
         provenance: Provenance,
         at_ms: u64,
     ) -> Result<Reservation> {
+        let _admission = self.lease.registry_admission()?;
         self.checked_root()?;
         let slot = endpoint.slot()?;
         provenance.validate()?;
         self.capacity(&slot)?;
+        #[cfg(test)]
+        self.lease.admission_after_capacity();
         let path = self.root.join(&slot);
         let previous = match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

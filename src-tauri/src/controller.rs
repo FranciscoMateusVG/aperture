@@ -19,12 +19,23 @@ struct Holder {
 pub(crate) struct ControllerLock {
     _file: File,
     hub_gate: std::sync::Mutex<()>,
+    admission: std::sync::Mutex<()>,
+    #[cfg(test)]
+    admission_probe: Option<AdmissionProbe>,
     hub_child: std::sync::Mutex<Option<std::process::Child>>,
     codex_slots: std::sync::Mutex<
         std::collections::BTreeMap<String, std::sync::Arc<std::sync::Mutex<CodexSlotState>>>,
     >,
     run: PathBuf,
     identity: crate::team_replacement::ProcessIdentity,
+}
+// Test-only finite rendezvous on the real admission path; no alternate writer.
+#[cfg(test)]
+pub(crate) struct AdmissionProbe {
+    pub counted: std::sync::mpsc::Sender<()>,
+    pub contended: std::sync::mpsc::Sender<()>,
+    pub resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    pub pause_once: std::sync::atomic::AtomicBool,
 }
 /// Validation only: unlike journal::ensure_private_dir, never repairs absence.
 pub(crate) fn private_dir_readonly(path: &Path) -> Result<(), String> {
@@ -102,6 +113,9 @@ impl ControllerLock {
         Ok(Self {
             _file: file,
             hub_gate: std::sync::Mutex::new(()),
+            admission: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            admission_probe: None,
             hub_child: std::sync::Mutex::new(None),
             codex_slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             run,
@@ -137,6 +151,47 @@ impl ControllerLock {
             return Err("E_CONTROLLER_LEASE: lock path changed".into());
         }
         Ok(())
+    }
+    /// Operational writer lane, never projected through Registry's RO API.
+    /// Lock order is slot/hub -> admission, never the reverse. Hold only through
+    /// namespace validation, mkdir and durable intent; no spawn/probe/wait here.
+    pub(crate) fn registry_admission(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        #[cfg(test)]
+        let guard = match self.admission.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if let Some(probe) = &self.admission_probe {
+                    let _ = probe.contended.send(());
+                }
+                self.admission.lock().map_err(|_| "E_CONTROLLER_POISONED")?
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err("E_CONTROLLER_POISONED".into()),
+        };
+        #[cfg(not(test))]
+        let guard = self.admission.lock().map_err(|_| "E_CONTROLLER_POISONED")?;
+        self.verify_live()?; // including after contention; a stale lease never writes
+        Ok(guard)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_admission_probe(&mut self, probe: AdmissionProbe) {
+        self.admission_probe = Some(probe);
+    }
+    #[cfg(test)]
+    pub(crate) fn admission_after_capacity(&self) {
+        if let Some(probe) = &self.admission_probe {
+            if probe
+                .pause_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                probe.counted.send(()).expect("capacity observer alive");
+                probe
+                    .resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("bounded admission release");
+            }
+        }
     }
     /// All hub supervisors borrowing this lease share one transition lock.
     /// A synchronous borrower cannot outlive the lease; no authority thread is

@@ -1014,6 +1014,16 @@ fn c2_unknown_versions_mixed_orphan_holes_and_unsafe_facts_deny_without_repair()
         }
         let before = snapshot(&registry.root);
         assert!(registry.codex_metadata("fixture").is_err());
+        let other = lease.codex_slot("other").unwrap();
+        let other_op = other.enter().unwrap();
+        assert!(registry
+            .begin_codex_v2(&other_op, Provenance::LegacyUnknown, 30)
+            .is_err());
+        assert!(registry
+            .reserve(Endpoint::Hub { port: 4517 }, Provenance::LegacyUnknown, 30)
+            .is_err());
+        assert!(!registry.root.join("codex-other").exists());
+        assert!(!registry.root.join("hub").exists());
         assert!(registry
             .begin_codex_v2(&op, Provenance::LegacyUnknown, 30)
             .is_err());
@@ -1056,4 +1066,227 @@ fn c2_operation_cannot_mutate_another_registry_and_read_projection_stays_narrow(
     assert_eq!(path, lease_b.run_dir().unwrap());
     registry.verify_read_context().unwrap();
     assert_eq!(snapshot(&registry.root), before);
+}
+
+// Both contenders call real metadata writers. Only their scheduling is injected.
+#[test]
+fn c2_admission_serializes_persisted_cap_v2_v2_and_hub_both_winners() {
+    use std::sync::{atomic::AtomicBool, mpsc, Mutex};
+    use std::time::Duration;
+    for (winner_hub, loser_hub) in [(false, false), (true, false), (false, true)] {
+        let f = Fixture::new();
+        {
+            let lease = f.lease();
+            let registry = Registry::open(&lease).unwrap();
+            for n in 0..127 {
+                let r = registry
+                    .reserve(
+                        Endpoint::CodexAppServer {
+                            seat: format!("persisted-{n}"),
+                        },
+                        Provenance::LegacyUnknown,
+                        1,
+                    )
+                    .unwrap();
+                let r = registry.record(&r, lease.identity().unwrap(), 2).unwrap();
+                registry.publish_current(&r).unwrap();
+            }
+        }
+        // Fresh lease has an empty in-memory slot map but 127 persisted slots.
+        let mut lease = f.lease();
+        let (counted_tx, counted_rx) = mpsc::channel();
+        let (contended_tx, contended_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        lease.set_admission_probe(crate::controller::AdmissionProbe {
+            counted: counted_tx,
+            contended: contended_tx,
+            resume: Mutex::new(resume_rx),
+            pause_once: AtomicBool::new(true),
+        });
+        let registry = Registry::open(&lease).unwrap();
+        let before = snapshot(&registry.root);
+        let attempt = |hub: bool, seat: &str| -> Result<String> {
+            let registry = Registry::open(&lease)?;
+            if hub {
+                let _transition = lease.hub_transition()?;
+                registry
+                    .reserve(Endpoint::Hub { port: 4517 }, Provenance::LegacyUnknown, 3)
+                    .map(|r| r.incarnation)
+            } else {
+                let slot = lease.codex_slot(seat)?;
+                let op = slot.enter()?;
+                registry.begin_codex_v2(&op, Provenance::LegacyUnknown, 3)
+            }
+        };
+        std::thread::scope(|scope| {
+            let winner = scope.spawn(|| attempt(winner_hub, "winner"));
+            counted_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("winner at count-before-mkdir");
+            assert_eq!(snapshot(&registry.root), before);
+            let loser = scope.spawn(|| attempt(loser_hub, "loser"));
+            contended_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("actual admission mutex contention");
+            // No timing race: both are now known to be before their first effect.
+            assert_eq!(snapshot(&registry.root), before);
+            resume_tx.send(()).unwrap();
+            assert!(winner.join().unwrap().is_ok());
+            assert!(loser.join().unwrap().is_err());
+        });
+        assert_eq!(fs::read_dir(&registry.root).unwrap().count(), 128);
+        let loser_slot = if loser_hub { "hub" } else { "codex-loser" };
+        assert!(!registry.root.join(loser_slot).exists());
+        let after = snapshot(&registry.root);
+        for (path, bytes) in &before {
+            assert_eq!(after.get(path), Some(bytes));
+        }
+        assert_eq!(after.len(), before.len() + 1, "only one durable intent");
+    }
+}
+
+#[test]
+fn c2_admission_poison_or_lost_lease_denies_both_writers_without_effects() {
+    for poison in [true, false] {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        if poison {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _admission = lease.registry_admission().unwrap();
+                panic!("deliberate admission poison");
+            }))
+            .is_err());
+        } else {
+            fs::remove_file(f.0.join(".aperture/run/daemons.lock")).unwrap();
+        }
+        let before = snapshot(&registry.root);
+        assert!(registry
+            .begin_codex_v2(&op, Provenance::LegacyUnknown, 1)
+            .is_err());
+        assert!(registry
+            .reserve(Endpoint::Hub { port: 4517 }, Provenance::LegacyUnknown, 1)
+            .is_err());
+        assert_eq!(snapshot(&registry.root), before);
+        assert_eq!(fs::read_dir(&registry.root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn c2_each_nonready_or_terminal_phase_retains_slot_without_global_outage() {
+    use CodexEventV2 as E;
+    use CodexPhaseV2 as P;
+    // Every non-ready/terminal projection, with distinct Unknown origins.
+    for (step, expected) in [
+        (0, P::SpawnIntentUnknown),
+        (1, P::SpawnedUnready),
+        (2, P::PublicationIncomplete),
+        (4, P::StopIntentUnknown),
+        (5, P::TermResultUnresolved),
+        (6, P::Unknown),
+        (7, P::Unknown),
+        (8, P::TermSentThenDaemonGoneDescendantsUnverified),
+        (9, P::CleanupIntentUnknown),
+        (10, P::Unknown),
+        (11, P::FixedDirectEntryRemoved),
+        (12, P::FixedLinkRemovedTargetRetained),
+    ] {
+        let f = Fixture::new();
+        let lease = f.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let slot = lease.codex_slot("original").unwrap();
+        let op = slot.enter().unwrap();
+        let id = registry
+            .begin_codex_v2(&op, Provenance::LegacyUnknown, 1)
+            .unwrap();
+        let append = |event| registry.append_codex_v2(&op, &id, event, 2).unwrap();
+        if step >= 1 {
+            append(E::Spawned {
+                process: Identity::from_native(lease.identity().unwrap()).unwrap(),
+            });
+        }
+        if step >= 2 {
+            append(E::SocketReady {
+                pins: v2_pins(step == 12),
+            });
+        }
+        if step >= 3 {
+            registry.publish_codex_v2(&op, &id).unwrap();
+        }
+        if step >= 4 {
+            append(E::StopIntent {});
+        }
+        if step >= 5 {
+            append(E::TermResult {
+                result: if step == 6 {
+                    TermResultV2::Esrch
+                } else {
+                    TermResultV2::ReturnedZero
+                },
+            });
+        }
+        if step >= 7 {
+            append(E::StopOutcome {
+                outcome: if step == 7 {
+                    StopOutcomeV2::Unknown
+                } else {
+                    StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified
+                },
+            });
+        }
+        if step >= 9 {
+            append(E::CleanupIntent {});
+        }
+        if step >= 10 {
+            append(E::CleanupOutcome {
+                outcome: match step {
+                    10 => CleanupOutcomeV2::Unknown,
+                    11 => CleanupOutcomeV2::FixedDirectEntryRemoved,
+                    12 => CleanupOutcomeV2::FixedLinkRemovedTargetRetained,
+                    _ => unreachable!(),
+                },
+            });
+        }
+        assert_eq!(
+            registry.codex_metadata("original").unwrap().unwrap().phase,
+            expected
+        );
+        let original = snapshot(&registry.root);
+        assert!(
+            registry.inspect().is_err(),
+            "adoption projection not relaxed"
+        );
+        error(
+            registry.begin_codex_v2(&op, Provenance::LegacyUnknown, 3),
+            "E_CODEX_NOT_PRISTINE",
+        );
+        assert!(registry
+            .reserve(
+                Endpoint::CodexAppServer {
+                    seat: "original".into()
+                },
+                Provenance::LegacyUnknown,
+                3
+            )
+            .is_err());
+        assert_eq!(snapshot(&registry.root), original);
+        let new_slot = lease.codex_slot("different").unwrap();
+        let new_op = new_slot.enter().unwrap();
+        registry
+            .begin_codex_v2(&new_op, Provenance::LegacyUnknown, 3)
+            .unwrap();
+        // The first unrelated v2 is itself now incomplete; hub admission still works.
+        registry
+            .reserve(Endpoint::Hub { port: 4517 }, Provenance::LegacyUnknown, 3)
+            .unwrap();
+        assert_eq!(fs::read_dir(&registry.root).unwrap().count(), 3);
+        let after = snapshot(&registry.root);
+        for (path, bytes) in &original {
+            assert_eq!(after.get(path), Some(bytes));
+        }
+        assert_eq!(after.len(), original.len() + 2);
+        assert!(registry.inspect().is_err());
+    }
 }
