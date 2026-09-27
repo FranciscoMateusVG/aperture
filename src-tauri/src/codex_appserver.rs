@@ -55,6 +55,37 @@ pub(crate) struct NativeCodexSupervisor<'a> {
 #[cfg(test)]
 thread_local! { static C2_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 const CODEX_UNKNOWN: &str = "E_CODEX_OPERATION_UNKNOWN";
+// A path pin narrows check/use drift; it is not atomic exec identity proof.
+#[derive(Debug, PartialEq, Eq)]
+struct CodexExecutablePin {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    mode: u32,
+    nlink: u64,
+}
+impl CodexExecutablePin {
+    fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::symlink_metadata(path).map_err(|_| CODEX_UNKNOWN)?;
+        if !m.is_file()
+            || m.file_type().is_symlink()
+            || (m.uid() != unsafe { libc::geteuid() } && m.uid() != 0)
+            || m.nlink() != 1
+            || m.mode() & 0o111 == 0
+            || m.mode() & 0o022 != 0
+        {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            uid: m.uid(),
+            mode: m.mode(),
+            nlink: m.nlink(),
+        })
+    }
+}
 impl<'a> NativeCodexSupervisor<'a> {
     pub(crate) fn new(
         lease: &'a crate::controller::ControllerLock,
@@ -126,7 +157,8 @@ impl<'a> NativeCodexSupervisor<'a> {
         self.registry.verify_operation(&op)?;
         self.registry.validate_namespace()?; // structure, NOT global readiness
         if let Some(snapshot) = self.registry.codex_snapshot(&self.spec.seat)? {
-            if snapshot.phase != P::ReadyMetadataOnly {
+            if snapshot.phase != P::ReadyMetadataOnly || snapshot.provenance != self.spec.provenance
+            {
                 return Err(CODEX_UNKNOWN.into());
             }
             crate::team_terminal::codex_live_pins(
@@ -143,15 +175,14 @@ impl<'a> NativeCodexSupervisor<'a> {
         }
         crate::team_terminal::codex_pristine_endpoint(self.registry, &op)?;
         crate::controller::private_dir_readonly(&self.spec.codex_home)?;
-        let exec = fs::symlink_metadata(&self.spec.executable).map_err(|_| CODEX_UNKNOWN)?;
-        if !exec.is_file() || exec.file_type().is_symlink() || exec.mode() & 0o111 == 0 {
-            return Err(CODEX_UNKNOWN.into());
-        }
+        let executable_pin = CodexExecutablePin::capture(&self.spec.executable)?;
         let id = self
             .registry
             .begin_codex_v2(&op, self.spec.provenance.clone(), Self::now()?)?;
         let intent = self.snapshot()?;
         self.edge("intent")?;
+        #[cfg(test)]
+        registered_tests::c2_fix_executable_drift(&self.spec)?;
         crate::team_terminal::codex_pristine_endpoint(self.registry, &op)?;
         self.registry.recheck_snapshot(&self.spec.seat, &intent)?;
         self.registry.verify_operation(&op)?;
@@ -162,12 +193,15 @@ impl<'a> NativeCodexSupervisor<'a> {
             .ok_or(CODEX_UNKNOWN)?;
         let socket = run.join(format!("{}.sock", self.spec.seat));
         let mut command = Command::new(&self.spec.executable);
+        // No ambient provider/auth/PATH/locale transport in this internal freeze.
+        command.env_clear();
         command
             .args(["app-server", "--listen"])
             .arg(format!("unix://{}", socket.display()));
         #[cfg(test)]
         if let Some((root, mode)) = &self.spec.fixture {
             command = Command::new(&self.spec.executable);
+            command.env_clear();
             command
                 .args([
                     "--exact",
@@ -196,7 +230,7 @@ impl<'a> NativeCodexSupervisor<'a> {
             .create(true)
             .append(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(log_path)
             .map_err(|_| CODEX_UNKNOWN)?;
         let m = log.metadata().map_err(|_| CODEX_UNKNOWN)?;
@@ -204,6 +238,17 @@ impl<'a> NativeCodexSupervisor<'a> {
             || m.uid() != unsafe { libc::geteuid() }
             || m.nlink() != 1
             || m.mode() & 0o777 != 0o600
+        {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        // A FIFO swapped in after path validation must not block open. Only a
+        // validated regular descriptor reaches the child, with NONBLOCK cleared.
+        use std::os::fd::AsRawFd;
+        let flags = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(log.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) }
+                != 0
+            || unsafe { libc::fcntl(log.as_raw_fd(), libc::F_GETFL) } != flags & !libc::O_NONBLOCK
         {
             return Err(CODEX_UNKNOWN.into());
         }
@@ -227,6 +272,9 @@ impl<'a> NativeCodexSupervisor<'a> {
         #[cfg(test)]
         if self.spec.fault.as_deref() == Some("post-spawn-retained") {
             op.fail_next_spawn_observation();
+        }
+        if CodexExecutablePin::capture(&self.spec.executable)? != executable_pin {
+            return Err(CODEX_UNKNOWN.into());
         }
         let identity = op
             .spawn_retained(&mut command)

@@ -645,7 +645,18 @@ impl Drop for C2Fixture {
             eprintln!("C2 fixture own daemon reaped/Gone pid={}", identity.pid);
         }
         let path = self.inner.home.join(".aperture/logs/codex-fixture.log");
-        if let Ok(file) = fs::File::open(path) {
+        // The negative log fixture is an actual FIFO with no reader/writer.
+        // Diagnostic cleanup must not turn a bounded refusal into a blocking read.
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+        {
+            if !file.metadata().unwrap().is_file() {
+                eprintln!("C2 finite child diagnostic: non-regular leaf not read");
+                return;
+            }
             let mut data = vec![];
             file.take(8193).read_to_end(&mut data).unwrap();
             let truncated = data.len() > 8192;
@@ -676,6 +687,10 @@ fn c2_inert_native_entry() {
                 .starts_with("ac-")
     );
     let mode = std::env::var("APERTURE_C2_MODE").unwrap();
+    if mode == "boundary-fifo" || mode == "boundary-env" {
+        c2_fix_boundary_controller(&root, &mode);
+        return;
+    }
     if mode == "controller" {
         let lease = ControllerLock::acquire(&root.join("home")).unwrap();
         let registry = Registry::open(&lease).unwrap();
@@ -697,7 +712,41 @@ fn c2_inert_native_entry() {
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
-    assert!(mode == "direct" || mode == "link");
+    assert!(mode == "direct" || mode == "link" || mode == "env-audit");
+    if mode == "env-audit" {
+        assert!(std::env::var_os("C2_SYNTHETIC_SENTINEL").is_none());
+        for key in ["PATH", "TMPDIR", "LC_ALL"] {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "implicit fixture environment key {key}"
+            );
+        }
+        assert_eq!(
+            PathBuf::from(std::env::var_os("HOME").unwrap()),
+            root.join("home")
+        );
+        assert_eq!(
+            PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()),
+            root.join("codex-home")
+        );
+        assert_eq!(std::env::var("APERTURE_C2_MODE").unwrap(), "env-audit");
+        assert_eq!(
+            PathBuf::from(std::env::var_os("APERTURE_C2_SOCKET").unwrap()),
+            root.join("home/.aperture/run/fixture.sock")
+        );
+        // Observe the actual inherited stdout/stderr descriptors, not Command's model.
+        for fd in [1, 2] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+            assert_ne!(flags & libc::O_APPEND, 0);
+        }
+        fs::write(
+            root.join("env-flags-ok"),
+            b"explicit-inputs-present; ambient-absent; regular-blocking-append",
+        )
+        .unwrap();
+    }
     assert_ne!(
         unsafe { libc::signal(libc::SIGTERM, c2_term as *const () as libc::sighandler_t) },
         libc::SIG_ERR
@@ -1362,5 +1411,295 @@ fn c2b_injected_signal_and_observation_errors_remain_unknown_without_resend() {
         assert_eq!(super::C2_SIGNAL_CALLS.with(|v| v.get()), signals + expected_calls);
         // Explicit fault injections are not claims of observed OS PID reuse,
         // real ESRCH or a native wait failure. The successful TERM path is real.
+    }
+}
+
+
+// Deterministic cfg(test) drift after the real durable SpawnIntent. The mutation
+// target must be the fixture's private copy, never the shared Cargo test image.
+pub(super) fn c2_fix_executable_drift(spec: &super::NativeCodexSpec) -> Result<(), String> {
+    let fault = spec.fault.as_deref();
+    if !matches!(fault, Some("exec-mode-drift" | "exec-inode-drift")) {
+        return Ok(());
+    }
+    let root = &spec.fixture.as_ref().expect("private drift fixture").0;
+    assert_eq!(spec.executable, root.join("private-executable"));
+    assert_ne!(spec.executable, std::env::current_exe().unwrap());
+    assert_eq!(fs::symlink_metadata(&spec.executable).unwrap().nlink(), 1);
+    if fault == Some("exec-mode-drift") {
+        // Still a valid executable mode; equality of the captured pin must deny.
+        fs::set_permissions(&spec.executable, fs::Permissions::from_mode(0o500)).unwrap();
+    } else {
+        fs::rename(&spec.executable, root.join("retained-original-executable")).unwrap();
+        fs::write(&spec.executable, b"not executed: private replacement").unwrap();
+        fs::set_permissions(&spec.executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    Ok(())
+}
+
+fn c2_fix_boundary_controller(root: &Path, mode: &str) {
+    use crate::daemon_registry::{CodexPhaseV2, StopOutcomeV2};
+    assert_eq!(
+        std::env::var("C2_SYNTHETIC_SENTINEL").unwrap(),
+        "synthetic-only"
+    );
+    let home = root.join("home");
+    let lease = ControllerLock::acquire(&home).unwrap();
+    let registry = Registry::open(&lease).unwrap();
+    let spec = super::NativeCodexSpec {
+        seat: "fixture".into(),
+        executable: std::env::current_exe().unwrap(),
+        codex_home: root.join("codex-home"),
+        provenance: Provenance::LegacyUnknown,
+        fixture: Some((root.into(), "env-audit".into())),
+        fault: None,
+    };
+    let supervisor = super::NativeCodexSupervisor::new(&lease, &registry, spec).unwrap();
+    let signals = super::C2_SIGNAL_CALLS.with(|v| v.get());
+    let unlinks = crate::team_terminal::codex_unlink_calls();
+    if mode == "boundary-fifo" {
+        let logs = home.join(".aperture/logs");
+        crate::journal::ensure_private_dir(&logs).unwrap();
+        let fifo = logs.join("codex-fixture.log");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let before = fs::symlink_metadata(&fifo).unwrap();
+        let start = Instant::now();
+        assert_eq!(supervisor.reconcile().unwrap_err(), super::CODEX_UNKNOWN);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let intent = registry.codex_snapshot("fixture").unwrap().unwrap();
+        assert_eq!(intent.phase, CodexPhaseV2::SpawnIntentUnknown);
+        let history = snapshot(&home.join(".aperture/run/daemons"));
+        assert!(supervisor.reconcile().is_err());
+        assert_eq!(snapshot(&home.join(".aperture/run/daemons")), history);
+        assert_eq!(registry.codex_snapshot("fixture").unwrap().unwrap(), intent);
+        let after = fs::symlink_metadata(&fifo).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode()),
+            (after.dev(), after.ino(), after.mode())
+        );
+        assert_eq!(super::C2_SIGNAL_CALLS.with(|v| v.get()), signals);
+        assert_eq!(crate::team_terminal::codex_unlink_calls(), unlinks);
+        assert!(!root.join("c2-pid.json").exists());
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        assert_eq!(op.spawn_attempts(), 0);
+        assert!(op.retained_pid().is_none());
+        fs::write(
+            root.join("boundary-ok"),
+            b"fifo-bounded; intent-retained; zero-spawn-term-unlink",
+        )
+        .unwrap();
+    } else {
+        let spawned = supervisor.reconcile().unwrap();
+        assert!(spawned.created);
+        assert!(root.join("env-flags-ok").is_file());
+        let log = fs::symlink_metadata(home.join(".aperture/logs/codex-fixture.log")).unwrap();
+        assert!(log.is_file());
+        assert_eq!(
+            (log.uid(), log.mode() & 0o777, log.nlink()),
+            (unsafe { libc::geteuid() }, 0o600, 1)
+        );
+        let id = registry
+            .codex_snapshot("fixture")
+            .unwrap()
+            .unwrap()
+            .incarnation;
+        assert_eq!(
+            supervisor.stop(&id).unwrap(),
+            StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified
+        );
+        assert_eq!(team_process::state(&spawned.identity), ProcessState::Gone);
+        assert_eq!(super::C2_SIGNAL_CALLS.with(|v| v.get()), signals + 1);
+        assert_eq!(crate::team_terminal::codex_unlink_calls(), unlinks);
+        fs::write(
+            root.join("boundary-ok"),
+            b"environment-and-log-flags; native-child-reaped-gone",
+        )
+        .unwrap();
+    }
+}
+
+// Same existing inert entry and identity-owned cleanup. The parent enforces a
+// deadline even if the FIFO regression blocks inside the controller's syscall.
+fn c2_fix_run_boundary(mode: &str) {
+    let mut f = C2Fixture::new();
+    let log = fs::File::create(f.inner.root.join("child.log")).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "codex_appserver::registered_tests::c2_inert_native_entry",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("APERTURE_C2_FIXTURE", &f.inner.root)
+        .env("APERTURE_C2_MODE", mode)
+        .env("C2_SYNTHETIC_SENTINEL", "synthetic-only")
+        .env("PATH", "/synthetic/not-a-path")
+        .env("TMPDIR", "/synthetic/not-a-tmp")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let identity = team_process::observe(child.id()).unwrap().unwrap().identity;
+    f.inner.children.push(OwnedChild {
+        child,
+        identity: identity.clone(),
+    });
+    let mut status = None;
+    wait_for(|| {
+        status = f.inner.children[0].child.try_wait().unwrap();
+        status.is_some()
+    });
+    assert!(
+        status.unwrap().success(),
+        "bounded synthetic boundary controller failed"
+    );
+    assert_eq!(team_process::state(&identity), ProcessState::Gone);
+    assert!(f.inner.root.join("boundary-ok").is_file());
+}
+
+#[test]
+fn c2b_fix_fifo_no_reader_is_bounded_unknown_without_effects() {
+    c2_fix_run_boundary("boundary-fifo");
+}
+#[test]
+fn c2b_fix_explicit_environment_and_regular_log_flags_reach_native_child() {
+    c2_fix_run_boundary("boundary-env");
+}
+#[test]
+fn c2b_fix_executable_mode_and_inode_drift_after_intent_deny_spawn() {
+    for fault in ["exec-mode-drift", "exec-inode-drift"] {
+        let f = C2Fixture::new();
+        let lease = f.inner.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let mut spec = f.spec(Some(fault));
+        spec.executable = f.inner.root.join("private-executable");
+        fs::copy(std::env::current_exe().unwrap(), &spec.executable).unwrap();
+        fs::set_permissions(&spec.executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = super::CodexExecutablePin::capture(&spec.executable).unwrap();
+        let supervisor = super::NativeCodexSupervisor::new(&lease, &registry, spec).unwrap();
+        let signals = super::C2_SIGNAL_CALLS.with(|v| v.get());
+        let unlinks = crate::team_terminal::codex_unlink_calls();
+        assert_eq!(supervisor.reconcile().unwrap_err(), super::CODEX_UNKNOWN);
+        assert_ne!(
+            super::CodexExecutablePin::capture(&supervisor.spec.executable).unwrap(),
+            before
+        );
+        assert_eq!(
+            registry.codex_snapshot("fixture").unwrap().unwrap().phase,
+            crate::daemon_registry::CodexPhaseV2::SpawnIntentUnknown
+        );
+        let facts = snapshot(&f.inner.home.join(".aperture/run/daemons"));
+        assert!(supervisor.reconcile().is_err());
+        assert_eq!(snapshot(&f.inner.home.join(".aperture/run/daemons")), facts);
+        assert_eq!(super::C2_SIGNAL_CALLS.with(|v| v.get()), signals);
+        assert_eq!(crate::team_terminal::codex_unlink_calls(), unlinks);
+        let slot = lease.codex_slot("fixture").unwrap();
+        let op = slot.enter().unwrap();
+        assert_eq!(op.spawn_attempts(), 0);
+        assert!(op.retained_pid().is_none());
+    }
+}
+#[test]
+fn c2b_fix_unsafe_executable_denied_before_intent() {
+    for case in [
+        "group-write",
+        "world-write",
+        "no-exec",
+        "symlink",
+        "hardlink",
+        "directory",
+    ] {
+        let f = C2Fixture::new();
+        let lease = f.inner.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let mut spec = f.spec(None);
+        let private = f.inner.root.join("private-executable");
+        fs::write(&private, b"private inert nonexecuted bytes").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        spec.executable = private.clone();
+        match case {
+            "group-write" => {
+                fs::set_permissions(&private, fs::Permissions::from_mode(0o720)).unwrap()
+            }
+            "world-write" => {
+                fs::set_permissions(&private, fs::Permissions::from_mode(0o702)).unwrap()
+            }
+            "no-exec" => fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap(),
+            "symlink" => {
+                spec.executable = f.inner.root.join("exec-link");
+                symlink(&private, &spec.executable).unwrap();
+            }
+            "hardlink" => fs::hard_link(&private, f.inner.root.join("exec-hardlink")).unwrap(),
+            "directory" => {
+                spec.executable = f.inner.root.join("exec-dir");
+                fs::create_dir(&spec.executable).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = snapshot(&f.inner.home);
+        let signals = super::C2_SIGNAL_CALLS.with(|v| v.get());
+        let unlinks = crate::team_terminal::codex_unlink_calls();
+        let supervisor = super::NativeCodexSupervisor::new(&lease, &registry, spec).unwrap();
+        assert!(supervisor.reconcile().is_err());
+        assert_eq!(snapshot(&f.inner.home), before);
+        assert_eq!(super::C2_SIGNAL_CALLS.with(|v| v.get()), signals);
+        assert_eq!(crate::team_terminal::codex_unlink_calls(), unlinks);
+        let slot = lease.codex_slot("fixture").unwrap();
+        assert_eq!(slot.enter().unwrap().spawn_attempts(), 0);
+    }
+}
+#[test]
+fn c2b_fix_adoption_provenance_must_match_without_relabel_or_effects() {
+    let release = |c: &str| Provenance::Release {
+        release_sha: c.repeat(40),
+    };
+    for stored in [Provenance::LegacyUnknown, release("a")] {
+        let f = C2Fixture::new();
+        let lease = f.inner.lease();
+        let registry = Registry::open(&lease).unwrap();
+        let mut spec = f.spec(None);
+        spec.provenance = stored.clone();
+        let supervisor = super::NativeCodexSupervisor::new(&lease, &registry, spec).unwrap();
+        let created = supervisor.reconcile().unwrap();
+        f.eof(2);
+        let before = snapshot(&f.inner.home.join(".aperture/run/daemons"));
+        let signals = super::C2_SIGNAL_CALLS.with(|v| v.get());
+        let unlinks = crate::team_terminal::codex_unlink_calls();
+        for requested in [Provenance::LegacyUnknown, release("a"), release("b")] {
+            let mut spec = f.spec(None);
+            spec.provenance = requested.clone();
+            let observer = super::NativeCodexSupervisor::new(&lease, &registry, spec).unwrap();
+            let result = observer.reconcile();
+            if requested == stored {
+                let result = result.unwrap();
+                assert_eq!(result.identity, created.identity);
+                assert!(!result.created);
+                assert_eq!(result.wait, "NOT_OBSERVED");
+            } else {
+                assert_eq!(result.unwrap_err(), super::CODEX_UNKNOWN);
+            }
+            assert_eq!(
+                snapshot(&f.inner.home.join(".aperture/run/daemons")),
+                before
+            );
+            assert_eq!(
+                registry
+                    .codex_snapshot("fixture")
+                    .unwrap()
+                    .unwrap()
+                    .provenance,
+                stored
+            );
+            assert_eq!(super::C2_SIGNAL_CALLS.with(|v| v.get()), signals);
+            assert_eq!(crate::team_terminal::codex_unlink_calls(), unlinks);
+            let slot = lease.codex_slot("fixture").unwrap();
+            assert_eq!(slot.enter().unwrap().spawn_attempts(), 1);
+        }
     }
 }
