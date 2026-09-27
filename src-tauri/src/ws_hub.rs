@@ -256,3 +256,152 @@ mod tests {
 // Native replacement consumes the existing watchdog control seam only.
 #[path = "team_revoke_native.rs"]
 pub(crate) mod managed_control;
+
+// B1 protocol completion only. Deliberately not wired into legacy supervision:
+// server identity/adoption needs the independent B2 binding contract.
+const SNAPSHOT_FRAME_BYTES: usize = 4096;
+const SNAPSHOT_TOTAL_BYTES: usize = 256 * 1024;
+const SNAPSHOT_ENTRIES: usize = 256;
+const SNAPSHOT_FRAMES: usize = 512;
+const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotCompletion {
+    pub claimed_hub_pid: u32,
+    pub entries: usize,
+}
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum SnapshotFrame {
+    #[serde(rename = "presence")]
+    Presence {
+        agent: String,
+        event: String,
+        ts: String,
+    },
+    #[serde(rename = "subscriber_snapshot_end")]
+    End {
+        protocol_version: u32,
+        hub_pid: u32,
+        snapshot_count: usize,
+    },
+}
+
+/// One initial snapshot on one fresh connection. Callers must register their
+/// frame consumer BEFORE sending hello. Output is an untrusted PID claim, not
+/// proof of peer identity, authentication, readiness, or adoption authority.
+pub(crate) struct SnapshotDecoder {
+    started: std::time::Instant,
+    bytes: usize,
+    frames: usize,
+    agents: std::collections::HashSet<String>,
+    complete: bool,
+    failed: Option<&'static str>,
+}
+impl SnapshotDecoder {
+    pub(crate) fn new(started: std::time::Instant) -> Self {
+        Self {
+            started,
+            bytes: 0,
+            frames: 0,
+            agents: Default::default(),
+            complete: false,
+            failed: None,
+        }
+    }
+    /// Time check for an otherwise silent peer. No frame, timeout, or successful
+    /// hello send can synthesize SnapshotCompletion.
+    pub(crate) fn check_deadline(&mut self, now: std::time::Instant) -> Result<(), &'static str> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if !self.complete
+            && (now < self.started || now.duration_since(self.started) >= SNAPSHOT_DEADLINE)
+        {
+            self.failed = Some("E_HUB_SNAPSHOT_TIMEOUT");
+            return Err("E_HUB_SNAPSHOT_TIMEOUT");
+        }
+        Ok(())
+    }
+    pub(crate) fn feed(
+        &mut self,
+        message: &tungstenite::Message,
+        now: std::time::Instant,
+    ) -> Result<Option<SnapshotCompletion>, &'static str> {
+        let result = self.decode(message, now);
+        if let Err(error) = result {
+            self.failed = Some(error);
+        }
+        result
+    }
+    fn decode(
+        &mut self,
+        message: &tungstenite::Message,
+        now: std::time::Instant,
+    ) -> Result<Option<SnapshotCompletion>, &'static str> {
+        self.check_deadline(now)?;
+        if self.complete {
+            return Err("E_HUB_SNAPSHOT_AFTER_END");
+        }
+        let bytes = match message {
+            tungstenite::Message::Text(v) => v.len(),
+            tungstenite::Message::Ping(v) | tungstenite::Message::Pong(v) => v.len(),
+            _ => return Err("E_HUB_SNAPSHOT_FRAME"),
+        };
+        // Includes control messages: an endless ping stream cannot evade budget.
+        if bytes > SNAPSHOT_FRAME_BYTES
+            || self.frames >= SNAPSHOT_FRAMES
+            || self
+                .bytes
+                .checked_add(bytes)
+                .is_none_or(|n| n > SNAPSHOT_TOTAL_BYTES)
+        {
+            return Err("E_HUB_SNAPSHOT_LIMIT");
+        }
+        self.frames += 1;
+        self.bytes += bytes;
+        let tungstenite::Message::Text(text) = message else {
+            return Ok(None);
+        };
+        let frame: SnapshotFrame =
+            serde_json::from_str(text).map_err(|_| "E_HUB_SNAPSHOT_FRAME")?;
+        match frame {
+            SnapshotFrame::Presence { agent, event, ts } => {
+                if agent.is_empty()
+                    || agent.len() > 128
+                    || agent.chars().any(char::is_control)
+                    || !matches!(event.as_str(), "join" | "busy" | "idle")
+                    || ts.len() > 64
+                    || chrono::DateTime::parse_from_rfc3339(&ts).is_err()
+                    || self.agents.len() >= SNAPSHOT_ENTRIES
+                    || !self.agents.insert(agent)
+                {
+                    return Err("E_HUB_SNAPSHOT_ENTRY");
+                }
+                Ok(None)
+            }
+            SnapshotFrame::End {
+                protocol_version,
+                hub_pid,
+                snapshot_count,
+            } => {
+                if protocol_version != 1 {
+                    return Err("E_HUB_SNAPSHOT_VERSION");
+                }
+                if hub_pid <= 1 || hub_pid > i32::MAX as u32 || snapshot_count != self.agents.len()
+                {
+                    return Err("E_HUB_SNAPSHOT_END");
+                }
+                self.complete = true;
+                Ok(Some(SnapshotCompletion {
+                    claimed_hub_pid: hub_pid,
+                    entries: snapshot_count,
+                }))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "ws_hub_tests.rs"]
+mod snapshot_tests;

@@ -311,11 +311,17 @@ const hello = (ws, role, agent, options = {}) => {
 
 async function authenticate(hub, ws, role, agent) {
   const principal = agent ?? (role === "subscriber" ? "watchdog" : "glados");
+  // Subscribe before hello: an empty snapshot completes immediately. Existing
+  // tests start recording live presence only after this initial snapshot.
+  const end = role === "subscriber"
+    ? waitFor(ws, (m) => m.type === "subscriber_snapshot_end", "subscriber snapshot end")
+    : null;
   hello(ws, role, agent);
   await hub.waitForEvent(
     (e) => e.event === "hello" && e.role === role && e.agent === principal,
     `authenticated ${role} hello for ${principal}`,
   );
+  if (end) await end;
 }
 
 /** Attach a live frame recorder to a socket. Returns the array of parsed frames. */
@@ -378,6 +384,60 @@ function closeAll(...sockets) {
     }
   }
 }
+
+// B1 is a completion delimiter, never server authentication or adoption proof.
+for (const count of [0, 2]) {
+  test(`subscriber snapshot: ${count} entries precede exactly one finite end marker`, async () => {
+    const hub = await spawnHub();
+    const sockets = [];
+    try {
+      for (const name of ["izzy-test", "dup-test"].slice(0, count)) {
+        const agent = await connect(hub.port);
+        sockets.push(agent);
+        await authenticate(hub, agent, "agent", name);
+      }
+      const subscriber = await connect(hub.port);
+      sockets.push(subscriber);
+      const frames = recordFrames(subscriber); // MUST precede hello, even when empty.
+      await authenticate(hub, subscriber, "subscriber");
+      assert.equal(frames.length, count + 1);
+      assert.deepEqual(frames.slice(0, count).map((m) => m.agent), ["izzy-test", "dup-test"].slice(0, count));
+      assert.ok(frames.slice(0, count).every((m) => m.type === "presence" && m.event === "join" && Number.isFinite(Date.parse(m.ts))));
+      assert.deepEqual(frames[count], {
+        type: "subscriber_snapshot_end", protocol_version: 1,
+        hub_pid: hub.proc.pid, snapshot_count: count,
+      });
+      // Existing consumers can ignore the new type and still receive live presence.
+      const live = await connect(hub.port);
+      sockets.push(live);
+      const joined = waitFor(subscriber, (m) => m.type === "presence" && m.agent === "dup2", "post-snapshot live presence");
+      await authenticate(hub, live, "agent", "dup2");
+      await joined;
+      assert.equal(frames.filter((m) => m.type === "subscriber_snapshot_end").length, 1);
+      assert.equal(frames.at(-1).agent, "dup2");
+      const output = JSON.stringify([frames, hub.stderrEvents]);
+      for (const token of Object.values(TOKENS)) assert.equal(output.includes(token), false, "no credential in response/log");
+    } finally {
+      closeAll(...sockets);
+      hub.stop();
+    }
+  });
+}
+
+test("producer hello does not receive subscriber completion", async () => {
+  const hub = await spawnHub();
+  let producer;
+  try {
+    producer = await connect(hub.port);
+    const frames = recordFrames(producer);
+    await authenticate(hub, producer, "producer", "glados");
+    await sleep(100);
+    assert.deepEqual(frames, []);
+  } finally {
+    closeAll(producer);
+    hub.stop();
+  }
+});
 
 // ── a. hello-then-join ──────────────────────────────────────────────────────
 
@@ -454,15 +514,18 @@ test("hello authentication fails closed for missing, invalid, and wrong-principa
       [{ type: "hello", role: "agent", agent: "izzy-test", token: "ff".repeat(32) }, 4001],
       [{ type: "hello", role: "agent", agent: "izzy-test", token: TOKENS.glados }, 4002],
       [{ type: "hello", role: "subscriber", agent: "watchdog" }, 4001],
+      [{ type: "hello", role: "subscriber", agent: "watchdog", token: "ff".repeat(32) }, 4001],
       [{ type: "hello", role: "producer", agent: "glados", token: "malformed" }, 4001],
       [{ type: "hello", role: "subscriber", agent: "operator", token: TOKENS.operator }, 4002],
     ];
     for (const [frame, expectedCode] of cases) {
       const ws = await connect(hub.port);
+      const frames = recordFrames(ws);
       const closed = waitForClose(ws, "unauthenticated hello close");
       ws.send(JSON.stringify(frame));
       const result = await closed;
       assert.equal(result.code, expectedCode, "forged principal/token binding uses 4002; other auth failures use 4001");
+      assert.equal(frames.some((m) => m.type === "subscriber_snapshot_end"), false, "auth rejection never emits snapshot completion");
       assert.equal(
         result.reason,
         expectedCode === 4002 ? "principal mismatch" : "expected hello",
@@ -797,6 +860,13 @@ test("managed identity revocation is durable, exact-generation, and fail-closed"
     const replayedClose = waitForClose(replayedGenerationOne, "revoked generation rejected after token deletion");
     hello(replayedGenerationOne, "agent", "p1-a-worker");
     assert.equal((await replayedClose).code, 4003, "durable revocation, not missing token fallback, rejects generation one");
+
+    const revokedSubscriber = await connect(hub.port);
+    const revokedFrames = recordFrames(revokedSubscriber);
+    const revokedClose = waitForClose(revokedSubscriber, "revoked subscriber denied before snapshot");
+    hello(revokedSubscriber, "subscriber", "p1-a-worker");
+    assert.equal((await revokedClose).code, 4003);
+    assert.equal(revokedFrames.some((m) => m.type === "subscriber_snapshot_end"), false);
 
     const generationTwoToken = "0b".repeat(32);
     const generationTwoTokenId = createHash("sha256").update(generationTwoToken).digest("hex");
