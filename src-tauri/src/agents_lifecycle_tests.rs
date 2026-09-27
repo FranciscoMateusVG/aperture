@@ -196,3 +196,38 @@ fn c3_model_into_codex_and_missing_target_leave_no_mutation() {
     crate::codex_appserver::shutdown();
     assert_eq!(tree(&h.0), before);
 }
+
+#[test]
+fn c3_watchdog_claude_pristine_respawn_denied_before_all_effects() {
+    let h = Home::new();
+    let lease = ControllerLock::acquire(&h.0).unwrap();
+    let app = state("fixture", "opus");
+    {
+        let mut state = app.lock().unwrap();
+        let agent = state.agents.get_mut("fixture").unwrap();
+        agent.status = "running".into();
+        agent.tmux_window_id = Some("owned-fixture-pane".into());
+    }
+    // This is genuinely legacy Claude/no-history, so the Codex/history guard
+    // cannot accidentally satisfy the Respawn oracle.
+    require_legacy_lifecycle_at(&h.0, &h.0.join(".claude/aperture"), "fixture").unwrap();
+    assert!(!h.0.join(".aperture/run/daemons/codex-fixture").exists());
+    fs::write(h.0.join("pane-sentinel"), b"owned pane retained").unwrap();
+    let before = tree(&h.0);
+    let state_before = serde_json::to_value(&app.lock().unwrap().agents["fixture"]).unwrap();
+    let effects = crate::watchdog::c3_rekick_fixture(&app, "fixture", &h.0, false);
+    assert_eq!(effects, crate::watchdog::C3RekickEffects::default());
+    assert_eq!(tree(&h.0), before);
+    assert_eq!(serde_json::to_value(&app.lock().unwrap().agents["fixture"]).unwrap(), state_before);
+    lease.verify_live().unwrap();
+
+    // Positive control of the SAME ingress and actual effect-site interception:
+    // Nudge still emits its two key sends, never real tmux in a test build.
+    let nudge = crate::watchdog::c3_nudge_fixture(&app, "fixture", &h.0);
+    assert_eq!(nudge.pane_keys, 2);
+    assert_eq!(nudge.pane_kills, 0);
+    assert_eq!(nudge.external_boots, 0);
+    assert_eq!(nudge.pane_sentinel, "keys-sent");
+    assert_eq!(tree(&h.0), before);
+    assert_eq!(serde_json::to_value(&app.lock().unwrap().agents["fixture"]).unwrap(), state_before);
+}

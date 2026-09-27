@@ -876,6 +876,12 @@ fn execute_rekick_at(
     // Unjoined watchdog work receives no positive Codex authority, including
     // stale is_codex=false after a model change. No pane teardown on denial.
     if crate::agents::detached_codex_denied_at(home, app_state, name, is_codex).is_err() { return; }
+    // C3: even Claude/no-history Respawn has no tracked internal authority.
+    // The external boot wrapper would reacquire RuntimeOwner's held lease only
+    // AFTER destructive pane effects. Deny the entire tier before those effects.
+    // D must replace this with tracked admission/drain/join, not pass an Arc or
+    // simply remove this fence. Nudge remains the existing non-lifecycle path.
+    if matches!(tier, RekickTier::Respawn) { return; }
     match tier {
         RekickTier::Nudge => {
             // Claude nudge: run the boot-routine turn in the EXISTING pane so the
@@ -888,29 +894,24 @@ fn execute_rekick_at(
                 return;
             };
             eprintln!("[watchdog] {name}: re-kick attempt {attempt} — NUDGE (send-keys boot turn)");
-            let _ = crate::tmux::tmux_send_keys(win.to_string(), crate::launcher::KICKOFF_TEXT.into());
+            let _ = rekick_tmux_send_keys(win.to_string(), crate::launcher::KICKOFF_TEXT.into());
             std::thread::sleep(Duration::from_millis(700));
-            let _ = crate::tmux::tmux_send_keys(win.to_string(), String::new());
+            let _ = rekick_tmux_send_keys(win.to_string(), String::new());
         }
         RekickTier::Respawn => {
-            // Respawn: a wedged agent won't answer a nudge, so tear the pane down
-            // and re-boot fresh (context is already forfeit). For Codex, a FULL
-            // app-server teardown forces the bridge to create + publish a fresh
-            // thread-id — sidestepping the surviving-app-server / stale-thread-id
-            // edge without a bridge change (GLaDOS's edge, wisp-gsrc0s).
+            // Retained legacy body is unreachable under the unconditional tier
+            // denial above; it is NOT a viable internal boot under RuntimeOwner.
             eprintln!("[watchdog] {name}: re-kick attempt {attempt} — RESPAWN");
             if let Some(win) = window_id {
-                let _ = crate::tmux::tmux_send_keys(win.to_string(), "C-c".into());
+                let _ = rekick_tmux_send_keys(win.to_string(), "C-c".into());
                 std::thread::sleep(Duration::from_millis(300));
-                let _ = crate::tmux::tmux_kill_window(win.to_string());
+                let _ = rekick_tmux_kill_window(win.to_string());
             }
             // Codex (including retained history) was denied before any pane effect.
             std::thread::sleep(Duration::from_millis(300));
-            // In-process boot (keeps the child mapped — no new orphan) through
-            // the real spawn path: fresh window + kickoff, which rewrites the
-            // .kickoff file → the next tick sees a newer timestamp and resets
-            // this agent's attempt counter to a clean slate.
-            match crate::boot_agent_headless(name) {
+            // This external wrapper reacquires authority. D must replace the
+            // legacy path before Respawn can ever be admitted again.
+            match rekick_boot_agent_headless(name) {
                 Ok(win) => {
                     eprintln!("[watchdog] {name}: respawned, new window {win}");
                     // aperture-3x136: write the fresh window id back into
@@ -930,6 +931,49 @@ fn execute_rekick_at(
             }
         }
     }
+}
+
+// Test interception is at every native effect site, not a parallel decision
+// algorithm. In non-test builds each wrapper delegates unchanged.
+fn rekick_tmux_send_keys(window: String, text: String) -> Result<(), String> {
+    #[cfg(test)] {
+        let _ = (window, text);
+        C3_REKICK_EFFECTS.with(|v| { let mut e = v.borrow_mut(); e.pane_keys += 1; e.pane_sentinel = "keys-sent"; });
+        return Ok(());
+    }
+    #[cfg(not(test))] { crate::tmux::tmux_send_keys(window, text) }
+}
+fn rekick_tmux_kill_window(window: String) -> Result<(), String> {
+    #[cfg(test)] {
+        let _ = window;
+        C3_REKICK_EFFECTS.with(|v| { let mut e = v.borrow_mut(); e.pane_kills += 1; e.pane_sentinel = "removed"; });
+        return Ok(());
+    }
+    #[cfg(not(test))] { crate::tmux::tmux_kill_window(window) }
+}
+fn rekick_boot_agent_headless(name: &str) -> Result<String, String> {
+    #[cfg(test)] {
+        let _ = name;
+        C3_REKICK_EFFECTS.with(|v| v.borrow_mut().external_boots += 1);
+        return Err("E_FIXTURE_EXTERNAL_BOOT_INTERCEPTED".into());
+    }
+    #[cfg(not(test))] { crate::boot_agent_headless(name) }
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct C3RekickEffects {
+    pub pane_keys: usize,
+    pub pane_kills: usize,
+    pub external_boots: usize,
+    pub pane_sentinel: &'static str,
+}
+#[cfg(test)]
+impl Default for C3RekickEffects {
+    fn default() -> Self { Self { pane_keys: 0, pane_kills: 0, external_boots: 0, pane_sentinel: "owned-pane-intact" } }
+}
+#[cfg(test)]
+thread_local! {
+    static C3_REKICK_EFFECTS: std::cell::RefCell<C3RekickEffects> = std::cell::RefCell::new(C3RekickEffects::default());
 }
 
 /// After the attempt budget is spent with no hub-join, escalate to the operator:
@@ -1193,6 +1237,14 @@ mod managed_presence_tests {
 }
 
 #[cfg(test)]
-pub(crate) fn c3_rekick_fixture(state: &Arc<Mutex<AppState>>, name: &str, home: &std::path::Path, is_codex: bool) {
-    execute_rekick_at(state, name, is_codex, Some("must-not-reach-pane"), RekickTier::Respawn, 1, home);
+pub(crate) fn c3_rekick_fixture(state: &Arc<Mutex<AppState>>, name: &str, home: &std::path::Path, is_codex: bool) -> C3RekickEffects {
+    C3_REKICK_EFFECTS.with(|v| *v.borrow_mut() = C3RekickEffects::default());
+    execute_rekick_at(state, name, is_codex, Some("owned-fixture-pane"), RekickTier::Respawn, 1, home);
+    C3_REKICK_EFFECTS.with(|v| v.borrow().clone())
+}
+#[cfg(test)]
+pub(crate) fn c3_nudge_fixture(state: &Arc<Mutex<AppState>>, name: &str, home: &std::path::Path) -> C3RekickEffects {
+    C3_REKICK_EFFECTS.with(|v| *v.borrow_mut() = C3RekickEffects::default());
+    execute_rekick_at(state, name, false, Some("owned-fixture-pane"), RekickTier::Nudge, 1, home);
+    C3_REKICK_EFFECTS.with(|v| v.borrow().clone())
 }
