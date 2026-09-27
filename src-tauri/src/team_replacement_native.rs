@@ -1009,6 +1009,50 @@ fn reserve_recovery(
     Ok(reservation)
 }
 
+// One observation-first poll. Re-read on terminal/Gone/deadline so a receipt
+// published at that boundary is not lost. Diagnostic errors never override a
+// conflicting receipt into success. Neither Gone nor these facts authorize
+// cleanup: the unchanged native cleanup path must prove every process itself.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeObservationPoll<T> {
+    Observed(T),
+    Pending,
+    Ended(crate::team_claude_launch::LaunchEnd),
+}
+fn claude_observation_poll<T>(
+    mut observation: impl FnMut() -> Result<Option<T>, ReplacementError>,
+    mut health: impl FnMut() -> Result<crate::team_claude_launch::LaunchHealth, ReplacementError>,
+    timed_out: bool,
+) -> Result<ClaudeObservationPoll<T>, ReplacementError> {
+    use crate::team_claude_launch::LaunchEnd;
+    let sample = observation()?;
+    let status = health()?;
+    if !matches!(status.process, ProcessState::Same | ProcessState::Gone) {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    let terminal = status.end.or_else(|| {
+        if status.process == ProcessState::Gone { Some(LaunchEnd::RootExitedWithoutObservation) }
+        else if timed_out { Some(LaunchEnd::ObservationTimeout) } else { None }
+    });
+    if sample.is_some() || terminal.is_some() {
+        let sample = if sample.is_some() { sample } else { observation()? };
+        let final_status = health()?;
+        if !matches!(final_status.process, ProcessState::Same | ProcessState::Gone) {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        if let Some(value) = sample {
+            if status.end.is_some() || final_status.end.is_some() || !final_status.exec_boundary {
+                return Err(ReplacementError::OutcomeUnknown);
+            }
+            return Ok(ClaudeObservationPoll::Observed(value));
+        }
+        if let Some(end) = final_status.end.or(terminal) {
+            return Ok(ClaudeObservationPoll::Ended(end));
+        }
+    }
+    Ok(ClaudeObservationPoll::Pending)
+}
+
 fn start_native(
     home: &Path,
     team: &str,
@@ -1045,6 +1089,7 @@ fn start_native(
         }
     };
     let mut child = None;
+    let mut claude_diagnostics = None;
     let result = (|| {
         let token = crate::hub_auth::managed::provision(home, team, &launcher, &reservation)
             .map_err(|_| ReplacementError::NativeFailure)?;
@@ -1144,7 +1189,8 @@ fn start_native(
                     },
                     || {
                         pending
-                            .release(&reservation, attempt.budget())
+                            .release(&reservation, attempt.budget(), attempt.id())
+                            .map(|diagnostics| { claude_diagnostics = Some(diagnostics); })
                             .map_err(|_| ReplacementError::OutcomeUnknown)
                     },
                 );
@@ -1168,6 +1214,30 @@ fn start_native(
         }
         let until = attempt.budget().forward_until(Duration::from_secs(85))?;
         let observation = loop {
+            if let Some(diagnostics) = &claude_diagnostics {
+                let poll = claude_observation_poll(
+                    || runtime_observation(home, team, &reservation, &selected.harness),
+                    || diagnostics.health().map_err(|_| ReplacementError::OutcomeUnknown),
+                    Instant::now() >= until,
+                )?;
+                match poll {
+                    ClaudeObservationPoll::Observed(v) => break v,
+                    ClaudeObservationPoll::Pending => {},
+                    ClaudeObservationPoll::Ended(end) => {
+                        if !matches!(end, crate::team_claude_launch::LaunchEnd::GateError { .. }) {
+                            diagnostics.finish(end).map_err(|_| ReplacementError::OutcomeUnknown)?;
+                        }
+                        return Err(ReplacementError::ModelUnverified);
+                    }
+                }
+                // `until` is already capped by the original total minus the
+                // 40s cleanup reserve. At its boundary perform the final read
+                // above, rather than exiting via a generic budget error first.
+                std::thread::sleep(Duration::from_millis(25)
+                    .min(until.saturating_duration_since(Instant::now())));
+                continue;
+            }
+            // Codex path unchanged: its native ReleasedChild supplies waitpid.
             attempt.budget().forward(Duration::ZERO)?;
             if Instant::now() >= until {
                 return Err(ReplacementError::ModelUnverified);

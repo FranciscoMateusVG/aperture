@@ -31,7 +31,8 @@ impl ClaudeLaunchMode {
     fn is_diagnostic(&self) -> bool { *self == Self::DiagnosticPreinput }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ClaudeError {
     Invalid,
     Unsafe,
@@ -918,6 +919,180 @@ struct GateRelease {
     root_pid: u32,
     root_start_time_us: u64,
 }
+// Diagnostic-only evidence in the existing per-generation directory. These
+// types cannot signal, launch, commit an owner, or admit recovery. No raw error,
+// CLI output, argv, environment, token, or prompt is persisted here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchDiagnosticContext {
+    schema_version: u32,
+    runtime_attempt_id: String,
+    team: String,
+    seat: String,
+    generation: u64,
+    session_id: String,
+    launch_sha256: String,
+    attempt_sha256: String,
+    root_pid: u32,
+    root_start_time_us: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchStage {
+    ReleaseWait,
+    RecordStructure,
+    PinsSettings,
+    RepositoryCwd,
+    OwnerBinding,
+    SessionFreshness,
+    ExecBoundary,
+}
+const LAUNCH_STAGES: [LaunchStage; 7] = [
+    LaunchStage::ReleaseWait, LaunchStage::RecordStructure,
+    LaunchStage::PinsSettings, LaunchStage::RepositoryCwd,
+    LaunchStage::OwnerBinding, LaunchStage::SessionFreshness, LaunchStage::ExecBoundary,
+];
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum LaunchEnd {
+    GateError { error: ClaudeError },
+    RootExitedWithoutObservation,
+    ObservationTimeout,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchDiagnosticFact {
+    schema_version: u32,
+    context_sha256: String,
+    stage: Option<LaunchStage>,
+    end: Option<LaunchEnd>,
+}
+/// Non-serde parent handle. Constructed only alongside native release, never
+/// from an RPC or an untrusted receipt. Historical launches need no new facts.
+pub(crate) struct LaunchDiagnostics {
+    home: PathBuf,
+    dir: PathBuf,
+    context: LaunchDiagnosticContext,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LaunchHealth {
+    pub(crate) end: Option<LaunchEnd>,
+    pub(crate) exec_boundary: bool,
+    pub(crate) process: crate::team_replacement::ProcessState,
+}
+fn diagnostic_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ClaudeError> {
+    serde_json::from_slice(&private_bytes(path, 4096)?.0).map_err(|_| ClaudeError::Invalid)
+}
+fn diagnostic_optional<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, ClaudeError> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ClaudeError::Unsafe),
+        Ok(_) => diagnostic_json(path).map(Some),
+    }
+}
+impl LaunchDiagnostics {
+    fn context_sha(&self) -> Result<String, ClaudeError> {
+        Ok(digest(&serde_json::to_vec(&self.context).map_err(|_| ClaudeError::Invalid)?))
+    }
+    fn check_context(&self) -> Result<(), ClaudeError> {
+        let current: LaunchDiagnosticContext = diagnostic_json(&self.dir.join("claude-diagnostic-context.json"))?;
+        if current != self.context { return Err(ClaudeError::Owner); }
+        Ok(())
+    }
+    fn progress(&self) -> Result<(Option<LaunchStage>, Option<LaunchEnd>), ClaudeError> {
+        self.check_context()?;
+        let hash = self.context_sha()?;
+        // Read terminal first and capture the highest durable step backwards.
+        // Forward scanning missing->present can falsely reject a concurrent
+        // valid writer advancing between reads. Earlier no-replace steps are
+        // already durable before a later step can exist.
+        let terminal: Option<LaunchDiagnosticFact> = diagnostic_optional(&self.dir.join("claude-diagnostic-terminal.json"))?;
+        let mut highest = None;
+        for n in (0..LAUNCH_STAGES.len()).rev() {
+            match std::fs::symlink_metadata(self.dir.join(format!("claude-stage-{n}.json"))) {
+                Ok(_) => { highest = Some(n); break; }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(ClaudeError::Unsafe),
+            }
+        }
+        let mut last = None;
+        for (n, stage) in LAUNCH_STAGES.iter().enumerate().take(highest.map_or(0, |n| n + 1)) {
+            let fact: Option<LaunchDiagnosticFact> = diagnostic_optional(&self.dir.join(format!("claude-stage-{n}.json")))?;
+            match fact {
+                None => return Err(ClaudeError::Invalid),
+                Some(f) => {
+                    if f.schema_version != 1 || f.context_sha256 != hash
+                        || f.stage != Some(*stage) || f.end.is_some() { return Err(ClaudeError::Invalid); }
+                    last = Some(*stage);
+                }
+            }
+        }
+        let end = match terminal {
+            None => None,
+            Some(f) => {
+                if f.schema_version != 1 || f.context_sha256 != hash || f.stage != last || f.end.is_none() {
+                    return Err(ClaudeError::Invalid);
+                }
+                f.end
+            }
+        };
+        Ok((last, end))
+    }
+    fn stage(&self, stage: LaunchStage) -> Result<(), ClaudeError> {
+        let (last, terminal) = self.progress()?;
+        let n = LAUNCH_STAGES.iter().position(|s| *s == stage).ok_or(ClaudeError::Invalid)?;
+        if terminal.is_some() || last != n.checked_sub(1).map(|i| LAUNCH_STAGES[i]) {
+            return Err(ClaudeError::Closed);
+        }
+        write_private_json_atomic(&self.dir.join(format!("claude-stage-{n}.json")), &LaunchDiagnosticFact {
+            schema_version: 1, context_sha256: self.context_sha()?, stage: Some(stage), end: None,
+        }, false).map_err(|_| ClaudeError::Io)
+    }
+    pub(crate) fn finish(&self, end: LaunchEnd) -> Result<(), ClaudeError> {
+        let (last, terminal) = self.progress()?;
+        if terminal.is_some() { return Err(ClaudeError::Closed); }
+        write_private_json_atomic(&self.dir.join("claude-diagnostic-terminal.json"), &LaunchDiagnosticFact {
+            schema_version: 1, context_sha256: self.context_sha()?, stage: last, end: Some(end),
+        }, false).map_err(|_| ClaudeError::Io)
+    }
+    pub(crate) fn health(&self) -> Result<LaunchHealth, ClaudeError> {
+        let (stage, end) = self.progress()?;
+        let r: LaunchRecord = read_private_json(&self.dir.join("claude-launch.json")).map_err(|_| ClaudeError::Unsafe)?;
+        let a: ClaudeAttempt = diagnostic_json(&self.home.join(".aperture/run").join(
+            format!("{}.g{}.claude-attempt.json", self.context.seat, self.context.generation)))?;
+        if record_sha(&r)? != self.context.launch_sha256
+            || digest(&serde_json::to_vec(&a).map_err(|_| ClaudeError::Invalid)?) != self.context.attempt_sha256 {
+            return Err(ClaudeError::Owner);
+        }
+        let identity = crate::team_process::identity_from_owner(self.context.root_pid, self.context.root_start_time_us)
+            .map_err(|_| ClaudeError::Process)?;
+        Ok(LaunchHealth { end, exec_boundary: stage == Some(LaunchStage::ExecBoundary),
+            process: crate::team_process::state(&identity) })
+    }
+    fn for_gate(home: &Path, team: &str, seat: &str, generation: u64, until: Instant) -> Result<Self, ClaudeError> {
+        let dir = generation_dir(home, seat, generation);
+        // The helper can start before the parent publishes context/release.
+        // Wait under the original gate clock; never reset it on progress.
+        let context: LaunchDiagnosticContext = loop {
+            if Instant::now() >= until { return Err(ClaudeError::Closed); }
+            if let Some(c) = diagnostic_optional(&dir.join("claude-diagnostic-context.json"))? { break c; }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if context.schema_version != 1 || context.team != team || context.seat != seat
+            || context.generation != generation || !canonical_uuid(&context.runtime_attempt_id)
+            || !canonical_uuid(&context.session_id) || context.root_pid != std::process::id()
+            || [&context.launch_sha256, &context.attempt_sha256].iter().any(|s|
+                s.len() != 64 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            return Err(ClaudeError::Owner);
+        }
+        let handle = Self { home: home.into(), dir, context };
+        let identity = crate::team_process::identity_from_owner(handle.context.root_pid, handle.context.root_start_time_us)
+            .map_err(|_| ClaudeError::Process)?;
+        if crate::team_process::state(&identity) != crate::team_replacement::ProcessState::Same { return Err(ClaudeError::Process); }
+        Ok(handle)
+    }
+}
+
 /// Documented CLI storage only: all project directories, no guessed cwd
 /// encoding and no JSONL body reads. This proves bounded observed absence,
 /// not atomic exclusion of an unrelated process running under the same UID.
@@ -1177,12 +1352,6 @@ fn record_sha(record: &LaunchRecord) -> Result<String, ClaudeError> {
         &serde_json::to_vec(record).map_err(|_| ClaudeError::Invalid)?,
     ))
 }
-fn validate_record(home: &Path, r: &LaunchRecord, budget: &Deadline) -> Result<(), ClaudeError> {
-    let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or(ClaudeError::Unsafe)?;
-    validate_record_at(home, r, budget, infra)
-}
 // Internal root seam for hermetic packaging fixtures; never caller-selected.
 fn validate_record_at(
     home: &Path,
@@ -1190,6 +1359,13 @@ fn validate_record_at(
     budget: &Deadline,
     infra: &Path,
 ) -> Result<(), ClaudeError> {
+    validate_record_staged(home, r, budget, infra, |_| Ok(()))
+}
+fn validate_record_staged(
+    home: &Path, r: &LaunchRecord, budget: &Deadline, infra: &Path,
+    mut stage: impl FnMut(LaunchStage) -> Result<(), ClaudeError>,
+) -> Result<(), ClaudeError> {
+    stage(LaunchStage::RecordStructure)?;
     valid_selector(&r.team, &r.seat, r.generation)?;
     if r.schema_version != 1
         || [&r.executable, &r.helper, &r.node, &r.tmux, &r.cwd]
@@ -1229,6 +1405,7 @@ fn validate_record_at(
     if plan.argv != r.args {
         return Err(ClaudeError::Invalid);
     }
+    stage(LaunchStage::PinsSettings)?;
     let expected_private = [
         base.join("claude-settings.json"),
         base.join("claude-mcp.json"),
@@ -1289,6 +1466,7 @@ fn validate_record_at(
             return Err(ClaudeError::Unsafe);
         }
     }
+    stage(LaunchStage::RepositoryCwd)?;
     let repo = repository::resolve_native(
         home,
         &r.team,
@@ -1463,10 +1641,17 @@ impl PendingClaude {
         &self,
         res: &StartReservation,
         budget: &Deadline,
-    ) -> Result<(), ClaudeError> {
+        runtime_attempt_id: &str,
+    ) -> Result<LaunchDiagnostics, ClaudeError> {
+        let infra = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or(ClaudeError::Unsafe)?;
+        self.release_at(res, budget, runtime_attempt_id, infra)
+    }
+    fn release_at(&self, res: &StartReservation, budget: &Deadline, runtime_attempt_id: &str, infra: &Path)
+        -> Result<LaunchDiagnostics, ClaudeError> {
+        if !canonical_uuid(runtime_attempt_id) { return Err(ClaudeError::Invalid); }
         let home = &self.published.home;
         let r = &self.published.record;
-        validate_record(home, r, budget)?;
+        validate_record_at(home, r, budget, infra)?;
         if res.seat != r.seat
             || res.generation != r.generation
             || digest(res.nonce().as_bytes()) != r.nonce_sha256
@@ -1496,12 +1681,27 @@ impl PendingClaude {
                     root_pid: a.root_pid,
                     root_start_time_us: a.root_start_time_us,
                 };
+                let diagnostics = LaunchDiagnostics {
+                    home: home.clone(),
+                    dir: generation_dir(home, &r.seat, r.generation),
+                    context: LaunchDiagnosticContext {
+                        schema_version: 1, runtime_attempt_id: runtime_attempt_id.into(),
+                        team: r.team.clone(), seat: r.seat.clone(), generation: r.generation,
+                        session_id: r.session_id.clone(), launch_sha256: release.launch_sha256.clone(),
+                        attempt_sha256: release.attempt_sha256.clone(), root_pid: release.root_pid,
+                        root_start_time_us: release.root_start_time_us,
+                    },
+                };
+                // Context is durable before releasing the already-waiting helper.
+                write_private_json_atomic(&diagnostics.dir.join("claude-diagnostic-context.json"),
+                    &diagnostics.context, false).map_err(|_| ClaudeError::Io)?;
                 write_private_json_atomic(
                     &generation_dir(home, &r.seat, r.generation).join("claude-release.json"),
                     &release,
                     false,
                 )
-                .map_err(|_| ClaudeError::Closed)
+                .map_err(|_| ClaudeError::Closed)?;
+                Ok(diagnostics)
             },
         )
     }
@@ -1518,7 +1718,28 @@ pub(crate) fn gate_native(
 ) -> Result<(), ClaudeError> {
     valid_selector(team, seat, generation)?;
     let until = Instant::now() + GATE_WAIT;
-    let dir = generation_dir(home, seat, generation);
+    let diagnostics = LaunchDiagnostics::for_gate(home, team, seat, generation, until)?;
+    let infra = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or(ClaudeError::Unsafe)?;
+    preserve_gate_result(&diagnostics, || gate_with_diagnostics(
+        home, team, seat, generation, until, &diagnostics, infra,
+        |mut cmd| { let _error = cmd.exec(); Err(ClaudeError::Io) },
+    ))
+}
+fn preserve_gate_result(diagnostics: &LaunchDiagnostics, run: impl FnOnce() -> Result<(), ClaudeError>) -> Result<(), ClaudeError> {
+    let result = run();
+    if let Err(error) = result {
+        // Failure to persist remains a failure, never a fabricated diagnosis.
+        diagnostics.finish(LaunchEnd::GateError { error })?;
+    }
+    result
+}
+fn gate_with_diagnostics(
+    home: &Path, team: &str, seat: &str, generation: u64, until: Instant,
+    diagnostics: &LaunchDiagnostics, infra: &Path,
+    exec: impl FnOnce(Command) -> Result<(), ClaudeError>,
+) -> Result<(), ClaudeError> {
+    let dir = &diagnostics.dir;
+    diagnostics.stage(LaunchStage::ReleaseWait)?;
     let path = dir.join("claude-release.json");
     loop {
         match std::fs::symlink_metadata(&path) {
@@ -1531,20 +1752,32 @@ pub(crate) fn gate_native(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    diagnostics.stage(LaunchStage::RecordStructure)?;
     let r: LaunchRecord =
         read_private_json(&dir.join("claude-launch.json")).map_err(|_| ClaudeError::Unsafe)?;
     if r.team != team || r.seat != seat || r.generation != generation {
         return Err(ClaudeError::Owner);
     }
     let budget = Deadline::new();
-    validate_record(home, &r, &budget)?;
+    if record_sha(&r)? != diagnostics.context.launch_sha256 || r.session_id != diagnostics.context.session_id {
+        return Err(ClaudeError::Owner);
+    }
+    validate_record_staged(home, &r, &budget, infra, |s| {
+        if s == LaunchStage::RecordStructure { Ok(()) } else { diagnostics.stage(s) }
+    })?;
     let release: GateRelease = read_private_json(&path).map_err(|_| ClaudeError::Unsafe)?;
-    let mut cmd = gate_command(home, &r)?;
+    if release.launch_sha256 != diagnostics.context.launch_sha256
+        || release.attempt_sha256 != diagnostics.context.attempt_sha256
+        || release.root_pid != diagnostics.context.root_pid
+        || release.root_start_time_us != diagnostics.context.root_start_time_us { return Err(ClaudeError::Owner); }
+    diagnostics.stage(LaunchStage::OwnerBinding)?;
+    let cmd = gate_command(home, &r)?;
     crate::team_claude_observation::with_gated_attempt_until(home, team, seat, generation, until, |a| {
         validate_release(&r, a, &release, std::process::id())?;
         if Instant::now() > until {
             return Err(ClaudeError::Closed);
         }
+        diagnostics.stage(LaunchStage::SessionFreshness)?;
         session_absent(
             home,
             &r.session_id,
@@ -1552,9 +1785,19 @@ pub(crate) fn gate_native(
         )?;
         // Advisory lock descriptors are close-on-exec. Keep the exact native
         // owner/token check locked through exec, not across a user-space gap.
-        let _error = cmd.exec();
-        Err(ClaudeError::Io)
+        // BEFORE exec: intention only. Successful exec cannot write a result.
+        exec_after_durable_intent(until, || diagnostics.stage(LaunchStage::ExecBoundary), || exec(cmd))
     })
+}
+fn exec_after_durable_intent(
+    until: Instant,
+    persist: impl FnOnce() -> Result<(), ClaudeError>,
+    exec: impl FnOnce() -> Result<(), ClaudeError>,
+) -> Result<(), ClaudeError> {
+    if Instant::now() >= until { return Err(ClaudeError::Closed); }
+    persist()?; // Includes directory fsync; visibility alone is not success.
+    if Instant::now() >= until { return Err(ClaudeError::Closed); }
+    exec()
 }
 fn validate_release(
     r: &LaunchRecord,
@@ -1962,6 +2205,8 @@ mod publication_tests {
             std::fs::remove_dir_all(&self.home).unwrap();
         }
     }
+    include!("team_claude_launch_diagnostics_tests.rs");
+
     #[test]
     fn pre_spawn_collision_denies_before_native_tmux_admission() {
         let f = Fixture::new();

@@ -1442,3 +1442,54 @@ fn inbox_probe_finally_always_cleans_including_successful_input_window() {
         else {assert_eq!(result.is_ok(),sequence_ok);}
     }}
 }
+
+#[test]
+fn claude_diagnostic_poll_success_and_terminal_observation_races() {
+    use crate::team_claude_launch::{LaunchEnd, LaunchHealth};
+    let status = |process, end| LaunchHealth { process, end, exec_boundary: true };
+    assert_eq!(claude_observation_poll(|| Ok(Some(42)), || Ok(status(ProcessState::Same, None)), false),
+        Ok(ClaudeObservationPoll::Observed(42)));
+    for (process, timeout) in [(ProcessState::Gone, false), (ProcessState::Same, true)] {
+        let mut calls = 0;
+        let result = claude_observation_poll(|| { calls += 1; Ok(if calls == 2 { Some(42) } else { None }) },
+            || Ok(status(process.clone(), None)), timeout);
+        assert_eq!(calls, 2);
+        assert_eq!(result, Ok(ClaudeObservationPoll::Observed(42)));
+    }
+    let mut calls = 0;
+    let error = LaunchEnd::GateError { error: crate::team_claude_launch::ClaudeError::Unsafe };
+    assert_eq!(claude_observation_poll(|| { calls += 1; Ok(if calls == 2 { Some(42) } else { None }) },
+        || Ok(status(ProcessState::Same, Some(error))), false), Err(ReplacementError::OutcomeUnknown));
+    assert_eq!(calls, 2);
+    let mut health_calls = 0;
+    assert_eq!(claude_observation_poll(|| Ok(Some(42)), || {
+        health_calls += 1; Ok(status(ProcessState::Same, if health_calls == 2 { Some(error) } else { None }))
+    }, false), Err(ReplacementError::OutcomeUnknown));
+}
+#[test]
+fn claude_diagnostic_poll_early_failure_timeout_and_unknown_stay_distinct() {
+    use crate::team_claude_launch::{LaunchEnd, LaunchHealth};
+    let gate = LaunchEnd::GateError { error: crate::team_claude_launch::ClaudeError::Owner };
+    for (process, end, timeout, expected) in [
+        (ProcessState::Same, Some(gate), false, ClaudeObservationPoll::Ended(gate)),
+        (ProcessState::Gone, None, false, ClaudeObservationPoll::Ended(LaunchEnd::RootExitedWithoutObservation)),
+        (ProcessState::Same, None, true, ClaudeObservationPoll::Ended(LaunchEnd::ObservationTimeout)),
+        (ProcessState::Same, None, false, ClaudeObservationPoll::Pending),
+    ] {
+        let start = Instant::now();
+        assert_eq!(claude_observation_poll::<()>(|| Ok(None), || Ok(LaunchHealth {
+            process: process.clone(), end, exec_boundary: false,
+        }), timeout), Ok(expected));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+    for process in [ProcessState::Unreadable, ProcessState::Recycled] {
+        assert_eq!(claude_observation_poll(|| Ok(Some(42)), || Ok(LaunchHealth {
+            process: process.clone(), end: None, exec_boundary: true,
+        }), false), Err(ReplacementError::OutcomeUnknown));
+    }
+    assert_eq!(claude_observation_poll::<()>(|| Ok(None), || Err(ReplacementError::OutcomeUnknown), false),
+        Err(ReplacementError::OutcomeUnknown));
+    assert_eq!(claude_observation_poll(|| Ok(Some(42)), || Ok(LaunchHealth {
+        process: ProcessState::Same, end: None, exec_boundary: false,
+    }), false), Err(ReplacementError::OutcomeUnknown));
+}
