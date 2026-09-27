@@ -41,6 +41,10 @@ pub(crate) struct NativeCodexSpec {
     #[cfg(test)]
     pub fault: Option<String>,
 }
+#[cfg(test)]
+impl NativeCodexSpec {
+    pub(crate) fn copy_fixture(&self) -> Self { Self { seat: self.seat.clone(), executable: self.executable.clone(), codex_home: self.codex_home.clone(), provenance: self.provenance.clone(), fixture: self.fixture.clone(), fault: self.fault.clone() } }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CodexObservation {
     pub identity: crate::team_replacement::ProcessIdentity,
@@ -55,6 +59,23 @@ pub(crate) struct NativeCodexSupervisor<'a> {
 #[cfg(test)]
 thread_local! { static C2_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 const CODEX_UNKNOWN: &str = "E_CODEX_OPERATION_UNKNOWN";
+// No production preparation constructor. C3 production is denied before intent.
+struct CodexPreparation<'a> {
+    #[cfg(test)]
+    plan: &'a crate::agents::PreparedCaller<'a>,
+    _borrow: std::marker::PhantomData<&'a ()>,
+}
+impl CodexPreparation<'_> {
+    fn recheck(&self) -> Result<(), String> {
+        #[cfg(test)] { return self.plan.recheck(); }
+        #[cfg(not(test))] { Err("E_CODEX_LAUNCH_INPUTS_UNVERIFIED".into()) }
+    }
+    fn prepare(&self) -> Result<(), String> {
+        self.recheck()?;
+        #[cfg(test)] { return self.plan.prepare(); }
+        #[cfg(not(test))] { Err("E_CODEX_LAUNCH_INPUTS_UNVERIFIED".into()) }
+    }
+}
 // A path pin narrows check/use drift; it is not atomic exec identity proof.
 #[derive(Debug, PartialEq, Eq)]
 struct CodexExecutablePin {
@@ -119,6 +140,13 @@ impl<'a> NativeCodexSupervisor<'a> {
             spec,
         })
     }
+    #[cfg(test)]
+    pub(crate) fn prepared_fixture(
+        &self, op: &mut crate::controller::CodexOperation<'_>, plan: &crate::agents::PreparedCaller<'_>,
+    ) -> Result<CodexObservation, String> {
+        if plan.expected.name != self.spec.seat { return Err(CODEX_UNKNOWN.into()); }
+        self.reconcile_held(op, Some(&CodexPreparation { plan, _borrow: std::marker::PhantomData }))
+    }
     fn socket_resolver(&self) -> Result<crate::team_terminal::CodexSocketResolver, String> {
         #[cfg(test)]
         if let Some((root, _)) = &self.spec.fixture {
@@ -146,15 +174,26 @@ impl<'a> NativeCodexSupervisor<'a> {
             .map_err(|_| CODEX_UNKNOWN.into())
     }
     pub(crate) fn reconcile(&self) -> Result<CodexObservation, String> {
+        let slot = self.lease.codex_slot(&self.spec.seat)?;
+        let mut op = slot.enter()?;
+        self.reconcile_held(&mut op, None)
+    }
+    // Private synchronous body, never a callback/capability returned by RO APIs.
+    fn reconcile_held(
+        &self,
+        op: &mut crate::controller::CodexOperation<'_>,
+        preparation: Option<&CodexPreparation<'_>>,
+    ) -> Result<CodexObservation, String> {
         use crate::daemon_registry::{CodexEventV2 as E, CodexPhaseV2 as P, Identity};
         use std::os::unix::{
             fs::{MetadataExt, OpenOptionsExt},
             process::CommandExt,
         };
         use std::process::Stdio;
-        let slot = self.lease.codex_slot(&self.spec.seat)?;
-        let mut op = slot.enter()?;
+        // Selector check precedes even target reads. Lease/root alone is insufficient.
+        if op.seat() != self.spec.seat { return Err(CODEX_UNKNOWN.into()); }
         self.registry.verify_operation(&op)?;
+        if let Some(p) = preparation { p.recheck()?; }
         self.registry.validate_namespace()?; // structure, NOT global readiness
         if let Some(snapshot) = self.registry.codex_snapshot(&self.spec.seat)? {
             if snapshot.phase != P::ReadyMetadataOnly || snapshot.provenance != self.spec.provenance
@@ -181,6 +220,12 @@ impl<'a> NativeCodexSupervisor<'a> {
             .begin_codex_v2(&op, self.spec.provenance.clone(), Self::now()?)?;
         let intent = self.snapshot()?;
         self.edge("intent")?;
+        if let Some(p) = preparation {
+            self.registry.recheck_snapshot(&self.spec.seat, &intent)?;
+            p.prepare()?;
+            self.registry.recheck_snapshot(&self.spec.seat, &intent)?;
+            p.recheck()?;
+        }
         #[cfg(test)]
         registered_tests::c2_fix_executable_drift(&self.spec)?;
         crate::team_terminal::codex_pristine_endpoint(self.registry, &op)?;
@@ -273,6 +318,7 @@ impl<'a> NativeCodexSupervisor<'a> {
         if self.spec.fault.as_deref() == Some("post-spawn-retained") {
             op.fail_next_spawn_observation();
         }
+        if let Some(p) = preparation { p.recheck()?; }
         if CodexExecutablePin::capture(&self.spec.executable)? != executable_pin {
             return Err(CODEX_UNKNOWN.into());
         }
@@ -551,161 +597,17 @@ pub fn socket_path(agent_name: &str) -> String {
 /// `codex_home` is the per-agent /tmp/aperture-codex-<name> dir whose
 /// config.toml carries model, approval policy, and MCP wiring — the
 /// app-server (the actual engine behind `--remote`) reads it via CODEX_HOME.
-pub fn spawn_app_server(agent_name: &str, codex_home: &str) -> Result<String, String> {
-    let sock = socket_path(agent_name);
-    let run_dir = format!("{}/.aperture/run", home_dir());
-    fs::create_dir_all(&run_dir)
-        .map_err(|e| format!("Failed to create {}: {}", run_dir, e))?;
-
-    // Cross-process spawn-if-absent (aperture-r8n62): the in-process `servers()`
-    // map is always empty in a fresh `aperture-boot` process, so a stale map is
-    // no evidence that the socket is free. Probe the sock directly — if a
-    // healthy app-server (from a prior boot or the running launcher) already
-    // owns it, reuse it instead of deleting the sock and stacking an orphan.
-    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
-        println!(
-            "[aperture] codex app-server for '{}' already live on {} — reusing (no respawn)",
-            agent_name, sock
-        );
-        return Ok(sock);
-    }
-
-    let handle = {
-        let mut map = servers().lock().map_err(|e| e.to_string())?;
-        if let Some(existing) = map.get(&agent_name.to_string()) {
-            if !existing.stop.load(Ordering::SeqCst) {
-                // Supervisor already running for this agent — reuse it.
-                return Ok(sock);
-            }
-            // Stale stopped handle (shouldn't normally persist) — replace it.
-            map.remove(agent_name);
-        }
-        let handle = Arc::new(ServerHandle {
-            stop: AtomicBool::new(false),
-            child: Mutex::new(None),
-        });
-        map.insert(agent_name.to_string(), Arc::clone(&handle));
-        handle
-    };
-
-    let name = agent_name.to_string();
-    let codex_home = codex_home.to_string();
-    let sock_for_thread = sock.clone();
-
-    std::thread::spawn(move || {
-        loop {
-            if SHUTTING_DOWN.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
-                break;
-            }
-
-            // Delete any stale socket file before (re)spawning — a leftover
-            // sock from a crashed app-server would make --listen fail.
-            let _ = fs::remove_file(&sock_for_thread);
-
-            match Command::new(codex_bin())
-                .args(["app-server", "--listen", &format!("unix://{}", sock_for_thread)])
-                .env("CODEX_HOME", &codex_home)
-                .env("PATH", path_env())
-                .spawn()
-            {
-                Ok(child) => {
-                    println!(
-                        "[aperture] codex app-server for '{}' started (pid {}) on {}",
-                        name,
-                        child.id(),
-                        sock_for_thread
-                    );
-                    if let Ok(mut guard) = handle.child.lock() {
-                        *guard = Some(child);
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[aperture] warn: failed to spawn codex app-server for '{}' ({})",
-                        name, e
-                    );
-                }
-            }
-
-            // Poll the child until it exits (or is taken by stop/shutdown).
-            // Same try_wait-on-interval pattern as ws_hub.rs — we can't block
-            // in Child::wait() while the handle sits in the mutex.
-            loop {
-                std::thread::sleep(Duration::from_millis(500));
-                let Ok(mut guard) = handle.child.lock() else { break };
-                match guard.as_mut() {
-                    Some(child) => match child.try_wait() {
-                        Ok(Some(status)) => {
-                            eprintln!(
-                                "[aperture] codex app-server for '{}' exited ({}) — respawning in 2s",
-                                name, status
-                            );
-                            *guard = None;
-                            break;
-                        }
-                        Ok(None) => {} // still running
-                        Err(e) => {
-                            eprintln!(
-                                "[aperture] codex app-server for '{}' wait error ({}) — respawning in 2s",
-                                name, e
-                            );
-                            *guard = None;
-                            break;
-                        }
-                    },
-                    // stop_app_server()/shutdown() took and killed the child.
-                    None => break,
-                }
-            }
-
-            if SHUTTING_DOWN.load(Ordering::SeqCst) || handle.stop.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(2));
-        }
-
-        let _ = fs::remove_file(&sock_for_thread);
-    });
-
-    Ok(sock)
+pub fn spawn_app_server(_agent_name: &str, _codex_home: &str) -> Result<String, String> {
+    Err("E_CODEX_LAUNCH_INPUTS_UNVERIFIED".into())
 }
 
-/// Kill the app-server for one agent and stop its supervisor loop. Called
-/// from `agents.rs::stop_agent()`; a no-op for agents without an app-server.
-pub fn stop_app_server(agent_name: &str) {
-    let handle = {
-        let Ok(mut map) = servers().lock() else { return };
-        map.remove(agent_name)
-    };
-    if let Some(handle) = handle {
-        handle.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = handle.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        let _ = fs::remove_file(socket_path(agent_name));
-    }
+/// Compatibility stop is a denial, never evidence that an agent/descendants stopped.
+pub fn stop_app_server(_agent_name: &str) -> Result<(), String> {
+    Err("E_CODEX_LAUNCH_INPUTS_UNVERIFIED".into())
 }
 
-/// Kill every app-server and stop all supervisor loops. Called from the
-/// `tauri::RunEvent::Exit` handler in lib.rs (alongside ws_hub::shutdown) so
-/// app-servers never outlive the launcher and squat on their sockets.
-pub fn shutdown() {
-    SHUTTING_DOWN.store(true, Ordering::SeqCst);
-    let Ok(mut map) = servers().lock() else { return };
-    for (name, handle) in map.drain() {
-        handle.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = handle.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        let _ = fs::remove_file(socket_path(&name));
-    }
-}
+/// Detach only. No signal/unlink/port sweep; D admission/drain is still outstanding.
+pub fn shutdown() {}
 
 #[cfg(test)]
 mod tests {
@@ -724,7 +626,7 @@ mod tests {
     /// mutates the process-global `HOME`. It is the only HOME-mutating test in
     /// this module; keep it that way to avoid cross-test races.
     #[test]
-    fn spawn_app_server_reuses_live_socket_without_respawn() {
+    fn spawn_app_server_denies_legacy_socket_only_reuse() {
         // Keep the path short: unix socket paths must fit in SUN_LEN (~104 on
         // macOS), so we can't nest under the long system temp dir.
         let tmp = std::path::PathBuf::from(format!("/tmp/ap-r8n62-{}", std::process::id()));
@@ -748,7 +650,7 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
 
-        assert_eq!(result.as_deref(), Ok(sock.as_str()), "reuse must return the live sock path");
+        assert_eq!(result.unwrap_err(), "E_CODEX_LAUNCH_INPUTS_UNVERIFIED");
         assert!(
             std::path::Path::new(&sock).exists(),
             "reuse path must NOT delete the live socket"

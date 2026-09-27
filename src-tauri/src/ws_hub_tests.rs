@@ -903,3 +903,40 @@ fn b2_direct_child_wait_handle_survives_supervisor_drop() {
         5
     );
 }
+
+#[test]
+fn c3_hub_reconcile_accepts_unrelated_v2_structure_not_readiness() {
+    use crate::daemon_registry::{CodexEventV2 as E, Identity, NodePinV2, SocketPinsV2, TermResultV2, StopOutcomeV2, CleanupOutcomeV2};
+    for stage in [0,1,2,4,6,8,9,10,11] {
+        let mut f=NativeFixture::new();let lease=ControllerLock::acquire(&f.home).unwrap();
+        let expected=f.launch("normal");f.wait_file("fixture-ready");f.published(&lease,&expected);
+        let registry=Registry::open(&lease).unwrap();let slot=lease.codex_slot("unrelated").unwrap();let op=slot.enter().unwrap();
+        let id=registry.begin_codex_v2(&op,Provenance::LegacyUnknown,1).unwrap();
+        let append=|event|registry.append_codex_v2(&op,&id,event,2).unwrap();
+        if stage>=1 {append(E::Spawned{process:Identity::from_native(lease.identity().unwrap()).unwrap()});}
+        if stage>=2 {
+            // Unrelated CODEX METADATA only; not claimed native socket/TERM proof.
+            let parent=NodePinV2{dev:1,ino:2,uid:unsafe{libc::geteuid()},mode:libc::S_IFDIR as u32|0o700,links:0};
+            let leaf=NodePinV2{dev:1,ino:3,uid:parent.uid,mode:libc::S_IFSOCK as u32|0o600,links:1};
+            append(E::SocketReady{pins:SocketPinsV2{format_version:1,parents:vec![parent],entry:leaf,native_target:None}});
+        }
+        if stage>=3 {registry.publish_codex_v2(&op,&id).unwrap();}
+        if stage>=4 {append(E::StopIntent{});}
+        if stage>=5 {append(E::TermResult{result:if stage==6{TermResultV2::Esrch}else{TermResultV2::ReturnedZero}});}
+        if stage>=7 {append(E::StopOutcome{outcome:StopOutcomeV2::TermSentThenDaemonGoneDescendantsUnverified});}
+        if stage>=9 {append(E::CleanupIntent{});}
+        if stage>=10 {append(E::CleanupOutcome{outcome:if stage==10{CleanupOutcomeV2::Unknown}else{CleanupOutcomeV2::FixedDirectEntryRemoved}});}
+        assert!(registry.inspect().is_err());
+        let before=crate::agents::lifecycle_tests::tree(&f.home.join(".aperture/run/daemons"));
+        let adopted=Supervisor::new(&lease,f.spec("normal")).unwrap().reconcile().unwrap();
+        assert!(!adopted.spawned);assert_eq!(adopted.identity,expected);
+        assert_eq!(crate::agents::lifecycle_tests::tree(&f.home.join(".aperture/run/daemons")),before);
+        assert!(registry.begin_codex_v2(&op,Provenance::LegacyUnknown,3).is_err());
+        // Actual hub path must still deny malformed namespace without touching target.
+        fs::write(f.home.join(".aperture/run/daemons/orphan"),b"unknown").unwrap();
+        let malformed=crate::agents::lifecycle_tests::tree(&f.home.join(".aperture/run/daemons"));
+        assert!(Supervisor::new(&lease,f.spec("normal")).unwrap().reconcile().is_err());
+        assert_eq!(crate::agents::lifecycle_tests::tree(&f.home.join(".aperture/run/daemons")),malformed);
+        assert_eq!(team_process::state(&expected),ProcessState::Same);
+    }
+}

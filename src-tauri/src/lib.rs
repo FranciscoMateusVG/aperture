@@ -75,22 +75,32 @@ pub use team_terminal::attach_existing as attach_managed_terminal;
 /// harness (aperture-xt16e) and the watchdog re-kick (aperture-wul6m). Returns
 /// the new tmux window id.
 pub fn boot_agent_headless(name: &str) -> Result<String, String> {
-    let state = config::default_state();
-    let agent = state
-        .agents
-        .get(name)
-        .ok_or_else(|| format!("agent '{}' not found in registry (check APERTURE_AGENTS_DIR)", name))?;
-    let tmux_session = std::env::var("APERTURE_TMUX_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| state.tmux_session.clone());
-    agents::boot_agent_process(
-        agent,
-        tmux_session,
-        state.mcp_server_path.clone(),
-        state.mcp_sentry_server_path.clone(),
-        state.project_dir.clone(),
-    )
+    agents::require_legacy_lifecycle(name)?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("home unavailable")?;
+    let mut initial = config::default_state();
+    if initial.agents.get(name).is_some_and(|a| a.model.starts_with("codex/")) {
+        return Err(agents::LifecycleRefusal::InputsUnverified.code().into());
+    }
+    if let Some(session) = std::env::var("APERTURE_TMUX_SESSION").ok().filter(|s| !s.is_empty()) { initial.tmux_session = session; }
+    let state = Arc::new(Mutex::new(initial));
+    boot_agent_headless_external(&home, name, &state)
+}
+// Same synchronous external path used by the public binary wrapper and inert
+// fixtures. No production executable/environment override is accepted here.
+pub(crate) fn boot_agent_headless_external(
+    home: &std::path::Path, name: &str, state: &Arc<Mutex<state::AppState>>,
+) -> Result<String, String> {
+    // Deny Codex input before acquiring/creating controller files when possible.
+    let agent = state.lock().map_err(|e| e.to_string())?.agents.get(name).ok_or("agent not found")?.clone();
+    if agent.model.starts_with("codex/") {
+        return Err(agents::LifecycleRefusal::InputsUnverified.code().into());
+    }
+    let lease = controller::ControllerLock::acquire(home)?;
+    let runtime = daemons::RuntimeOwner::new(lease);
+    let context = runtime.lifecycle()?;
+    agents::start_agent_shared(name.to_string(), state, &context)?;
+    state.lock().map_err(|e| e.to_string())?.agents.get(name)
+        .and_then(|v| v.tmux_window_id.clone()).ok_or_else(|| "boot has no window".into())
 }
 
 /// Authenticated, headless V4 team activation. The request carries selectors
@@ -225,13 +235,15 @@ pub fn run() {
         }
     }
 
-    if let Err(error) = daemons::start(&_controller, Arc::clone(&app_state)) {
+    let runtime = Arc::new(daemons::RuntimeOwner::new(_controller));
+    if let Err(error) = runtime.start(Arc::clone(&app_state)) {
         eprintln!("[aperture] daemon startup refused: {error}");
         return;
     }
 
     tauri::Builder::default()
         .manage(app_state)
+        .manage(runtime)
         .invoke_handler(tauri::generate_handler![
             // Launcher essentials — start/stop/list agents and configure model.
             agents::start_agent,
@@ -265,10 +277,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
-            // Kill the WS hub child on app exit so it doesn't outlive the
-            // launcher and hold port 4517 across restarts. Same for the
-            // per-agent codex app-servers (Comms v2 Phase 2) so stale
-            // processes never squat on ~/.aperture/run/*.sock.
+            // Detach only; D still owes admission closure and task joins.
+            // No daemon/port kill or unlink is authority granted by GUI exit.
             if let tauri::RunEvent::Exit = event {
                 ws_hub::shutdown();
                 codex_appserver::shutdown();

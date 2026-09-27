@@ -33,6 +33,12 @@ impl Fixture {
         }
         std::fs::write(root.join("ui/index.html"), "packaged fixture").unwrap();
         std::fs::write(root.join(".aperture/run/owner/sentinel"), "unchanged").unwrap();
+        Self::from_owned_root(root).await
+    }
+
+    // Only new()'s exclusive synthetic root or restart_owned()'s consumed fixture.
+    // No directory creation, sentinel rewrite, or operational HOME fallback here.
+    async fn from_owned_root(root: PathBuf) -> Self {
         let app = AppState {
             tmux_session: "fixture-never-started".into(),
             agents: HashMap::new(),
@@ -45,7 +51,11 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let open = crate::web_auth::credential().unwrap();
+        let lease = crate::controller::ControllerLock::acquire(&root).unwrap();
+        lease.rotate_open_capability(&open).unwrap();
+        let runtime = Arc::new(crate::daemons::RuntimeOwner::new(lease));
         let state = WebState {
+            runtime,
             authority: address.clone(),
             origin: format!("http://{address}"),
             auth: Arc::new(Mutex::new(BrowserAuth::new(&open).unwrap())),
@@ -67,6 +77,18 @@ impl Fixture {
             preserve: false,
         }
     }
+    async fn restart_owned(mut self) -> Self {
+        self.task.abort();
+        let joined = (&mut self.task).await;
+        assert!(joined.unwrap_err().is_cancelled());
+        let root = self.root.clone();
+        self.preserve = true;
+        // Drop the entire previous WebState, including its sole runtime lease,
+        // after all requests and the server task have completed.
+        drop(self);
+        Self::from_owned_root(root).await
+    }
+
     async fn request(
         &self,
         method: &str,
@@ -1487,25 +1509,12 @@ async fn packaged_ui_refresh_and_csp_in_native_chrome() {
 async fn same_home_restart_rotates_open_capability_before_new_router() {
     use std::os::unix::fs::MetadataExt;
     let mut f = Fixture::new().await;
-    let lease = crate::controller::ControllerLock::acquire(&f.root).unwrap();
-    lease.rotate_open_capability(&f.open).unwrap();
     let old_session = f.session().await;
     let old_exchange = f.mint().await;
     let old_open = f.open.clone();
     let before = std::fs::read(f.root.join(".aperture/run/owner/sentinel")).unwrap();
-    f.task.abort();
-    let _ = (&mut f.task).await;
-    drop(lease);
-    let lease = crate::controller::ControllerLock::acquire(&f.root).unwrap();
-    f.open = crate::web_auth::credential().unwrap();
-    lease.rotate_open_capability(&f.open).unwrap();
+    f = f.restart_owned().await;
     assert_ne!(f.open, old_open);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    f.state.authority = listener.local_addr().unwrap().to_string();
-    f.state.origin = format!("http://{}", f.state.authority);
-    f.state.auth = Arc::new(Mutex::new(BrowserAuth::new(&f.open).unwrap()));
-    let app = router(f.state.clone());
-    f.task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     assert_eq!(f.redeem(&old_exchange).await.0, 410);
     assert_eq!(f.api("GET", "/api/version", &old_session, "").await.0, 401);
     assert_eq!(
@@ -1532,6 +1541,11 @@ async fn same_home_restart_rotates_open_capability_before_new_router() {
         std::fs::read(f.root.join(".aperture/run/owner/sentinel")).unwrap(),
         before
     );
+    let root = f.root.clone();
+    f.task.abort();
+    assert!((&mut f.task).await.unwrap_err().is_cancelled());
+    drop(f);
+    assert!(!root.exists(), "owned restart fixture root was not removed");
 }
 
 
@@ -1551,4 +1565,22 @@ fn csp_oracle_requires_listener_attribute_not_dom_substrings() {
         assert!(!has_csp_events(&format!(r#"<html data-csp="{values}">"#), external));
     }
     assert!(has_csp_events(&format!(r#"<html lang="en" data-csp="eval,{external},inline" data-inline="blocked">"#), external));
+}
+
+#[tokio::test]
+async fn c3_http_codex_mutators_reach_fenced_shared_ingress_without_effects() {
+    let f=Fixture::new().await;
+    crate::journal::ensure_private_dir(&f.root.join(".claude/aperture/fixture")).unwrap();
+    let agent=crate::agents::lifecycle_tests::state("fixture","codex/test").lock().unwrap().agents["fixture"].clone();
+    f.state.app.lock().unwrap().agents.insert("fixture".into(),agent.clone());
+    let session=f.session().await;
+    let before=tree(&f.root);
+    for (route,body) in [("start",json!({"name":"fixture"})),("stop",json!({"name":"fixture"})),("restart",json!({"name":"fixture"})),("model",json!({"name":"fixture","model":"opus"}))] {
+        let (code,_,text)=f.api("POST",&format!("/api/agents/fixture/{route}"),&session,&body.to_string()).await;
+        assert_ne!(code,200);assert!(text.contains("E_WEB_COMMAND_FAILED"));
+        assert_eq!(tree(&f.root),before);
+        assert_eq!(serde_json::to_value(&f.state.app.lock().unwrap().agents["fixture"]).unwrap(),serde_json::to_value(&agent).unwrap());
+    }
+    let (code,_,_)=f.api("POST","/api/agents/fixture/model",&session,&json!({"name":"fixture","model":"codex/test"}).to_string()).await;
+    assert_eq!(code,200);assert_eq!(tree(&f.root),before);
 }

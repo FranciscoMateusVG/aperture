@@ -866,6 +866,16 @@ fn execute_rekick(
         eprintln!("[watchdog] re-kick denied: E_TEAM_LIFECYCLE_REQUIRED");
         return;
     }
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return; };
+    execute_rekick_at(app_state, name, is_codex, window_id, tier, attempt, &home);
+}
+fn execute_rekick_at(
+    app_state: &Arc<Mutex<AppState>>, name: &str, is_codex: bool,
+    window_id: Option<&str>, tier: RekickTier, attempt: u8, home: &std::path::Path,
+) {
+    // Unjoined watchdog work receives no positive Codex authority, including
+    // stale is_codex=false after a model change. No pane teardown on denial.
+    if crate::agents::detached_codex_denied_at(home, app_state, name, is_codex).is_err() { return; }
     match tier {
         RekickTier::Nudge => {
             // Claude nudge: run the boot-routine turn in the EXISTING pane so the
@@ -894,15 +904,7 @@ fn execute_rekick(
                 std::thread::sleep(Duration::from_millis(300));
                 let _ = crate::tmux::tmux_kill_window(win.to_string());
             }
-            if is_codex {
-                crate::codex_appserver::stop_app_server(name);
-                // Remove the socket + thread-id handoff files so the fresh boot's
-                // spawn_app_server probe (r8n62) can't reuse a stale/orphaned
-                // server and the pane won't read a stale thread id.
-                let base = format!("{}/{}", run_dir(), name);
-                let _ = std::fs::remove_file(format!("{base}.sock"));
-                let _ = std::fs::remove_file(format!("{base}.thread-id"));
-            }
+            // Codex (including retained history) was denied before any pane effect.
             std::thread::sleep(Duration::from_millis(300));
             // In-process boot (keeps the child mapped — no new orphan) through
             // the real spawn path: fresh window + kickoff, which rewrites the
@@ -1188,4 +1190,9 @@ mod managed_presence_tests {
         let joined = Presence { online: true, online_since: Some(at-ONLINE_DEBOUNCE), turn: None };
         assert!(managed_presence_write("team-worker", true, true, Some(&joined), at).turn_state.is_none());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn c3_rekick_fixture(state: &Arc<Mutex<AppState>>, name: &str, home: &std::path::Path, is_codex: bool) {
+    execute_rekick_at(state, name, is_codex, Some("must-not-reach-pane"), RekickTier::Respawn, 1, home);
 }

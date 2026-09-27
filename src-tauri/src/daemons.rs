@@ -28,6 +28,23 @@ pub(crate) fn start_checked(
     _downstream: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let registry = crate::daemon_registry::Registry::open(lease)?;
-    let _unverified_metadata = registry.inspect()?;
+    let _unverified_metadata = registry.validate_namespace()?;
     Err("E_DAEMON_SUPERVISION_PENDING: F2-A startup is fenced until safe supervision is implemented and reviewed".into())
+}
+
+// One composition-owned lease. C3 lends synchronous contexts only; positive
+// Codex work is fenced, so no authority is exported to unjoined tasks. D still
+// must close admission/drain/join before this owner may be released in a live app.
+pub(crate) struct RuntimeOwner {
+    lease: ControllerLock,
+}
+impl RuntimeOwner {
+    pub(crate) fn new(lease: ControllerLock) -> Self { Self { lease } }
+    pub(crate) fn lifecycle(&self) -> Result<crate::agents::LifecycleContext<'_>, String> {
+        #[cfg(test)] { return crate::agents::LifecycleContext::fixture_context(&self.lease); }
+        #[cfg(not(test))] { crate::agents::LifecycleContext::new(&self.lease) }
+    }
+    pub(crate) fn start(&self, state: Arc<Mutex<AppState>>) -> Result<(), String> {
+        start(&self.lease, state)
+    }
 }

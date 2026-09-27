@@ -125,8 +125,9 @@ fn watchdog_guard_precedes_nudge_teardown_and_shared_boot() {
     let gate = body.find("if crate::agents::require_legacy_lifecycle(name).is_err()").unwrap();
     let after_gate = &body[gate..];
     assert!(after_gate.find("return;").unwrap() < after_gate.find("match tier").unwrap());
-    for effect in ["tmux_send_keys(", "tmux_kill_window(", "stop_app_server(",
-                   "remove_file(", "boot_agent_headless("] {
+    let detached = body.find("detached_codex_denied_at(").unwrap();
+    for effect in ["tmux_send_keys(", "tmux_kill_window(", "boot_agent_headless("] {
+        assert!(detached < body.find(effect).unwrap());
         assert!(gate < body.find(effect).unwrap(), "effect before guard: {effect}");
     }
 }

@@ -25,6 +25,7 @@ struct WebState {
     origin: String,
     auth: Arc<Mutex<BrowserAuth>>,
     app: Arc<Mutex<AppState>>,
+    runtime: Arc<crate::daemons::RuntimeOwner>,
     home: PathBuf,
     project: PathBuf,
     ui: PathBuf,
@@ -315,9 +316,9 @@ fn execute(
                 return Err(wire_error());
             }
             legacy(match command {
-                Command::Start => crate::agents::start_agent_shared(n.name, &s.app),
-                Command::Stop => crate::agents::stop_agent_shared(n.name, &s.app),
-                Command::Restart => crate::agents::restart_agent_shared(n.name, &s.app),
+                Command::Start => crate::agents::start_agent_shared(n.name, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?),
+                Command::Stop => crate::agents::stop_agent_shared(n.name, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?),
+                Command::Restart => crate::agents::restart_agent_shared(n.name, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?),
                 _ => crate::agents::clear_attention_shared(n.name, &s.app),
             })
         }
@@ -327,7 +328,7 @@ fn execute(
                 return Err(wire_error());
             }
             legacy(crate::agents::update_agent_model_shared(
-                m.name, m.model, &s.app,
+                m.name, m.model, &s.app, &s.runtime.lifecycle().map_err(|_| wire_error())?,
             ))
         }
         Command::TmuxSession => {
@@ -573,7 +574,9 @@ pub async fn serve() -> Result<(), String> {
             .map_err(|_| "application state unavailable")?
             .project_dir,
     );
+    let runtime = Arc::new(crate::daemons::RuntimeOwner::new(lease));
     let s = WebState {
+        runtime: runtime.clone(),
         authority: "127.0.0.1:4519".into(),
         origin: "http://127.0.0.1:4519".into(),
         auth: Arc::new(Mutex::new(auth)),
@@ -587,14 +590,14 @@ pub async fn serve() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:4519")
         .await
         .map_err(|_| "local address unavailable")?;
-    crate::daemons::start(&lease, app)?;
+    runtime.start(app)?;
     axum::serve(listener, router(s))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
         .map_err(|_| "local server stopped unexpectedly")?;
-    // Legacy shutdown only; daemon survival/adoption is the separately gated F2.
+    // Detach only. This does NOT prove D close-admission/drain/join; startup remains fenced.
     crate::ws_hub::shutdown();
     crate::codex_appserver::shutdown();
     Ok(())

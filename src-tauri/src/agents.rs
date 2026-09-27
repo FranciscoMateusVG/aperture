@@ -14,7 +14,7 @@ use crate::state::AgentDef;
 #[path = "team_legacy_guard.rs"]
 pub(crate) mod legacy_lifecycle_guard;
 
-fn require_legacy_lifecycle_at(
+pub(crate) fn require_legacy_lifecycle_at(
     home: &std::path::Path,
     agents_root: &std::path::Path,
     name: &str,
@@ -39,6 +39,157 @@ pub(crate) fn require_legacy_lifecycle(name: &str) -> Result<(), String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| home.join(".claude/aperture"));
     require_legacy_lifecycle_at(&home, &agents_root, name)
+}
+
+// C3 is a fenced caller boundary, not permission to activate Codex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleRefusal { InputsUnverified, PlanChanged, ContextMismatch }
+impl LifecycleRefusal {
+    pub(crate) fn code(self) -> &'static str { match self {
+        Self::InputsUnverified => "E_CODEX_LAUNCH_INPUTS_UNVERIFIED",
+        Self::PlanChanged => "E_LIFECYCLE_PLAN_CHANGED",
+        Self::ContextMismatch => "E_LIFECYCLE_CONTEXT_MISMATCH",
+    } }
+}
+pub(crate) struct LifecycleContext<'a> {
+    lease: &'a crate::controller::ControllerLock,
+    home: std::path::PathBuf,
+    roots: std::path::PathBuf,
+    #[cfg(test)] pub(crate) fixture: Option<&'a LifecycleFixture>,
+}
+impl<'a> LifecycleContext<'a> {
+    pub(crate) fn new(lease: &'a crate::controller::ControllerLock) -> Result<Self, String> {
+        let home = lease.run_dir()?.parent().and_then(std::path::Path::parent)
+            .ok_or(LifecycleRefusal::ContextMismatch.code())?.to_path_buf();
+        let roots = std::env::var_os("APERTURE_AGENTS_DIR").filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".claude/aperture"));
+        Ok(Self { roots, home, lease,
+            #[cfg(test)] fixture: None })
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_context(lease: &'a crate::controller::ControllerLock) -> Result<Self, String> {
+        let mut context = Self::new(lease)?;
+        context.roots = context.home.join(".claude/aperture");
+        Ok(context)
+    }
+    fn classify(&self, name: &str) -> Result<(), String> {
+        self.lease.verify_live()?;
+        require_legacy_lifecycle_at(&self.home, &self.roots, name)
+    }
+    fn has_codex_history(&self, name: &str) -> Result<bool, String> {
+        if !crate::daemon_registry::valid_name(name) { return Err(LifecycleRefusal::ContextMismatch.code().into()); }
+        // Read-only rejection: any leaf (including malformed/symlink) is history,
+        // never enrollment or adoption. No Registry::open on a denial path.
+        let root = self.lease.run_dir()?.join("daemons");
+        match fs::symlink_metadata(&root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(LifecycleRefusal::InputsUnverified.code().into()),
+            Ok(_) => crate::controller::private_dir_readonly(&root)?,
+        }
+        match fs::symlink_metadata(root.join(format!("codex-{name}"))) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(LifecycleRefusal::InputsUnverified.code().into()),
+        }
+    }
+}
+pub(crate) fn detached_codex_denied_at(home: &std::path::Path, state: &Arc<Mutex<AppState>>, name: &str, is_codex: bool) -> Result<(), String> {
+    require_legacy_lifecycle_at(home, &home.join(".claude/aperture"), name)?;
+    let agent = state.lock().map_err(|_| LifecycleRefusal::PlanChanged.code())?.agents.get(name)
+        .ok_or(LifecycleRefusal::PlanChanged.code())?.clone();
+    if is_codex || agent.model.starts_with("codex/") {
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    let history = home.join(".aperture/run/daemons").join(format!("codex-{name}"));
+    match fs::symlink_metadata(history) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(LifecycleRefusal::InputsUnverified.code().into()),
+    }
+}
+fn same_lifecycle_plan(a: &AgentDef, b: &AgentDef) -> bool {
+    a.name == b.name && a.model == b.model && a.role == b.role && a.prompt_file == b.prompt_file
+        && a.status == b.status && a.tmux_window_id == b.tmux_window_id
+}
+fn verify_plan(state: &Arc<Mutex<AppState>>, expected: &AgentDef) -> Result<(), String> {
+    let state = state.lock().map_err(|_| LifecycleRefusal::PlanChanged.code())?;
+    if !state.agents.get(&expected.name).is_some_and(|v| same_lifecycle_plan(v, expected)) {
+        return Err(LifecycleRefusal::PlanChanged.code().into());
+    }
+    Ok(())
+}
+#[derive(Clone)]
+pub(crate) enum LifecycleAction { Start, Stop, Restart, Model(String) }
+fn with_lifecycle_plan(
+    name: &str, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, action: LifecycleAction,
+    execute: impl FnOnce(&AgentDef, &mut crate::controller::CodexOperation<'_>) -> Result<(), String>,
+) -> Result<(), String> {
+    context.classify(name)?;
+    let advisory = state.lock().map_err(|e| e.to_string())?.agents.get(name)
+        .ok_or_else(|| format!("Agent '{name}' not found"))?.clone();
+    #[cfg(test)]
+    if let Some(pause) = context.fixture.and_then(|f| f.pause.as_ref()) {
+        pause.arrived.send(()).map_err(|_| "E_FIXTURE_CHANNEL")?;
+        pause.resume.lock().unwrap().recv_timeout(std::time::Duration::from_secs(3)).map_err(|_| "E_FIXTURE_DEADLINE")?;
+    }
+    // NEVER wait on a seat while holding AppState.
+    let slot = context.lease.codex_slot(name)?;
+    let mut op = slot.enter()?;
+    context.classify(name)?;
+    verify_plan(state, &advisory)?;
+    if let LifecycleAction::Model(ref requested) = action {
+        if requested == &advisory.model { return Ok(()); } // verified effect-free no-op, not persistence
+    }
+    let codex = advisory.model.starts_with("codex/")
+        || matches!(&action, LifecycleAction::Model(v) if v.starts_with("codex/"));
+    let history = context.has_codex_history(name)?;
+    if codex || history {
+        #[cfg(test)]
+        if matches!(action, LifecycleAction::Start) && !history {
+            if let Some(fixture) = context.fixture.filter(|f| f.spec.is_some()) {
+                let registry = crate::daemon_registry::Registry::open(context.lease)?;
+                let plan = PreparedCaller { state, expected: &advisory, fixture };
+                let spec = fixture.spec.as_ref().unwrap();
+                let supervisor = crate::codex_appserver::NativeCodexSupervisor::new(context.lease, &registry, spec.copy_fixture())?;
+                supervisor.prepared_fixture(&mut op, &plan)?;
+                return Ok(());
+            }
+        }
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    verify_plan(state, &advisory)?;
+    execute(&advisory, &mut op)
+}
+
+#[cfg(test)]
+pub(crate) struct LifecyclePause {
+    pub arrived: std::sync::mpsc::SyncSender<()>,
+    pub resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+#[cfg(test)]
+pub(crate) struct LifecycleFixture {
+    pub spec: Option<crate::codex_appserver::NativeCodexSpec>,
+    pub preparation_file: std::path::PathBuf,
+    pub fail_preparation: bool,
+    pub preparation_count: std::sync::atomic::AtomicUsize,
+    pub effects: Mutex<Vec<&'static str>>,
+    pub pause: Option<LifecyclePause>,
+}
+#[cfg(test)]
+pub(crate) struct PreparedCaller<'a> {
+    pub state: &'a Arc<Mutex<AppState>>,
+    pub expected: &'a AgentDef,
+    pub fixture: &'a LifecycleFixture,
+}
+#[cfg(test)]
+impl PreparedCaller<'_> {
+    pub(crate) fn recheck(&self) -> Result<(), String> { verify_plan(self.state, self.expected) }
+    pub(crate) fn prepare(&self) -> Result<(), String> {
+        self.recheck()?;
+        self.fixture.preparation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.fixture.effects.lock().unwrap().push("prepare");
+        fs::write(&self.fixture.preparation_file, b"owned synthetic preparation").map_err(|_| "E_FIXTURE_PREPARE")?;
+        if self.fixture.fail_preparation { Err("E_FIXTURE_PREPARE".into()) } else { Ok(()) }
+    }
 }
 
 /// One assignee's resolved current-work summary (aperture-nr65b).
@@ -131,13 +282,19 @@ fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
 }
 
 #[tauri::command]
-pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
-    start_agent_shared(name, state.inner())
+    start_agent_shared(name, state.inner(), &runtime.lifecycle()?)
 }
 
-pub(crate) fn start_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
-    require_legacy_lifecycle(&name)?;
+pub(crate) fn start_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Start, |expected, op| {
+        verify_plan(state, expected)?;
+        start_agent_held(name.clone(), state, context, op)
+    })
+}
+fn start_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     // Extract all needed data while holding the lock briefly, then release it
     // before doing any expensive I/O (subprocess calls, file writes). This
     // prevents the global state mutex from blocking list_agents polling and
@@ -163,7 +320,8 @@ pub(crate) fn start_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> 
         )
     }; // ← mutex released here; all I/O below is lock-free
 
-    let window_id = boot_agent_process(
+    let window_id = boot_agent_process_held(
+        context, op,
         &agent,
         tmux_session,
         mcp_server_path,
@@ -199,6 +357,29 @@ pub fn boot_agent_process(
     project_dir: String,
 ) -> Result<String, String> {
     require_legacy_lifecycle(&agent.name)?;
+    if agent.model.starts_with("codex/") { return Err(LifecycleRefusal::InputsUnverified.code().into()); }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("home unavailable")?;
+    let lease = crate::controller::ControllerLock::acquire(&home)?;
+    let context = LifecycleContext::new(&lease)?;
+    let slot = lease.codex_slot(&agent.name)?;
+    let mut op = slot.enter()?;
+    boot_agent_process_held(&context, &mut op, agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir)
+}
+fn boot_agent_process_held(
+    context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>,
+    agent: &AgentDef, tmux_session: String, mcp_server_path: String,
+    mcp_sentry_server_path: String, project_dir: String,
+) -> Result<String, String> {
+    context.classify(&agent.name)?;
+    if op.seat() != agent.name { return Err(LifecycleRefusal::ContextMismatch.code().into()); }
+    op.verify_for(context.lease)?;
+    if agent.model.starts_with("codex/") || context.has_codex_history(&agent.name)? {
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    #[cfg(test)] if let Some(f) = context.fixture {
+        f.effects.lock().unwrap().push("legacy-boot");
+        return Ok("fixture-pane".into());
+    }
     let name = agent.name.clone();
 
     // Create a dedicated tmux window for this agent
@@ -487,7 +668,7 @@ pub fn boot_agent_process(
 
     if boot_result.is_err() {
         let _ = tmux::tmux_kill_window(window_id);
-        codex_appserver::stop_app_server(&name);
+        // Codex never entered this legacy attempt; no daemon rollback authority.
     }
 
     boot_result
@@ -499,7 +680,8 @@ pub fn boot_agent_process(
 /// kickoff file, and clear the watchdog's in-memory state — see the comments
 /// inline. Does NOT touch AppState; callers write `status`/`tmux_window_id`
 /// themselves under a fresh lock.
-fn teardown_agent(name: &str, window_id: Option<String>) {
+fn teardown_agent(name: &str, window_id: Option<String>, context: &LifecycleContext<'_>) {
+    #[cfg(test)] if let Some(f) = context.fixture { f.effects.lock().unwrap().push("legacy-teardown"); return; }
     if let Some(window_id) = window_id {
         let _ = tmux::tmux_send_keys(window_id.clone(), "C-c".into());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -510,7 +692,7 @@ fn teardown_agent(name: &str, window_id: Option<String>) {
 
     // Comms Layer v2, Phase 2: kill this agent's supervised codex app-server
     // (no-op for Claude agents, which never register one).
-    codex_appserver::stop_app_server(name);
+    // Codex teardown was denied at ingress. Do not infer daemon stop from a void call.
 
     // aperture-wul6m: clear watchdog eligibility for a DELIBERATE stop so it is
     // never fought. Removing the kickoff file drops the agent below the
@@ -525,13 +707,19 @@ fn teardown_agent(name: &str, window_id: Option<String>) {
 }
 
 #[tauri::command]
-pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
-    stop_agent_shared(name, state.inner())
+    stop_agent_shared(name, state.inner(), &runtime.lifecycle()?)
 }
 
-pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
-    require_legacy_lifecycle(&name)?;
+pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Stop, |expected, op| {
+        verify_plan(state, expected)?;
+        stop_agent_held(name.clone(), state, context, op)
+    })
+}
+fn stop_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     // Extract needed data and release the lock before the blocking sleep calls
     let (window_id_opt, is_running) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
@@ -547,7 +735,7 @@ pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> R
         return Err(format!("Agent '{}' is not running", name));
     }
 
-    teardown_agent(&name, window_id_opt);
+    teardown_agent(&name, window_id_opt, context);
 
     // Re-acquire to update status
     {
@@ -577,13 +765,19 @@ pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> R
 /// every blocking step (tmux probe, teardown sleeps, boot), re-lock only to
 /// write the outcome.
 #[tauri::command]
-pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
-    restart_agent_shared(name, state.inner())
+    restart_agent_shared(name, state.inner(), &runtime.lifecycle()?)
 }
 
-pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
-    require_legacy_lifecycle(&name)?;
+pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Restart, |expected, op| {
+        verify_plan(state, expected)?;
+        restart_agent_held(name.clone(), state, context, op)
+    })
+}
+fn restart_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         let agent = app_state
@@ -608,10 +802,10 @@ pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -
     };
 
     if live_window.is_some() {
-        teardown_agent(&name, live_window);
+        teardown_agent(&name, live_window, context);
     } else {
         eprintln!("[aperture] restart_agent: '{}' is not running — skipping stop, booting fresh", name);
-        teardown_agent(&name, None);
+        teardown_agent(&name, None, context);
     }
 
     // Reflect the stopped state before the (possibly failing) boot so a boot
@@ -624,7 +818,8 @@ pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>) -
         }
     }
 
-    let window_id = boot_agent_process(
+    let window_id = boot_agent_process_held(
+        context, op,
         &agent,
         tmux_session,
         mcp_server_path,
@@ -829,13 +1024,23 @@ pub fn is_valid_model(model: &str) -> bool {
 }
 
 #[tauri::command]
-pub fn update_agent_model(name: String, model: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn update_agent_model(name: String, model: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
     require_legacy_lifecycle(&name)?;
-    update_agent_model_shared(name, model, state.inner())
+    update_agent_model_shared(name, model, state.inner(), &runtime.lifecycle()?)
 }
 
-pub(crate) fn update_agent_model_shared(name: String, model: String, state: &Arc<Mutex<AppState>>) -> Result<(), String> {
-    require_legacy_lifecycle(&name)?;
+pub(crate) fn update_agent_model_shared(name: String, model: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    context.classify(&name)?;
+    if !is_valid_model(&model) {
+        return Err(format!("Invalid model '{}'. Must be one of {} or codex/<model>", model, CLAUDE_MODEL_ALIASES.join("/")));
+    }
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Model(model.clone()), |expected, _op| {
+        verify_plan(state, expected)?;
+        update_agent_model_held(name.clone(), model.clone(), state, context)
+    })
+}
+fn update_agent_model_held(name: String, model: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     if !is_valid_model(&model) {
         return Err(format!(
             "Invalid model '{}'. Must be one of {} or codex/<model>",
@@ -850,6 +1055,13 @@ pub(crate) fn update_agent_model_shared(name: String, model: String, state: &Arc
         .get_mut(&name)
         .ok_or(format!("Agent '{}' not found", name))?;
 
+    if agent.model.starts_with("codex/") || model.starts_with("codex/") {
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    #[cfg(test)] if let Some(f) = context.fixture {
+        f.effects.lock().unwrap().push("legacy-model");
+        return Ok(());
+    }
     agent.model = model.clone();
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -1517,3 +1729,7 @@ mod tests {
 #[cfg(test)]
 #[path = "agents_team_tests.rs"]
 mod team_lifecycle_guard_tests;
+
+#[cfg(test)]
+#[path = "agents_lifecycle_tests.rs"]
+pub(crate) mod lifecycle_tests;

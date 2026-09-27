@@ -1703,3 +1703,51 @@ fn c2b_fix_adoption_provenance_must_match_without_relabel_or_effects() {
         }
     }
 }
+
+#[test]
+fn c3_prepared_caller_one_intent_one_preparation_native_spawn_and_no_retry() {
+    use crate::agents::{lifecycle_tests, LifecycleContext};
+    for failure in [false,true] {
+        let f=C2Fixture::new();let lease=f.inner.lease();let registry=Registry::open(&lease).unwrap();
+        let app=lifecycle_tests::state("fixture","codex/test");
+        let mut fixture=lifecycle_tests::fixture(&f.inner.root);fixture.spec=Some(f.spec(None));fixture.fail_preparation=failure;
+        let mut ctx=LifecycleContext::fixture_context(&lease).unwrap();ctx.fixture=Some(&fixture);
+        let result=crate::agents::start_agent_shared("fixture".into(),&app,&ctx);
+        assert_eq!(fixture.preparation_count.load(std::sync::atomic::Ordering::SeqCst),1);
+        assert!(fixture.preparation_file.is_file());
+        let slot=lease.codex_slot("fixture").unwrap();let op=slot.enter().unwrap();
+        assert_eq!(op.spawn_attempts(),if failure {0}else{1});drop(op);
+        let facts=lifecycle_tests::tree(&f.inner.home.join(".aperture/run/daemons"));
+        if failure {assert!(result.is_err());assert_eq!(registry.codex_snapshot("fixture").unwrap().unwrap().phase,crate::daemon_registry::CodexPhaseV2::SpawnIntentUnknown);}
+        else {result.unwrap();f.eof(2);assert_eq!(registry.codex_snapshot("fixture").unwrap().unwrap().phase,crate::daemon_registry::CodexPhaseV2::ReadyMetadataOnly);}
+        assert!(crate::agents::start_agent_shared("fixture".into(),&app,&ctx).is_err());
+        assert_eq!(fixture.preparation_count.load(std::sync::atomic::Ordering::SeqCst),1);
+        assert_eq!(lifecycle_tests::tree(&f.inner.home.join(".aperture/run/daemons")),facts);
+        assert_eq!(app.lock().unwrap().agents["fixture"].status,"stopped"); // native daemon != complete UI boot
+        if !failure {
+            let expected=app.lock().unwrap().agents["fixture"].clone();
+            let plan=crate::agents::PreparedCaller{state:&app,expected:&expected,fixture:&fixture};
+            let supervisor=super::NativeCodexSupervisor::new(&lease,&registry,f.spec(None)).unwrap();
+            let mut op=slot.enter().unwrap();
+            assert!(!supervisor.prepared_fixture(&mut op,&plan).unwrap().created);
+            assert_eq!(fixture.preparation_count.load(std::sync::atomic::Ordering::SeqCst),1); // native adoption skips preparation
+        }
+    }
+}
+#[test]
+fn c3_held_wrong_selector_and_missing_home_deny_before_intent_or_preparation() {
+    use crate::agents::lifecycle_tests;
+    for missing in [false,true] {
+        let f=C2Fixture::new();let lease=f.inner.lease();let registry=Registry::open(&lease).unwrap();
+        let app=lifecycle_tests::state("fixture","codex/test");let expected=app.lock().unwrap().agents["fixture"].clone();
+        let fixture=lifecycle_tests::fixture(&f.inner.root);let plan=crate::agents::PreparedCaller{state:&app,expected:&expected,fixture:&fixture};
+        if missing {fs::remove_dir(f.inner.root.join("codex-home")).unwrap();}
+        let before=lifecycle_tests::tree(&f.inner.home);let signals=super::C2_SIGNAL_CALLS.with(|v|v.get());let unlinks=crate::team_terminal::codex_unlink_calls();
+        let supervisor=super::NativeCodexSupervisor::new(&lease,&registry,f.spec(None)).unwrap();
+        let slot=lease.codex_slot(if missing {"fixture"}else{"other"}).unwrap();let mut op=slot.enter().unwrap();
+        assert!(supervisor.prepared_fixture(&mut op,&plan).is_err());assert_eq!(op.spawn_attempts(),0);
+        assert_eq!(fixture.preparation_count.load(std::sync::atomic::Ordering::SeqCst),0);
+        assert_eq!(lifecycle_tests::tree(&f.inner.home),before);assert!(!fixture.preparation_file.exists());
+        assert_eq!(super::C2_SIGNAL_CALLS.with(|v|v.get()),signals);assert_eq!(crate::team_terminal::codex_unlink_calls(),unlinks);
+    }
+}

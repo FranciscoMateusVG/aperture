@@ -97,7 +97,7 @@ impl<'a> Supervisor<'a> {
     pub(crate) fn reconcile(&mut self) -> Result<HubObservation, String> {
         let _flight = self.lease.hub_transition()?;
         let registry = Registry::open(self.lease)?;
-        registry.inspect()?;
+        registry.validate_namespace()?; // namespace structure is not target adoption
         // Reap only our direct child, without signals. Error is not Gone.
         let mut held_child = self.lease.hub_child()?;
         if let Some(child) = held_child.as_mut() {
