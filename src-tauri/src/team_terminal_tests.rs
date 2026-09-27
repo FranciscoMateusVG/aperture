@@ -1007,3 +1007,101 @@ fn coordination_cipher_requires_the_same_native_binding_and_recheck() {
     fs::remove_file(socket).unwrap();
     assert!(capture_coordination_peers(&f.home).unwrap().is_empty());
 }
+
+#[test]
+fn c2b_native_pin_mapping_and_fixed_link_unlink_retain_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = SocketFixture::new();
+    // C2 native policy has a direct child of pinned /private/tmp; do not omit
+    // an intermediate fixture directory from the persisted parent order.
+    f.daemon = f.root.clone();
+    f.target = f.root.join("a".repeat(64));
+    let listener = std::os::unix::net::UnixListener::bind(&f.target).unwrap();
+    fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    f._listener = listener;
+    f.relink(&f.target);
+    fs::create_dir_all(f.root.join(".aperture/run")).unwrap();
+    for p in [f.root.join(".aperture"), f.root.join(".aperture/run")] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let binding = f.pin().unwrap();
+    let values = codex_pin_values(&f.root, &f.link, &binding).unwrap();
+    assert_eq!(
+        values.parents,
+        coordination_runtime_dirs(&f.root)
+            .unwrap()
+            .iter()
+            .map(pin_value)
+            .collect::<Vec<_>>()
+    );
+    let target = values.native_target.unwrap();
+    assert_eq!(target.basename, "a".repeat(64));
+    let mut parents = system_tmp_pins().unwrap();
+    parents.push(PathPin::read(&f.daemon).unwrap());
+    assert_eq!(
+        target.parents,
+        parents.iter().map(pin_value).collect::<Vec<_>>()
+    );
+    assert_eq!(target.leaf, pin_value(&PathPin::read(&f.target).unwrap()));
+    assert_eq!(target.leaf.links, 1);
+    assert!(target.parents.iter().all(|p| p.links == 0));
+    let before = codex_unlink_calls();
+    assert!(
+        native_explicit_refusal(&f.target).is_err(),
+        "live listener never refusal"
+    );
+    assert_eq!(codex_unlink_calls(), before);
+    let old = std::mem::replace(
+        &mut f._listener,
+        std::os::unix::net::UnixListener::bind(f.root.join("other.sock")).unwrap(),
+    );
+    drop(old);
+    native_explicit_refusal(&f.target).unwrap();
+    let proof = CodexCleanup::new(f.link.clone(), binding).unwrap();
+    assert_eq!(
+        proof.unlink().unwrap(),
+        crate::daemon_registry::CleanupOutcomeV2::FixedLinkRemovedTargetRetained
+    );
+    assert!(!f.link.symlink_metadata().is_ok());
+    assert!(f.target.exists());
+    assert_eq!(codex_unlink_calls(), before + 1);
+}
+
+#[test]
+fn c2b_cleanup_fd_path_swap_absence_and_nonrefusal_never_unlink() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    for change in ["link", "parent", "parent-replaced", "leaf", "absent"] {
+        let f = SocketFixture::new();
+        let proof = CodexCleanup::new(f.link.clone(), f.pin().unwrap()).unwrap();
+        let before = codex_unlink_calls();
+        if change == "parent-replaced" {
+            let moved = f.root.with_extension("moved");
+            fs::rename(&f.root, &moved).unwrap();
+            fs::create_dir(&f.root).unwrap();
+            fs::set_permissions(&f.root, fs::Permissions::from_mode(0o700)).unwrap();
+            let denied = proof.unlink().is_err();
+            // Restore own tree before asserting, so fixture teardown is faithful.
+            fs::remove_dir(&f.root).unwrap();
+            fs::rename(moved, &f.root).unwrap();
+            assert!(denied);
+            assert_eq!(codex_unlink_calls(), before);
+            continue;
+        }
+        match change {
+            "link" => f.relink(&f.target),
+            "parent" => fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap(),
+            "leaf" => fs::set_permissions(&f.target, fs::Permissions::from_mode(0o640)).unwrap(),
+            "absent" => fs::remove_file(&f.link).unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(proof.unlink().is_err());
+        assert_eq!(codex_unlink_calls(), before);
+    }
+    let f = SocketFixture::new();
+    assert!(native_explicit_refusal(&f.root.join("missing.sock")).is_err());
+    assert!(native_explicit_refusal(&f.root).is_err());
+    let live = UnixListener::bind(f.root.join("live.sock")).unwrap();
+    assert!(native_explicit_refusal(&f.root.join("live.sock")).is_err());
+    drop(live);
+    native_explicit_refusal(&f.root.join("live.sock")).unwrap();
+}

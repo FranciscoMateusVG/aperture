@@ -1290,3 +1290,51 @@ fn c2_each_nonready_or_terminal_phase_retains_slot_without_global_outage() {
         assert!(registry.inspect().is_err());
     }
 }
+
+#[test]
+fn c2b_snapshot_revision_covers_hidden_fact_values_and_current_without_authority() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let registry = Registry::open(&lease).unwrap();
+    let slot = lease.codex_slot("fixture").unwrap();
+    let op = slot.enter().unwrap();
+    let id = v2_ready(&registry, &op, false);
+    let before = registry.codex_snapshot("fixture").unwrap().unwrap();
+    let dir = registry.root.join("codex-fixture");
+    let original = registry.history("codex-fixture").unwrap();
+    // Equal phase, identity and visible pins; change a hidden timestamp or nonce.
+    for field in ["time", "nonce"] {
+        for fact in original.codex.values() {
+            let mut changed = fact.clone();
+            if field == "time" {
+                changed.at_ms += 100;
+            } else {
+                changed.operation = Uuid::new_v4().to_string();
+            }
+            // A shared nonce is needed for the valid same-operation prefix.
+            if field == "nonce" {
+                changed.operation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+            }
+            journal::write_private_json_atomic(&dir.join(changed.filename()), &changed, true)
+                .unwrap();
+        }
+        let after = registry.codex_snapshot("fixture").unwrap().unwrap();
+        assert_eq!(before.phase, after.phase);
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(before.pins, after.pins);
+        assert_ne!(before, after);
+        assert!(registry.recheck_snapshot("fixture", &before).is_err());
+        for fact in original.codex.values() {
+            journal::write_private_json_atomic(&dir.join(fact.filename()), fact, true).unwrap();
+        }
+    }
+    fs::remove_file(dir.join("current")).unwrap();
+    assert_ne!(registry.codex_snapshot("fixture").unwrap().unwrap(), before);
+    write(&dir.join("current"), &id);
+    registry.recheck_snapshot("fixture", &before).unwrap();
+    assert_eq!(registry.validate_namespace().unwrap(), 1);
+    assert_eq!(
+        registry.verified_run_dir().unwrap(),
+        f.0.join(".aperture/run")
+    );
+}

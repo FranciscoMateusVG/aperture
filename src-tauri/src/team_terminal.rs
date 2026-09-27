@@ -170,6 +170,47 @@ fn pin_socket(socket: &Path, daemon: &Path, uid: u32) -> Result<SocketBinding> {
     Ok(result)
 }
 fn resolve_socket(socket: &Path) -> Result<SocketBinding> {
+    resolve_socket_in_native_dir(
+        socket,
+        &PathBuf::from(format!("/private/tmp/codex-daemon-{}", unsafe {
+            libc::geteuid()
+        })),
+    )
+}
+// No request/public override: production has only the fixed native directory.
+// The alternate field and constructor do not exist in a non-test build.
+pub(crate) struct CodexSocketResolver {
+    #[cfg(test)]
+    fixture_native: Option<PathBuf>,
+}
+impl CodexSocketResolver {
+    pub(crate) fn production() -> Self {
+        Self {
+            #[cfg(test)]
+            fixture_native: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(native: &Path) -> Result<Self> {
+        if native.parent() != Some(Path::new("/private/tmp")) {
+            return Err(ERROR.into());
+        }
+        system_tmp_pins()?;
+        crate::controller::private_dir_readonly(native)?;
+        Ok(Self {
+            fixture_native: Some(native.into()),
+        })
+    }
+    fn resolve(&self, socket: &Path) -> Result<SocketBinding> {
+        #[cfg(test)]
+        if let Some(native) = &self.fixture_native {
+            // No fallback to the operator's daemon directory on any failure.
+            return resolve_socket_in_native_dir(socket, native);
+        }
+        resolve_socket(socket)
+    }
+}
+fn resolve_socket_in_native_dir(socket: &Path, daemon: &Path) -> Result<SocketBinding> {
     let uid = unsafe { libc::geteuid() };
     let entry = PathPin::read(socket)?;
     let parents = if entry.kind(libc::S_IFLNK) {
@@ -177,11 +218,7 @@ fn resolve_socket(socket: &Path) -> Result<SocketBinding> {
     } else {
         vec![]
     };
-    let mut binding = pin_socket(
-        socket,
-        &PathBuf::from(format!("/private/tmp/codex-daemon-{uid}")),
-        uid,
-    )?;
+    let mut binding = pin_socket(socket, daemon, uid)?;
     if binding.pins.first() != Some(&entry) {
         return Err(ERROR.into());
     }
@@ -276,6 +313,341 @@ fn registered_socket_observation(
     registry.verify_read_context()?;
     Ok(())
 }
+// C2b operational adapters: paths are derived from the registry's own lease and
+// selector. None of these observations is a saved signal/deletion capability.
+fn codex_fixed_context(
+    registry: &crate::daemon_registry::Registry<'_>,
+    operation: &crate::controller::CodexOperation<'_>,
+) -> Result<(PathBuf, PathBuf, Vec<PathPin>)> {
+    registry.verify_operation(operation)?;
+    let run = registry.verified_run_dir()?;
+    let home = run.parent().and_then(Path::parent).ok_or(ERROR)?;
+    let guards = legacy_probe_pins(home, operation.seat())?;
+    Ok((
+        home.into(),
+        run.join(format!("{}.sock", operation.seat())),
+        guards,
+    ))
+}
+pub(crate) fn codex_pristine_endpoint(
+    registry: &crate::daemon_registry::Registry<'_>,
+    operation: &crate::controller::CodexOperation<'_>,
+) -> Result<()> {
+    let (_, socket, guards) = codex_fixed_context(registry, operation)?;
+    match fs::symlink_metadata(socket) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(ERROR.into()),
+    }
+    for guard in guards {
+        guard.recheck()?;
+    }
+    registry.verify_operation(operation)
+}
+fn pin_value(pin: &PathPin) -> crate::daemon_registry::NodePinV2 {
+    crate::daemon_registry::NodePinV2 {
+        dev: pin.dev,
+        ino: pin.ino,
+        uid: pin.uid,
+        mode: pin.mode,
+        links: pin.links,
+    }
+}
+fn codex_pin_values(
+    home: &Path,
+    socket: &Path,
+    binding: &SocketBinding,
+) -> Result<crate::daemon_registry::SocketPinsV2> {
+    use crate::daemon_registry::{NativeTargetV2, SocketPinsV2};
+    // Explicit wire order; SocketBinding's internal vector has a different order.
+    let parents = coordination_runtime_dirs(home)?
+        .iter()
+        .map(pin_value)
+        .collect();
+    let entry = PathPin::read(socket)?;
+    let native_target = if let Some((fixed, target)) = &binding.link {
+        if fixed != socket || target != &binding.path {
+            return Err(ERROR.into());
+        }
+        let mut parents = system_tmp_pins()?;
+        parents.push(PathPin::read(target.parent().ok_or(ERROR)?)?);
+        Some(NativeTargetV2 {
+            basename: target
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or(ERROR)?
+                .into(),
+            parents: parents.iter().map(pin_value).collect(),
+            leaf: pin_value(&PathPin::read(target)?),
+        })
+    } else {
+        None
+    };
+    binding.recheck()?;
+    Ok(SocketPinsV2 {
+        format_version: 1,
+        parents,
+        entry: pin_value(&entry),
+        native_target,
+    })
+}
+pub(crate) fn codex_live_pins(
+    registry: &crate::daemon_registry::Registry<'_>,
+    operation: &crate::controller::CodexOperation<'_>,
+    snapshot: &crate::daemon_registry::CodexSnapshot,
+    resolver: &CodexSocketResolver,
+) -> Result<crate::daemon_registry::SocketPinsV2> {
+    use crate::{daemon_registry::CodexPhaseV2 as P, team_replacement::ProcessState};
+    if !matches!(
+        snapshot.phase,
+        P::SpawnedUnready | P::ReadyMetadataOnly | P::StopIntentUnknown
+    ) {
+        return Err(ERROR.into());
+    }
+    let (home, socket, guards) = codex_fixed_context(registry, operation)?;
+    registry.recheck_snapshot(operation.seat(), snapshot)?;
+    let expected = snapshot.identity.as_ref().ok_or(ERROR)?;
+    if team_process::state(expected) != ProcessState::Same {
+        return Err(ERROR.into());
+    }
+    let binding = verify_socket_with(
+        &socket,
+        expected.pid,
+        |path| resolver.resolve(path),
+        socket_peer,
+    )?;
+    let values = codex_pin_values(&home, &socket, &binding)?;
+    if snapshot.phase != P::SpawnedUnready && snapshot.pins.as_ref() != Some(&values) {
+        return Err(ERROR.into());
+    }
+    if legacy_probe_pins(&home, operation.seat())? != guards
+        || resolver.resolve(&socket)? != binding
+        || team_process::state(expected) != ProcessState::Same
+    {
+        return Err(ERROR.into());
+    }
+    for guard in guards {
+        guard.recheck()?;
+    }
+    registry.recheck_snapshot(operation.seat(), snapshot)?;
+    registry.verify_operation(operation)?;
+    Ok(values)
+}
+
+#[cfg(test)]
+thread_local! { static CODEX_UNLINK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn codex_unlink_calls() -> usize {
+    CODEX_UNLINK_CALLS.with(|v| v.get())
+}
+
+// Private, non-exported deletion proof. The only target is the derived fixed
+// run basename; neither a stored path nor a caller's path can reach unlinkat.
+struct CodexCleanup {
+    parent: std::os::fd::OwnedFd,
+    parent_pin: PathPin,
+    basename: std::ffi::CString,
+    binding: SocketBinding,
+}
+impl CodexCleanup {
+    fn new(socket: PathBuf, binding: SocketBinding) -> Result<Self> {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        };
+        let parent_path = socket.parent().ok_or(ERROR)?;
+        let parent_pin = PathPin::read(parent_path)?;
+        let name = socket.file_name().ok_or(ERROR)?.as_bytes();
+        let basename = std::ffi::CString::new(name).map_err(|_| ERROR)?;
+        let path = std::ffi::CString::new(parent_path.as_os_str().as_bytes()).map_err(|_| ERROR)?;
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(ERROR.into());
+        }
+        let parent = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let result = Self {
+            parent,
+            parent_pin,
+            basename,
+            binding,
+        };
+        let _ = result.parent.as_raw_fd();
+        result.recheck()?;
+        Ok(result)
+    }
+    fn fd_pin(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe { libc::fstat(self.parent.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(ERROR.into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_dev as u64 != self.parent_pin.dev
+            || stat.st_ino as u64 != self.parent_pin.ino
+            || stat.st_uid != self.parent_pin.uid
+            || stat.st_mode as u32 != self.parent_pin.mode
+        {
+            return Err(ERROR.into());
+        }
+        self.parent_pin.recheck()
+    }
+    fn recheck(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        self.fd_pin()?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.basename.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(ERROR.into());
+        }
+        let stat = unsafe { stat.assume_init() };
+        let pin = self.binding.pins.first().ok_or(ERROR)?;
+        if stat.st_dev as u64 != pin.dev
+            || stat.st_ino as u64 != pin.ino
+            || stat.st_uid != pin.uid
+            || stat.st_mode as u32 != pin.mode
+            || stat.st_nlink as u64 != pin.links
+        {
+            return Err(ERROR.into());
+        }
+        // The binding was policy-resolved before proof creation. Recheck every
+        // pinned component and exact link target, without substituting policy.
+        self.binding.recheck()?;
+        Ok(())
+    }
+    fn unlink(self) -> Result<crate::daemon_registry::CleanupOutcomeV2> {
+        use crate::daemon_registry::CleanupOutcomeV2 as O;
+        use std::os::fd::AsRawFd;
+        // Caller has just rechecked context/revision/Gone. Recheck FD+name at
+        // the syscall too; same-UID concurrent swaps are not atomically excluded.
+        self.recheck()?;
+        #[cfg(test)]
+        CODEX_UNLINK_CALLS.with(|v| v.set(v.get() + 1));
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.basename.as_ptr(), 0) } != 0 {
+            return Err(ERROR.into());
+        }
+        self.fd_pin()?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.basename.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != -1
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT)
+        {
+            return Err(ERROR.into());
+        }
+        if self.binding.link.is_some() {
+            // Every target/system pin remains; only the first fixed-link pin
+            // is now absent. Never delete or claim cleanup of the target.
+            for pin in self.binding.pins.iter().skip(1) {
+                pin.recheck()?;
+            }
+            Ok(O::FixedLinkRemovedTargetRetained)
+        } else {
+            Ok(O::FixedDirectEntryRemoved)
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+fn native_explicit_refusal(path: &Path) -> Result<()> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    };
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(ERROR.into());
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    addr.sun_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as u8;
+    for (at, value) in addr.sun_path.iter_mut().zip(bytes) {
+        *at = *value as libc::c_char;
+    }
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(ERROR.into());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
+    {
+        return Err(ERROR.into());
+    }
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_un).cast(),
+            addr.sun_len as libc::socklen_t,
+        )
+    };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    // Only the direct connect refusal class is conclusive here. EINPROGRESS,
+    // ENOENT, EACCES, timeout, success/EOF and all other errors are NOT refusal.
+    if rc == -1 && errno == Some(libc::ECONNREFUSED) {
+        Ok(())
+    } else {
+        Err(ERROR.into())
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn native_explicit_refusal(_: &Path) -> Result<()> {
+    Err(ERROR.into())
+}
+pub(crate) fn codex_cleanup_fixed(
+    registry: &crate::daemon_registry::Registry<'_>,
+    operation: &crate::controller::CodexOperation<'_>,
+    snapshot: &crate::daemon_registry::CodexSnapshot,
+    resolver: &CodexSocketResolver,
+) -> Result<crate::daemon_registry::CleanupOutcomeV2> {
+    use crate::{daemon_registry::CodexPhaseV2, team_replacement::ProcessState};
+    if snapshot.phase != CodexPhaseV2::CleanupIntentUnknown {
+        return Err(ERROR.into());
+    }
+    let (home, socket, guards) = codex_fixed_context(registry, operation)?;
+    registry.recheck_snapshot(operation.seat(), snapshot)?;
+    let expected = snapshot.identity.as_ref().ok_or(ERROR)?;
+    if team_process::state(expected) != ProcessState::Gone {
+        return Err(ERROR.into());
+    }
+    let binding = resolver.resolve(&socket)?;
+    if snapshot.pins.as_ref() != Some(&codex_pin_values(&home, &socket, &binding)?) {
+        return Err(ERROR.into());
+    }
+    let proof = CodexCleanup::new(socket, binding)?;
+    native_explicit_refusal(&proof.binding.path)?;
+    proof.recheck()?;
+    if legacy_probe_pins(&home, operation.seat())? != guards {
+        return Err(ERROR.into());
+    }
+    for guard in guards {
+        guard.recheck()?;
+    }
+    registry.recheck_snapshot(operation.seat(), snapshot)?;
+    registry.verify_operation(operation)?;
+    if team_process::state(expected) != ProcessState::Gone {
+        return Err(ERROR.into());
+    }
+    let result = proof.unlink()?;
+    registry.recheck_snapshot(operation.seat(), snapshot)?;
+    registry.verify_operation(operation)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 pub(crate) fn registered_socket_test_observation(
     registry: &crate::daemon_registry::Registry<'_>,

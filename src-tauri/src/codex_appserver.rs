@@ -30,6 +30,409 @@ pub(crate) fn probe_registered(
         .map_err(|_| "E_CODEX_UNVERIFIED: registered Unix identity could not be observed".into())
 }
 
+// Internal C2b only. No legacy/UI/managed caller is wired to this supervisor.
+pub(crate) struct NativeCodexSpec {
+    pub seat: String,
+    pub executable: std::path::PathBuf,
+    pub codex_home: std::path::PathBuf,
+    pub provenance: crate::daemon_registry::Provenance,
+    #[cfg(test)]
+    pub fixture: Option<(std::path::PathBuf, String)>,
+    #[cfg(test)]
+    pub fault: Option<String>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CodexObservation {
+    pub identity: crate::team_replacement::ProcessIdentity,
+    pub created: bool,
+    pub wait: &'static str,
+}
+pub(crate) struct NativeCodexSupervisor<'a> {
+    lease: &'a crate::controller::ControllerLock,
+    registry: &'a crate::daemon_registry::Registry<'a>,
+    spec: NativeCodexSpec,
+}
+#[cfg(test)]
+thread_local! { static C2_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+const CODEX_UNKNOWN: &str = "E_CODEX_OPERATION_UNKNOWN";
+impl<'a> NativeCodexSupervisor<'a> {
+    pub(crate) fn new(
+        lease: &'a crate::controller::ControllerLock,
+        registry: &'a crate::daemon_registry::Registry<'a>,
+        spec: NativeCodexSpec,
+    ) -> Result<Self, String> {
+        lease.verify_live()?;
+        if !crate::agent_loader::is_valid_seat_name(&spec.seat)
+            || !spec.executable.is_absolute()
+            || !spec.codex_home.is_absolute()
+            || spec.executable.components().any(|v| {
+                !matches!(
+                    v,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+            || spec.codex_home.components().any(|v| {
+                !matches!(
+                    v,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        // Constructor is read-only. Registry creation is explicit caller setup.
+        registry.verify_read_context()?;
+        Ok(Self {
+            lease,
+            registry,
+            spec,
+        })
+    }
+    fn socket_resolver(&self) -> Result<crate::team_terminal::CodexSocketResolver, String> {
+        #[cfg(test)]
+        if let Some((root, _)) = &self.spec.fixture {
+            return crate::team_terminal::CodexSocketResolver::fixture(root);
+        }
+        Ok(crate::team_terminal::CodexSocketResolver::production())
+    }
+    fn edge(&self, point: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if self.spec.fault.as_deref() == Some(point) {
+            return Err("E_CODEX_FIXTURE_EDGE".into());
+        }
+        let _ = point;
+        Ok(())
+    }
+    fn snapshot(&self) -> Result<crate::daemon_registry::CodexSnapshot, String> {
+        self.registry
+            .codex_snapshot(&self.spec.seat)?
+            .ok_or_else(|| CODEX_UNKNOWN.into())
+    }
+    fn now() -> Result<u64, String> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_millis() as u64)
+            .map_err(|_| CODEX_UNKNOWN.into())
+    }
+    pub(crate) fn reconcile(&self) -> Result<CodexObservation, String> {
+        use crate::daemon_registry::{CodexEventV2 as E, CodexPhaseV2 as P, Identity};
+        use std::os::unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            process::CommandExt,
+        };
+        use std::process::Stdio;
+        let slot = self.lease.codex_slot(&self.spec.seat)?;
+        let mut op = slot.enter()?;
+        self.registry.verify_operation(&op)?;
+        self.registry.validate_namespace()?; // structure, NOT global readiness
+        if let Some(snapshot) = self.registry.codex_snapshot(&self.spec.seat)? {
+            if snapshot.phase != P::ReadyMetadataOnly {
+                return Err(CODEX_UNKNOWN.into());
+            }
+            crate::team_terminal::codex_live_pins(
+                self.registry,
+                &op,
+                &snapshot,
+                &self.socket_resolver()?,
+            )?;
+            return Ok(CodexObservation {
+                identity: snapshot.identity.ok_or(CODEX_UNKNOWN)?,
+                created: false,
+                wait: "NOT_OBSERVED",
+            });
+        }
+        crate::team_terminal::codex_pristine_endpoint(self.registry, &op)?;
+        crate::controller::private_dir_readonly(&self.spec.codex_home)?;
+        let exec = fs::symlink_metadata(&self.spec.executable).map_err(|_| CODEX_UNKNOWN)?;
+        if !exec.is_file() || exec.file_type().is_symlink() || exec.mode() & 0o111 == 0 {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        let id = self
+            .registry
+            .begin_codex_v2(&op, self.spec.provenance.clone(), Self::now()?)?;
+        let intent = self.snapshot()?;
+        self.edge("intent")?;
+        crate::team_terminal::codex_pristine_endpoint(self.registry, &op)?;
+        self.registry.recheck_snapshot(&self.spec.seat, &intent)?;
+        self.registry.verify_operation(&op)?;
+        let run = self.lease.run_dir()?;
+        let home = run
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or(CODEX_UNKNOWN)?;
+        let socket = run.join(format!("{}.sock", self.spec.seat));
+        let mut command = Command::new(&self.spec.executable);
+        command
+            .args(["app-server", "--listen"])
+            .arg(format!("unix://{}", socket.display()));
+        #[cfg(test)]
+        if let Some((root, mode)) = &self.spec.fixture {
+            command = Command::new(&self.spec.executable);
+            command
+                .args([
+                    "--exact",
+                    "codex_appserver::registered_tests::c2_inert_native_entry",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("APERTURE_C2_FIXTURE", root)
+                .env("APERTURE_C2_MODE", mode)
+                .env("APERTURE_C2_SOCKET", &socket);
+        }
+        command
+            .env("HOME", home)
+            .env("CODEX_HOME", &self.spec.codex_home)
+            .stdin(Stdio::null());
+        // Detached diagnostics use the existing private log convention, only
+        // after durable intent. No adopted config/log is rewritten.
+        let logs = home.join(".aperture/logs");
+        crate::journal::ensure_private_dir(&logs)?;
+        let log_path = crate::journal::validate_component_path(
+            &logs,
+            &format!("codex-{}.log", self.spec.seat),
+            true,
+        )?;
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(log_path)
+            .map_err(|_| CODEX_UNKNOWN)?;
+        let m = log.metadata().map_err(|_| CODEX_UNKNOWN)?;
+        if !m.is_file()
+            || m.uid() != unsafe { libc::geteuid() }
+            || m.nlink() != 1
+            || m.mode() & 0o777 != 0o600
+        {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        command
+            .stdout(log.try_clone().map_err(|_| CODEX_UNKNOWN)?)
+            .stderr(log);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        // Earliest spawn boundary: retained slot plus durable unchanged intent.
+        crate::team_terminal::codex_pristine_endpoint(self.registry, &op)?;
+        crate::controller::private_dir_readonly(&self.spec.codex_home)?;
+        self.registry.recheck_snapshot(&self.spec.seat, &intent)?;
+        self.registry.verify_operation(&op)?;
+        #[cfg(test)]
+        if self.spec.fault.as_deref() == Some("post-spawn-retained") {
+            op.fail_next_spawn_observation();
+        }
+        let identity = op
+            .spawn_retained(&mut command)
+            .map_err(|e| format!("{CODEX_UNKNOWN}: {e:?}"))?;
+        self.edge("spawned")?;
+        self.registry.append_codex_v2(
+            &op,
+            &id,
+            E::Spawned {
+                process: Identity::from_native(&identity)?,
+            },
+            Self::now()?,
+        )?;
+        self.edge("recorded")?;
+        let spawned = self.snapshot()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let pins = loop {
+            self.registry.recheck_snapshot(&self.spec.seat, &spawned)?;
+            self.registry.verify_operation(&op)?;
+            if crate::team_process::state(&identity) != crate::team_replacement::ProcessState::Same
+            {
+                let _ = op.try_wait();
+                return Err(CODEX_UNKNOWN.into());
+            }
+            match crate::team_terminal::codex_live_pins(
+                self.registry,
+                &op,
+                &spawned,
+                &self.socket_resolver()?,
+            ) {
+                Ok(pins) => break pins,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(_) => return Err(CODEX_UNKNOWN.into()),
+            }
+        };
+        self.registry
+            .append_codex_v2(&op, &id, E::SocketReady { pins }, Self::now()?)?;
+        self.edge("ready")?;
+        self.registry.publish_codex_v2(&op, &id)?;
+        self.edge("published")?;
+        let current = self.snapshot()?;
+        crate::team_terminal::codex_live_pins(
+            self.registry,
+            &op,
+            &current,
+            &self.socket_resolver()?,
+        )?;
+        Ok(CodexObservation {
+            identity,
+            created: true,
+            wait: "DIRECT_CHILD_RETAINED",
+        })
+    }
+    fn term_once(&self, pid: u32) -> crate::daemon_registry::TermResultV2 {
+        use crate::daemon_registry::TermResultV2 as T;
+        #[cfg(test)]
+        match self.spec.fault.as_deref() {
+            Some("term-esrch-injected") => return T::Esrch,
+            Some("term-error-injected") => return T::OtherError,
+            _ => {}
+        }
+        #[cfg(test)]
+        C2_SIGNAL_CALLS.with(|v| v.set(v.get() + 1));
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if rc == 0 { T::ReturnedZero } else if errno == Some(libc::ESRCH) { T::Esrch } else { T::OtherError }
+    }
+    fn stop_observation(&self, op: &mut crate::controller::CodexOperation<'_>,
+        identity: &crate::team_replacement::ProcessIdentity) -> Result<crate::team_replacement::ProcessState, String>
+    {
+        use crate::team_replacement::ProcessState as P;
+        #[cfg(test)]
+        match self.spec.fault.as_deref() {
+            Some("term-timeout-injected") => return Ok(P::Same),
+            Some("term-recycled-injected") => return Ok(P::Recycled),
+            Some("term-unreadable-injected") => return Ok(P::Unreadable),
+            Some("term-wait-error-injected") => return Err("E_CODEX_WAIT_UNKNOWN".into()),
+            _ => {}
+        }
+        op.try_wait()?;
+        Ok(crate::team_process::state(identity))
+    }
+    pub(crate) fn stop(
+        &self,
+        incarnation: &str,
+    ) -> Result<crate::daemon_registry::StopOutcomeV2, String> {
+        use crate::daemon_registry::{
+            CodexEventV2 as E, CodexPhaseV2 as P, StopOutcomeV2 as O, TermResultV2 as T,
+        };
+        use crate::team_replacement::ProcessState;
+        let slot = self.lease.codex_slot(&self.spec.seat)?;
+        let mut op = slot.enter()?;
+        self.registry.verify_operation(&op)?;
+        self.registry.validate_namespace()?;
+        let before = self.snapshot()?;
+        if before.incarnation != incarnation || before.phase != P::ReadyMetadataOnly {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        crate::team_terminal::codex_live_pins(
+            self.registry,
+            &op,
+            &before,
+            &self.socket_resolver()?,
+        )?;
+        self.registry
+            .append_codex_v2(&op, incarnation, E::StopIntent {}, Self::now()?)?;
+        self.edge("stop-intent")?;
+        let intent = self.snapshot()?;
+        crate::team_terminal::codex_live_pins(
+            self.registry,
+            &op,
+            &intent,
+            &self.socket_resolver()?,
+        )?;
+        self.registry.recheck_snapshot(&self.spec.seat, &intent)?;
+        self.registry.verify_operation(&op)?;
+        let identity = intent.identity.as_ref().ok_or(CODEX_UNKNOWN)?;
+        if crate::team_process::state(identity) != ProcessState::Same {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        let raw = self.term_once(identity.pid);
+        self.edge("term-sent")?;
+        self.registry.append_codex_v2(
+            &op,
+            incarnation,
+            E::TermResult {
+                result: raw.clone(),
+            },
+            Self::now()?,
+        )?;
+        let sent = self.snapshot()?;
+        let mut outcome = O::Unknown;
+        if raw == T::ReturnedZero {
+            let wait_budget = Duration::from_secs(3);
+            #[cfg(test)]
+            let wait_budget = if self.spec.fault.as_deref() == Some("term-timeout-injected") { Duration::ZERO } else { wait_budget };
+            let deadline = std::time::Instant::now() + wait_budget;
+            loop {
+                self.registry.recheck_snapshot(&self.spec.seat, &sent)?;
+                let observed = match self.stop_observation(&mut op, identity) {
+                    Ok(observed) => observed,
+                    Err(_) => break,
+                };
+                match observed {
+                    ProcessState::Gone => {
+                        outcome = O::TermSentThenDaemonGoneDescendantsUnverified;
+                        break;
+                    }
+                    ProcessState::Same if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.registry.append_codex_v2(
+            &op,
+            incarnation,
+            E::StopOutcome {
+                outcome: outcome.clone(),
+            },
+            Self::now()?,
+        )?;
+        Ok(outcome)
+    }
+    pub(crate) fn cleanup(
+        &self,
+        incarnation: &str,
+    ) -> Result<crate::daemon_registry::CleanupOutcomeV2, String> {
+        use crate::daemon_registry::{CleanupOutcomeV2 as O, CodexEventV2 as E, CodexPhaseV2 as P};
+        let slot = self.lease.codex_slot(&self.spec.seat)?;
+        let op = slot.enter()?;
+        self.registry.verify_operation(&op)?;
+        self.registry.validate_namespace()?;
+        let before = self.snapshot()?;
+        if before.incarnation != incarnation
+            || before.phase != P::TermSentThenDaemonGoneDescendantsUnverified
+        {
+            return Err(CODEX_UNKNOWN.into());
+        }
+        self.registry
+            .append_codex_v2(&op, incarnation, E::CleanupIntent {}, Self::now()?)?;
+        self.edge("cleanup-intent")?;
+        let intent = self.snapshot()?;
+        let outcome = crate::team_terminal::codex_cleanup_fixed(
+            self.registry,
+            &op,
+            &intent,
+            &self.socket_resolver()?,
+        )
+        .unwrap_or(O::Unknown);
+        self.edge("cleanup-effect")?;
+        self.registry.append_codex_v2(
+            &op,
+            incarnation,
+            E::CleanupOutcome {
+                outcome: outcome.clone(),
+            },
+            Self::now()?,
+        )?;
+        Ok(outcome)
+    }
+}
+
 #[cfg(test)]
 #[path = "codex_appserver_tests.rs"]
 mod registered_tests;

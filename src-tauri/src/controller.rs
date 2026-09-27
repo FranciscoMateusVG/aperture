@@ -257,6 +257,10 @@ impl ControllerLock {
 struct CodexSlotState {
     child: Option<std::process::Child>,
     identity: Option<crate::team_replacement::ProcessIdentity>,
+    #[cfg(test)]
+    fail_after_spawn: bool,
+    #[cfg(test)]
+    spawn_attempts: usize,
 }
 /// An operational handle, not a value returned by Registry observation.
 pub(crate) struct CodexSlot<'a> {
@@ -289,6 +293,12 @@ impl CodexSlot<'_> {
         })
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CodexSpawnError {
+    Refused,
+    SpawnUnknown,
+    PostSpawnUnknown,
+}
 impl CodexOperation<'_> {
     pub(crate) fn seat(&self) -> &str {
         self.seat
@@ -301,6 +311,56 @@ impl CodexOperation<'_> {
             return Err("E_CONTROLLER_CONTEXT".into());
         }
         self.lease.verify_live()
+    }
+    /// Single operational spawn-to-retention primitive. No fallible operation
+    /// occurs between successful spawn and installation into the occupied slot.
+    pub(crate) fn spawn_retained(
+        &mut self,
+        command: &mut std::process::Command,
+    ) -> Result<crate::team_replacement::ProcessIdentity, CodexSpawnError> {
+        if !std::path::Path::new(command.get_program()).is_absolute()
+            || self.state.child.is_some()
+            || self.lease.verify_live().is_err()
+        {
+            return Err(CodexSpawnError::Refused);
+        }
+        #[cfg(test)]
+        {
+            self.state.spawn_attempts += 1;
+        }
+        let child = command.spawn().map_err(|_| CodexSpawnError::SpawnUnknown)?;
+        self.state.child = Some(child);
+        #[cfg(test)]
+        if self.state.fail_after_spawn {
+            return Err(CodexSpawnError::PostSpawnUnknown);
+        }
+        self.lease
+            .verify_live()
+            .map_err(|_| CodexSpawnError::PostSpawnUnknown)?;
+        let pid = self.state.child.as_ref().unwrap().id();
+        let native = crate::team_process::observe(pid)
+            .map_err(|_| CodexSpawnError::PostSpawnUnknown)?
+            .ok_or(CodexSpawnError::PostSpawnUnknown)?;
+        if native.ppid != std::process::id()
+            || native.uid != unsafe { libc::geteuid() }
+            || native.pgid != pid
+        {
+            return Err(CodexSpawnError::PostSpawnUnknown);
+        }
+        self.state.identity = Some(native.identity.clone());
+        Ok(native.identity)
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_spawn_observation(&mut self) {
+        self.state.fail_after_spawn = true;
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_pid(&self) -> Option<u32> {
+        self.state.child.as_ref().map(|c| c.id())
+    }
+    #[cfg(test)]
+    pub(crate) fn spawn_attempts(&self) -> usize {
+        self.state.spawn_attempts
     }
     /// Retain wait ownership without exporting Child or signal authority. On
     /// rejection return ownership to the operational caller, never kill/drop it

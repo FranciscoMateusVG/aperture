@@ -355,6 +355,17 @@ pub(crate) struct CodexMetadataV2 {
     pub phase: CodexPhaseV2,
     pub entries: usize,
 }
+/// Value-only observation; opaque revision binds every validated fact/current
+/// value, including operation/timestamps not exposed as a caller capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexSnapshot {
+    pub incarnation: String,
+    pub identity: Option<ProcessIdentity>,
+    pub phase: CodexPhaseV2,
+    pub provenance: Provenance,
+    pub pins: Option<SocketPinsV2>,
+    revision: [u8; 32],
+}
 fn budget(used: usize, additional: usize) -> Result<()> {
     if used.checked_add(additional).map_or(true, |n| n > MAX_FACTS) {
         Err(fail("E_DAEMON_CAPACITY"))
@@ -737,6 +748,53 @@ impl<'a> Registry<'a> {
             Err(_) => Err(fail("E_DAEMON_PATH")),
             Ok(_) => self.codex_view(&slot, &self.history(&slot)?).map(Some),
         }
+    }
+    pub(crate) fn validate_namespace(&self) -> Result<usize> {
+        self.namespace_slots()
+    }
+    /// Verifies a separately acquired operation; never returns its lease/guard.
+    pub(crate) fn verify_operation(
+        &self,
+        operation: &crate::controller::CodexOperation<'_>,
+    ) -> Result<()> {
+        operation.verify_for(self.lease)?;
+        self.checked_root()
+    }
+    pub(crate) fn codex_snapshot(&self, seat: &str) -> Result<Option<CodexSnapshot>> {
+        use sha2::{Digest, Sha256};
+        let slot = Endpoint::CodexAppServer { seat: seat.into() }.slot()?;
+        self.checked_root()?;
+        match fs::symlink_metadata(self.root.join(&slot)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(fail("E_DAEMON_PATH")),
+            Ok(_) => {}
+        }
+        let h = self.history(&slot)?;
+        let view = self.codex_view(&slot, &h)?;
+        let provenance = match &h.codex[&0].event {
+            CodexEventV2::SpawnIntent { provenance, .. } => provenance.clone(),
+            _ => return Err(fail("E_CODEX_METADATA")),
+        };
+        let pins = h.codex.get(&2).and_then(|f| match &f.event {
+            CodexEventV2::SocketReady { pins } => Some(pins.clone()),
+            _ => None,
+        });
+        let bytes =
+            serde_json::to_vec(&(&h.codex, &h.current)).map_err(|_| fail("E_CODEX_METADATA"))?;
+        Ok(Some(CodexSnapshot {
+            incarnation: view.incarnation,
+            identity: view.process,
+            phase: view.phase,
+            provenance,
+            pins,
+            revision: Sha256::digest(bytes).into(),
+        }))
+    }
+    pub(crate) fn recheck_snapshot(&self, seat: &str, expected: &CodexSnapshot) -> Result<()> {
+        if self.codex_snapshot(seat)?.as_ref() != Some(expected) {
+            return Err(fail("E_CODEX_REVISION_CHANGED"));
+        }
+        self.verify_read_context()
     }
     /// Metadata intent only. First C2a writer: one pristine incarnation forever.
     /// No external-effect callback exists; full future operation budget is paid
