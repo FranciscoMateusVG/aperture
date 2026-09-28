@@ -13,21 +13,24 @@ export async function initializeBrowserSession(): Promise<boolean> {
   const link = document.createElement("button"); link.textContent = "Open another window";
   panel.append(status, link, logout);
   document.getElementById("navbar")!.append(panel);
-  const onEnded = () => { status.textContent = "Session ended; reopen Aperture"; link.disabled = logout.disabled = true; };
+  let incompatible = false;
+  let ended = false;
+  const onEnded = () => { ended = true; status.textContent = "Session ended; reopen Aperture"; link.disabled = logout.disabled = true; };
   if (window.location.origin !== CANONICAL_ORIGIN) { onEnded(); return false; }
-  const onIncompatible = () => { status.textContent = "UI/API incompatible; reload Aperture"; link.disabled = true; };
+  const onIncompatible = () => { incompatible = true; status.textContent = "UI/API incompatible; reload Aperture"; link.disabled = true; };
   try {
     const web = createWebTransport({ fetch: window.fetch.bind(window), storage: window.sessionStorage, onEnded, onIncompatible });
     setCommandTransport(web.call);
     logout.onclick = async () => {
       logout.disabled = true;
-      try { await web.logout(); } catch { status.textContent = "Logout unconfirmed; retry or close this window"; logout.disabled = false; }
+      try { await web.logout(); } catch { if (!incompatible && !ended) status.textContent = "Logout unconfirmed; retry or close this window"; logout.disabled = ended; }
     };
     link.onclick = async () => {
+      if (link.disabled || incompatible || ended) return;
       link.disabled = true;
       try { window.open(await web.link(), "_blank", "noopener,noreferrer"); }
-      catch { status.textContent = "New window unavailable; reopen Aperture"; }
-      finally { link.disabled = false; }
+      catch { if (!incompatible && !ended) status.textContent = "New window unavailable; reopen Aperture"; }
+      finally { link.disabled = incompatible || ended; }
     };
     if (exchange !== null) await web.exchange(exchange);
     await web.resume(); // Includes schema gate before main init/polling/mutations.
