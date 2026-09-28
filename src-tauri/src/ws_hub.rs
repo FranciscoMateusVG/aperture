@@ -50,6 +50,23 @@ fn resolve_node() -> String {
     "node".to_string()
 }
 
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub(crate) struct HubScriptPin {path:PathBuf,dev:u64,ino:u64,uid:u32,mode:u32,nlink:u64,len:u64,mtime:(i64,i64),ctime:(i64,i64)}
+impl HubScriptPin {
+    fn capture(path:&Path)->Result<Self,String>{
+        if !path.is_absolute(){return Err("E_HUB_SCRIPT_PATH".into());}
+        let f=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map_err(|_|"E_HUB_SCRIPT_UNVERIFIED")?;
+        let m=f.metadata().map_err(|_|"E_HUB_SCRIPT_UNVERIFIED")?;
+        if !m.is_file()||m.uid()!=unsafe{libc::geteuid()}||m.nlink()!=1||m.mode()&0o7022!=0||m.mode()&0o400==0||m.len()>8*1024*1024{return Err("E_HUB_SCRIPT_UNVERIFIED".into());}
+        let of=|m:&std::fs::Metadata|Self{path:path.into(),dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),nlink:m.nlink(),len:m.len(),mtime:(m.mtime(),m.mtime_nsec()),ctime:(m.ctime(),m.ctime_nsec())};
+        let pin=of(&m);let mut bytes=Vec::new();let mut f=f;
+        (&mut f).take(8*1024*1024+1).read_to_end(&mut bytes).map_err(|_|"E_HUB_SCRIPT_UNVERIFIED")?;
+        if bytes.len() as u64!=pin.len||of(&f.metadata().map_err(|_|"E_HUB_SCRIPT_UNVERIFIED")?)!=pin{return Err("E_HUB_SCRIPT_DRIFT".into());}
+        let rebound=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map_err(|_|"E_HUB_SCRIPT_UNVERIFIED")?;
+        if of(&rebound.metadata().map_err(|_|"E_HUB_SCRIPT_UNVERIFIED")?)!=pin{return Err("E_HUB_SCRIPT_DRIFT".into());}Ok(pin)
+    }
+    fn recheck(&self)->Result<(),String>{if Self::capture(&self.path)?!=*self{return Err("E_HUB_SCRIPT_DRIFT".into());}Ok(())}
+}
 /// Fixed native launch parameters. Production and inert fixtures use the same
 /// supervisor, spawn/record and pre-bearer proof path, not copied algorithms.
 pub(crate) struct HubSpec {
@@ -58,6 +75,8 @@ pub(crate) struct HubSpec {
     pub endpoint: SocketAddr,
     pub home: PathBuf,
     pub env: Vec<(String,String)>,
+    pub script_pin: Option<HubScriptPin>,
+    pub executable_pin: Option<crate::daemons::ToolPin>,
     pub provenance: Provenance,
     #[cfg(test)]
     pub fault: Option<String>,
@@ -76,7 +95,7 @@ pub(crate) struct Supervisor<'a> {
     spec: HubSpec,
 }
 impl<'a> Supervisor<'a> {
-    pub(crate) fn new(lease: &'a ControllerLock, spec: HubSpec) -> Result<Self, String> {
+    pub(crate) fn new(lease: &'a ControllerLock, mut spec: HubSpec) -> Result<Self, String> {
         lease.verify_live()?;
         if spec.endpoint.ip() != Ipv4Addr::LOCALHOST
             || spec.endpoint.port() == 0
@@ -85,6 +104,9 @@ impl<'a> Supervisor<'a> {
         {
             return Err(UNVERIFIED.into());
         }
+        let executable_pin=match spec.executable_pin.take(){Some(pin)=>pin,None=>crate::daemons::ToolPin::capture(&spec.command)?};
+        if executable_pin.path!=spec.command{return Err(UNVERIFIED.into());}executable_pin.recheck()?;
+        spec.executable_pin=Some(executable_pin);
         Ok(Self { lease, spec })
     }
     fn edge(&self, point: &str) -> Result<(), String> {
@@ -96,6 +118,7 @@ impl<'a> Supervisor<'a> {
         Ok(())
     }
     pub(crate) fn reconcile(&mut self) -> Result<HubObservation, String> {
+        if let Some(pin)=&self.spec.script_pin {pin.recheck()?;}
         let _flight = self.lease.hub_transition()?;
         let registry = Registry::open(self.lease)?;
         registry.validate_namespace()?; // namespace structure is not target adoption
@@ -147,7 +170,8 @@ impl<'a> Supervisor<'a> {
         self.edge("reserved")?;
         self.lease.verify_live()?;
         crate::hub_auth::provision_under_lease(self.lease,"watchdog")?;
-        let executable_pin=crate::daemons::ToolPin::capture(&self.spec.command)?;
+        let executable_pin=self.spec.executable_pin.as_ref().ok_or(UNVERIFIED)?;
+        executable_pin.recheck()?;
         let mut command = Command::new(&self.spec.command);
         command.env_clear().envs(self.spec.env.clone());
         command
@@ -205,6 +229,8 @@ impl<'a> Supervisor<'a> {
         }
         executable_pin.recheck()?;
         self.lease.verify_live()?;
+        #[cfg(test)] snapshot_tests::local_script_drift(&self.spec);
+        if let Some(pin)=&self.spec.script_pin {pin.recheck()?;}
         drop(free);
         let child = command.spawn().map_err(|_| "E_HUB_SPAWN_UNKNOWN")?;
         let pid = child.id();
@@ -254,13 +280,10 @@ fn now_ms() -> Result<u64, String> {
 /// Local installed composition; tool selection is complete before entering here.
 pub(crate) fn local_spec(lease:&ControllerLock,tools:&crate::daemons::LocalTools,script:&Path)->Result<HubSpec,String>{
     tools.node.recheck()?;
-    let meta=std::fs::symlink_metadata(script).map_err(|_|"E_LOCAL_MCP_PATH")?;
-    if !script.is_absolute() || !meta.is_file() || meta.file_type().is_symlink() || meta.mode()&0o022!=0 {
-        return Err("E_LOCAL_MCP_PATH".into());
-    }
+    let script_pin=Some(HubScriptPin::capture(script)?);
     let home=lease.run_dir()?.parent().and_then(Path::parent).ok_or(UNVERIFIED)?.to_path_buf();
     let spec=HubSpec{command:tools.node.path.clone(),args:vec![script.as_os_str().into()],
-        endpoint:SocketAddr::from((Ipv4Addr::LOCALHOST,HUB_PORT)),home,env:tools.environment(),provenance:Provenance::LegacyUnknown,
+        endpoint:SocketAddr::from((Ipv4Addr::LOCALHOST,HUB_PORT)),home,env:tools.environment(),script_pin,executable_pin:Some(tools.node.clone()),provenance:Provenance::LegacyUnknown,
         #[cfg(test)] fault:None,#[cfg(test)] fixture_mode:String::new()};
     Ok(spec)
 }
@@ -281,6 +304,8 @@ pub(crate) fn spawn_ws_hub(lease: &ControllerLock, project_dir: String) -> Resul
         endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, HUB_PORT)),
         home,
         env:vec![],
+        executable_pin:None,
+        script_pin:Some(HubScriptPin::capture(&Path::new(&project_dir).join("mcp-server/dist/ws-hub.js"))?),
         provenance: Provenance::LegacyUnknown,
         #[cfg(test)]
         fault: None,

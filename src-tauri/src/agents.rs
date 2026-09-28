@@ -187,6 +187,8 @@ fn with_lifecycle_plan(
 pub(crate) struct LocalCodexPreparation<'a> {
     context: &'a LifecycleContext<'a>, state:&'a Arc<Mutex<AppState>>, expected:&'a AgentDef,
     codex_home:std::path::PathBuf, bus:String, sentry:String, project:String,
+    bus_pin:LocalInputPin, sentry_pin:LocalInputPin,
+    #[cfg(test)] drift_point: Option<&'static str>,
 }
 impl LocalCodexPreparation<'_> {
     pub(crate) fn seat(&self)->&str{&self.expected.name}
@@ -198,15 +200,16 @@ impl LocalCodexPreparation<'_> {
         if state.mcp_server_path!=self.bus || state.mcp_sentry_server_path!=self.sentry || state.project_dir!=self.project {
             return Err(LifecycleRefusal::PlanChanged.code().into());
         }
-        for path in [&self.bus,&self.sentry] { local_regular_bytes(std::path::Path::new(path),8*1024*1024)?; }
+        self.bus_pin.recheck(std::path::Path::new(&self.bus))?;
+        self.sentry_pin.recheck(std::path::Path::new(&self.sentry))?;
         Ok(())
     }
-    fn configuration(&self)->Result<toml::Value,String>{
+    fn configuration(&self)->Result<(toml::Value,LocalInputPin),String>{
         self.recheck()?;
         let path=self.codex_home.join("config.toml");
-        let bytes=local_regular_bytes(&path,256*1024)?;
+        let (bytes,pin)=local_pinned_bytes(&path,256*1024)?;
         use std::os::unix::fs::MetadataExt;
-        if fs::symlink_metadata(&path).map_err(|_|"E_LOCAL_CODEX_CONFIG")?.mode()&0o777!=0o600 {
+        if pin.mode&0o777!=0o600 {
             return Err("E_LOCAL_CODEX_CONFIG_PRIVATE_REQUIRED".into());
         }
         let config:toml::Value=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_CODEX_CONFIG")?.parse().map_err(|_|"E_LOCAL_CODEX_CONFIG")?;
@@ -216,10 +219,10 @@ impl LocalCodexPreparation<'_> {
             let server=servers.get(name).and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
             if server.get("env").is_some_and(|v|!v.is_table()){return Err("E_LOCAL_CODEX_CONFIG".into());}
         }
-        Ok(config)
+        Ok((config,pin))
     }
     pub(crate) fn prepare(&self)->Result<(),String>{
-        let mut config=self.configuration()?;
+        let (mut config,config_pin)=self.configuration()?;
         let config_path=self.codex_home.join("config.toml");
         let table=config.as_table_mut().ok_or("E_LOCAL_CODEX_CONFIG")?;
         // Preserve operator trust/approvals/provider configuration verbatim in
@@ -233,6 +236,8 @@ impl LocalCodexPreparation<'_> {
         }
         // All shape/path/plan checks precede token rotation and the config write.
         self.recheck()?;
+        #[cfg(test)] lifecycle_tests::local_config_drift(self,"before-token");
+        config_pin.recheck(&config_path)?;
         let token=hub_auth::provision_under_lease(self.context.lease,&self.expected.name)?;
         for (name,path) in [("aperture-bus",&self.bus),("sentry",&self.sentry)] {
             let server=servers.get_mut(name).and_then(toml::Value::as_table_mut).ok_or("E_LOCAL_CODEX_CONFIG")?;
@@ -244,17 +249,35 @@ impl LocalCodexPreparation<'_> {
         }
         let output=toml::to_string(&config).map_err(|_|"E_LOCAL_CODEX_CONFIG")?;
         self.recheck()?;
+        #[cfg(test)] lifecycle_tests::local_config_drift(self,"before-replace");
+        config_pin.recheck(&config_path)?;
         crate::journal::write_private_bytes_atomic(&config_path,output.as_bytes(),true)
     }
 }
-fn local_regular_bytes(path:&std::path::Path,cap:u64)->Result<Vec<u8>,String>{
-    use std::os::unix::fs::{OpenOptionsExt,MetadataExt};use std::io::Read;
+#[derive(Clone,Debug,PartialEq,Eq)]
+struct LocalInputPin {dev:u64,ino:u64,uid:u32,mode:u32,nlink:u64,len:u64,mtime:(i64,i64),ctime:(i64,i64)}
+impl LocalInputPin {
+    fn of(m:&fs::Metadata)->Self {use std::os::unix::fs::MetadataExt;Self{dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),nlink:m.nlink(),len:m.len(),mtime:(m.mtime(),m.mtime_nsec()),ctime:(m.ctime(),m.ctime_nsec())}}
+    fn recheck(&self,path:&std::path::Path)->Result<(),String>{
+        let f=local_input_fd(path,self.len)?;
+        if Self::of(&f.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?)!=*self {return Err("E_LOCAL_INPUT_DRIFT".into());}Ok(())
+    }
+}
+fn local_input_fd(path:&std::path::Path,cap:u64)->Result<fs::File,String>{
+    use std::os::unix::fs::{OpenOptionsExt,MetadataExt};
     let file=fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map_err(|_|"E_LOCAL_INPUT_MISSING")?;
     let m=file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
-    if !m.is_file() || m.nlink()!=1 || m.uid()!=unsafe{libc::geteuid()} || m.mode()&0o022!=0 || m.len()>cap {return Err("E_LOCAL_INPUT_UNVERIFIED".into());}
-    let mut bytes=Vec::new();file.take(cap+1).read_to_end(&mut bytes).map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
-    if bytes.len() as u64>cap{return Err("E_LOCAL_INPUT_UNVERIFIED".into());}Ok(bytes)
+    if !m.is_file() || m.nlink()!=1 || m.uid()!=unsafe{libc::geteuid()} || m.mode()&0o7022!=0 || m.mode()&0o400==0 || m.len()>cap {return Err("E_LOCAL_INPUT_UNVERIFIED".into());}Ok(file)
 }
+fn local_pinned_bytes(path:&std::path::Path,cap:u64)->Result<(Vec<u8>,LocalInputPin),String>{
+    use std::io::Read;
+    let mut file=local_input_fd(path,cap)?;
+    let pin=LocalInputPin::of(&file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?);
+    let mut bytes=Vec::new();(&mut file).take(cap+1).read_to_end(&mut bytes).map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
+    if bytes.len() as u64!=pin.len || bytes.len() as u64>cap || LocalInputPin::of(&file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?)!=pin {return Err("E_LOCAL_INPUT_DRIFT".into());}
+    pin.recheck(path)?;Ok((bytes,pin))
+}
+fn local_regular_bytes(path:&std::path::Path,cap:u64)->Result<Vec<u8>,String>{local_pinned_bytes(path,cap).map(|(bytes,_)|bytes)}
 fn shell_quote(value:&str)->String{format!("'{}'",value.replace('\'',"'\\''"))}
 fn wait_local_thread(path:&std::path::Path,work:&crate::daemons::RuntimeWork)->Result<String,String>{
     let until=std::time::Instant::now()+std::time::Duration::from_secs(60);
@@ -282,7 +305,9 @@ fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&Lif
     let home=std::path::PathBuf::from(format!("/private/tmp/aperture-codex-{}",expected.name));
     crate::controller::private_dir_readonly(&home).map_err(|_|"E_LOCAL_CODEX_HOME_REQUIRED: existing configured private per-agent home required")?;
     let (bus,sentry,project,session)={let s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;(s.mcp_server_path.clone(),s.mcp_sentry_server_path.clone(),s.project_dir.clone(),s.tmux_session.clone())};
-    let plan=LocalCodexPreparation{context,state,expected,codex_home:home.clone(),bus,sentry,project};
+    let bus_pin=local_pinned_bytes(std::path::Path::new(&bus),8*1024*1024)?.1;
+    let sentry_pin=local_pinned_bytes(std::path::Path::new(&sentry),8*1024*1024)?.1;
+    let plan=LocalCodexPreparation{context,state,expected,codex_home:home.clone(),bus,sentry,project,bus_pin,sentry_pin,#[cfg(test)]drift_point:None};
     plan.configuration()?; // input shape/modes before registry or durable intent
     let registry=crate::daemon_registry::Registry::open(context.lease)?;
     if registry.codex_snapshot(&expected.name)?.is_none() {
@@ -498,6 +523,64 @@ pub fn boot_agent_process(
     let mut op = slot.enter()?;
     boot_agent_process_held(&context, &mut op, agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir)
 }
+struct LocalClaudeStaging {root:std::path::PathBuf, directory:fs::File, identity:(u64,u64,u32,u32), written:std::cell::RefCell<Vec<(String,LocalInputPin)>>}
+impl LocalClaudeStaging {
+    fn prepare(context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>,seat:&str)->Result<Self,String>{
+        use std::os::unix::fs::MetadataExt;
+        context.classify(seat)?;op.verify_for(context.lease)?;
+        if op.seat()!=seat{return Err("E_LIFECYCLE_CONTEXT_MISMATCH".into());}
+        use std::os::{fd::{AsRawFd,FromRawFd},unix::fs::OpenOptionsExt};
+        fn child(parent:&fs::File,name:&str)->Result<fs::File,String>{
+            let name=std::ffi::CString::new(name).map_err(|_|"E_LOCAL_STAGING")?;
+            let flags=libc::O_RDONLY|libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC;
+            let mut fd=unsafe{libc::openat(parent.as_raw_fd(),name.as_ptr(),flags)};
+            if fd<0 && std::io::Error::last_os_error().raw_os_error()==Some(libc::ENOENT){
+                if unsafe{libc::mkdirat(parent.as_raw_fd(),name.as_ptr(),0o700)}!=0{return Err("E_LOCAL_STAGING".into());}
+                fd=unsafe{libc::openat(parent.as_raw_fd(),name.as_ptr(),flags)};
+            }
+            if fd<0{return Err("E_LOCAL_STAGING".into());}let f=unsafe{fs::File::from_raw_fd(fd)};
+            let m=f.metadata().map_err(|_|"E_LOCAL_STAGING")?;
+            if !m.is_dir()||m.uid()!=unsafe{libc::geteuid()}||m.mode()&0o7777!=0o700{return Err("E_LOCAL_STAGING".into());}Ok(f)
+        }
+        let run=context.lease.run_dir()?;
+        let run_fd=fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC).open(&run).map_err(|_|"E_LOCAL_STAGING")?;
+        let parent=child(&run_fd,"launch")?;let directory=child(&parent,seat)?;
+        let root=run.join("launch").join(seat);let m=directory.metadata().map_err(|_|"E_LOCAL_STAGING")?;
+        let out=Self{root,directory,identity:(m.dev(),m.ino(),m.uid(),m.mode()),written:Default::default()};
+        out.recheck_empty(context,op)?;Ok(out)
+    }
+    fn recheck(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        use std::os::unix::fs::MetadataExt;
+        context.classify(op.seat())?;op.verify_for(context.lease)?;
+        crate::controller::private_dir_readonly(&self.root)?;
+        for m in [self.directory.metadata().map_err(|_|"E_LOCAL_STAGING")?,fs::symlink_metadata(&self.root).map_err(|_|"E_LOCAL_STAGING")?]{
+            if (m.dev(),m.ino(),m.uid(),m.mode())!=self.identity{return Err("E_LOCAL_STAGING_DRIFT".into());}
+        }Ok(())
+    }
+    fn recheck_empty(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        self.recheck(context,op)?;
+        for name in ["mcp.json","prompt.md","launch.sh"]{match fs::symlink_metadata(self.root.join(name)){
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},_=>return Err("E_LOCAL_STAGING_EXISTS".into())
+        }}Ok(())
+    }
+    fn write_new(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>,name:&str,bytes:&[u8],mode:u32)->Result<(),String>{
+        use std::os::fd::{AsRawFd,FromRawFd};use std::io::Write;
+        if !matches!((name,mode),("mcp.json",0o600)|("prompt.md",0o600)|("launch.sh",0o700)){return Err("E_LOCAL_STAGING".into());}
+        self.recheck(context,op)?;let leaf=std::ffi::CString::new(name).map_err(|_|"E_LOCAL_STAGING")?;
+        let fd=unsafe{libc::openat(self.directory.as_raw_fd(),leaf.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC,mode)};
+        if fd<0{return Err("E_LOCAL_STAGING_EXISTS".into());}let mut f=unsafe{fs::File::from_raw_fd(fd)};
+        let initial=LocalInputPin::of(&f.metadata().map_err(|_|"E_LOCAL_STAGING")?);
+        if initial.uid!=unsafe{libc::geteuid()} || initial.nlink!=1 || initial.mode&0o7777!=mode || initial.mode&libc::S_IFMT as u32!=libc::S_IFREG as u32{return Err("E_LOCAL_STAGING".into());}
+        f.write_all(bytes).and_then(|_|f.sync_all()).map_err(|_|"E_LOCAL_STAGING")?;
+        let pin=LocalInputPin::of(&f.metadata().map_err(|_|"E_LOCAL_STAGING")?);pin.recheck(&self.root.join(name))?;
+        self.recheck(context,op)?;self.written.borrow_mut().push((name.into(),pin));Ok(())
+    }
+    fn recheck_written(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        self.recheck(context,op)?;
+        if self.written.borrow().len()!=3{return Err("E_LOCAL_STAGING_INCOMPLETE".into());}
+        for (name,pin) in self.written.borrow().iter(){pin.recheck(&self.root.join(name))?;}Ok(())
+    }
+}
 fn boot_agent_process_held(
     context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>,
     agent: &AgentDef, tmux_session: String, mcp_server_path: String,
@@ -520,11 +603,18 @@ fn boot_agent_process_held(
     let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;
     let tools=work.tools()?;
     let claude=tools.claude.as_ref().ok_or("E_LOCAL_CLAUDE_MISSING")?;claude.recheck()?;
-    if find_running_window(&tmux::list_windows_local(&tmux_session,work)?,&name).is_some(){return Err("E_LOCAL_PANE_ALREADY_PRESENT".into());}
+    // Launch exclusion is not UI liveness: a retained shell also owns this
+    // exact seat name. Never recreate/reuse it after an uncertain attempt.
+    if tmux::list_windows_local(&tmux_session,work)?.iter().any(|window|window.name==name){
+        return Err("E_LOCAL_PANE_ALREADY_PRESENT".into());
+    }
+    let staging=LocalClaudeStaging::prepare(context,op,&name)?;
+    let bus_pin=local_pinned_bytes(std::path::Path::new(&mcp_server_path),8*1024*1024)?.1;
+    let sentry_pin=local_pinned_bytes(std::path::Path::new(&mcp_sentry_server_path),8*1024*1024)?.1;
     let window_id = tmux::create_window_local(&tmux_session,&name,work)?;
-    // From this point onward every failure must remove the already-created
-    // window. Otherwise the watchdog sees a half-booted agent and respawns it
-    // repeatedly, leaving orphan panes behind.
+    // Every subsequent failure retains the pane; the next Start consults the
+    // real window list above, including shells. External removal/rename is not
+    // durable reconciliation and is deliberately outside this bounded guard.
     let boot_result = (|| -> Result<String, String> {
 
     // Ensure agent's mailbox directory exists
@@ -550,6 +640,9 @@ fn boot_agent_process_held(
     let claude_bin = claude.path.to_string_lossy().into_owned();
     let pane_codex_bin = std::env::var("APERTURE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let launcher_path_prefix = std::env::var("APERTURE_LAUNCHER_PATH_PREFIX").ok();
+    staging.recheck_empty(context,op)?;
+    bus_pin.recheck(std::path::Path::new(&mcp_server_path))?;
+    sentry_pin.recheck(std::path::Path::new(&mcp_sentry_server_path))?;
     let hub_token_path = hub_auth::provision_under_lease(context.lease,&name)?;
     let hub_token_path = hub_token_path.to_string_lossy().into_owned();
 
@@ -601,7 +694,7 @@ fn boot_agent_process_held(
         }
     });
 
-    let launcher_path = format!("/tmp/aperture-launch-{}.sh", name);
+    let launcher_path = staging.root.join("launch.sh").to_string_lossy().into_owned();
     let launcher_script = if agent.model.starts_with("codex/") {
         let bare_model = agent.model.trim_start_matches("codex/");
         let codex_home = format!("/tmp/aperture-codex-{}", name);
@@ -713,12 +806,8 @@ fn boot_agent_process_held(
             &sock_path,
         )
     } else {
-        let config_path = format!("/tmp/aperture-mcp-{}.json", name);
-        fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&mcp_config).unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
+        let config_path = staging.root.join("mcp.json").to_string_lossy().into_owned();
+        staging.write_new(context,op,"mcp.json",serde_json::to_string_pretty(&mcp_config).map_err(|_|"E_LOCAL_MCP_CONFIG")?.as_bytes(),0o600)?;
 
         // Read prompt and inject agent-specific skills. Resident/lazy split
         // parity with the Codex path (aperture-g4hku): when resident.txt
@@ -729,8 +818,8 @@ fn boot_agent_process_held(
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);
-        let prompt_path = format!("/tmp/aperture-prompt-{}.md", name);
-        fs::write(&prompt_path, &prompt_content).map_err(|e| e.to_string())?;
+        let prompt_path = staging.root.join("prompt.md").to_string_lossy().into_owned();
+        staging.write_new(context,op,"prompt.md",prompt_content.as_bytes(),0o600)?;
 
         let mut env=tools.environment();
         env.push(("APERTURE_HUB_TOKEN_FILE".into(),hub_token_path.clone()));
@@ -739,10 +828,10 @@ fn boot_agent_process_held(
         format!("#!/bin/sh\nset -eu\ncd {}\nPROMPT=$(/bin/cat {})\nexec /usr/bin/env -i {} {} --dangerously-skip-permissions --model {} --system-prompt \"$PROMPT\" --mcp-config {} --name {} {}\n",
             shell_quote(&project_dir),shell_quote(&prompt_path),assignments,shell_quote(&claude_bin),shell_quote(&agent.model),shell_quote(&config_path),shell_quote(&name),shell_quote(launcher::KICKOFF_TEXT))
     };
-    fs::write(&launcher_path, &launcher_script).map_err(|e| e.to_string())?;
-
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&launcher_path,fs::Permissions::from_mode(0o700)).map_err(|_|"E_LOCAL_LAUNCHER")?;
+    staging.write_new(context,op,"launch.sh",launcher_script.as_bytes(),0o700)?;
+    staging.recheck_written(context,op)?;
+    bus_pin.recheck(std::path::Path::new(&mcp_server_path))?;
+    sentry_pin.recheck(std::path::Path::new(&mcp_sentry_server_path))?;
     claude.recheck()?;work.check_open()?;
     tmux::send_local(&window_id,&shell_quote(&launcher_path),work)?;
 

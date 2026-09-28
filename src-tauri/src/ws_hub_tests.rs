@@ -231,6 +231,8 @@ impl NativeFixture {
             endpoint: self.endpoint,
             home: self.home.clone(),
             env:vec![],
+            script_pin:None,
+            executable_pin:None,
             provenance: Provenance::LegacyUnknown,
             fault: None,
             fixture_mode: String::new(),
@@ -367,6 +369,8 @@ fn inert_process_entry() {
             endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
             home: home.clone(),
             env:vec![],
+            script_pin:None,
+            executable_pin:None,
             provenance: Provenance::LegacyUnknown,
             fault: None,
             fixture_mode: "normal".into(),
@@ -1039,4 +1043,22 @@ fn local_composition_unknown_hub_closes_without_token_rotation_or_spawn() {
     assert_eq!(fs::read(f.home.join(".aperture/run/hub-tokens/watchdog.token")).unwrap(),token);
     assert!(!f.home.join(".aperture/run/daemons/hub").exists());
     drop(owner);drop(f);
+}
+
+pub(super) fn local_script_drift(spec:&HubSpec){
+    if spec.fault.as_deref()==Some("local-script-drift") {
+        let path=&spec.script_pin.as_ref().unwrap().path;
+        assert!(path.starts_with(&spec.home));
+        fs::write(path,b"// changed owned script\n").unwrap();
+    }
+}
+#[test]
+fn local_hub_script_pin_rechecks_at_spawn_and_retains_incomplete_intent(){
+    let f=NativeFixture::new();let lease=ControllerLock::acquire(&f.home).unwrap();let path=f.home.join("hub-fixture.js");fs::write(&path,b"// own inert script\n").unwrap();
+    let mut spec=f.spec("normal");spec.script_pin=Some(HubScriptPin::capture(&path).unwrap());spec.fault=Some("local-script-drift".into());
+    assert_eq!(Supervisor::new(&lease,spec).unwrap().reconcile().unwrap_err(),"E_HUB_SCRIPT_DRIFT");
+    assert!(lease.hub_child().unwrap().is_none());
+    assert!(TcpListener::bind(f.endpoint).is_ok());
+    let registry=Registry::open(&lease).unwrap();assert!(registry.validate_namespace().is_err());
+    assert!(!f.home.join("fixture-ready").exists()); // token/intent may exist; never claim zero earlier effects
 }

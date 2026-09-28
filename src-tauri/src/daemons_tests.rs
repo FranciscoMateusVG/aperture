@@ -218,3 +218,19 @@ fn local_list_ingress_loads_real_private_registry_and_queries_real_inert_clients
     assert_eq!(std::fs::read_to_string(&events).unwrap(),"list-windows\nlist\n");
     drop(body);drop(work);owner.close().unwrap();drop(owner);
 }
+
+#[test]
+fn local_tool_ctime_denies_in_place_overwrite_with_restored_mtime() {
+    use std::os::unix::fs::{PermissionsExt,MetadataExt};use std::io::Write;
+    let h=Home::new();let tool=h.0.join("native-inert");
+    std::fs::write(&tool,b"#!/bin/sh\nexit 0\n").unwrap();std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tools=LocalTools::fixture(&h.0,&tool);let pin=tools.tmux.clone();let before=std::fs::metadata(&tool).unwrap();
+    let owner=RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),tools).unwrap();let work=owner.admit(None).unwrap();let body=work.body().unwrap();
+    let mut input=work.client(&pin,vec![]).unwrap();let audit=Arc::new(Mutex::new(ClientAudit::default()));input.audit=Some(audit.clone());
+    let mut file=std::fs::OpenOptions::new().write(true).open(&tool).unwrap();file.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap())).unwrap();drop(file);
+    let after=std::fs::metadata(&tool).unwrap();
+    assert_eq!((before.ino(),before.len(),before.mode(),before.mtime(),before.mtime_nsec()),(after.ino(),after.len(),after.mode(),after.mtime(),after.mtime_nsec()));
+    assert!(matches!(run_client(&work,input,Duration::from_secs(1),1024,1024),Err(e) if e=="E_LOCAL_TOOL_CHANGED"));
+    assert_eq!(audit.lock().unwrap().pid,0);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}

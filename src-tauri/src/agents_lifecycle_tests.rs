@@ -258,7 +258,7 @@ fn local_codex_preparation_preserves_operator_semantics_and_validates_before_tok
     let bus=h.0.join("bus.js");let sentry=h.0.join("sentry.js");fs::write(&bus,"synthetic").unwrap();fs::write(&sentry,"synthetic").unwrap();
     let home=h.0.join("codex-home");ensure_private_dir(&home).unwrap();
     let expected={let mut s=app.lock().unwrap();s.mcp_server_path=bus.to_string_lossy().into_owned();s.mcp_sentry_server_path=sentry.to_string_lossy().into_owned();s.project_dir=h.0.to_string_lossy().into_owned();s.agents["fixture"].clone()};
-    let plan=LocalCodexPreparation{context:&context,state:&app,expected:&expected,codex_home:home.clone(),bus:bus.to_string_lossy().into_owned(),sentry:sentry.to_string_lossy().into_owned(),project:h.0.to_string_lossy().into_owned()};
+    let plan=LocalCodexPreparation{context:&context,state:&app,expected:&expected,codex_home:home.clone(),bus:bus.to_string_lossy().into_owned(),sentry:sentry.to_string_lossy().into_owned(),project:h.0.to_string_lossy().into_owned(),bus_pin:local_pinned_bytes(&bus,1024).unwrap().1,sentry_pin:local_pinned_bytes(&sentry,1024).unwrap().1,drift_point:None};
     let path=home.join("config.toml");
     fs::write(&path,"model='old'\n[mcp_servers.aperture-bus]\nenv=7\n[mcp_servers.sentry]\ncommand='old'\n").unwrap();
     assert!(plan.prepare().is_err());assert!(!h.0.join(".aperture/run/hub-tokens").exists());
@@ -291,4 +291,97 @@ fn local_thread_resume_requires_exact_existing_uuid_and_close_cancels_wait(){
         assert_eq!(task.join().unwrap().unwrap_err(),"E_RUNTIME_CLOSING");
     });
     drop(work);owner.close().unwrap();drop(owner);
+}
+
+#[test]
+fn local_claude_uncertain_create_retains_shell_and_denies_repeat_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let h=Home::new();
+    let tool=h.0.join("tmux-inert");let events=h.0.join("events");let pane=h.0.join("retained-pane");
+    // Same native bounded client as production. The own inert process records
+    // its create effect, then reports failure; no real tmux or provider runs.
+    let script=format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n list-windows) if test -f '{}'; then printf '@42||fixture||zsh\\n'; fi;;\n new-window) printf 'owned shell' > '{}'; exit 9;;\n *) exit 8;;\nesac\n",events.display(),pane.display(),pane.display());
+    fs::write(&tool,script).unwrap();fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();
+    ensure_private_dir(&h.0.join(".aperture/run/hub-tokens")).unwrap();
+    let token=h.0.join(".aperture/run/hub-tokens/fixture.token");fs::write(&token,b"synthetic untouched token").unwrap();
+    fs::write(h.0.join("configuration-sentinel"),b"unchanged").unwrap();
+    let app=state("fixture","opus");
+    let bus=h.0.join("bus.js");let sentry=h.0.join("sentry.js");fs::write(&bus,b"inert").unwrap();fs::write(&sentry,b"inert").unwrap();
+    {let mut a=app.lock().unwrap();a.mcp_server_path=bus.to_string_lossy().into_owned();a.mcp_sentry_server_path=sentry.to_string_lossy().into_owned();}
+    let tools=crate::daemons::LocalTools::fixture(&h.0,&tool);
+    let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),tools).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    let before=serde_json::to_value(&app.lock().unwrap().agents["fixture"]).unwrap();
+    assert_eq!(start_agent_shared("fixture".into(),&app,&ctx).unwrap_err(),"E_TMUX_OUTCOME_UNKNOWN");
+    assert_eq!(fs::read(&pane).unwrap(),b"owned shell");
+    assert_eq!(fs::read_to_string(&events).unwrap(),"list-windows\nnew-window\n");
+    let mut retained=tree(&h.0);retained.remove(Path::new("events"));
+    assert_eq!(start_agent_shared("fixture".into(),&app,&ctx).unwrap_err(),"E_LOCAL_PANE_ALREADY_PRESENT");
+    let mut after=tree(&h.0);after.remove(Path::new("events"));assert_eq!(retained,after);
+    drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+    // A fresh owner/context still asks the real client; no in-memory marker
+    // manufactured the denial. A shell remains stopped for UI classification.
+    let tools=crate::daemons::LocalTools::fixture(&h.0,&tool);
+    let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),tools).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    assert_eq!(start_agent_shared("fixture".into(),&app,&ctx).unwrap_err(),"E_LOCAL_PANE_ALREADY_PRESENT");
+    let mut after=tree(&h.0);after.remove(Path::new("events"));assert_eq!(retained,after);
+    assert_eq!(fs::read_to_string(&events).unwrap(),"list-windows\nnew-window\nlist-windows\nlist-windows\n");
+    assert_eq!(serde_json::to_value(&app.lock().unwrap().agents["fixture"]).unwrap(),before);
+    assert_eq!(fs::read(&token).unwrap(),b"synthetic untouched token");
+    assert!(find_running_window(&[tmux::WindowInfo{window_id:"@42".into(),name:"fixture".into(),command:"zsh".into()}],"fixture").is_none());
+    drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
+
+pub(super) fn local_config_drift(plan:&LocalCodexPreparation<'_>,point:&str){
+    if plan.drift_point==Some(point){
+        assert!(plan.codex_home.parent().unwrap().file_name().unwrap().to_string_lossy().starts_with("aperture-c3-"));
+        fs::write(plan.codex_home.join("config.toml"),b"model='operator-change'\n").unwrap();
+    }
+}
+#[test]
+fn local_codex_config_drift_preserves_operator_edit_at_both_write_boundaries(){
+    use std::os::unix::fs::PermissionsExt;
+    for point in ["before-token","before-replace"] {
+        let h=Home::new();let tools=crate::daemons::LocalTools::fixture(&h.0,&std::env::current_exe().unwrap());
+        let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),tools).unwrap();
+        let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let context=work.lifecycle("fixture").unwrap();
+        let app=state("fixture","codex/selected");let bus=h.0.join("bus.js");let sentry=h.0.join("sentry.js");
+        fs::write(&bus,b"inert").unwrap();fs::write(&sentry,b"inert").unwrap();
+        let home=h.0.join("codex-home");ensure_private_dir(&home).unwrap();let config=home.join("config.toml");
+        fs::write(&config,b"model='initial'\n[mcp_servers.aperture-bus]\ncommand='old'\n[mcp_servers.sentry]\ncommand='old'\n").unwrap();fs::set_permissions(&config,fs::Permissions::from_mode(0o600)).unwrap();
+        let expected={let mut s=app.lock().unwrap();s.mcp_server_path=bus.to_string_lossy().into_owned();s.mcp_sentry_server_path=sentry.to_string_lossy().into_owned();s.project_dir=h.0.to_string_lossy().into_owned();s.agents["fixture"].clone()};
+        let mut plan=LocalCodexPreparation{context:&context,state:&app,expected:&expected,codex_home:home,bus:bus.to_string_lossy().into_owned(),sentry:sentry.to_string_lossy().into_owned(),project:h.0.to_string_lossy().into_owned(),bus_pin:local_pinned_bytes(&bus,1024).unwrap().1,sentry_pin:local_pinned_bytes(&sentry,1024).unwrap().1,drift_point:Some(point)};
+        assert!(plan.prepare().is_err());assert_eq!(fs::read(&config).unwrap(),b"model='operator-change'\n");
+        assert_eq!(h.0.join(".aperture/run/hub-tokens/fixture.token").exists(),point=="before-replace");
+        // After-token drift is partial, not zero-effect rollback. Script drift
+        // also denies against its previously loaded pin, not a freshly relabeled file.
+        plan.drift_point=None;fs::write(&bus,b"other").unwrap();assert!(plan.recheck().is_err());
+        drop(context);drop(body);drop(work);owner.close().unwrap();drop(owner);
+    }
+}
+#[test]
+fn local_claude_staging_denies_existing_leaves_before_effects_and_writes_private_modes(){
+    use std::os::unix::fs::{PermissionsExt,MetadataExt};
+    for leaf in ["mcp.json","prompt.md","launch.sh"] {for symlink in [false,true] {
+        let h=Home::new();let tool=h.0.join("tmux-inert");let events=h.0.join("events");
+        fs::write(&tool,format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ntest \"$1\" = list-windows\n",events.display())).unwrap();fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();
+        let tools=crate::daemons::LocalTools::fixture(&h.0,&tool);let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),tools).unwrap();
+        let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();let app=state("fixture","opus");
+        let staging=h.0.join(".aperture/run/launch/fixture");ensure_private_dir(&staging).unwrap();let target=h.0.join("untouched");fs::write(&target,b"synthetic only").unwrap();
+        if symlink{std::os::unix::fs::symlink(&target,staging.join(leaf)).unwrap();}else{fs::write(staging.join(leaf),b"permissive existing").unwrap();fs::set_permissions(staging.join(leaf),fs::Permissions::from_mode(0o644)).unwrap();}
+        let before=tree(&h.0);assert_eq!(start_agent_shared("fixture".into(),&app,&ctx).unwrap_err(),"E_LOCAL_STAGING_EXISTS");
+        let mut after=tree(&h.0);after.remove(Path::new("events"));assert_eq!(before,after);
+        assert_eq!(fs::read_to_string(&events).unwrap(),"list-windows\n");assert!(!h.0.join(".aperture/run/hub-tokens").exists());
+        drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+    }}
+    let h=Home::new();let owner=crate::daemons::RuntimeOwner::new(ControllerLock::acquire(&h.0).unwrap());
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    let slot=ctx.lease.codex_slot("fixture").unwrap();let op=slot.enter().unwrap();let staging=LocalClaudeStaging::prepare(&ctx,&op,"fixture").unwrap();
+    for (leaf,mode) in [("mcp.json",0o600),("prompt.md",0o600),("launch.sh",0o700)]{
+        staging.write_new(&ctx,&op,leaf,b"synthetic",mode).unwrap();assert_eq!(fs::metadata(staging.root.join(leaf)).unwrap().mode()&0o7777,mode);
+    }
+    assert_eq!(fs::metadata(&staging.root).unwrap().mode()&0o7777,0o700);staging.recheck_written(&ctx,&op).unwrap();
+    assert!(staging.write_new(&ctx,&op,"mcp.json",b"overwrite denied",0o600).is_err());
+    drop(op);drop(slot);drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
 }

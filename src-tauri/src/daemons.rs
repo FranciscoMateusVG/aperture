@@ -19,7 +19,7 @@ pub(crate) fn start_checked(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ToolPin {
     pub(crate) path: std::path::PathBuf,
-    dev: u64, ino: u64, uid: u32, mode: u32, len: u64, modified: (i64, i64),
+    dev: u64, ino: u64, uid: u32, mode: u32, len: u64, modified: (i64, i64), changed: (i64, i64),
 }
 impl ToolPin {
     pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
@@ -31,7 +31,7 @@ impl ToolPin {
             || m.mode() & 0o6022 != 0 || m.mode() & 0o111 == 0 {
             return Err("E_LOCAL_TOOL_UNSAFE".into());
         }
-        Ok(Self { path:path.to_path_buf(),dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),len:m.len(),modified:(m.mtime(),m.mtime_nsec()) })
+        Ok(Self { path:path.to_path_buf(),dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),len:m.len(),modified:(m.mtime(),m.mtime_nsec()),changed:(m.ctime(),m.ctime_nsec()) })
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
         if &Self::capture(&self.path)?!=self { return Err("E_LOCAL_TOOL_CHANGED".into()); }
