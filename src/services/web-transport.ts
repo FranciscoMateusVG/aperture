@@ -1,3 +1,4 @@
+import { WEB_BUILD, SCHEMA_HEADER, incompatible } from "./web-build";
 import type { CommandCall } from "./command-transport";
 export const SESSION_KEY = "aperture.web.session.v1";
 export const CANONICAL_ORIGIN = "http://127.0.0.1:4519";
@@ -9,6 +10,8 @@ interface WebEnvironment {
   fetch: typeof fetch;
   storage: Pick<Storage, "getItem" | "setItem" | "removeItem">;
   onEnded: () => void;
+  onIncompatible?: () => void;
+  build?: { ui_id: string; api_schema: number } | null;
 }
 function selector(value: unknown): string {
   if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(value)) throw invalid();
@@ -45,6 +48,12 @@ export function commandRoute(command: string, args: Record<string, unknown> = {}
   }
 }
 export function createWebTransport(env: WebEnvironment) {
+  const build = env.build === undefined ? WEB_BUILD : env.build;
+  let blocked = false;
+  function mismatch(): never { blocked = true; env.onIncompatible?.(); throw incompatible(); }
+  function requireBuild(): void {
+    if (blocked || !build || !/^[0-9a-f]{32}$/.test(build.ui_id) || build.api_schema !== 1) mismatch();
+  }
   function clear(): void { env.storage.removeItem(SESSION_KEY); env.onEnded(); }
   async function request(path: string, body?: Record<string, unknown>, authenticated = true): Promise<unknown> {
     const headers: Record<string, string> = {};
@@ -53,22 +62,30 @@ export function createWebTransport(env: WebEnvironment) {
       if (!token(session)) { clear(); throw ended(); }
       headers.Authorization = `Bearer ${session}`;
     }
+    if (path.startsWith("/api/") && path !== "/api/version") { requireBuild(); headers[SCHEMA_HEADER] = String(build!.api_schema); }
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let response: Response;
     try {
       response = await env.fetch(path, { method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: "omit", cache: "no-store", redirect: "error", referrerPolicy: "no-referrer" });
     } catch { throw { code: "E_WEB_OUTCOME_UNKNOWN", message: "Request outcome unknown; refresh state before another operation" }; }
     if (response.status === 401) { clear(); throw ended(); }
+    if (path.startsWith("/api/") && response.ok && response.headers.get(SCHEMA_HEADER) !== String(build?.api_schema)) mismatch();
     let data: unknown;
     try { data = await response.json(); } catch { throw { code: "E_RESPONSE_INVALID", message: "Invalid response" }; }
     if (!response.ok) {
+      if (obj(data) && data.code === "E_WEB_API_INCOMPATIBLE") mismatch();
       if (obj(data) && typeof data.code === "string" && /^E_[A-Z0-9_]{1,80}$/.test(data.code) && typeof data.message === "string" && data.message.length <= 256) throw data;
       throw { code: "E_RESPONSE_INVALID", message: "Invalid error response" };
     }
     return data;
   }
+  async function compatible(): Promise<void> {
+    requireBuild();
+    await request("/api/version");
+  }
   const call: CommandCall = async <T>(command: string, args?: Record<string, unknown>) => {
     const route = commandRoute(command, args);
+    if (route.body !== undefined) await compatible();
     return await request(route.path, route.body) as T;
   };
   return {
@@ -79,13 +96,14 @@ export function createWebTransport(env: WebEnvironment) {
       if (!obj(result) || Object.keys(result).join() !== "session" || !token(result.session)) { clear(); throw invalid(); }
       env.storage.setItem(SESSION_KEY, result.session);
     },
-    async resume(): Promise<void> { await call("get_version"); },
+    async resume(): Promise<void> { await compatible(); },
     async logout(): Promise<void> {
       const result = await request("/session/logout", {});
       if (!obj(result) || result.revoked !== true) throw invalid();
       clear();
     },
     async link(): Promise<string> {
+      await compatible();
       const result = await request("/session/link", {});
       if (!obj(result) || Object.keys(result).join() !== "exchange" || !token(result.exchange)) throw invalid();
       return `${CANONICAL_ORIGIN}/#t=${result.exchange}`;

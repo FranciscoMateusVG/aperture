@@ -29,6 +29,11 @@ struct WebState {
     home: PathBuf,
     project: PathBuf,
     ui: PathBuf,
+    ui_builds: Arc<Mutex<std::collections::BTreeMap<String, ui_files::Build>>>,
+    #[cfg(test)]
+    test_counts: Arc<[std::sync::atomic::AtomicUsize; 2]>,
+    #[cfg(test)]
+    test_schema: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     ui_fixture: bool,
 }
@@ -95,6 +100,12 @@ async fn outer(State(s): State<WebState>, request: Request, next: Next) -> Respo
     }
     response
 }
+fn api_schema(s: &WebState) -> &'static str {
+    #[cfg(test)]
+    if s.test_schema.load(std::sync::atomic::Ordering::SeqCst)==2 { return "2"; }
+    let _ = s;
+    "1"
+}
 async fn api_gate(State(s): State<WebState>, mut request: Request, next: Next) -> Response {
     if !browser_boundary(
         &s,
@@ -108,11 +119,18 @@ async fn api_gate(State(s): State<WebState>, mut request: Request, next: Next) -
     if !valid {
         return auth_error(401);
     }
+    let path = request.uri().path();
+    if path != "/api/version" && !path.ends_with("/bootstrap")
+        && header(request.headers(), "x-aperture-api-schema") != Some(api_schema(&s)) {
+        return error(409, "E_WEB_API_INCOMPATIBLE", "UI/API incompatible; reload Aperture");
+    }
     // Only this trusted boundary constructs web authority; body fields cannot.
     request
         .extensions_mut()
         .insert(Operator(Arc::new(AuthenticatedActor::operator_ui())));
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response.headers_mut().insert("x-aperture-api-schema", HeaderValue::from_static(api_schema(&s)));
+    response
 }
 async fn bootstrap_denied() -> Response {
     // Deliberately no engine/state/body extractor: before domain/JSON parsing.
@@ -443,12 +461,16 @@ async fn command(s: WebState, actor: Operator, cmd: Command, request: Request) -
     let seat = if matches!(cmd, Command::Start | Command::Stop | Command::Restart | Command::Model) {
         input.get("name").and_then(Value::as_str)
     } else { None };
+    #[cfg(test)]
+    s.test_counts[0].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let work = match s.runtime.admit(seat) {
         Ok(work) => work,
         Err(_) => return error(409, "E_RUNTIME_UNAVAILABLE", "runtime admission refused"),
     };
     match tokio::task::spawn_blocking(move || {
         let _body = work.body().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
+        #[cfg(test)]
+        s.test_counts[1].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         execute(&s, &actor.0, cmd, input, &work)
     }).await {
         Ok(Ok(v)) => Json(v).into_response(),
@@ -479,46 +501,14 @@ async fn static_file(State(s): State<WebState>, request: Request) -> Response {
     if request.method() != Method::GET && request.method() != Method::HEAD {
         return error(404, "E_WEB_NOT_FOUND", "route not found");
     }
-    let raw = request.uri().path();
-    let path = if raw == "/" {
-        "index.html"
-    } else {
-        raw.trim_start_matches('/')
-    };
-    if !path
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c))
-        || path
-            .split('/')
-            .any(|p| p.is_empty() || p == ".." || p == ".")
-    {
-        return error(404, "E_WEB_NOT_FOUND", "route not found");
-    }
-    let mime = match path.rsplit('.').next() {
-        Some("html") if path == "index.html" => "text/html; charset=utf-8",
-        Some("js") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("woff2") => "font/woff2",
-        _ => return error(404, "E_WEB_NOT_FOUND", "route not found"),
-    };
-    let root = match std::fs::canonicalize(&s.ui) {
-        Ok(p) => p,
-        Err(_) => return error(404, "E_WEB_NOT_FOUND", "UI build unavailable"),
-    };
-    let target = match std::fs::canonicalize(root.join(path)) {
-        Ok(p) if p.starts_with(&root) => p,
-        _ => return error(404, "E_WEB_NOT_FOUND", "route not found"),
-    };
-    if !std::fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() <= 8 * 1024 * 1024) {
-        return error(404, "E_WEB_NOT_FOUND", "route not found");
-    }
-    match std::fs::read(target) {
-        Ok(bytes) => ([("content-type", mime)], bytes).into_response(),
-        Err(_) => error(404, "E_WEB_NOT_FOUND", "route not found"),
+    let result = s.ui_builds.lock().ok().and_then(|mut builds|
+        ui_files::serve(&s.ui, request.uri().path(), &mut builds).ok());
+    match result {
+        Some((mime, bytes)) => ([("content-type", mime)], if request.method() == Method::HEAD { vec![] } else { bytes }).into_response(),
+        None => error(404, "E_WEB_NOT_FOUND", "UI build unavailable"),
     }
 }
+
 fn router(s: WebState) -> Router {
     let mut api = Router::new();
     for (path, write, cmd) in [
@@ -596,11 +586,16 @@ pub async fn serve() -> Result<(), String> {
         origin: "http://127.0.0.1:4519".into(),
         auth: Arc::new(Mutex::new(auth)),
         app: app.clone(),
-        ui: home.join(".aperture/ui/current"),
+        ui: home.join(".aperture/ui"),
+        ui_builds: Arc::new(Mutex::new(Default::default())),
         home,
         project,
         #[cfg(test)]
         ui_fixture: false,
+        #[cfg(test)]
+        test_counts: Arc::new(Default::default()),
+        #[cfg(test)]
+        test_schema: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:4519")
         .await
@@ -681,3 +676,174 @@ pub async fn open() -> Result<(), String> {
 #[cfg(test)]
 #[path = "web_server_tests.rs"]
 mod tests;
+
+// UI-only read descriptor. No launch authority, E1 runtime schema or publisher.
+// Uses the same native openat/nofollow/fdopendir idiom as the RO release reader.
+mod ui_files {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::{collections::{BTreeMap, BTreeSet}, ffi::{CStr, CString}, fs::{File, Metadata}, io::Read,
+        os::{fd::{AsRawFd, FromRawFd, IntoRawFd}, unix::fs::MetadataExt}, path::{Component, Path}};
+    type R<T> = Result<T, ()>;
+    const FLAGS: i32 = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Entry { path: String, bytes: u64, sha256: String }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Manifest { schema_version: u32, ui_id: String, api_schema: u32, files: Vec<Entry> }
+    #[derive(Clone, PartialEq, Eq)]
+    struct Pin(u64,u64,u32,u32,u64,u64,i64,i64,i64,i64);
+    fn pin(m: &Metadata) -> Pin { Pin(m.dev(),m.ino(),m.uid(),m.mode(),m.nlink(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()) }
+    fn anchor(a: &Pin, b: &Pin) -> bool { (a.0,a.1,a.2,a.3)==(b.0,b.1,b.2,b.3) }
+    fn hex(v: &str, n: usize) -> bool { v.len()==n && v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
+    fn relative(v: &str) -> bool {
+        !v.is_empty() && v.len()<=512 && v.split('/').count()<=8 && v.split('/').all(|p|
+            !p.is_empty() && p.len()<=128 && p!="." && p!=".." && p.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)))
+    }
+    fn mime(v: &str) -> Option<&'static str> {
+        match v.rsplit('.').next()? {
+            "html" if v=="index.html" => Some("text/html; charset=utf-8"),
+            "js"=>Some("text/javascript; charset=utf-8"),"css"=>Some("text/css; charset=utf-8"),
+            "svg"=>Some("image/svg+xml"),"png"=>Some("image/png"),"woff2"=>Some("font/woff2"),_=>None
+        }
+    }
+    fn open(parent: &File, name: &str, dir: bool) -> R<File> {
+        let name=CString::new(name).map_err(|_|())?;
+        let fd=unsafe{libc::openat(parent.as_raw_fd(),name.as_ptr(),FLAGS | if dir {libc::O_DIRECTORY}else{0})};
+        if fd<0 {Err(())}else{Ok(unsafe{File::from_raw_fd(fd)})}
+    }
+    fn directory(fd: &File) -> R<Pin> {
+        let m=fd.metadata().map_err(|_|())?;
+        if !m.is_dir() || m.uid()!=unsafe{libc::geteuid()} || m.mode()&0o7022!=0 || m.mode()&0o500!=0o500 {return Err(());}
+        Ok(pin(&m))
+    }
+    // Every ancestor checked without canonicalize-following a symlink. System
+    // /private/tmp is the sole explicit root-owned sticky temporary exception.
+    fn root(path: &Path) -> R<File> {
+        if !path.is_absolute(){return Err(());}
+        let raw=unsafe{libc::open(c"/".as_ptr(),FLAGS|libc::O_DIRECTORY)};
+        if raw<0{return Err(());} let mut fd=unsafe{File::from_raw_fd(raw)};
+        let mut here=PathBuf::from("/");
+        for part in path.components().skip(1) {
+            let Component::Normal(name)=part else{return Err(());};
+            let before=pin(&fd.metadata().map_err(|_|())?);
+            let next=open(&fd,name.to_str().ok_or(())?,true)?;
+            if !anchor(&before,&pin(&fd.metadata().map_err(|_|())?)){return Err(());}
+            fd=next;here.push(name);
+            let m=fd.metadata().map_err(|_|())?;
+            let tmp=here==Path::new("/private/tmp") && m.uid()==0 && m.mode()&0o7777==0o1777;
+            if !m.is_dir() || (m.uid()!=0 && m.uid()!=unsafe{libc::geteuid()}) || (!tmp && m.mode()&0o7022!=0){return Err(());}
+        }
+        directory(&fd)?;Ok(fd)
+    }
+    fn read(parent: &File, name: &str, cap: u64) -> R<(Vec<u8>,Pin)> {
+        let mut fd=open(parent,name,false)?;let m=fd.metadata().map_err(|_|())?;
+        if !m.is_file() || m.uid()!=unsafe{libc::geteuid()} || m.nlink()!=1 || m.mode()&0o7022!=0 || m.mode()&0o400==0 || m.len()>cap{return Err(());}
+        let before=pin(&m);let mut bytes=Vec::new();(&mut fd).take(cap+1).read_to_end(&mut bytes).map_err(|_|())?;
+        if bytes.len() as u64>cap || bytes.len() as u64!=m.len() || pin(&fd.metadata().map_err(|_|())?)!=before{return Err(());}
+        let rebound=open(parent,name,false)?;
+        if pin(&rebound.metadata().map_err(|_|())?)!=before{return Err(());}
+        Ok((bytes,before))
+    }
+    fn names(fd: &File, remaining: usize) -> R<Vec<String>> {
+        let copy=open(fd,".",true)?.into_raw_fd();let raw=unsafe{libc::fdopendir(copy)};
+        if raw.is_null(){unsafe{libc::close(copy)};return Err(());}
+        struct Dir(*mut libc::DIR);impl Drop for Dir {fn drop(&mut self){unsafe{libc::closedir(self.0)};}}
+        let dir=Dir(raw);let mut out=Vec::new();
+        loop {
+            unsafe{*libc::__error()=0;}
+            let ent=unsafe{libc::readdir(dir.0)};
+            if ent.is_null(){if unsafe{*libc::__error()}!=0{return Err(());}break;}
+            let name=unsafe{CStr::from_ptr((*ent).d_name.as_ptr())}.to_str().map_err(|_|())?;
+            if name=="." || name==".."{continue;}
+            if out.len()>=remaining{return Err(());}out.push(name.to_owned());
+        }
+        out.sort();Ok(out)
+    }
+    fn parse(bytes: &[u8], id: &str) -> R<Manifest> {
+        let m:Manifest=serde_json::from_slice(bytes).map_err(|_|())?;
+        if m.schema_version!=1 || m.api_schema!=1 || m.ui_id!=id || !hex(id,32) || m.files.is_empty() || m.files.len()>512{return Err(());}
+        let mut aliases=BTreeMap::new();let mut leaves=BTreeSet::new();let mut total=0u64;
+        for (i,e) in m.files.iter().enumerate() {
+            if !relative(&e.path) || mime(&e.path).is_none() || e.path.eq_ignore_ascii_case("UI.json") || !hex(&e.sha256,64) || e.bytes>8*1024*1024 || (e.path=="index.html" && e.bytes>256*1024) || (i>0 && m.files[i-1].path>=e.path){return Err(());}
+            total=total.checked_add(e.bytes).filter(|v|*v<=32*1024*1024).ok_or(())?;
+            leaves.insert(e.path.to_ascii_lowercase());
+            let mut prefix=String::new();
+            for part in e.path.split('/') {
+                if !prefix.is_empty(){prefix.push('/');}prefix.push_str(part);
+                if let Some(old)=aliases.insert(prefix.to_ascii_lowercase(),prefix.clone()){if old!=prefix{return Err(());}}
+            }
+        }
+        for e in &m.files {for (i,_) in e.path.match_indices('/') {if leaves.contains(&e.path[..i].to_ascii_lowercase()){return Err(());}}}
+        if !m.files.iter().any(|e|e.path=="index.html"){return Err(());}Ok(m)
+    }
+    fn inventory(fd:&File, prefix:&str, m:&Manifest, out:&mut BTreeMap<String,Pin>, selected:&str, content:&mut Option<Vec<u8>>) -> R<()> {
+        let initial=directory(fd)?;
+        for name in names(fd,4096usize.checked_sub(out.len()).ok_or(())?)? {
+            let rel=format!("{prefix}{name}");if !relative(&rel) || out.len()>=4096{return Err(());}
+            if rel=="UI.json" {let (_,p)=read(fd,&name,128*1024)?;out.insert(rel,p);continue;}
+            if let Some(e)=m.files.iter().find(|e|e.path==rel) {
+                let (bytes,p)=read(fd,&name,8*1024*1024)?;
+                if e.bytes!=bytes.len() as u64 || format!("{:x}",Sha256::digest(&bytes))!=e.sha256{return Err(());}
+                if rel==selected {*content=Some(bytes);}out.insert(rel,p);
+            } else if m.files.iter().any(|e|e.path.starts_with(&(rel.clone()+"/"))) {
+                let dir=open(fd,&name,true)?;let p=directory(&dir)?;out.insert(rel.clone(),p.clone());
+                inventory(&dir,&(rel+"/"),m,out,selected,content)?;
+                if directory(&open(fd,&name,true)?)?!=p{return Err(());}
+            } else {return Err(());}
+        }
+        if directory(fd)?!=initial{return Err(());}Ok(())
+    }
+    pub(super) struct Build {fd:File, root_pin:Pin, manifest:Manifest, pins:BTreeMap<String,Pin>, valid:bool}
+    impl Build {
+        fn new(fd:File,id:&str)->R<Self> {
+            let p=directory(&fd)?;let (bytes,mp)=read(&fd,"UI.json",128*1024)?;let m=parse(&bytes,id)?;
+            let mut pins=BTreeMap::new();inventory(&fd,"",&m,&mut pins,"",&mut None)?;
+            if pins.get("UI.json")!=Some(&mp) || m.files.iter().any(|e|!pins.contains_key(&e.path)) || directory(&fd)?!=p{return Err(());}
+            Ok(Self{fd,root_pin:p,manifest:m,pins,valid:true})
+        }
+        fn bytes(&mut self, current:&File, path:&str)->R<Vec<u8>> {
+            if !self.valid{return Err(());}
+            let result=(|| {
+                if directory(current)?!=self.root_pin || directory(&self.fd)?!=self.root_pin{return Err(());}
+                let mut pins=BTreeMap::new();let mut content=None;
+                inventory(&self.fd,"",&self.manifest,&mut pins,path,&mut content)?;
+                if pins!=self.pins{return Err(());}content.ok_or(())
+            })();
+            if result.is_err(){self.valid=false;}result
+        }
+    }
+    pub(super) fn serve(path:&Path, url:&str, builds:&mut BTreeMap<String,Build>)->R<(&'static str,Vec<u8>)> {
+        let ui=root(path)?;
+        let (id,leaf)=if url=="/" || url=="/index.html" {
+            let link_pin = || -> R<(u64,u64,i64,i64)> {
+                let mut st=std::mem::MaybeUninit::<libc::stat>::uninit();
+                if unsafe{libc::fstatat(ui.as_raw_fd(),c"current".as_ptr(),st.as_mut_ptr(),libc::AT_SYMLINK_NOFOLLOW)}!=0{return Err(());}
+                let st=unsafe{st.assume_init()};
+                if st.st_mode & libc::S_IFMT != libc::S_IFLNK || st.st_uid!=unsafe{libc::geteuid()} || st.st_nlink!=1{return Err(());}
+                Ok((st.st_dev as u64,st.st_ino,st.st_ctime,st.st_ctime_nsec))
+            };
+            let before=link_pin()?;
+            let mut buf=[0u8;33];let n=unsafe{libc::readlinkat(ui.as_raw_fd(),c"current".as_ptr(),buf.as_mut_ptr().cast(),buf.len())};
+            if n!=32 || link_pin()?!=before{return Err(());}let id=std::str::from_utf8(&buf[..32]).map_err(|_|())?;
+            if !hex(id,32){return Err(());}(id.to_owned(),"index.html")
+        } else {
+            let rest=url.strip_prefix("/ui/").ok_or(())?;let (id,leaf)=rest.split_once('/').ok_or(())?;
+            if !hex(id,32) || !relative(leaf){return Err(());}(id.to_owned(),leaf)
+        };
+        let mime=mime(leaf).ok_or(())?;
+        let selected=open(&ui,&id,true)?;
+        if !builds.contains_key(&id) {
+            // Bounded retained descriptors; no eviction that would forget drift.
+            if builds.len()>=512{return Err(());}builds.insert(id.clone(),Build::new(selected.try_clone().map_err(|_|())?,&id)?);
+        }
+        let build=builds.get_mut(&id).ok_or(())?;
+        // A request for a missing asset is not evidence that a valid build drifted.
+        if !build.manifest.files.iter().any(|e|e.path==leaf){return Err(());}
+        let data=build.bytes(&selected,leaf)?;
+        let rebound=root(path)?;
+        if !anchor(&directory(&ui)?,&directory(&rebound)?) || directory(&open(&rebound,&id,true)?)?!=directory(&selected)?{return Err(());}
+        Ok((mime,data))
+    }
+}

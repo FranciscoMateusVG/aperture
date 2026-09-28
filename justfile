@@ -389,3 +389,14 @@ recall-gate *ARGS:
 # Local UI contract/component suite; no server, deployment, or runtime bootstrap.
 test-ui:
     pnpm test
+
+# Build a new versioned UI directory only; no install, deployment or pointer move.
+[positional-arguments]
+ui-build node destination:
+    #!/bin/sh
+    set -eu
+    case "$1" in /*) ;; *) echo 'absolute Node required' >&2; exit 1;; esac
+    case "$2" in /*) ;; *) echo 'absolute new destination required' >&2; exit 1;; esac
+    test ! -e "$2" && test ! -L "$2"
+    "$1" node_modules/typescript/bin/tsc --noEmit
+    "$1" node_modules/vite/bin/vite.js build --mode web-release --outDir "$2"

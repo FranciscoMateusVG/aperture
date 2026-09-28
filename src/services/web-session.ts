@@ -15,12 +15,10 @@ export async function initializeBrowserSession(): Promise<boolean> {
   document.getElementById("navbar")!.append(panel);
   const onEnded = () => { status.textContent = "Session ended; reopen Aperture"; link.disabled = logout.disabled = true; };
   if (window.location.origin !== CANONICAL_ORIGIN) { onEnded(); return false; }
+  const onIncompatible = () => { status.textContent = "UI/API incompatible; reload Aperture"; link.disabled = true; };
   try {
-    const web = createWebTransport({ fetch: window.fetch.bind(window), storage: window.sessionStorage, onEnded });
+    const web = createWebTransport({ fetch: window.fetch.bind(window), storage: window.sessionStorage, onEnded, onIncompatible });
     setCommandTransport(web.call);
-    if (exchange !== null) await web.exchange(exchange);
-    else await web.resume();
-    status.textContent = "Local operator session";
     logout.onclick = async () => {
       logout.disabled = true;
       try { await web.logout(); } catch { status.textContent = "Logout unconfirmed; retry or close this window"; logout.disabled = false; }
@@ -31,6 +29,13 @@ export async function initializeBrowserSession(): Promise<boolean> {
       catch { status.textContent = "New window unavailable; reopen Aperture"; }
       finally { link.disabled = false; }
     };
+    if (exchange !== null) await web.exchange(exchange);
+    await web.resume(); // Includes schema gate before main init/polling/mutations.
+    status.textContent = "Local operator session";
     return true;
-  } catch { onEnded(); return false; }
+  } catch (error) {
+    if ((error as { code?: string })?.code === "E_WEB_API_INCOMPATIBLE") onIncompatible();
+    else onEnded();
+    return false;
+  }
 }

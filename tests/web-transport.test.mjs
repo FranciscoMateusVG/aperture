@@ -11,7 +11,7 @@ const session="s".repeat(43),exchange="e".repeat(43);
 function fixture(response=()=>new Response(JSON.stringify({semver:"fixture"}),{status:200})) {
  const data=new Map([[SESSION_KEY,session]]),calls=[];let ended=0;
  const storage={getItem:k=>data.get(k)??null,setItem:(k,v)=>data.set(k,v),removeItem:k=>data.delete(k)};
- const api=createWebTransport({storage,onEnded:()=>ended++,fetch:async(path,options)=>{calls.push([path,options]);return response(path,options)}});
+ const api=createWebTransport({storage,build:{ui_id:"a".repeat(32),api_schema:1},onEnded:()=>ended++,fetch:async(path,options)=>{calls.push([path,options]);const r=response(path,options);if(r.ok)r.headers.set("X-Aperture-Api-Schema","1");return r}});
  return {api,data,calls,get ended(){return ended}};
 }
 test("finite mapping covers all 20 registrations without a generic invocation route",()=>{
@@ -40,7 +40,7 @@ test("adapter composes real service factories; selectors retain snake_case and p
  const bad=fixture(()=>new Response(JSON.stringify({wrong:true}),{status:200}));
  await assert.rejects(createTeamCommands(bad.api.call).list(),e=>e.code==="E_RESPONSE_INVALID");
  const write=fixture(()=>new Response("null",{status:200}));await createCommands(write.api.call).tmuxSelectWindow("@9");
- assert.equal(write.calls[0][1].body,JSON.stringify({window_id:"@9"}));
+ assert.equal(write.calls.at(-1)[1].body,JSON.stringify({window_id:"@9"}));
 });
 test("refresh reuses browsing-context session; exchange is in JSON only, fragment removed synchronously",async()=>{
  const f=fixture(()=>new Response(JSON.stringify({session}),{status:200}));let removed=false;
@@ -69,4 +69,34 @@ test("all nine legacy service methods use the injected call and unknown authorit
  await api.startAgent('a');await api.stopAgent('a');await api.restartAgent('a');await api.listAgents();await api.updateAgentModel('a','sonnet');await api.clearAttention('a');await api.getVersion();await api.tmuxCreateSession('aperture');await api.tmuxSelectWindow('@1');
  assert.equal(calls.length,9);assert.equal(new Set(calls.map(x=>x[0])).size,9);
  for(const [command,args] of [['tmux_create_session',{sessionName:'aperture',actor:'glados'}],['start_agent',{name:'a',principal:'glados'}],['get_version',{capability:'x'}]]) assert.throws(()=>commandRoute(command,args));
+});
+
+test("schema is pinned per document, checked at every POST/resume, never learned from API",async()=>{
+ const calls=[],data=new Map([[SESSION_KEY,session]]);let schema="1",incompatible=0,postDeny=false;
+ const api=createWebTransport({build:{ui_id:"a".repeat(32),api_schema:1},storage:{getItem:k=>data.get(k),setItem:(k,v)=>data.set(k,v),removeItem:k=>data.delete(k)},onEnded(){},onIncompatible(){incompatible++},
+ fetch:async(path,init)=>{calls.push([path,init]);return new Response(JSON.stringify(path==="/session/logout"?{revoked:true}:postDeny&&init.method==="POST"?{code:"E_WEB_API_INCOMPATIBLE",message:"reload"}:"ok"),{status:postDeny&&path.startsWith('/api/')&&init.method==="POST"?409:200,headers:{"X-Aperture-Api-Schema":schema}})}});
+ await api.resume();await api.call("tmux_create_session",{sessionName:"aperture"});
+ assert.deepEqual(calls.map(c=>c[0]),["/api/version","/api/version","/api/tmux/session"]);
+ assert.equal(calls.at(-1)[1].headers["X-Aperture-Api-Schema"],"1");
+ schema="2";
+ await assert.rejects(api.call("tmux_create_session",{sessionName:"aperture"}),e=>e.code==="E_WEB_API_INCOMPATIBLE");
+ assert.equal(calls.filter(c=>c[1].method==="POST").length,1);assert.equal(incompatible,1);
+ schema="1";await assert.rejects(api.resume(),e=>e.code==="E_WEB_API_INCOMPATIBLE");
+ await api.logout();assert.equal(data.has(SESSION_KEY),false);
+});
+test("change between preflight and POST returns mismatch; no resubmit or silent session expiry",async()=>{
+ let calls=0,expired=0,mismatch=0;
+ const api=createWebTransport({build:{ui_id:"a".repeat(32),api_schema:1},storage:{getItem:()=>session,setItem(){},removeItem(){throw Error('must retain session')}},onEnded(){expired++},onIncompatible(){mismatch++},
+ fetch:async(_path,init)=>{calls++;return new Response(JSON.stringify(init.method==='GET'?'ok':{code:'E_WEB_API_INCOMPATIBLE',message:'reload'}),{status:init.method==='GET'?200:409,headers:{'X-Aperture-Api-Schema':init.method==='GET'?'1':'2'}})}});
+ await assert.rejects(api.call('stop_agent',{name:'x'}),e=>e.code==='E_WEB_API_INCOMPATIBLE');assert.equal(calls,2);assert.equal(mismatch,1);assert.equal(expired,0);
+});
+test("missing/duplicated schema and absent build deny, network loss does not create retry",async()=>{
+ for(const value of [null,'1, 1','01','2']) {
+  let posts=0;const headers=value===null?{}:{'X-Aperture-Api-Schema':value};
+  const api=createWebTransport({build:{ui_id:'b'.repeat(32),api_schema:1},storage:{getItem:()=>session,setItem(){},removeItem(){}},onEnded(){},fetch:async(_p,o)=>{if(o.method==='POST')posts++;return new Response('"v"',{headers});}});
+  await assert.rejects(api.call('clear_attention',{name:'x'}),e=>e.code==='E_WEB_API_INCOMPATIBLE');assert.equal(posts,0);
+ }
+ let n=0;const api=createWebTransport({build:{ui_id:'a'.repeat(32),api_schema:1},storage:{getItem:()=>session,setItem(){},removeItem(){}},onEnded(){},fetch:async(_p,o)=>{n++;if(n===1)throw Error('disconnect');return new Response('"v"',{headers:{'X-Aperture-Api-Schema':'1'}});}});
+ await assert.rejects(api.call('stop_agent',{name:'x'}),e=>e.code==='E_WEB_OUTCOME_UNKNOWN');assert.equal(n,1);
+ await api.resume();await api.call('stop_agent',{name:'x'});assert.equal(n,4);
 });

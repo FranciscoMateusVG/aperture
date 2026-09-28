@@ -5,6 +5,28 @@ use std::{
     path::Path,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+fn write_ui_manifest(build:&Path,id:&str) {
+    use sha2::{Digest,Sha256};
+    fn walk(root:&Path,at:&Path,files:&mut Vec<Value>) {
+        for entry in std::fs::read_dir(at).unwrap() {
+            let path=entry.unwrap().path();
+            if path.is_dir(){walk(root,&path,files);}else if path.file_name().unwrap()!="UI.json" {
+                let bytes=std::fs::read(&path).unwrap();
+                files.push(json!({"path":path.strip_prefix(root).unwrap().to_str().unwrap(),"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))}));
+            }
+        }
+    }
+    let mut files=vec![];walk(build,build,&mut files);files.sort_by(|a,b|a["path"].as_str().cmp(&b["path"].as_str()));
+    std::fs::write(build.join("UI.json"),serde_json::to_vec(&json!({"schema_version":1,"ui_id":id,"api_schema":1,"files":files})).unwrap()).unwrap();
+}
+fn fixture_ui(ui:&Path,id:&str,index:&str)->PathBuf {
+    let build=ui.join(id);std::fs::create_dir(&build).unwrap();std::fs::write(build.join("index.html"),index).unwrap();
+    write_ui_manifest(&build,id);build
+}
+fn point_ui(ui:&Path,id:&str) {
+    let current=ui.join("current");if std::fs::symlink_metadata(&current).is_ok(){std::fs::remove_file(&current).unwrap();}
+    std::os::unix::fs::symlink(id,current).unwrap();
+}
 struct Fixture {
     state: WebState,
     open: String,
@@ -16,6 +38,8 @@ impl Fixture {
     async fn new() -> Self {
         let root = std::env::temp_dir().join(format!("aperture-web-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root,std::fs::Permissions::from_mode(0o700)).unwrap();
         for p in [
             "ui",
             ".aperture/run/owner",
@@ -26,12 +50,12 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(root.join(p)).unwrap();
         }
-        use std::os::unix::fs::PermissionsExt;
         for dir in [".aperture", ".aperture/run"] {
             std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
-        std::fs::write(root.join("ui/index.html"), "packaged fixture").unwrap();
+        fixture_ui(&root.join("ui"), &"a".repeat(32), "packaged fixture");
+        point_ui(&root.join("ui"), &"a".repeat(32));
         std::fs::write(root.join(".aperture/run/owner/sentinel"), "unchanged").unwrap();
         Self::from_owned_root(root).await
     }
@@ -63,6 +87,9 @@ impl Fixture {
             home: root.clone(),
             project: root.clone(),
             ui: root.join("ui"),
+            ui_builds: Arc::new(Mutex::new(Default::default())),
+            test_counts: Arc::new(Default::default()),
+            test_schema: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             ui_fixture: false,
         };
         let app = router(state.clone());
@@ -142,6 +169,7 @@ impl Fixture {
                 ("Origin", &self.state.origin),
                 ("Sec-Fetch-Site", "same-origin"),
                 ("Content-Type", "application/json"),
+                ("X-Aperture-Api-Schema", "1"),
             ],
             &json!({"exchange":exchange}).to_string(),
         )
@@ -170,6 +198,7 @@ impl Fixture {
                 ("Origin", &self.state.origin),
                 ("Sec-Fetch-Site", "same-origin"),
                 ("Content-Type", "application/json"),
+                ("X-Aperture-Api-Schema", "1"),
                 ("Authorization", &format!("Bearer {session}")),
             ],
             body,
@@ -1083,8 +1112,9 @@ mod browser_fixture {
         let run = proof.lock().unwrap().run.clone();
         let ending = concat!("<", "/script>");
         let frame_end = concat!("<", "/iframe>");
-        let frame_document =
-            format!("<!doctype html><html><body><script src='/frame-target.js'>{ending}");
+        let frame_id = "f".repeat(32);
+        let frame_script = format!("/ui/{frame_id}/frame-target.js");
+        let frame_document = format!("<!doctype html><html><body><script src='{frame_script}'>{ending}");
         let parent = format!("<!doctype html><html><body><script src='/parent.js'>{ending}<iframe id='denied' src='{}/index.html'>{frame_end}<iframe id='control' src='/control-frame'>{frame_end}", f.state.origin);
         let parent_js = r#"
 let good=false,bad=false;
@@ -1128,7 +1158,7 @@ setTimeout(()=>fetch('/__fixture/report',{method:'POST',headers:{'Content-Type':
                 }),
             )
             .route(
-                "/frame-target.js",
+                &frame_script,
                 get(move || async move { ([("content-type", "text/javascript")], frame_js) }),
             )
             .route(
@@ -1159,24 +1189,24 @@ setTimeout(()=>fetch('/__fixture/report',{method:'POST',headers:{'Content-Type':
                 }
             }
         }
-        let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("dist");
+        let built = PathBuf::from(std::env::var_os("APERTURE_UI_BROWSER_BUILD").expect("explicit task-owned versioned build required"));
         assert!(
             built.join("index.html").is_file(),
             "task-owned UI build required; never build implicitly"
         );
-        copy_ui(&built, &f.state.ui, &f.state.origin);
-        let index = std::fs::read_to_string(f.state.ui.join("index.html")).unwrap();
+        let manifest:Value=serde_json::from_slice(&std::fs::read(built.join("UI.json")).unwrap()).unwrap();
+        let ui_id=manifest["ui_id"].as_str().unwrap();
+        let ui_build=f.state.ui.join(ui_id);
+        copy_ui(&built, &ui_build, &f.state.origin);
+        let index = std::fs::read_to_string(ui_build.join("index.html")).unwrap();
         assert!(!index.contains("http://") && !index.contains("https://"));
         std::fs::write(
-            f.state.ui.join("index.html"),
-            format!("{index}<script src='/probe.js'>{ending}"),
+            ui_build.join("index.html"),
+            format!("{index}<script src='/ui/{ui_id}/probe.js'>{ending}"),
         )
         .unwrap();
         std::fs::write(
-            f.state.ui.join("positive.js"),
+            ui_build.join("positive.js"),
             "document.documentElement.dataset.selfScript='pass';",
         )
         .unwrap();
@@ -1186,7 +1216,7 @@ document.addEventListener('securitypolicyviolation',e=>{if(e.disposition!=='enfo
 const inline=document.createElement('script');inline.textContent='window.inlineExecuted=true';document.head.append(inline);
 try{(0,eval)('window.evalExecuted=true')}catch{}
 const external=document.createElement('script');external.src='OTHER/external.js';document.head.append(external);
-const positive=document.createElement('script');positive.src='/positive.js';document.head.append(positive);
+const positive=document.createElement('script');positive.src='/ui/UI_ID/positive.js';document.head.append(positive);
 const prior=sessionStorage.getItem('fixture-session'),phase=prior?'refreshed':'loaded';
 let first=null,firstAt=0,done=false;
 const tick=setInterval(async()=>{
@@ -1204,8 +1234,10 @@ const tick=setInterval(async()=>{
  const result=await fetch('/__fixture/report',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'omit',body:JSON.stringify({run:'RUN',phase,renders:[first,n],session_restored:restored,self_script:root.dataset.selfScript==='pass'&&!window.inlineExecuted&&!window.evalExecuted&&!window.externalExecuted,violations:[...violations],control:false,forbidden_frame_ran:false})});
  if(result.ok&&phase==='loaded'){sessionStorage.setItem('fixture-session',session);location.reload()}
 },50);
-"#.replace("OTHER",&other_origin).replace("RUN",&run);
-        std::fs::write(f.state.ui.join("probe.js"), probe).unwrap();
+"#.replace("OTHER",&other_origin).replace("RUN",&run).replace("UI_ID",ui_id);
+        std::fs::write(ui_build.join("probe.js"), probe).unwrap();
+        write_ui_manifest(&ui_build,ui_id);
+        point_ui(&f.state.ui,ui_id);
         let app = ui_router(f.state.clone(), proof.clone());
         f.task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let exchange = f.mint().await;
@@ -1220,8 +1252,10 @@ const tick=setInterval(async()=>{
         .await;
         // The actual static route serves index.html, not arbitrary HTML filenames.
         // Both framed documents have byte-identical HTML+JS; only app response headers differ.
-        std::fs::write(f.state.ui.join("index.html"), &frame_document).unwrap();
-        std::fs::write(f.state.ui.join("frame-target.js"), frame_js).unwrap();
+        let frame_build=fixture_ui(&f.state.ui,&frame_id,&frame_document);
+        std::fs::write(frame_build.join("frame-target.js"),frame_js).unwrap();
+        write_ui_manifest(&frame_build,&frame_id);
+        point_ui(&f.state.ui,&frame_id);
         let (status, headers, body) = f.request("GET", "/index.html", &[], "").await;
         assert_eq!(status, 200);
         assert!(headers.contains("text/html"));
@@ -1489,7 +1523,9 @@ const tick=setInterval(async()=>{
             assert_eq!(result.0, 200);
             assert!(result.2.contains("browser-fixture-1"));
             let document = "<!doctype html><html><body>frame fixture";
-            std::fs::write(f.state.ui.join("index.html"), document).unwrap();
+            let id="e".repeat(32);
+            fixture_ui(&f.state.ui,&id,document);
+            point_ui(&f.state.ui,&id);
             let (status, headers, body) = f.request("GET", "/index.html", &[], "").await;
             assert_eq!(status, 200);
             assert!(headers.contains("text/html"));
@@ -1594,7 +1630,7 @@ async fn d_cancelled_http_body_remains_admitted_until_real_exit() {
     f.state.runtime.fixture_pause(arrived,go);
     // The actual authenticated TCP ingress queues the real blocking closure.
     let mut stream=tokio::net::TcpStream::connect(&f.state.authority).await.unwrap();
-    let request=format!("GET /api/agents HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",f.state.authority,f.state.origin,session);
+    let request=format!("GET /api/agents HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer {}\r\nX-Aperture-Api-Schema: 1\r\nConnection: close\r\n\r\n",f.state.authority,f.state.origin,session);
     stream.write_all(request.as_bytes()).await.unwrap();
     tokio::task::spawn_blocking(move || notice.recv_timeout(Duration::from_secs(3)).unwrap()).await.unwrap();
     drop(stream); // cancel the client, never the already-admitted body
@@ -1608,4 +1644,128 @@ async fn d_cancelled_http_body_remains_admitted_until_real_exit() {
     tokio::task::spawn_blocking(move || owner.close()).await.unwrap().unwrap();
     assert!(f.state.runtime.admit(None).is_err());
     assert_eq!(std::fs::read(f.root.join(".aperture/run/owner/sentinel")).unwrap(),b"unchanged");
+}
+
+#[tokio::test]
+async fn ui_compatibility_denies_before_body_and_admission_with_same_route_positive() {
+    use std::sync::atomic::Ordering;
+    let mut f=Fixture::new().await;
+    // Recompose only this owned router with inert effects, retaining its lease.
+    f.task.abort();let _=(&mut f.task).await;
+    f.state.ui_fixture=true;
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.state.authority=listener.local_addr().unwrap().to_string();f.state.origin=format!("http://{}",f.state.authority);
+    let app=router(f.state.clone());f.task=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+    let session=f.session().await;let auth=format!("Bearer {session}");
+    let base=[("Authorization",auth.as_str()),("Origin",f.state.origin.as_str()),("Sec-Fetch-Site","same-origin"),("Content-Type","application/json")];
+    let before=tree(&f.root);
+    for extra in [vec![],vec![("X-Aperture-Api-Schema","2")],vec![("X-Aperture-Api-Schema","01")],vec![("X-Aperture-Api-Schema","1"),("X-Aperture-Api-Schema","1")]] {
+        let mut h=base.to_vec();h.extend(extra);
+        let r=f.request("POST","/api/tmux/session",&h,"not-json").await;
+        assert_eq!(r.0,409);assert!(r.2.contains("E_WEB_API_INCOMPATIBLE"));
+        assert_eq!(f.request("GET","/api/teams",&h,"").await.0,409);
+        assert_eq!(f.state.test_counts[0].load(Ordering::SeqCst),0);assert_eq!(f.state.test_counts[1].load(Ordering::SeqCst),0);
+    }
+    assert_eq!(tree(&f.root),before);
+    assert_eq!(f.api("POST","/api/tmux/session",&session,r#"{"session_name":"aperture"}"#).await.0,200);
+    assert_eq!(f.state.test_counts[0].load(Ordering::SeqCst),1);assert_eq!(f.state.test_counts[1].load(Ordering::SeqCst),1);
+    let version=f.request("GET","/api/version",&base,"").await;assert_eq!(version.0,200);assert!(version.1.contains("x-aperture-api-schema: 1"));
+    // Deterministic deployment change after a successful preflight, before POST.
+    let counts=f.state.test_counts.iter().map(|c|c.load(Ordering::SeqCst)).collect::<Vec<_>>();
+    f.state.test_schema.store(2,Ordering::SeqCst);
+    let denied=f.api("POST","/api/tmux/session",&session,r#"{"session_name":"aperture"}"#).await;
+    assert_eq!(denied.0,409);assert!(denied.2.contains("E_WEB_API_INCOMPATIBLE"));
+    assert_eq!(f.state.test_counts.iter().map(|c|c.load(Ordering::SeqCst)).collect::<Vec<_>>(),counts);
+    assert_eq!(f.api("POST","/api/teams/t/seats/s/bootstrap",&session,"bad").await.0,403);
+    assert_eq!(f.api("POST","/api/teams/t/approve",&session,"bad").await.0,404);
+    assert_eq!(f.api("POST","/session/logout",&session,"{}").await.0,200);
+}
+
+#[tokio::test]
+async fn ui_real_vite_builds_keep_a_assets_after_current_b() {
+    let receipt=std::env::var_os("APERTURE_UI_BUILD_RECEIPT").expect("paired A/B Vite build receipt required");
+    let r:Value=serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+    let f=Fixture::new().await;
+    fn copy(from:&Path,to:&Path){std::fs::create_dir(to).unwrap();for e in std::fs::read_dir(from).unwrap(){let p=e.unwrap().path();let t=to.join(p.file_name().unwrap());assert!(!p.is_symlink());if p.is_dir(){copy(&p,&t)}else{std::fs::copy(p,t).unwrap();}}}
+    for label in ["A","B"] {
+        let source=PathBuf::from(r[label].as_str().unwrap());
+        let m:Value=serde_json::from_slice(&std::fs::read(source.join("UI.json")).unwrap()).unwrap();
+        copy(&source,&f.state.ui.join(m["ui_id"].as_str().unwrap()));
+    }
+    let a=r["ids"][0].as_str().unwrap();let b=r["ids"][1].as_str().unwrap();
+    point_ui(&f.state.ui,a);let index_a=f.request("GET","/",&[],"").await;assert_eq!(index_a.0,200);assert!(index_a.2.contains(a));
+    point_ui(&f.state.ui,b);let index_b=f.request("GET","/",&[],"").await;assert_eq!(index_b.0,200);assert!(index_b.2.contains(b));assert_ne!(index_a.2,index_b.2);
+    let m:Value=serde_json::from_slice(&std::fs::read(f.state.ui.join(a).join("UI.json")).unwrap()).unwrap();
+    for entry in m["files"].as_array().unwrap() {
+        let rel=entry["path"].as_str().unwrap();let bytes=std::fs::read(f.state.ui.join(a).join(rel)).unwrap();
+        let response=f.request("GET",&format!("/ui/{a}/{rel}"),&[],"").await;assert_eq!(response.0,200);assert_eq!(response.2.as_bytes(),bytes);
+    }
+    assert_eq!(f.request("GET",&format!("/ui/{a}/UI.json"),&[],"").await.0,404);
+    assert_eq!(f.request("GET",&format!("/ui/{a}/missing.js"),&[],"").await.0,404);
+    assert_eq!(f.request("GET",&format!("/ui/{a}/index.html"),&[],"").await.0,200,"missing request does not poison A");
+}
+
+#[tokio::test]
+async fn ui_drift_is_denied_without_fallback_or_repair() {
+    let f=Fixture::new().await;let a="a".repeat(32);let p=f.state.ui.join(&a).join("index.html");
+    assert_eq!(f.request("GET","/",&[],"").await.0,200);
+    std::fs::write(&p,"drift").unwrap();let before=tree(&f.root);
+    assert_eq!(f.request("GET","/",&[],"").await.0,404);assert_eq!(tree(&f.root),before);
+    std::fs::write(&p,"packaged fixture").unwrap();
+    assert_eq!(f.request("GET","/",&[],"").await.0,404,"observed drift remains unavailable");
+    let b="b".repeat(32);fixture_ui(&f.state.ui,&b,"build B");point_ui(&f.state.ui,&b);
+    assert_eq!(f.request("GET","/",&[],"").await.2,"build B");
+    assert_eq!(f.request("GET",&format!("/ui/{a}/index.html"),&[],"").await.0,404);
+}
+
+#[tokio::test]
+async fn ui_closed_manifest_rejects_unknown_duplicate_alias_prefix_and_capacity() {
+    let f=Fixture::new().await;let good:Value=serde_json::from_slice(&std::fs::read(f.state.ui.join("a".repeat(32)).join("UI.json")).unwrap()).unwrap();
+    let mut variants:Vec<String>=vec![];
+    for edit in 0..12 {
+        let mut m=good.clone();
+        match edit {
+            0=>{m["extra"]=json!(true);},1=>{m["api_schema"]=json!(2);},
+            2=>{m["files"][0]["bytes"]=json!(8*1024*1024+1);},
+            3=>{m["files"][0]["path"]=json!("../index.html");},
+            4=>{m["files"][0]["other"]=json!(false);},
+            5=>{let mut e=m["files"][0].clone();e["path"]=json!("INDEX.html");m["files"].as_array_mut().unwrap().insert(0,e);},
+            6=>{let e=m["files"][0].clone();m["files"]=json!(vec![e;513]);},
+            7=>{m["files"][0]["bytes"]=json!(256*1024+1);},
+            8=>{let mut entries=vec![m["files"][0].clone()];for n in 0..5 {entries.push(json!({"path":format!("z{n}.js"),"bytes":8*1024*1024,"sha256":"0".repeat(64)}));}m["files"]=json!(entries);},
+            9=>{m["files"][0]["path"]=json!(format!("{}.js","x".repeat(129)));},
+            10=>{m["files"][0]["path"]=json!("a/b/c/d/e/f/g/h/i.js");},
+            _=>{m["files"].as_array_mut().unwrap().push(json!({"path":"index.html/a.js","bytes":0,"sha256":"0".repeat(64)}));}
+        }
+        variants.push(serde_json::to_string(&m).unwrap());
+    }
+    variants.push(serde_json::to_string(&good).unwrap().replacen("\"schema_version\":1","\"schema_version\":1,\"schema_version\":1",1));
+    variants.push(serde_json::to_string(&good).unwrap().replacen("\"bytes\":16","\"bytes\":16,\"bytes\":16",1));
+    variants.push(" ".repeat(128*1024+1));
+    variants.push(serde_json::to_string(&good).unwrap().replacen("\"bytes\":16","\"bytes\":18446744073709551616",1));
+    for (n,mut bytes) in variants.into_iter().enumerate(){
+        let id=format!("{:032x}",n+1);let build=fixture_ui(&f.state.ui,&id,"packaged fixture");bytes=bytes.replace(&"a".repeat(32),&id);std::fs::write(build.join("UI.json"),&bytes).unwrap();
+        point_ui(&f.state.ui,&id);assert_eq!(f.request("GET","/",&[],"").await.0,404,"case {n}");assert_eq!(std::fs::read(build.join("UI.json")).unwrap(),bytes.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn ui_tree_types_links_extras_and_modes_are_bounded_and_unchanged() {
+    use std::os::unix::fs::{symlink,PermissionsExt};
+    let f=Fixture::new().await;
+    for case in 0..7 {
+        let id=format!("{:032x}",case+100);let build=fixture_ui(&f.state.ui,&id,"packaged fixture");point_ui(&f.state.ui,&id);
+        match case {
+            0=>{std::fs::write(build.join("extra.js"),"extra").unwrap();},
+            1=>{std::fs::remove_file(build.join("index.html")).unwrap();symlink("../a/index.html",build.join("index.html")).unwrap();},
+            2=>{std::fs::set_permissions(build.join("index.html"),std::fs::Permissions::from_mode(0o666)).unwrap();},
+            3=>{std::fs::remove_file(build.join("index.html")).unwrap();let p=std::ffi::CString::new(build.join("index.html").to_str().unwrap()).unwrap();assert_eq!(unsafe{libc::mkfifo(p.as_ptr(),0o600)},0);},
+            4=>{std::fs::hard_link(build.join("index.html"),build.join("second.html")).unwrap();},
+            5=>{std::fs::remove_file(f.state.ui.join("current")).unwrap();symlink(format!("./{id}"),f.state.ui.join("current")).unwrap();},
+            _=>{for n in 0..4097 {std::fs::create_dir(build.join(format!("extra{n}"))).unwrap();}}
+        }
+        let manifest=std::fs::read(build.join("UI.json")).unwrap();let now=std::time::Instant::now();
+        assert_eq!(f.request("GET","/",&[],"").await.0,404,"case {case}");assert!(now.elapsed()<Duration::from_secs(5));
+        assert_eq!(std::fs::read(build.join("UI.json")).unwrap(),manifest);
+    }
 }
