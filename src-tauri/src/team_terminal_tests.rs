@@ -1105,3 +1105,27 @@ fn c2b_cleanup_fd_path_swap_absence_and_nonrefusal_never_unlink() {
     drop(live);
     native_explicit_refusal(&f.root.join("live.sock")).unwrap();
 }
+
+#[test]
+fn local_attach_helper_is_adjacent_validated_and_never_checkout_fallback() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = SocketFixture::new();
+    let bin = f.root.join("bin"); fs::create_dir(&bin).unwrap();
+    let current = bin.join("aperture-server");
+    let helper = bin.join("aperture-boot");
+    // Even a valid checkout-looking file cannot substitute for a missing sibling.
+    let checkout = f.root.join("target/release"); fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("aperture-boot"), b"fixture").unwrap();
+    fs::set_permissions(checkout.join("aperture-boot"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err());
+    symlink(checkout.join("aperture-boot"), &helper).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err()); fs::remove_file(&helper).unwrap();
+    fs::write(&helper, b"own inert executable fixture").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o722)).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err());
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err());
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(boot_helper_adjacent(&current).unwrap(), helper);
+    assert!(boot_helper_adjacent(Path::new("relative/aperture-server")).is_err());
+}

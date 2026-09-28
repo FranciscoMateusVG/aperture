@@ -1248,10 +1248,14 @@ fn tui_args(thread: &str, socket: &Path) -> Vec<String> {
         format!("unix://{}", socket.display()),
     ]
 }
-fn boot_helper() -> Result<PathBuf> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/aperture-boot");
+fn boot_helper_adjacent(current_exe: &Path) -> Result<PathBuf> {
+    if !current_exe.is_absolute() { return Err(ERROR.into()); }
+    let p = current_exe.parent().ok_or(ERROR)?.join("aperture-boot");
     executable(&p)?;
     Ok(p)
+}
+fn boot_helper() -> Result<PathBuf> {
+    boot_helper_adjacent(&std::env::current_exe().map_err(|_| ERROR)?)
 }
 /// Called only by the GUI's operator command. Selectors are never shell input.
 pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {

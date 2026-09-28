@@ -552,7 +552,10 @@ fn connect_subscriber(
     loop {
         match ws.read() {
             Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Ok(frame) if allow_live && pending.len() < 256 => pending.push_back(decode_presence(&frame)?),
+            Ok(frame) if allow_live && pending.len() < 256 => {
+                validate_live_frame(&frame)?;
+                pending.push_back(frame);
+            },
             _ => return Err("E_HUB_POST_FRAME_OR_CLOSED".into()),
         }
     }
@@ -565,6 +568,13 @@ fn connect_subscriber(
 
 #[derive(Clone, Debug)]
 pub(crate) struct PresenceUpdate { pub agent: String, pub event: String }
+fn validate_live_frame(frame: &tungstenite::Message) -> Result<(), String> {
+    match frame {
+        tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => Ok(()),
+        tungstenite::Message::Text(_) => decode_presence(frame).map(|_| ()),
+        _ => Err(UNVERIFIED.into()),
+    }
+}
 fn decode_presence(frame: &tungstenite::Message) -> Result<PresenceUpdate, String> {
     let tungstenite::Message::Text(text) = frame else { return Err(UNVERIFIED.into()); };
     if text.len() > SNAPSHOT_FRAME_BYTES { return Err(UNVERIFIED.into()); }
@@ -583,7 +593,7 @@ pub(crate) struct BoundSubscriber {
     expected: ProcessIdentity,
     endpoint: SocketAddr,
     initial: Option<Vec<PresenceUpdate>>,
-    pending: std::collections::VecDeque<PresenceUpdate>,
+    pending: std::collections::VecDeque<tungstenite::Message>,
     rate: std::collections::VecDeque<Instant>,
 }
 impl BoundSubscriber {
@@ -598,24 +608,41 @@ impl BoundSubscriber {
     pub(crate) fn next(&mut self, lease: &ControllerLock) -> Result<Option<PresenceUpdate>, String> {
         if self.initial.is_some() { return Err(UNVERIFIED.into()); }
         self.verify(lease)?;
-        let value = if let Some(value) = self.pending.pop_front() { value } else {
-            self.ws.get_mut().until = Instant::now() + Duration::from_secs(1);
-            self.ws.get_mut().remaining = SNAPSHOT_FRAME_BYTES + 14;
-            match self.ws.read() {
-                Ok(frame) => decode_presence(&frame)?,
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                    self.verify(lease)?;
-                    return Ok(None);
+        // One absolute budget for the whole call, including controls and flush.
+        // A ping stream cannot renew the deadline or escape the live frame cap.
+        let until = Instant::now() + Duration::from_secs(1);
+        self.ws.get_mut().until = until;
+        self.ws.get_mut().remaining = SNAPSHOT_TOTAL_BYTES;
+        loop {
+            self.verify(lease)?;
+            if Instant::now() >= until { return Ok(None); }
+            let frame = if let Some(frame) = self.pending.pop_front() { frame } else {
+                match self.ws.read() {
+                    Ok(frame) => frame,
+                    Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        self.verify(lease)?;
+                        return Ok(None);
+                    }
+                    _ => return Err(UNVERIFIED.into()),
                 }
-                _ => return Err(UNVERIFIED.into()),
+            };
+            self.verify(lease)?;
+            let now = Instant::now();
+            while self.rate.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) { self.rate.pop_front(); }
+            if self.rate.len() >= 256 { return Err(UNVERIFIED.into()); }
+            self.rate.push_back(now); // Ping/Pong consume exactly the same cap as text.
+            validate_live_frame(&frame)?;
+            match frame {
+                tungstenite::Message::Ping(_) => {
+                    // tungstenite queues the matching Pong in read(). Flush it
+                    // now; merely accepting Ping leaves the server heartbeat unacked.
+                    self.ws.flush().map_err(|_| UNVERIFIED)?;
+                    self.verify(lease)?;
+                }
+                tungstenite::Message::Pong(_) => {},
+                _ => return decode_presence(&frame).map(Some),
             }
-        };
-        self.verify(lease)?;
-        let now = Instant::now();
-        while self.rate.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) { self.rate.pop_front(); }
-        if self.rate.len() >= 256 { return Err(UNVERIFIED.into()); }
-        self.rate.push_back(now);
-        Ok(Some(value))
+        }
     }
 }
 pub(crate) fn registered_subscriber(lease: &ControllerLock) -> Result<BoundSubscriber, String> {

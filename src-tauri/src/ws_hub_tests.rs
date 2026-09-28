@@ -461,6 +461,44 @@ fn inert_process_entry() {
                 if mode == "d-truncated" {
                     let _ = ws.send(presence("fixture")); return;
                 }
+                if mode.starts_with("local-live-") {
+                    ws.send(Message::Text(final_msg.to_string())).unwrap();
+                    // Parent releases this barrier only after post-binding and
+                    // initial snapshot consumption; no timing-based staging.
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while !run.join("fixture-live-go").exists() {
+                        assert!(Instant::now() < until);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    match mode.as_str() {
+                        "local-live-ping" => {
+                            ws.send(Message::Pong(b"unsolicited".to_vec())).unwrap();
+                            ws.send(Message::Ping(b"heartbeat".to_vec())).unwrap();
+                            assert_eq!(ws.read().unwrap(), Message::Pong(b"heartbeat".to_vec()));
+                            fs::write(run.join("fixture-pong"), b"matching-pong").unwrap();
+                            ws.send(text(serde_json::json!({"type":"presence","agent":"fixture","event":"busy","ts":"2026-09-27T12:00:00Z"}))).unwrap();
+                        }
+                        "local-live-binary" => { ws.send(Message::Binary(vec![1])).unwrap(); }
+                        "local-live-malformed" => { ws.send(Message::Text("{invalid".into())).unwrap(); }
+                        "local-live-close" => { ws.close(None).unwrap(); }
+                        "local-live-flood" => {
+                            // Queue together, never sleep across the client's rate window.
+                            for _ in 0..257 { ws.write(Message::Pong(vec![])).unwrap(); }
+                            ws.flush().unwrap();
+                        }
+                        _ => panic!("unknown fixture mode"),
+                    }
+                    let closed = match ws.read() {
+                        Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => true,
+                        Err(tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => true,
+                        Err(tungstenite::Error::Io(e)) => matches!(e.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset),
+                        Ok(Message::Close(_)) => true,
+                        _ => false,
+                    };
+                    assert!(closed, "expected bounded client teardown, not a timeout");
+                    fs::write(run.join("fixture-stream-closed"), b"closed").unwrap();
+                    return;
+                }
                 if mode == "d-live" {
                     final_msg["snapshot_count"] = serde_json::json!(1);
                     ws.write(presence("fixture")).unwrap();
@@ -1089,4 +1127,41 @@ fn local_hub_log_preflight_denies_unsafe_modes_before_reservation_token_or_spawn
     assert!(observed.spawned);assert_eq!(team_process::state(&observed.identity),ProcessState::Same);
     assert_eq!(fs::metadata(f.home.join(".aperture/logs/ws-hub.log")).unwrap().mode()&0o777,0o600);
     drop(lease);drop(f); // exact own child cleanup/reap in the existing fixture
+}
+
+#[test]
+fn local_live_ping_pong_preserves_bound_stream_presence_and_finite_teardown() {
+    let mut f = NativeFixture::new();
+    let identity = f.launch("local-live-ping"); f.wait_file("fixture-ready");
+    let lease = ControllerLock::acquire(&f.home).unwrap(); f.published(&lease, &identity);
+    let mut stream = registered_subscriber(&lease).unwrap();
+    assert!(stream.take_initial().unwrap().is_empty());
+    fs::write(lease.run_dir().unwrap().join("fixture-live-go"), b"go").unwrap();
+    let at = Instant::now();
+    let update = stream.next(&lease).unwrap().unwrap();
+    assert!(at.elapsed() < Duration::from_secs(2));
+    assert_eq!((update.agent.as_str(), update.event.as_str()), ("fixture", "busy"));
+    assert_eq!(f.wait_file("fixture-pong"), b"matching-pong");
+    assert_eq!(f.wait_file("fixture-hello-count"), b"1\n");
+    assert_eq!(stream.rate.len(), 3); // unsolicited Pong + Ping + presence
+    assert_eq!(team_process::state(&identity), ProcessState::Same);
+    drop(stream);
+    assert_eq!(f.wait_file("fixture-stream-closed"), b"closed");
+    drop(lease); // Fixture then reaps only its exact child and proves Gone.
+}
+
+#[test]
+fn local_live_controls_are_bounded_and_non_presence_data_fails_closed() {
+    for mode in ["local-live-binary", "local-live-malformed", "local-live-close", "local-live-flood"] {
+        let mut f = NativeFixture::new(); let identity = f.launch(mode); f.wait_file("fixture-ready");
+        let lease = ControllerLock::acquire(&f.home).unwrap(); f.published(&lease, &identity);
+        let mut stream = registered_subscriber(&lease).unwrap(); stream.take_initial().unwrap();
+        fs::write(lease.run_dir().unwrap().join("fixture-live-go"), b"go").unwrap();
+        let at = Instant::now();
+        assert!(stream.next(&lease).is_err(), "{mode}");
+        assert!(at.elapsed() < Duration::from_secs(2), "{mode}");
+        assert_eq!(f.wait_file("fixture-hello-count"), b"1\n");
+        drop(stream);
+        assert_eq!(f.wait_file("fixture-stream-closed"), b"closed");
+    }
 }
