@@ -57,6 +57,7 @@ pub(crate) struct HubSpec {
     pub args: Vec<std::ffi::OsString>,
     pub endpoint: SocketAddr,
     pub home: PathBuf,
+    pub env: Vec<(String,String)>,
     pub provenance: Provenance,
     #[cfg(test)]
     pub fault: Option<String>,
@@ -145,7 +146,10 @@ impl<'a> Supervisor<'a> {
         )?;
         self.edge("reserved")?;
         self.lease.verify_live()?;
+        crate::hub_auth::provision_under_lease(self.lease,"watchdog")?;
+        let executable_pin=crate::daemons::ToolPin::capture(&self.spec.command)?;
         let mut command = Command::new(&self.spec.command);
+        command.env_clear().envs(self.spec.env.clone());
         command
             .args(&self.spec.args)
             .env("HOME", &self.spec.home)
@@ -168,7 +172,7 @@ impl<'a> Supervisor<'a> {
             .create(true)
             .append(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(log_path)
             .map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
         let meta = log.metadata().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
@@ -177,6 +181,10 @@ impl<'a> Supervisor<'a> {
             || meta.nlink() != 1
             || meta.mode() & 0o077 != 0
         {
+            return Err("E_HUB_LOG_UNSAFE".into());
+        }
+        let flags=unsafe{libc::fcntl(log.as_raw_fd(),libc::F_GETFL)};
+        if flags<0 || unsafe{libc::fcntl(log.as_raw_fd(),libc::F_SETFL,flags & !libc::O_NONBLOCK)}<0 {
             return Err("E_HUB_LOG_UNSAFE".into());
         }
         command
@@ -195,6 +203,8 @@ impl<'a> Supervisor<'a> {
                 }
             });
         }
+        executable_pin.recheck()?;
+        self.lease.verify_live()?;
         drop(free);
         let child = command.spawn().map_err(|_| "E_HUB_SPAWN_UNKNOWN")?;
         let pid = child.id();
@@ -241,6 +251,19 @@ fn now_ms() -> Result<u64, String> {
     )
     .map_err(|_| UNVERIFIED.into())
 }
+/// Local installed composition; tool selection is complete before entering here.
+pub(crate) fn local_spec(lease:&ControllerLock,tools:&crate::daemons::LocalTools,script:&Path)->Result<HubSpec,String>{
+    tools.node.recheck()?;
+    let meta=std::fs::symlink_metadata(script).map_err(|_|"E_LOCAL_MCP_PATH")?;
+    if !script.is_absolute() || !meta.is_file() || meta.file_type().is_symlink() || meta.mode()&0o022!=0 {
+        return Err("E_LOCAL_MCP_PATH".into());
+    }
+    let home=lease.run_dir()?.parent().and_then(Path::parent).ok_or(UNVERIFIED)?.to_path_buf();
+    let spec=HubSpec{command:tools.node.path.clone(),args:vec![script.as_os_str().into()],
+        endpoint:SocketAddr::from((Ipv4Addr::LOCALHOST,HUB_PORT)),home,env:tools.environment(),provenance:Provenance::LegacyUnknown,
+        #[cfg(test)] fault:None,#[cfg(test)] fixture_mode:String::new()};
+    Ok(spec)
+}
 /// Called only inside the still-fenced aggregate composition. Production uses
 /// the identical Supervisor implementation as the inert process fixtures.
 pub(crate) fn spawn_ws_hub(lease: &ControllerLock, project_dir: String) -> Result<(), String> {
@@ -257,6 +280,7 @@ pub(crate) fn spawn_ws_hub(lease: &ControllerLock, project_dir: String) -> Resul
             .into_os_string()],
         endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, HUB_PORT)),
         home,
+        env:vec![],
         provenance: Provenance::LegacyUnknown,
         #[cfg(test)]
         fault: None,

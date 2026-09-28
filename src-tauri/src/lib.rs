@@ -97,7 +97,8 @@ pub(crate) fn boot_agent_headless_external(
         return Err(agents::LifecycleRefusal::InputsUnverified.code().into());
     }
     let lease = controller::ControllerLock::acquire(home)?;
-    let runtime = daemons::RuntimeOwner::new(lease);
+    let tools=daemons::LocalTools::resolve(home)?;
+    let runtime = daemons::RuntimeOwner::local(lease,tools)?;
     let result = {
         let work = runtime.admit(Some(name))?;
         let _body = work.body()?;
@@ -242,7 +243,8 @@ pub fn run() {
         }
     }
 
-    let runtime = Arc::new(daemons::RuntimeOwner::new(_controller));
+    let tools=match daemons::LocalTools::resolve(std::path::Path::new(&home)){Ok(t)=>t,Err(e)=>{eprintln!("[aperture] local tools: {e}");return;}};
+    let runtime = match daemons::RuntimeOwner::local(_controller,tools){Ok(r)=>Arc::new(r),Err(e)=>{eprintln!("[aperture] local runtime: {e}");return;}};
     if let Err(error) = runtime.start(Arc::clone(&app_state)) {
         eprintln!("[aperture] daemon startup refused: {error}");
         return;

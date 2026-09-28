@@ -54,20 +54,15 @@ fn downstream(lease: &ControllerLock, code: &str) {
     let watchdog = Cell::new(0);
     // Same preflight function invoked by daemons::start, with only the native
     // effects replaced. Never call production token/threads in a test.
-    error(
-        crate::daemons::start_checked(lease, || {
-            token.set(token.get() + 1);
-            poller.set(poller.get() + 1);
-            hub.set(hub.get() + 1);
-            watchdog.set(watchdog.get() + 1);
-            Ok(())
-        }),
-        code,
-    );
-    assert_eq!(
-        [token.get(), poller.get(), hub.get(), watchdog.get()],
-        [0; 4]
-    );
+    let result=crate::daemons::start_checked(lease,||{
+        token.set(token.get()+1);poller.set(poller.get()+1);hub.set(hub.get()+1);watchdog.set(watchdog.get()+1);Ok(())
+    });
+    if code=="VALID_NAMESPACE" {
+        // Historical fence cases have structurally valid metadata. This means
+        // preflight calls the supervisor once, NOT that identity/adoption is proven.
+        result.unwrap();assert_eq!([token.get(),poller.get(),hub.get(),watchdog.get()],[1;4]);
+    }else{error(result,code);assert_eq!([token.get(),poller.get(),hub.get(),watchdog.get()],[0;4]);}
+
 }
 fn write<T: Serialize>(path: &Path, value: &T) {
     journal::write_private_json_atomic(path, value, false).unwrap();
@@ -89,23 +84,23 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[test]
-fn pristine_registry_is_not_permission_to_start_legacy_supervision() {
+fn pristine_registry_enters_supervisor_preflight_once() {
     let f = Fixture::new();
     let lease = f.lease();
     let registry = Registry::open(&lease).unwrap();
     assert!(registry.inspect().unwrap().is_empty());
-    downstream(&lease, "E_DAEMON_SUPERVISION_PENDING");
+    downstream(&lease, "VALID_NAMESPACE");
     assert!(!f.0.join(".aperture/hub-tokens").exists());
 }
 
 #[test]
-fn unknown_listener_without_registry_never_reaches_legacy_kill_path() {
+fn namespace_admission_is_not_a_listener_identity_claim() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let f = Fixture::new();
     let lease = f.lease();
-    downstream(&lease, "E_DAEMON_SUPERVISION_PENDING");
+    downstream(&lease, "VALID_NAMESPACE");
     assert_eq!(listener.local_addr().unwrap(), address);
     assert!(std::net::TcpStream::connect(address).is_ok());
     assert!(listener.accept().is_ok());
@@ -149,7 +144,7 @@ fn each_publication_edge_is_incomplete_until_current_and_history_are_complete() 
     assert_eq!(inspected.len(), 1);
     assert_eq!(inspected[0].identity, ProcessState::Same);
     assert_eq!(inspected[0].provenance, Provenance::LegacyUnknown);
-    downstream(&lease, "E_DAEMON_SUPERVISION_PENDING"); // Same is NOT Adopted
+    downstream(&lease, "VALID_NAMESPACE"); // Same is NOT Adopted
     fs::remove_file(registry.root.join("hub/current")).unwrap();
     downstream(&lease, "E_DAEMON_PUBLICATION_INCOMPLETE"); // history is not Absent
 }
@@ -216,7 +211,7 @@ fn stale_current_cannot_hide_new_record_or_unfinished_reservation() {
             assert_eq!(now.get(&path), Some(&bytes));
         }
     }
-    downstream(&lease, "E_DAEMON_SUPERVISION_PENDING");
+    downstream(&lease, "VALID_NAMESPACE");
 }
 
 #[test]
@@ -392,7 +387,7 @@ fn identity_observations_are_not_adoption_or_respawn_permissions() {
     ] {
         assert_eq!(registry.inspect_with(|_| state).unwrap()[0].identity, state);
     }
-    downstream(&lease, "E_DAEMON_SUPERVISION_PENDING");
+    downstream(&lease, "VALID_NAMESPACE");
 }
 
 #[test]

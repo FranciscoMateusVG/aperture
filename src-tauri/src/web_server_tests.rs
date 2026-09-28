@@ -1769,3 +1769,17 @@ async fn ui_tree_types_links_extras_and_modes_are_bounded_and_unchanged() {
         assert_eq!(std::fs::read(build.join("UI.json")).unwrap(),manifest);
     }
 }
+
+#[test]
+fn local_package_ui_and_actual_mcp_entrypoints_are_adjacent_not_ambient() {
+    use std::os::unix::fs::DirBuilderExt;
+    let root=std::path::PathBuf::from(format!("/private/tmp/aperture-local-package-{}",uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    for dir in ["bin","ui","mcp-server/dist","mcp-server-sentry/dist/src"]{std::fs::create_dir_all(root.join(dir)).unwrap();}
+    for file in ["mcp-server/dist/index.js","mcp-server/dist/ws-hub.js","mcp-server-sentry/dist/src/index.js"]{std::fs::write(root.join(file),b"synthetic").unwrap();}
+    let exe=root.join("bin/aperture-server");let (ui,bus,sentry)=local_package_paths(&exe).unwrap();
+    assert_eq!(ui,root.join("ui"));assert_eq!(bus,root.join("mcp-server/dist/index.js"));assert_eq!(sentry,root.join("mcp-server-sentry/dist/src/index.js"));
+    std::fs::remove_file(&sentry).unwrap();std::fs::write(root.join("mcp-server-sentry/dist/index.js"),b"obsolete layout").unwrap();
+    assert!(local_package_paths(&exe).is_err(),"obsolete Sentry dist/index.js is not a fallback");
+    std::fs::remove_dir_all(&root).unwrap();assert!(!root.exists());
+}

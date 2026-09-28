@@ -230,6 +230,7 @@ impl NativeFixture {
             ],
             endpoint: self.endpoint,
             home: self.home.clone(),
+            env:vec![],
             provenance: Provenance::LegacyUnknown,
             fault: None,
             fixture_mode: String::new(),
@@ -365,6 +366,7 @@ fn inert_process_entry() {
             ],
             endpoint: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
             home: home.clone(),
+            env:vec![],
             provenance: Provenance::LegacyUnknown,
             fault: None,
             fixture_mode: "normal".into(),
@@ -1000,4 +1002,41 @@ fn d_subscriber_auth_truncation_duplicate_timeout_and_impostor_never_trusted() {
     assert!(registered_subscriber(&lease).is_err());
     assert!(!f.home.join(".aperture/run/fixture-hello-count").exists());
     assert_eq!(team_process::state(&impostor),ProcessState::Same); // no signal/spawn
+}
+
+#[test]
+fn local_composition_starts_registered_hub_and_drains_workers_without_killing_daemon() {
+    let f=NativeFixture::new();
+    let lease=ControllerLock::acquire(&f.home).unwrap();
+    let tools=crate::daemons::LocalTools::fixture(&f.home,&std::env::current_exe().unwrap());
+    let owner=crate::daemons::RuntimeOwner::local(lease,tools).unwrap();
+    let state=crate::agents::lifecycle_tests::state("fixture","opus");
+    owner.start_with_hub(state.clone(),f.spec("normal")).unwrap();
+    let identity:ProcessIdentity=serde_json::from_slice(&f.wait_file("fixture-daemon.json")).unwrap();
+    assert_eq!(team_process::state(&identity),ProcessState::Same);
+    assert!(ControllerLock::acquire(&f.home).is_err());
+    let token=fs::read(f.home.join(".aperture/run/hub-tokens/watchdog.token")).unwrap();
+    owner.close().unwrap();assert!(owner.admit(None).is_err());
+    assert_eq!(team_process::state(&identity),ProcessState::Same);
+    drop(owner);
+    let lease=ControllerLock::acquire(&f.home).unwrap();
+    let tools=crate::daemons::LocalTools::fixture(&f.home,&std::env::current_exe().unwrap());
+    let next=crate::daemons::RuntimeOwner::local(lease,tools).unwrap();
+    next.start_with_hub(state,f.spec("normal")).unwrap();
+    assert_eq!(fs::read(f.home.join(".aperture/run/hub-tokens/watchdog.token")).unwrap(),token,"adoption must not rotate token");
+    next.close().unwrap();drop(next);drop(f); // fixture kills/reaps only its exact native child
+}
+#[test]
+fn local_composition_unknown_hub_closes_without_token_rotation_or_spawn() {
+    let mut f=NativeFixture::new();let expected=f.launch("normal");f.wait_file("fixture-ready");
+    let token=fs::read(f.home.join(".aperture/run/hub-tokens/watchdog.token")).unwrap();
+    let lease=ControllerLock::acquire(&f.home).unwrap();
+    let tools=crate::daemons::LocalTools::fixture(&f.home,&std::env::current_exe().unwrap());
+    let owner=crate::daemons::RuntimeOwner::local(lease,tools).unwrap();
+    assert!(owner.start_with_hub(crate::agents::lifecycle_tests::state("fixture","opus"),f.spec("normal")).is_err());
+    assert!(owner.admit(None).is_err());
+    assert_eq!(team_process::state(&expected),ProcessState::Same);
+    assert_eq!(fs::read(f.home.join(".aperture/run/hub-tokens/watchdog.token")).unwrap(),token);
+    assert!(!f.home.join(".aperture/run/daemons/hub").exists());
+    drop(owner);drop(f);
 }

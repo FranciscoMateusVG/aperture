@@ -75,7 +75,7 @@ impl<'a> LifecycleContext<'a> {
     }
     fn require_tools(&self) -> Result<(), String> {
         #[cfg(test)] if self.fixture.is_some() { return Ok(()); }
-        Err("E_RUNTIME_TOOLS_UNVERIFIED".into())
+        self.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?.require_tools()
     }
     pub(crate) fn accounted(mut self, work: &'a crate::daemons::RuntimeWork) -> Self {
         self.work = Some(work); self
@@ -156,7 +156,14 @@ fn with_lifecycle_plan(
     let codex = advisory.model.starts_with("codex/")
         || matches!(&action, LifecycleAction::Model(v) if v.starts_with("codex/"));
     let history = context.has_codex_history(name)?;
+    if context.work.is_some_and(|w| w.tools().is_ok()) && matches!(action,LifecycleAction::Stop|LifecycleAction::Restart) {
+        return Err("E_LIFECYCLE_DESCENDANTS_UNVERIFIED: stop/restart is unavailable for this local installation".into());
+    }
     if codex || history {
+        if matches!(action,LifecycleAction::Start) && advisory.model.starts_with("codex/")
+            && context.work.is_some_and(|w|w.tools().is_ok()) {
+            return start_codex_local(state,&advisory,context,&mut op);
+        }
         #[cfg(test)]
         if matches!(action, LifecycleAction::Start) && !history {
             if let Some(fixture) = context.fixture.filter(|f| f.spec.is_some()) {
@@ -172,6 +179,137 @@ fn with_lifecycle_plan(
     }
     verify_plan(state, &advisory)?;
     execute(&advisory, &mut op)
+}
+
+// Production preparation is borrowed by the SAME held supervisor operation.
+// Existing login/home is an explicit prerequisite: never copy credentials or
+// manufacture trust/auth in order to make a fresh installation look ready.
+pub(crate) struct LocalCodexPreparation<'a> {
+    context: &'a LifecycleContext<'a>, state:&'a Arc<Mutex<AppState>>, expected:&'a AgentDef,
+    codex_home:std::path::PathBuf, bus:String, sentry:String, project:String,
+}
+impl LocalCodexPreparation<'_> {
+    pub(crate) fn seat(&self)->&str{&self.expected.name}
+    pub(crate) fn recheck(&self)->Result<(),String>{
+        self.context.classify(&self.expected.name)?;self.context.require_tools()?;
+        verify_plan(self.state,self.expected)?;
+        crate::controller::private_dir_readonly(&self.codex_home)?;
+        let state=self.state.lock().map_err(|_|"E_RUNTIME_STATE")?;
+        if state.mcp_server_path!=self.bus || state.mcp_sentry_server_path!=self.sentry || state.project_dir!=self.project {
+            return Err(LifecycleRefusal::PlanChanged.code().into());
+        }
+        for path in [&self.bus,&self.sentry] { local_regular_bytes(std::path::Path::new(path),8*1024*1024)?; }
+        Ok(())
+    }
+    fn configuration(&self)->Result<toml::Value,String>{
+        self.recheck()?;
+        let path=self.codex_home.join("config.toml");
+        let bytes=local_regular_bytes(&path,256*1024)?;
+        use std::os::unix::fs::MetadataExt;
+        if fs::symlink_metadata(&path).map_err(|_|"E_LOCAL_CODEX_CONFIG")?.mode()&0o777!=0o600 {
+            return Err("E_LOCAL_CODEX_CONFIG_PRIVATE_REQUIRED".into());
+        }
+        let config:toml::Value=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_CODEX_CONFIG")?.parse().map_err(|_|"E_LOCAL_CODEX_CONFIG")?;
+        let table=config.as_table().ok_or("E_LOCAL_CODEX_CONFIG")?;
+        let servers=table.get("mcp_servers").and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
+        for name in ["aperture-bus","sentry"] {
+            let server=servers.get(name).and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
+            if server.get("env").is_some_and(|v|!v.is_table()){return Err("E_LOCAL_CODEX_CONFIG".into());}
+        }
+        Ok(config)
+    }
+    pub(crate) fn prepare(&self)->Result<(),String>{
+        let mut config=self.configuration()?;
+        let config_path=self.codex_home.join("config.toml");
+        let table=config.as_table_mut().ok_or("E_LOCAL_CODEX_CONFIG")?;
+        // Preserve operator trust/approvals/provider configuration verbatim in
+        // value; only the selected model and local MCP executable paths change.
+        table.insert("model".into(),toml::Value::String(self.expected.model.trim_start_matches("codex/").into()));
+        let tools=self.context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?.tools()?;
+        let servers=table.get_mut("mcp_servers").and_then(toml::Value::as_table_mut).ok_or("E_LOCAL_CODEX_CONFIG")?;
+        for name in ["aperture-bus","sentry"]{
+            let server=servers.get(name).and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
+            if server.get("env").is_some_and(|v|!v.is_table()){return Err("E_LOCAL_CODEX_CONFIG".into());}
+        }
+        // All shape/path/plan checks precede token rotation and the config write.
+        self.recheck()?;
+        let token=hub_auth::provision_under_lease(self.context.lease,&self.expected.name)?;
+        for (name,path) in [("aperture-bus",&self.bus),("sentry",&self.sentry)] {
+            let server=servers.get_mut(name).and_then(toml::Value::as_table_mut).ok_or("E_LOCAL_CODEX_CONFIG")?;
+            server.insert("command".into(),toml::Value::String(tools.node.path.to_string_lossy().into_owned()));
+            server.insert("args".into(),toml::Value::Array(vec![toml::Value::String(path.clone())]));
+            let env=server.entry("env").or_insert_with(||toml::Value::Table(Default::default())).as_table_mut().ok_or("E_LOCAL_CODEX_CONFIG")?;
+            for (key,value) in tools.environment(){env.insert(key,toml::Value::String(value));}
+            if name=="aperture-bus"{env.insert("APERTURE_HUB_TOKEN_FILE".into(),toml::Value::String(token.to_string_lossy().into_owned()));}
+        }
+        let output=toml::to_string(&config).map_err(|_|"E_LOCAL_CODEX_CONFIG")?;
+        self.recheck()?;
+        crate::journal::write_private_bytes_atomic(&config_path,output.as_bytes(),true)
+    }
+}
+fn local_regular_bytes(path:&std::path::Path,cap:u64)->Result<Vec<u8>,String>{
+    use std::os::unix::fs::{OpenOptionsExt,MetadataExt};use std::io::Read;
+    let file=fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map_err(|_|"E_LOCAL_INPUT_MISSING")?;
+    let m=file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
+    if !m.is_file() || m.nlink()!=1 || m.uid()!=unsafe{libc::geteuid()} || m.mode()&0o022!=0 || m.len()>cap {return Err("E_LOCAL_INPUT_UNVERIFIED".into());}
+    let mut bytes=Vec::new();file.take(cap+1).read_to_end(&mut bytes).map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
+    if bytes.len() as u64>cap{return Err("E_LOCAL_INPUT_UNVERIFIED".into());}Ok(bytes)
+}
+fn shell_quote(value:&str)->String{format!("'{}'",value.replace('\'',"'\\''"))}
+fn wait_local_thread(path:&std::path::Path,work:&crate::daemons::RuntimeWork)->Result<String,String>{
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(60);
+    loop {
+        work.check_open()?;
+        match fs::symlink_metadata(path){
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Ok(_)=>{
+                let bytes=local_regular_bytes(path,128)?;
+                let thread=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
+                let id=uuid::Uuid::parse_str(thread).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
+                if id.to_string()!=thread{return Err("E_LOCAL_THREAD_UNVERIFIED".into());}
+                return Ok(thread.into());
+            },
+            Err(_)=>return Err("E_LOCAL_THREAD_UNVERIFIED".into()),
+        }
+        if std::time::Instant::now()>=until{return Err("E_LOCAL_THREAD_UNVERIFIED".into());}
+        work.wait_open(std::time::Duration::from_millis(50))?;
+    }
+}
+
+fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&LifecycleContext<'_>,op:&mut crate::controller::CodexOperation<'_>)->Result<(),String>{
+    let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;let tools=work.tools()?;
+    let executable=tools.codex.as_ref().ok_or("E_LOCAL_CODEX_MISSING")?;executable.recheck()?;
+    let home=std::path::PathBuf::from(format!("/private/tmp/aperture-codex-{}",expected.name));
+    crate::controller::private_dir_readonly(&home).map_err(|_|"E_LOCAL_CODEX_HOME_REQUIRED: existing configured private per-agent home required")?;
+    let (bus,sentry,project,session)={let s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;(s.mcp_server_path.clone(),s.mcp_sentry_server_path.clone(),s.project_dir.clone(),s.tmux_session.clone())};
+    let plan=LocalCodexPreparation{context,state,expected,codex_home:home.clone(),bus,sentry,project};
+    plan.configuration()?; // input shape/modes before registry or durable intent
+    let registry=crate::daemon_registry::Registry::open(context.lease)?;
+    if registry.codex_snapshot(&expected.name)?.is_none() {
+        match fs::symlink_metadata(context.lease.run_dir()?.join(format!("{}.thread-id",expected.name))) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            _=>return Err("E_LOCAL_THREAD_HISTORY_UNVERIFIED".into()),
+        }
+    }
+    let spec=crate::codex_appserver::NativeCodexSpec{seat:expected.name.clone(),executable:executable.path.clone(),codex_home:home.clone(),provenance:crate::daemon_registry::Provenance::LegacyUnknown,
+        #[cfg(test)]fixture:None,#[cfg(test)]fault:None};
+    let supervisor=crate::codex_appserver::NativeCodexSupervisor::new(context.lease,&registry,spec)?;
+    supervisor.prepared_local(op,&plan)?; // adoption skips prepare entirely
+    plan.recheck()?;
+    // Do not duplicate a live attached window or rewrite adopted configuration.
+    let windows=tmux::list_windows_local(&session,work)?;
+    let window=if let Some(existing)=find_running_window(&windows,&expected.name){existing.window_id.clone()}else{
+        let thread_path=context.lease.run_dir()?.join(format!("{}.thread-id",expected.name));
+        let thread=wait_local_thread(&thread_path,work)?;
+        supervisor.recheck_held(op)?;
+        let window=tmux::create_window_local(&session,&expected.name,work)?;
+        let socket=context.lease.run_dir()?.join(format!("{}.sock",expected.name));
+        let command=format!("/usr/bin/env -i HOME={} CODEX_HOME={} TERM=xterm-256color {} resume {} --remote {}",shell_quote(&context.home.to_string_lossy()),shell_quote(&home.to_string_lossy()),shell_quote(&executable.path.to_string_lossy()),shell_quote(&thread),shell_quote(&format!("unix://{}",socket.display())));
+        executable.recheck()?;work.check_open()?;tmux::send_local(&window,&command,work)?;window
+    };
+    verify_plan(state,expected)?;
+    let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;let agent=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
+    agent.tmux_window_id=Some(window);agent.status="running".into();Ok(())
 }
 
 #[cfg(test)]
@@ -229,33 +367,12 @@ struct CurrentTask {
 /// outcome). `Some(map)` with an assignee absent from the map means idle;
 /// `None` means suppress the summary line entirely, same as before this
 /// feature shipped.
-fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
-    let output = Command::new("bd")
-        .args(["list", "--status=in_progress", "--json", "--no-pager", "--limit", "0"])
-        .env(
-            "PATH",
-            format!(
-                "/opt/homebrew/bin:/usr/local/bin:{}",
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            eprintln!(
-                "[aperture] warn: `bd list --status=in_progress` exited non-zero ({}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return None;
-        }
-        Err(e) => {
-            eprintln!("[aperture] warn: failed to spawn `bd` for current-task resolution: {}", e);
-            return None;
-        }
-    };
+fn resolve_current_tasks(work: Option<&crate::daemons::RuntimeWork>) -> Option<HashMap<String, CurrentTask>> {
+    let work=work?;
+    let tools=work.tools().ok()?;
+    let input=work.client(&tools.bd,vec!["list".into(),"--status=in_progress".into(),"--json".into(),"--no-pager".into(),"--limit".into(),"512".into()]).ok()?;
+    let output=crate::daemons::run_client(work,input,std::time::Duration::from_secs(3),1024*1024,64*1024).ok()?;
+    if !output.accepted {return None;}
 
     let issues: Vec<serde_json::Value> = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
@@ -400,7 +517,11 @@ fn boot_agent_process_held(
     let name = agent.name.clone();
 
     // Create a dedicated tmux window for this agent
-    let window_id = tmux::tmux_create_window(tmux_session, name.clone())?;
+    let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;
+    let tools=work.tools()?;
+    let claude=tools.claude.as_ref().ok_or("E_LOCAL_CLAUDE_MISSING")?;claude.recheck()?;
+    if find_running_window(&tmux::list_windows_local(&tmux_session,work)?,&name).is_some(){return Err("E_LOCAL_PANE_ALREADY_PRESENT".into());}
+    let window_id = tmux::create_window_local(&tmux_session,&name,work)?;
     // From this point onward every failure must remove the already-created
     // window. Otherwise the watchdog sees a half-booted agent and respawns it
     // repeatedly, leaving orphan panes behind.
@@ -426,19 +547,21 @@ fn boot_agent_process_held(
     // byte-identical to the historical inline templates. The env reads live
     // here (side-effecting layer); the pure builders in launcher.rs only see
     // plain values.
-    let claude_bin = std::env::var("APERTURE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let claude_bin = claude.path.to_string_lossy().into_owned();
     let pane_codex_bin = std::env::var("APERTURE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let launcher_path_prefix = std::env::var("APERTURE_LAUNCHER_PATH_PREFIX").ok();
-    let hub_token_path = hub_auth::provision_token(&name)?;
+    let hub_token_path = hub_auth::provision_under_lease(context.lease,&name)?;
     let hub_token_path = hub_token_path.to_string_lossy().into_owned();
 
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "aperture-bus": {
                 "type": "stdio",
-                "command": "node",
+                "command": tools.node.path,
                 "args": [&mcp_server_path],
                 "env": {
+                    "PATH": tools.environment().into_iter().find(|(k,_)|k=="PATH").map(|(_,v)|v).unwrap_or_default(),
+                    "HOME": &home_dir,
                     "AGENT_NAME": &name,
                     "AGENT_ROLE": &agent.role,
                     "AGENT_MODEL": &agent.model,
@@ -456,7 +579,7 @@ fn boot_agent_process_held(
             // and other tools (aperture-bus, mempalace) still work.
             "sentry": {
                 "type": "stdio",
-                "command": "node",
+                "command": tools.node.path,
                 "args": [&mcp_sentry_server_path],
                 "env": {
                     "AGENT_NAME": &name,
@@ -609,25 +732,19 @@ fn boot_agent_process_held(
         let prompt_path = format!("/tmp/aperture-prompt-{}.md", name);
         fs::write(&prompt_path, &prompt_content).map_err(|e| e.to_string())?;
 
-        launcher::build_claude_launcher(
-            &claude_bin,
-            launcher_path_prefix.as_deref(),
-            &project_dir,
-            &prompt_path,
-            &agent.model,
-            &config_path,
-            &name,
-            true, // fresh_session — resume support arrives with aperture-syepg
-        )
+        let mut env=tools.environment();
+        env.push(("APERTURE_HUB_TOKEN_FILE".into(),hub_token_path.clone()));
+        env.push(("APERTURE_PROJECT_DIR".into(),project_dir.clone()));
+        let assignments=env.iter().map(|(k,v)|shell_quote(&format!("{k}={v}"))).collect::<Vec<_>>().join(" ");
+        format!("#!/bin/sh\nset -eu\ncd {}\nPROMPT=$(/bin/cat {})\nexec /usr/bin/env -i {} {} --dangerously-skip-permissions --model {} --system-prompt \"$PROMPT\" --mcp-config {} --name {} {}\n",
+            shell_quote(&project_dir),shell_quote(&prompt_path),assignments,shell_quote(&claude_bin),shell_quote(&agent.model),shell_quote(&config_path),shell_quote(&name),shell_quote(launcher::KICKOFF_TEXT))
     };
     fs::write(&launcher_path, &launcher_script).map_err(|e| e.to_string())?;
 
-    std::process::Command::new("chmod")
-        .args(["+x", &launcher_path])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    tmux::tmux_send_keys(window_id.clone(), launcher_path)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&launcher_path,fs::Permissions::from_mode(0o700)).map_err(|_|"E_LOCAL_LAUNCHER")?;
+    claude.recheck()?;work.check_open()?;
+    tmux::send_local(&window_id,&shell_quote(&launcher_path),work)?;
 
     // aperture-syepg: record the kickoff-fired timestamp for Claude — the
     // kickoff positional is baked into the launcher we just fired, so this
@@ -660,7 +777,9 @@ fn boot_agent_process_held(
     })();
 
     if boot_result.is_err() {
-        let _ = tmux::tmux_kill_window(window_id);
+        // Partial native launch is Unknown. Never destroy the pane/descendants
+        // to manufacture rollback or permit an automatic second attempt.
+        eprintln!("[aperture] partial local launch; retained pane {}",window_id);
         // Codex never entered this legacy attempt; no daemon rollback authority.
     }
 
@@ -888,10 +1007,16 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri
     let work = runtime.admit(None)?;
     let _body = work.body()?;
     work.require_tools()?;
-    list_agents_shared(state.inner())
+    list_agents_local(state.inner(), &work)
 }
 
 pub(crate) fn list_agents_shared(state: &Arc<Mutex<AppState>>) -> Result<Vec<AgentDef>, String> {
+    list_agents_impl(state,None)
+}
+pub(crate) fn list_agents_local(state:&Arc<Mutex<AppState>>,work:&crate::daemons::RuntimeWork)->Result<Vec<AgentDef>,String>{
+    work.require_tools()?;list_agents_impl(state,Some(work))
+}
+fn list_agents_impl(state:&Arc<Mutex<AppState>>,work:Option<&crate::daemons::RuntimeWork>)->Result<Vec<AgentDef>,String>{
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
 
     // V4 P0: the filesystem registry is authoritative and activation/archive
@@ -905,7 +1030,7 @@ pub(crate) fn list_agents_shared(state: &Arc<Mutex<AppState>>) -> Result<Vec<Age
     app_state.agents = merge_fresh_registry(fresh, &app_state.agents, &overrides);
 
     // Cross-reference with actual tmux windows to detect agents started outside the UI
-    if let Ok(windows) = tmux::tmux_list_windows(app_state.tmux_session.clone()) {
+    if let Some(Ok(windows)) = work.map(|w| tmux::list_windows_local(&app_state.tmux_session,w)) {
         for agent in app_state.agents.values_mut() {
             let running_window = find_running_window(&windows, &agent.name);
 
@@ -930,7 +1055,7 @@ pub(crate) fn list_agents_shared(state: &Arc<Mutex<AppState>>) -> Result<Vec<Age
     // common state that must render as "idle," not as missing data). The
     // sentinel for idle is current_task_id = Some("") with no title — see
     // the doc comment on AgentDef::current_task_id in state.rs.
-    let current_tasks = resolve_current_tasks();
+    let current_tasks = resolve_current_tasks(work);
     for agent in app_state.agents.values_mut() {
         if agent.status != "running" {
             agent.current_task_id = None;

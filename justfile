@@ -400,3 +400,37 @@ ui-build node destination:
     test ! -e "$2" && test ! -L "$2"
     "$1" node_modules/typescript/bin/tsc --noEmit
     "$1" node_modules/vite/bin/vite.js build --mode web-release --outDir "$2"
+
+# Personal local candidate only. No setup-all, launchd, existing app replacement,
+# runtime/current publication or process activation. Existing MCP outputs remain
+# explicit retained inputs; their dependency retention is not an immutable release.
+[positional-arguments]
+web-local-candidate node target destination bus_root sentry_root sentry_dist:
+    #!/bin/sh
+    set -eu
+    umask 077
+    node="$1"; target="$2"; destination="$3"; bus="$4"; sentry="$5"; sentry_dist="$6"
+    for path in "$node" "$target" "$destination" "$bus" "$sentry" "$sentry_dist"; do
+        case "$path" in /*) ;; *) echo 'absolute local inputs required' >&2; exit 1;; esac
+    done
+    test ! -e "$destination" && test ! -L "$destination"
+    test -f "$bus/dist/index.js" && test -f "$bus/dist/ws-hub.js" && test -d "$bus/node_modules"
+    test -f "$sentry/package.json" && test -d "$sentry/node_modules" && test -f "$sentry_dist/src/index.js"
+    /opt/homebrew/bin/cargo build --offline --locked --manifest-path src-tauri/Cargo.toml --release --bin aperture-server --target-dir "$target"
+    mkdir -m 700 "$destination"
+    mkdir -m 700 "$destination/bin" "$destination/ui" "$destination/mcp-server" "$destination/mcp-server-sentry"
+    cp "$target/release/aperture-server" "$destination/bin/aperture-server"
+    cp "$bus/package.json" "$destination/mcp-server/"
+    cp -R "$bus/dist" "$bus/node_modules" "$destination/mcp-server/"
+    cp "$sentry/package.json" "$destination/mcp-server-sentry/"
+    cp -R "$sentry/node_modules" "$destination/mcp-server-sentry/"
+    cp -R "$sentry_dist" "$destination/mcp-server-sentry/dist"
+    "$node" node_modules/typescript/bin/tsc --noEmit
+    "$node" node_modules/vite/bin/vite.js build --mode web-release --outDir "$destination/building-ui"
+    id=$(/usr/bin/plutil -extract ui_id raw -o - "$destination/building-ui/UI.json")
+    case "$id" in ''|*[!0-9a-f]*) echo 'invalid UI build id' >&2; exit 1;; esac
+    test "${#id}" -eq 32
+    mv "$destination/building-ui" "$destination/ui/$id"
+    ln -s "$id" "$destination/ui/current"
+    printf 'Candidate only: %s\nCopied MCP: %s\nCopied Sentry dependencies: %s\nPaired Sentry dist: %s\n' "$destination" "$bus" "$sentry" "$sentry_dist"
+    printf 'Activation after review: retain current HOME, set explicit APERTURE_NODE_BIN/TMUX_BIN/BD_BIN inputs, then bin/aperture-server and bin/aperture-server open. Ctrl-C drains this server; previous app remains untouched.\n'

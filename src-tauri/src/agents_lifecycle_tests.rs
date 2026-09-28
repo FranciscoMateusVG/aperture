@@ -247,3 +247,48 @@ fn d_accounted_context_is_same_seat_and_stops_before_later_mutation() {
     assert_eq!(tree(&h.0),before);
     drop(context);drop(work);owner.close().unwrap();
 }
+
+#[test]
+fn local_codex_preparation_preserves_operator_semantics_and_validates_before_token() {
+    let h=Home::new();let lease=ControllerLock::acquire(&h.0).unwrap();
+    let tools=crate::daemons::LocalTools::fixture(&h.0,&std::env::current_exe().unwrap());
+    let owner=crate::daemons::RuntimeOwner::local(lease,tools).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let context=work.lifecycle("fixture").unwrap();
+    let app=state("fixture","codex/selected");
+    let bus=h.0.join("bus.js");let sentry=h.0.join("sentry.js");fs::write(&bus,"synthetic").unwrap();fs::write(&sentry,"synthetic").unwrap();
+    let home=h.0.join("codex-home");ensure_private_dir(&home).unwrap();
+    let expected={let mut s=app.lock().unwrap();s.mcp_server_path=bus.to_string_lossy().into_owned();s.mcp_sentry_server_path=sentry.to_string_lossy().into_owned();s.project_dir=h.0.to_string_lossy().into_owned();s.agents["fixture"].clone()};
+    let plan=LocalCodexPreparation{context:&context,state:&app,expected:&expected,codex_home:home.clone(),bus:bus.to_string_lossy().into_owned(),sentry:sentry.to_string_lossy().into_owned(),project:h.0.to_string_lossy().into_owned()};
+    let path=home.join("config.toml");
+    fs::write(&path,"model='old'\n[mcp_servers.aperture-bus]\nenv=7\n[mcp_servers.sentry]\ncommand='old'\n").unwrap();
+    assert!(plan.prepare().is_err());assert!(!h.0.join(".aperture/run/hub-tokens").exists());
+    let original="model='old'\napproval_policy='on-request'\nsandbox_mode='workspace-write'\nunknown_future=['keep',3]\n[projects.'synthetic-project']\ntrust_level='untrusted'\n[model_providers.synthetic]\nname='fake'\nbase_url='http://127.0.0.1:1'\n[mcp_servers.aperture-bus]\ncommand='old'\nargs=['old']\ncustom_flag=true\n[mcp_servers.sentry]\ncommand='old'\nargs=['old']\n";
+    fs::write(&path,original).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path,fs::Permissions::from_mode(0o600)).unwrap();
+    plan.prepare().unwrap();
+    let before:toml::Value=original.parse().unwrap();let after:toml::Value=fs::read_to_string(&path).unwrap().parse().unwrap();
+    for key in ["approval_policy","sandbox_mode","unknown_future","projects","model_providers"]{assert_eq!(before[key],after[key]);}
+    assert_eq!(after["model"].as_str(),Some("selected"));
+    assert_eq!(after["mcp_servers"]["aperture-bus"]["custom_flag"].as_bool(),Some(true));
+    assert_eq!(after["mcp_servers"]["sentry"]["args"][0].as_str(),sentry.to_str());
+    assert!(h.0.join(".aperture/run/hub-tokens/fixture.token").is_file());
+    drop(context);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
+
+#[test]
+fn local_thread_resume_requires_exact_existing_uuid_and_close_cancels_wait(){
+    let h=Home::new();let owner=crate::daemons::RuntimeOwner::new(ControllerLock::acquire(&h.0).unwrap());
+    let work=owner.admit(None).unwrap();let path=h.0.join("thread-id");
+    fs::write(&path,b"00000000-0000-4000-8000-000000000001").unwrap();
+    assert_eq!(wait_local_thread(&path,&work).unwrap(),"00000000-0000-4000-8000-000000000001");
+    fs::write(&path,b"bad;command").unwrap();assert!(wait_local_thread(&path,&work).is_err());
+    fs::remove_file(&path).unwrap();
+    std::thread::scope(|scope|{
+        let task=scope.spawn(||wait_local_thread(&path,&work));
+        // close immediately closes admission, even though this wait owns work.
+        assert_eq!(owner.fixture_close_short().unwrap_err(),"E_RUNTIME_DRAIN_INCOMPLETE");
+        assert_eq!(task.join().unwrap().unwrap_err(),"E_RUNTIME_CLOSING");
+    });
+    drop(work);owner.close().unwrap();drop(owner);
+}

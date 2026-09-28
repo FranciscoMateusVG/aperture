@@ -31,33 +31,48 @@ pub fn tmux_create_session(session_name: String, runtime: tauri::State<'_, std::
 }
 pub(crate) fn tmux_create_session_shared(session_name: String, work: &crate::daemons::RuntimeWork) -> Result<String, String> {
     work.check_open()?;
-    work.require_tools()?;
-    let check = cmd("tmux")
-        .args(["has-session", "-t", &session_name])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if check.status.success() {
-        return Ok("already exists".into());
+    if !crate::daemon_registry::valid_name(&session_name) {return Err("E_RUNTIME_SELECTOR".into());}
+    let rows=local_output(work, vec!["list-sessions".into(),"-F".into(),"#{session_name}".into()])?;
+    let text=std::str::from_utf8(&rows).map_err(|_|"E_TMUX_UNVERIFIED")?;
+    if text.lines().any(|s|!crate::daemon_registry::valid_name(s)) {return Err("E_TMUX_UNVERIFIED".into());}
+    if text.lines().any(|s|s==session_name) {return Ok("already exists".into());}
+    // Only a successful complete list from the existing server proves absence.
+    // Nonzero/timeout/no-server is never a request to create a new server.
+    local_output(work,vec!["new-session".into(),"-d".into(),"-s".into(),session_name.clone()])?;
+    local_output(work,vec!["set-option".into(),"-t".into(),session_name.clone(),"mouse".into(),"on".into()])?;
+    local_output(work,vec!["set-option".into(),"-t".into(),session_name,"history-limit".into(),"50000".into()])?;
+    Ok("created".into())
+}
+pub(crate) fn local_output(work:&crate::daemons::RuntimeWork,args:Vec<String>)->Result<Vec<u8>,String>{
+    let tool=&work.tools()?.tmux;
+    let input=work.client(tool,args)?;
+    let out=crate::daemons::run_client(work,input,std::time::Duration::from_secs(3),1024*1024,64*1024)?;
+    if !out.accepted {return Err("E_TMUX_OUTCOME_UNKNOWN".into());}
+    Ok(out.stdout)
+}
+pub(crate) fn list_windows_local(session:&str,work:&crate::daemons::RuntimeWork)->Result<Vec<WindowInfo>,String>{
+    if !crate::daemon_registry::valid_name(session){return Err("E_RUNTIME_SELECTOR".into());}
+    let bytes=local_output(work,vec!["list-windows".into(),"-t".into(),session.into(),"-F".into(),"#{window_id}||#{window_name}||#{pane_current_command}".into()])?;
+    let text=std::str::from_utf8(&bytes).map_err(|_|"E_TMUX_UNVERIFIED")?;
+    let mut windows=Vec::new();
+    for line in text.lines(){
+        let fields=line.split("||").collect::<Vec<_>>();
+        if fields.len()!=3 || !window_selector(fields[0]) || windows.len()>=512 {return Err("E_TMUX_UNVERIFIED".into());}
+        windows.push(WindowInfo{window_id:fields[0].into(),name:fields[1].into(),command:fields[2].into()});
     }
-
-    let output = cmd("tmux")
-        .args(["new-session", "-d", "-s", &session_name])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if output.status.success() {
-        // Enable mouse scrolling and increase scrollback history
-        let _ = cmd("tmux")
-            .args(["set-option", "-t", &session_name, "-g", "mouse", "on"])
-            .output();
-        let _ = cmd("tmux")
-            .args(["set-option", "-t", &session_name, "-g", "history-limit", "50000"])
-            .output();
-        Ok("created".into())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    Ok(windows)
+}
+fn window_selector(s:&str)->bool{s.len()>1 && s.len()<=16 && s.starts_with('@') && s[1..].bytes().all(|v|v.is_ascii_digit())}
+pub(crate) fn create_window_local(session:&str,name:&str,work:&crate::daemons::RuntimeWork)->Result<String,String>{
+    if !crate::daemon_registry::valid_name(session)||!crate::daemon_registry::valid_name(name){return Err("E_RUNTIME_SELECTOR".into());}
+    let bytes=local_output(work,vec!["new-window".into(),"-t".into(),session.into(),"-n".into(),name.into(),"-P".into(),"-F".into(),"#{window_id}".into()])?;
+    let window=std::str::from_utf8(&bytes).map_err(|_|"E_TMUX_UNVERIFIED")?.trim_end_matches('\n');
+    if !window_selector(window){return Err("E_TMUX_UNVERIFIED".into());}Ok(window.into())
+}
+pub(crate) fn send_local(window:&str,text:&str,work:&crate::daemons::RuntimeWork)->Result<(),String>{
+    if !window_selector(window)||text.len()>65536{return Err("E_RUNTIME_SELECTOR".into());}
+    local_output(work,vec!["send-keys".into(),"-t".into(),window.into(),"-l".into(),text.into()])?;
+    local_output(work,vec!["send-keys".into(),"-t".into(),window.into(),"Enter".into()])?;Ok(())
 }
 
 #[tauri::command]
@@ -140,17 +155,8 @@ pub fn tmux_select_window(window_id: String, runtime: tauri::State<'_, std::sync
 }
 pub(crate) fn tmux_select_window_shared(window_id: String, work: &crate::daemons::RuntimeWork) -> Result<(), String> {
     work.check_open()?;
-    work.require_tools()?;
-    let output = cmd("tmux")
-        .args(["select-window", "-t", &window_id])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
+    if !window_selector(&window_id){return Err("E_RUNTIME_SELECTOR".into());}
+    local_output(work,vec!["select-window".into(),"-t".into(),window_id])?;Ok(())
 }
 
 pub fn tmux_capture_pane(window_id: &str) -> Result<String, String> {

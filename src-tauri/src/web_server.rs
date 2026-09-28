@@ -331,7 +331,7 @@ fn execute(
         Command::Version => Ok(crate::get_version()),
         Command::Agents => {
             work.require_tools().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
-            legacy(crate::agents::list_agents_shared(&s.app))
+            legacy(crate::agents::list_agents_local(&s.app,work))
         },
         Command::Start | Command::Stop | Command::Restart | Command::Attention => {
             let n: Name = decode(value)?;
@@ -565,6 +565,19 @@ fn router(s: WebState) -> Router {
 }
 
 /// Production composition. Never invokes the Tauri GUI or initializes a database.
+fn local_package_paths(executable:&std::path::Path)->Result<(PathBuf,PathBuf,PathBuf),String>{
+    let package=executable.parent().and_then(std::path::Path::parent).ok_or("E_LOCAL_PACKAGE")?;
+    let ui=package.join("ui");
+    if !std::fs::symlink_metadata(&ui).is_ok_and(|m|m.is_dir()&&!m.file_type().is_symlink()){return Err("E_LOCAL_UI_MISSING".into());}
+    let bus=package.join("mcp-server/dist/index.js");
+    let sentry=package.join("mcp-server-sentry/dist/src/index.js");
+    for path in [&bus,&sentry,&package.join("mcp-server/dist/ws-hub.js")]{
+        let m=std::fs::symlink_metadata(path).map_err(|_|"E_LOCAL_MCP_OUTPUT_MISSING")?;
+        if !m.is_file()||m.file_type().is_symlink(){return Err("E_LOCAL_MCP_OUTPUT_MISSING".into());}
+    }
+    Ok((ui,bus,sentry))
+}
+
 pub async fn serve() -> Result<(), String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -579,14 +592,22 @@ pub async fn serve() -> Result<(), String> {
             .map_err(|_| "application state unavailable")?
             .project_dir,
     );
-    let runtime = Arc::new(crate::daemons::RuntimeOwner::new(lease));
+    let tools=crate::daemons::LocalTools::resolve(&home)?;
+    let executable=std::env::current_exe().map_err(|_|"E_LOCAL_PACKAGE")?;
+    let (ui,bus,sentry)=local_package_paths(&executable)?;
+    {
+        let mut state=app.lock().map_err(|_|"E_RUNTIME_STATE")?;
+        state.mcp_server_path=bus.to_string_lossy().into_owned();
+        state.mcp_sentry_server_path=sentry.to_string_lossy().into_owned();
+    }
+    let runtime = Arc::new(crate::daemons::RuntimeOwner::local(lease,tools)?);
     let s = WebState {
         runtime: runtime.clone(),
         authority: "127.0.0.1:4519".into(),
         origin: "http://127.0.0.1:4519".into(),
         auth: Arc::new(Mutex::new(auth)),
         app: app.clone(),
-        ui: home.join(".aperture/ui"),
+        ui,
         ui_builds: Arc::new(Mutex::new(Default::default())),
         home,
         project,

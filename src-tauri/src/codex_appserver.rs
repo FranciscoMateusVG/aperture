@@ -60,21 +60,13 @@ pub(crate) struct NativeCodexSupervisor<'a> {
 thread_local! { static C2_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 const CODEX_UNKNOWN: &str = "E_CODEX_OPERATION_UNKNOWN";
 // No production preparation constructor. C3 production is denied before intent.
-struct CodexPreparation<'a> {
-    #[cfg(test)]
-    plan: &'a crate::agents::PreparedCaller<'a>,
-    _borrow: std::marker::PhantomData<&'a ()>,
+enum CodexPreparation<'a> {
+    #[cfg(test)] Fixture(&'a crate::agents::PreparedCaller<'a>),
+    Local(&'a crate::agents::LocalCodexPreparation<'a>),
 }
 impl CodexPreparation<'_> {
-    fn recheck(&self) -> Result<(), String> {
-        #[cfg(test)] { return self.plan.recheck(); }
-        #[cfg(not(test))] { Err("E_CODEX_LAUNCH_INPUTS_UNVERIFIED".into()) }
-    }
-    fn prepare(&self) -> Result<(), String> {
-        self.recheck()?;
-        #[cfg(test)] { return self.plan.prepare(); }
-        #[cfg(not(test))] { Err("E_CODEX_LAUNCH_INPUTS_UNVERIFIED".into()) }
-    }
+    fn recheck(&self)->Result<(),String>{match self {#[cfg(test)] Self::Fixture(p)=>p.recheck(),Self::Local(p)=>p.recheck()}}
+    fn prepare(&self)->Result<(),String>{match self {#[cfg(test)] Self::Fixture(p)=>p.prepare(),Self::Local(p)=>p.prepare()}}
 }
 // A path pin narrows check/use drift; it is not atomic exec identity proof.
 #[derive(Debug, PartialEq, Eq)]
@@ -145,7 +137,18 @@ impl<'a> NativeCodexSupervisor<'a> {
         &self, op: &mut crate::controller::CodexOperation<'_>, plan: &crate::agents::PreparedCaller<'_>,
     ) -> Result<CodexObservation, String> {
         if plan.expected.name != self.spec.seat { return Err(CODEX_UNKNOWN.into()); }
-        self.reconcile_held(op, Some(&CodexPreparation { plan, _borrow: std::marker::PhantomData }))
+        self.reconcile_held(op, Some(&CodexPreparation::Fixture(plan)))
+    }
+    pub(crate) fn prepared_local(&self,op:&mut crate::controller::CodexOperation<'_>,plan:&crate::agents::LocalCodexPreparation<'_>)->Result<CodexObservation,String>{
+        if plan.seat()!=self.spec.seat{return Err(CODEX_UNKNOWN.into());}
+        self.reconcile_held(op,Some(&CodexPreparation::Local(plan)))
+    }
+    pub(crate) fn recheck_held(&self,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        if op.seat()!=self.spec.seat{return Err(CODEX_UNKNOWN.into());}
+        self.registry.verify_operation(op)?;
+        let snapshot=self.snapshot()?;
+        if snapshot.phase!=crate::daemon_registry::CodexPhaseV2::ReadyMetadataOnly || snapshot.provenance!=self.spec.provenance {return Err(CODEX_UNKNOWN.into());}
+        crate::team_terminal::codex_live_pins(self.registry,op,&snapshot,&self.socket_resolver()?).map(|_|())
     }
     fn socket_resolver(&self) -> Result<crate::team_terminal::CodexSocketResolver, String> {
         #[cfg(test)]

@@ -382,9 +382,8 @@ const INBOX_NUDGE_TEXT: &str = "Inbox check (watchdog): unread BEADS messages ar
 
 /// One pass result: recipient name → oldest unread message age.
 fn query_oldest_unread(work: &crate::daemons::RuntimeWork) -> Option<HashMap<String, Duration>> {
-    // E has not supplied a trusted bd tool/environment descriptor. Denial is
-    // before any child spawn; cfg-only owned-client oracles cover the mechanism.
-    let input = crate::daemons::ClientInput::production_unverified().ok()?;
+    let tools=work.tools().ok()?;
+    let input=work.client(&tools.bd,vec!["list".into(),"--status=open".into(),"--type=message".into(),"--json".into(),"--limit=513".into()]).ok()?;
     let out = crate::daemons::run_client(work, input, Duration::from_secs(3), 1024*1024, 64*1024).ok()?;
     if !out.accepted { return None; }
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
@@ -394,7 +393,7 @@ fn query_oldest_unread(work: &crate::daemons::RuntimeWork) -> Option<HashMap<Str
     for row in rows {
         // Title format: "[from->to] preview…" — recipient is between "->" and "]".
         let Some(title) = row.get("title").and_then(|v| v.as_str()) else {
-            continue;
+            return None;
         };
         let Some(recipient) = title
             .split(']')
@@ -402,15 +401,16 @@ fn query_oldest_unread(work: &crate::daemons::RuntimeWork) -> Option<HashMap<Str
             .and_then(|head| head.split("->").nth(1))
             .map(|r| r.trim().to_string())
         else {
-            continue;
+            return None;
         };
         let Some(created) = row
             .get("created_at")
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         else {
-            continue;
+            return None;
         };
+        if !crate::daemon_registry::valid_name(&recipient) {return None;}
         let created_st: SystemTime = UNIX_EPOCH + Duration::from_millis(created.timestamp_millis().max(0) as u64);
         let age = at.duration_since(created_st).unwrap_or_default();
         let entry = oldest.entry(recipient).or_default();
@@ -1408,20 +1408,31 @@ pub(crate) struct NudgeInputs {
 }
 impl NudgeInputs {
     pub(crate) fn production() -> Self { Self { #[cfg(test)] fixture: None } }
-    fn target(&self, _work: &crate::daemons::RuntimeWork, index: usize) -> Result<EffectTarget, String> {
+    fn target(&self, work: &crate::daemons::RuntimeWork, index: usize, window:&str) -> Result<EffectTarget, String> {
         #[cfg(test)] if let Some(f) = &self.fixture {
             if let Some((after, changed)) = &f.target_after { if index >= *after { return Ok(changed.clone()); } }
             return Ok(f.target.clone());
         }
         let _ = index;
-        // No E-approved tool/target resolver exists; deny before intent, not a
-        // PATH lookup or a weaker production target proof.
-        Err("E_RUNTIME_TOOLS_UNVERIFIED".into())
+        if window.len()>16 || !window.starts_with('@') || window.len()<2 || !window[1..].bytes().all(|b|b.is_ascii_digit()){return Err("E_WATCHDOG_TARGET".into());}
+        let bytes=crate::tmux::local_output(work,vec!["display-message".into(),"-p".into(),"-t".into(),window.into(),"#{window_id}|#{pane_id}|#{pane_pid}".into()])?;
+        let text=std::str::from_utf8(&bytes).map_err(|_|"E_WATCHDOG_TARGET")?.trim_end_matches('\n');
+        let fields=text.split('|').collect::<Vec<_>>();
+        if fields.len()!=3 || fields[0]!=window{return Err("E_WATCHDOG_TARGET".into());}
+        let pid=fields[2].parse::<u32>().map_err(|_|"E_WATCHDOG_TARGET")?;
+        let native=crate::team_process::observe(pid).map_err(|_|"E_WATCHDOG_TARGET")?.ok_or("E_WATCHDOG_TARGET")?;
+        let target=EffectTarget{window:window.into(),pane:fields[1].into(),pid,birth:native.identity.start_time,uid:native.uid};
+        if !target_valid(&target){return Err("E_WATCHDOG_TARGET".into());}Ok(target)
     }
-    fn client(&self, index: usize) -> Result<crate::daemons::ClientInput, String> {
+    fn client(&self, work:&crate::daemons::RuntimeWork,index: usize,target:&EffectTarget,producer:NudgeProducer) -> Result<crate::daemons::ClientInput, String> {
         #[cfg(test)] if let Some(f) = &self.fixture { return f.clients.get(index).cloned().ok_or_else(|| "E_FIXTURE_CLIENT".into()); }
-        let _ = index;
-        crate::daemons::ClientInput::production_unverified()
+        if index>=4{return Err("E_WATCHDOG_TARGET".into());}
+        let mut args=vec!["send-keys".into(),"-t".into(),target.pane.clone()];
+        if index%2==0 {
+            args.push("-l".into());
+            args.push(if index==2 {String::new()} else {match producer {NudgeProducer::RekickNudge=>crate::launcher::KICKOFF_TEXT.into(),NudgeProducer::UnreadNudge=>INBOX_NUDGE_TEXT.into()}});
+        } else {args.push("Enter".into());}
+        work.client(&work.tools()?.tmux,args)
     }
 }
 fn effect_plan(agent: &crate::state::AgentDef) -> Result<String, String> {
@@ -1442,20 +1453,20 @@ pub(crate) fn guarded_nudge(
     let slot = lease.codex_slot(seat)?;
     let _operation = slot.enter()?;
     let _serial = EFFECT_SERIAL.lock().map_err(|_| "E_WATCHDOG_JOURNAL_UNAVAILABLE")?;
-    let target = inputs.target(work, 0)?;
+    let target = inputs.target(work, 0,plan.tmux_window_id.as_deref().ok_or("E_WATCHDOG_TARGET")?)?;
     if !target_valid(&target) || plan.tmux_window_id.as_deref() != Some(&target.window) { return Err("E_WATCHDOG_TARGET".into()); }
     let recheck = |index| -> Result<(), String> {
         work.check_open()?;
         crate::agents::detached_codex_denied_at(home, state, seat, false)?;
         let actual = state.lock().map_err(|_| "E_WATCHDOG_PLAN")?.agents.get(seat).ok_or("E_WATCHDOG_PLAN")?.clone();
-        if effect_plan(&actual)? != fingerprint || inputs.target(work, index)? != target { return Err("E_WATCHDOG_TARGET".into()); }
+        if effect_plan(&actual)? != fingerprint || inputs.target(work, index,&target.window)? != target { return Err("E_WATCHDOG_TARGET".into()); }
         let expected = crate::team_replacement::ProcessIdentity { pid: target.pid, start_time: target.birth.clone() };
         if crate::team_process::state(&expected) != crate::team_replacement::ProcessState::Same
             || !crate::team_process::observe(target.pid).ok().flatten().is_some_and(|p| p.identity == expected && p.uid == target.uid) { return Err("E_WATCHDOG_TARGET".into()); }
         Ok(())
     };
     recheck(0)?;
-    let _trusted_input = inputs.client(0)?; // prerequisite before intent, no command spawned
+    let _trusted_input = inputs.client(work,0,&target,producer)?; // prerequisite before intent, no command spawned
     let root = lease.run_dir()?.join("watchdog");
     let at = effect_now()?;
     let history = effect_history(&root, seat, at)?;
@@ -1485,7 +1496,7 @@ pub(crate) fn guarded_nudge(
         if recheck(index).is_err() { break; }
         let left = until.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() { break; }
-        let input = match inputs.client(index) { Ok(v) => v, Err(_) => break };
+        let input = match inputs.client(work,index,&target,producer) { Ok(v) => v, Err(_) => break };
         match crate::daemons::run_client(work, input, left.min(Duration::from_secs(2)), 64*1024, 64*1024) {
             Ok(result) => {
                 observations.push(DispatchObservation { spawned: result.spawned, accepted: result.accepted });

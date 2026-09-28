@@ -31,6 +31,18 @@ fn inert_client_entry() {
         Ok("short") => std::thread::sleep(Duration::from_millis(250)),
         Ok("sleep") => std::thread::sleep(Duration::from_secs(10)),
         Ok("overflow") => print!("{}", "x".repeat(100_000)),
+        Ok("local-list") => {
+            let home=PathBuf::from(std::env::var_os("HOME").unwrap());
+            assert!(home.file_name().unwrap().to_string_lossy().starts_with("aperture-d-"));
+            let tools=LocalTools::fixture(&home,&home.join("tmux-inert"));
+            let owner=RuntimeOwner::local(ControllerLock::acquire(&home).unwrap(),tools).unwrap();
+            let work=owner.admit(None).unwrap();let body=work.body().unwrap();
+            let state=Arc::new(Mutex::new(crate::config::default_state()));
+            let agents=crate::agents::list_agents_local(&state,&work).unwrap();
+            assert_eq!(agents.len(),1);assert_eq!(agents[0].name,"fixture");assert_eq!(agents[0].status,"running");
+            assert_eq!(agents[0].tmux_window_id.as_deref(),Some("@1"));
+            drop(body);drop(work);owner.close().unwrap();drop(owner);
+        },
         _ => panic!("missing finite fixture mode"),
     }
 }
@@ -165,4 +177,44 @@ fn d_poller_is_read_only_absence_overflow_unsafe_and_closing() {
     owner.close().unwrap();
     assert_eq!(crate::poller::scan_once(&h.0,&state,&worker).unwrap_err(),"E_RUNTIME_CLOSING");
     assert_eq!(crate::agents::lifecycle_tests::tree(&h.0),before);
+}
+
+#[test]
+fn local_real_client_selectors_positive_dispatch_and_drift_are_not_empty_tool_guards() {
+    use std::os::unix::fs::PermissionsExt;
+    let h=Home::new();let executable=h.0.join("tmux-inert");let events=h.0.join("events");
+    // Native own short-lived process on the actual run_client path. No tmux,
+    // provider or inherited environment. Shell uses builtins only.
+    let script=format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n list-sessions) printf 'aperture\\n';;\n list-windows) printf '@1||fixture||inert\\n';;\n select-window) exit 0;;\n *) exit 9;;\nesac\n",events.display());
+    std::fs::write(&executable,script).unwrap();std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tools=LocalTools::fixture(&h.0,&executable);
+    let owner=RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),tools).unwrap();
+    let work=owner.admit(None).unwrap();let body=work.body().unwrap();
+    assert!(crate::tmux::tmux_create_session_shared("-bad".into(),&work).is_err());
+    assert!(crate::tmux::tmux_select_window_shared(";bad".into(),&work).is_err());assert!(!events.exists());
+    assert_eq!(crate::tmux::tmux_create_session_shared("aperture".into(),&work).unwrap(),"already exists");
+    assert_eq!(crate::tmux::list_windows_local("aperture",&work).unwrap()[0].window_id,"@1");
+    crate::tmux::tmux_select_window_shared("@1".into(),&work).unwrap();
+    assert_eq!(std::fs::read_to_string(&events).unwrap(),"list-sessions\nlist-windows\nselect-window\n");
+    std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(crate::tmux::tmux_select_window_shared("@1".into(),&work).is_err());
+    assert_eq!(std::fs::read_to_string(&events).unwrap(),"list-sessions\nlist-windows\nselect-window\n");
+    drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
+
+#[test]
+fn local_list_ingress_loads_real_private_registry_and_queries_real_inert_clients(){
+    use std::os::unix::fs::PermissionsExt;
+    let h=Home::new();let root=h.0.join(".claude/aperture/fixture");
+    std::fs::write(root.join("manifest.json"),br#"{"name":"fixture","model":"opus","role":"backend","window":"fixture"}"#).unwrap();
+    std::fs::write(root.join("prompt.md"),"owned synthetic prompt").unwrap();
+    let executable=h.0.join("tmux-inert");let events=h.0.join("events");
+    let script=format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n list-windows) printf '@1||fixture||claude\\n';;\n list) printf '[]';;\n *) exit 9;;\nesac\n",events.display());
+    std::fs::write(&executable,script).unwrap();std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let parent=Home::new();let owner=parent.owner();let work=owner.admit(None).unwrap();let body=work.body().unwrap();
+    let mut input=client("local-list");input.env.push(("HOME".into(),h.0.to_string_lossy().into_owned()));
+    let result=run_client(&work,input,Duration::from_secs(5),64*1024,64*1024).unwrap();
+    assert!(result.accepted,"inert list child failed: {}",String::from_utf8_lossy(&result.stdout));
+    assert_eq!(std::fs::read_to_string(&events).unwrap(),"list-windows\nlist\n");
+    drop(body);drop(work);owner.close().unwrap();drop(owner);
 }

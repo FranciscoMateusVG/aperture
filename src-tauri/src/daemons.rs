@@ -1,23 +1,105 @@
 //! Shared startup under an already-held controller lease.
-//! F2-A is intentionally NOT launchable: even a pristine registry cannot prove
-//! a free endpoint, and passing a port probe to the legacy supervisor would race
-//! its kill-by-port path. B must replace that supervisor before removing this
-//! unconditional fence. There is no environment/flag/test bypass.
+//! Local composition uses the registered supervisor and tracked worker owner.
+//! No legacy kill-by-port or detached startup path is reachable here.
 use crate::{controller::ControllerLock, state::AppState};
 use std::sync::{Arc, Mutex};
-pub(crate) fn start(lease: &ControllerLock, _state: Arc<Mutex<AppState>>) -> Result<(), String> {
-    start_checked(lease, || Err("E_DAEMON_SUPERVISION_PENDING".into()))
-}
-
 // The actual production composition and inert counted-effects tests pass
 // through precisely this preflight, not a separate mock registry algorithm.
 pub(crate) fn start_checked(
     lease: &ControllerLock,
-    _downstream: impl FnOnce() -> Result<(), String>,
+    downstream: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let registry = crate::daemon_registry::Registry::open(lease)?;
-    let _unverified_metadata = registry.validate_namespace()?;
-    Err("E_DAEMON_SUPERVISION_PENDING: F2-A startup is fenced until safe supervision is implemented and reviewed".into())
+    registry.validate_namespace()?;
+    downstream()
+}
+
+// Local personal-installation inputs: resolved once, rechecked at each dispatch.
+// Pins detect replacement; they do not retain Homebrew/npm dependencies forever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolPin {
+    pub(crate) path: std::path::PathBuf,
+    dev: u64, ino: u64, uid: u32, mode: u32, len: u64, modified: (i64, i64),
+}
+impl ToolPin {
+    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        if !path.is_absolute() { return Err("E_LOCAL_TOOL_PATH".into()); }
+        let m=std::fs::symlink_metadata(path).map_err(|_| "E_LOCAL_TOOL_MISSING")?;
+        if !m.is_file() || m.file_type().is_symlink() || m.nlink()!=1
+            || (m.uid()!=unsafe{libc::geteuid()} && m.uid()!=0)
+            || m.mode() & 0o6022 != 0 || m.mode() & 0o111 == 0 {
+            return Err("E_LOCAL_TOOL_UNSAFE".into());
+        }
+        Ok(Self { path:path.to_path_buf(),dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),len:m.len(),modified:(m.mtime(),m.mtime_nsec()) })
+    }
+    pub(crate) fn recheck(&self) -> Result<(), String> {
+        if &Self::capture(&self.path)?!=self { return Err("E_LOCAL_TOOL_CHANGED".into()); }
+        Ok(())
+    }
+}
+#[derive(Clone)]
+pub(crate) struct LocalTools {
+    pub(crate) node: ToolPin,
+    pub(crate) tmux: ToolPin,
+    pub(crate) bd: ToolPin,
+    pub(crate) claude: Option<ToolPin>,
+    pub(crate) codex: Option<ToolPin>,
+    home: std::path::PathBuf,
+    path: String,
+}
+impl LocalTools {
+    pub(crate) fn resolve(home: &std::path::Path) -> Result<Self, String> {
+        fn find(home:&std::path::Path, key:&str, name:&str) -> Result<ToolPin,String> {
+            let candidates = if let Some(path)=std::env::var_os(key).filter(|v|!v.is_empty()) {
+                vec![std::path::PathBuf::from(path)]
+            } else { vec![std::path::PathBuf::from("/opt/homebrew/bin").join(name),std::path::PathBuf::from("/usr/local/bin").join(name),home.join(".local/bin").join(name)] };
+            for candidate in candidates {
+                match std::fs::canonicalize(&candidate) {
+                    Ok(path)=>return ToolPin::capture(&path),
+                    Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,
+                    Err(_)=>return Err("E_LOCAL_TOOL_PATH".into()),
+                }
+            }
+            Err(format!("E_LOCAL_TOOL_MISSING: {name}"))
+        }
+        let node=find(home,"APERTURE_NODE_BIN","node")?;
+        let tmux=find(home,"APERTURE_TMUX_BIN","tmux")?;
+        let bd=find(home,"APERTURE_BD_BIN","bd")?;
+        let claude=find(home,"APERTURE_CLAUDE_BIN","claude").ok();
+        let codex=find(home,"APERTURE_CODEX_BIN","codex").ok();
+        Self::from_pins(home,node,tmux,bd,claude,codex)
+    }
+    fn from_pins(home:&std::path::Path,node:ToolPin,tmux:ToolPin,bd:ToolPin,claude:Option<ToolPin>,codex:Option<ToolPin>)->Result<Self,String>{
+        if !home.is_absolute() { return Err("E_LOCAL_HOME".into()); }
+        let mut dirs=Vec::new();
+        for pin in [&node,&tmux,&bd].into_iter().chain(claude.iter()).chain(codex.iter()) {
+            let dir=pin.path.parent().ok_or("E_LOCAL_TOOL_PATH")?.to_str().ok_or("E_LOCAL_TOOL_PATH")?;
+            if dir.contains(':') { return Err("E_LOCAL_TOOL_PATH".into()); }
+            if !dirs.contains(&dir) {dirs.push(dir);}
+        }
+        dirs.extend(["/usr/bin","/bin"]);
+        let path=dirs.join(":");
+        Ok(Self{node,tmux,bd,claude,codex,home:home.to_path_buf(),path})
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(home:&std::path::Path,tool:&std::path::Path)->Self{
+        let pin=ToolPin::capture(tool).unwrap();
+        Self::from_pins(home,pin.clone(),pin.clone(),pin.clone(),Some(pin.clone()),Some(pin)).unwrap()
+    }
+    pub(crate) fn recheck(&self)->Result<(),String>{
+        self.node.recheck()?;self.tmux.recheck()?;self.bd.recheck()
+    }
+    pub(crate) fn environment(&self)->Vec<(String,String)>{
+        vec![("HOME".into(),self.home.to_string_lossy().into_owned()),("PATH".into(),self.path.clone()),
+            ("LANG".into(),"en_US.UTF-8".into()),("TERM".into(),"xterm-256color".into()),
+            ("BEADS_DIR".into(),self.home.join(".aperture/.beads").to_string_lossy().into_owned())]
+    }
+    pub(crate) fn client(&self, tool:&ToolPin,args:Vec<String>)->Result<ClientInput,String>{
+        tool.recheck()?;
+        Ok(ClientInput{executable:tool.path.clone(),args,env:self.environment(),pin:Some(tool.clone()),
+            #[cfg(test)] audit:None, #[cfg(test)] unreadable:false})
+    }
 }
 
 // D: the core, not a request future, owns the lease. Tokens/workers retain it
@@ -39,6 +121,7 @@ struct RuntimeCore {
     wake: Condvar,
     workers: Mutex<Vec<(&'static str, std::thread::JoinHandle<()>)>>,
     close_serial: Mutex<()>,
+    tools: Option<LocalTools>,
     #[cfg(test)] pause: Mutex<Option<Arc<BodyPause>>>,
     #[cfg(test)] fail_worker_at: Mutex<Option<usize>>,
 }
@@ -57,9 +140,15 @@ pub(crate) struct RuntimeBody<'a> {
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl RuntimeOwner {
-    pub(crate) fn new(lease: ControllerLock) -> Self {
+    pub(crate) fn new(lease: ControllerLock) -> Self { Self::compose(lease,None) }
+    pub(crate) fn local(lease: ControllerLock, tools: LocalTools) -> Result<Self,String> {
+        tools.recheck()?;
+        if tools.home.join(".aperture/run")!=lease.run_dir()? {return Err("E_LOCAL_HOME".into());}
+        Ok(Self::compose(lease,Some(tools)))
+    }
+    fn compose(lease: ControllerLock, tools: Option<LocalTools>) -> Self {
         Self { core: Arc::new(RuntimeCore {
-            lease, admission: Mutex::new(Admission { phase: RuntimePhase::Open, bodies: 0, seats: HashSet::new() }),
+            lease, tools, admission: Mutex::new(Admission { phase: RuntimePhase::Open, bodies: 0, seats: HashSet::new() }),
             wake: Condvar::new(), workers: Mutex::new(Vec::new()), close_serial: Mutex::new(()),
             #[cfg(test)] pause: Mutex::new(None),
             #[cfg(test)] fail_worker_at: Mutex::new(None),
@@ -69,7 +158,21 @@ impl RuntimeOwner {
         admit_core(&self.core, seat)
     }
     pub(crate) fn start(&self, state: Arc<Mutex<AppState>>) -> Result<(), String> {
-        start_checked(&self.core.lease, || self.start_workers(state))
+        let tools=self.core.tools.as_ref().ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;
+        tools.recheck()?;
+        let hub_script=std::path::PathBuf::from(&state.lock().map_err(|_|"E_RUNTIME_STATE")?.mcp_server_path)
+            .parent().ok_or("E_LOCAL_MCP_PATH")?.join("ws-hub.js");
+        let spec=crate::ws_hub::local_spec(&self.core.lease,tools,&hub_script)?;
+        self.start_with_hub(state,spec)
+    }
+    pub(crate) fn start_with_hub(&self,state:Arc<Mutex<AppState>>,spec:crate::ws_hub::HubSpec)->Result<(),String>{
+        self.core.tools.as_ref().ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?.recheck()?;
+        let result=start_checked(&self.core.lease,||{
+            crate::ws_hub::Supervisor::new(&self.core.lease,spec)?.reconcile()?;
+            self.start_workers(state)
+        });
+        if result.is_err(){self.close()?;}
+        result
     }
     pub(crate) fn close(&self) -> Result<(), String> { self.close_until(Instant::now() + Duration::from_secs(15)) }
     fn close_until(&self, until: Instant) -> Result<(), String> {
@@ -199,6 +302,7 @@ pub(crate) struct ClientInput {
     executable: std::path::PathBuf,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    pin: Option<ToolPin>,
     #[cfg(test)] pub(crate) audit: Option<Arc<Mutex<ClientAudit>>>,
     #[cfg(test)] pub(crate) unreadable: bool,
 }
@@ -208,7 +312,7 @@ impl ClientInput {
     }
     #[cfg(test)]
     pub(crate) fn fixture(executable: std::path::PathBuf, args: Vec<String>, env: Vec<(String, String)>) -> Self {
-        Self { executable, args, env, audit: None, unreadable: false }
+        Self { executable, args, env, pin:None, audit: None, unreadable: false }
     }
 }
 #[cfg(test)]
@@ -249,6 +353,8 @@ pub(crate) fn run_client(
     command.args(&input.args).env_clear().envs(input.env)
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let until = Instant::now() + budget;
+    work.check_open()?;
+    if let Some(pin)=&input.pin {pin.recheck()?;}
     let child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return Ok(ClientResult { spawned: false, accepted: false, stdout: vec![], stderr: vec![], unknown: false }),
@@ -436,8 +542,12 @@ impl RuntimeOwner {
 impl RuntimeWork {
     pub(crate) fn require_tools(&self) -> Result<(), String> {
         self.check_open()?;
-        // E, not the existence of old ambient-PATH helpers, must approve the
-        // production descriptors. No override or inherited environment here.
-        Err("E_RUNTIME_TOOLS_UNVERIFIED".into())
+        self.tools().map(|_| ())
     }
+    pub(crate) fn tools(&self)->Result<&LocalTools,String>{
+        self.check_open()?;
+        let tools=self.core.tools.as_ref().ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;
+        tools.recheck()?;Ok(tools)
+    }
+    pub(crate) fn client(&self,tool:&ToolPin,args:Vec<String>)->Result<ClientInput,String>{self.tools()?.client(tool,args)}
 }
