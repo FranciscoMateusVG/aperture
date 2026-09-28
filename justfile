@@ -190,6 +190,52 @@ build-mcp-sentry:
     cd mcp-server-sentry && pnpm install && pnpm build
     @echo "✅ Sentry MCP wrap server built"
 
+# Local E3 laboratory recipes. TMPDIR is an explicit private scratch root;
+# destinations are new direct children. No publish/current/setup-all changes.
+[positional-arguments]
+e3-sentry-prepare node pnpm cache destination:
+    #!/bin/sh
+    set -eu
+    umask 077
+    node="$1"; pnpm="$2"; cache="$3"; destination="$4"
+    case "$node:$pnpm" in /*:/*) ;; *) exit 64;; esac
+    test -n "${HOME:-}"; test -n "${TMPDIR:-}"
+    test -d "$TMPDIR"; test ! -L "$TMPDIR"
+    test "$cache" = "$TMPDIR/store"; test -d "$cache"; test ! -L "$cache"
+    test "$destination" = "$TMPDIR/sentry-prepare"
+    /bin/mkdir -m 700 "$destination"
+    /bin/cp mcp-server-sentry/package.json mcp-server-sentry/pnpm-lock.yaml mcp-server-sentry/tsconfig.json mcp-server-sentry/vitest.config.ts "$destination/"
+    /bin/cp -R mcp-server-sentry/src mcp-server-sentry/tests "$destination/"
+    cd "$destination"
+    /usr/bin/env -i HOME="$HOME" TMPDIR="$TMPDIR" NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null "$node" "$pnpm" install --prod=false --frozen-lockfile --offline --ignore-scripts --package-import-method=copy --node-linker=hoisted --no-config.prefer-symlinked-executables --no-config.extend-node-path --store-dir "$cache"
+
+[positional-arguments]
+e3-sentry-build node prepared:
+    #!/bin/sh
+    set -eu
+    node="$1"; prepared="$2"
+    case "$node" in /*) ;; *) exit 64;; esac
+    test "$prepared" = "$TMPDIR/sentry-prepare"; test -d "$prepared"; test ! -L "$prepared"
+    test ! -e "$prepared/dist"; test ! -L "$prepared/dist"
+    /usr/bin/env -i HOME="$HOME" TMPDIR="$TMPDIR" "$node" "$prepared/node_modules/typescript/bin/tsc" --project "$prepared/tsconfig.json" --noEmitOnError
+
+[positional-arguments]
+e3-sentry-export node pnpm cache prepared destination:
+    #!/bin/sh
+    set -eu
+    umask 077
+    node="$1"; pnpm="$2"; cache="$3"; prepared="$4"; destination="$5"
+    case "$node:$pnpm" in /*:/*) ;; *) exit 64;; esac
+    test -d "$TMPDIR"; test ! -L "$TMPDIR"
+    test "$cache" = "$TMPDIR/store"; test -d "$cache"; test ! -L "$cache"
+    test "$prepared" = "$TMPDIR/sentry-prepare"; test -d "$prepared/dist"; test ! -L "$prepared"
+    test "$destination" = "$TMPDIR/sentry-export"
+    /bin/mkdir -m 700 "$destination"
+    /bin/cp "$prepared/package.json" "$prepared/pnpm-lock.yaml" "$destination/"
+    /bin/cp -R "$prepared/dist" "$destination/"
+    cd "$destination"
+    /usr/bin/env -i HOME="$HOME" TMPDIR="$TMPDIR" NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null "$node" "$pnpm" install --prod --frozen-lockfile --offline --ignore-scripts --package-import-method=copy --node-linker=hoisted --no-config.prefer-symlinked-executables --no-config.extend-node-path --store-dir "$cache"
+
 # Run the Sentry MCP wrap server's test suite
 test-mcp-sentry:
     @echo "🧪 Running Sentry MCP wrap server tests..."

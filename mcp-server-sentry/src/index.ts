@@ -26,11 +26,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport, DEFAULT_INHERITED_ENV_VARS } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
+import { fileURLToPath } from "node:url";
 
 import {
   loadAllowlist,
@@ -111,30 +112,62 @@ async function startUpstreamClient(): Promise<void> {
     return;
   }
 
-  // The upstream is @sentry/mcp-server. We resolve its CLI path via
-  // require.resolve fallback because pnpm hoists differently per repo.
-  const upstreamCmd = process.env.SENTRY_MCP_UPSTREAM_CMD ?? "npx";
-  const upstreamArgs = process.env.SENTRY_MCP_UPSTREAM_ARGS
-    ? process.env.SENTRY_MCP_UPSTREAM_ARGS.split(" ")
-    : ["-y", "@sentry/mcp-server"];
+  // The compiled wrapper is dist/src/index.js. Resolve only its local dependency,
+  // never npx, PATH, .bin, a parent checkout, or environment-supplied commands.
+  // This binds selection, not Node provenance/retention (the E2 release gate).
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const dependency = path.join(root, "node_modules/@sentry/mcp-server");
+  for (const dir of ["node_modules", "node_modules/@sentry", "node_modules/@sentry/mcp-server", "node_modules/@sentry/mcp-server/dist"]) {
+    const info = fs.lstatSync(path.join(root, dir));
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Non-local upstream directory");
+  }
+  const manifestPath = path.join(dependency, "package.json");
+  const fd = fs.openSync(manifestPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  let manifest: { name?: string; bin?: Record<string, string> };
+  try {
+    const info = fs.fstatSync(fd);
+    if (!info.isFile() || info.size > 65536) throw new Error("Invalid upstream manifest");
+    manifest = JSON.parse(fs.readFileSync(fd, "utf8"));
+  } finally { fs.closeSync(fd); }
+  if (manifest.name !== "@sentry/mcp-server" || manifest.bin?.["sentry-mcp"] !== "./dist/index.js") {
+    throw new Error("Unsupported local upstream CLI");
+  }
+  const cli = path.join(dependency, "dist/index.js");
+  const info = fs.lstatSync(cli);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Invalid local upstream CLI");
 
+  // SDK merges its default inherited variables even when env is supplied.
+  // Explicit empty masks prevent ambient PATH/SHELL/USER/etc from reaching it;
+  // this is not claimed as OS env_clear. Only HOME and the existing token pass.
+  const upstreamEnv: Record<string, string> = Object.fromEntries(
+    DEFAULT_INHERITED_ENV_VARS.map((name) => [name, ""]),
+  );
+  upstreamEnv.HOME = process.env.HOME ?? "";
+  upstreamEnv.SENTRY_ACCESS_TOKEN = sentryToken;
   const transport = new StdioClientTransport({
-    command: upstreamCmd,
-    args: upstreamArgs,
-    env: {
-      ...process.env,
-      SENTRY_ACCESS_TOKEN: sentryToken,
-    },
+    command: process.execPath,
+    args: [cli],
+    env: upstreamEnv,
+    stderr: "pipe",
   });
+  // Drain without forwarding arbitrary upstream stderr (including split secrets).
+  // Our own bounded startup/close error messages still use the existing redactor.
+  transport.stderr?.on("data", () => {});
 
   const client = new Client(
     { name: "aperture-sentry-wrap", version: "1.1.0" },
     { capabilities: {} },
   );
-  await client.connect(transport);
+  let listed;
+  try {
+    await client.connect(transport, { timeout: 5000 });
+    listed = await client.listTools({}, { timeout: 5000 });
+  } catch (error) {
+    await client.close();
+    await transport.close();
+    throw error;
+  }
   upstreamClient = client;
-
-  const listed = await client.listTools();
   upstreamTools = listed.tools.map((t) => ({
     name: t.name,
     description: t.description,
@@ -449,6 +482,16 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // A closed caller must not leave the private upstream child behind.
+  process.stdin.once("end", () => {
+    void (async () => {
+      await upstreamClient?.close();
+      await server.close();
+    })().catch((error: unknown) => {
+      process.stderr.write(redact(`[sentry-mcp] close failed: ${String(error)}\n`));
+      process.exitCode = 1;
+    });
+  });
   process.stderr.write("[sentry-mcp] server ready on stdio\n");
 }
 
