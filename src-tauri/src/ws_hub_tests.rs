@@ -1062,3 +1062,31 @@ fn local_hub_script_pin_rechecks_at_spawn_and_retains_incomplete_intent(){
     let registry=Registry::open(&lease).unwrap();assert!(registry.validate_namespace().is_err());
     assert!(!f.home.join("fixture-ready").exists()); // token/intent may exist; never claim zero earlier effects
 }
+
+#[test]
+fn local_hub_log_preflight_denies_unsafe_modes_before_reservation_token_or_spawn(){
+    use std::os::unix::fs::{PermissionsExt,MetadataExt};
+    for directory_unsafe in [true,false] {
+        let f=NativeFixture::new();let lease=ControllerLock::acquire(&f.home).unwrap();
+        let logs=f.home.join(".aperture/logs");crate::journal::ensure_private_dir(&logs).unwrap();
+        let path=logs.join("ws-hub.log");fs::write(&path,b"owned diagnostic sentinel").unwrap();
+        fs::set_permissions(&path,fs::Permissions::from_mode(if directory_unsafe {0o600}else{0o644})).unwrap();
+        fs::set_permissions(&logs,fs::Permissions::from_mode(if directory_unsafe {0o755}else{0o700})).unwrap();
+        let token_path=f.home.join(".aperture/run/hub-tokens/watchdog.token");let token=fs::read(&token_path).unwrap();let before=fs::metadata(&path).unwrap();
+        let error=Supervisor::new(&lease,f.spec("normal")).unwrap().reconcile().unwrap_err();
+        if directory_unsafe{assert!(error.starts_with("E_PERMISSION_UNSAFE"));}else{assert_eq!(error,"E_HUB_LOG_UNSAFE");}
+        assert!(!f.home.join(".aperture/run/daemons/hub").exists(),"no reservation or current namespace");
+        assert_eq!(fs::read(&token_path).unwrap(),token,"no token rotation");
+        assert!(lease.hub_child().unwrap().is_none());assert!(!f.home.join("fixture-ready").exists());
+        assert!(TcpListener::bind(f.endpoint).is_ok());
+        let after=fs::metadata(&path).unwrap();assert_eq!((before.ino(),before.mode()),(after.ino(),after.mode()));
+        assert_eq!(fs::read(&path).unwrap(),b"owned diagnostic sentinel");
+        assert_eq!(fs::metadata(&logs).unwrap().mode()&0o777,if directory_unsafe {0o755}else{0o700});
+    }
+    // Positive control through the same actual supervisor and owned inert child.
+    let f=NativeFixture::new();let lease=ControllerLock::acquire(&f.home).unwrap();
+    let observed=Supervisor::new(&lease,f.spec("normal")).unwrap().reconcile().unwrap();
+    assert!(observed.spawned);assert_eq!(team_process::state(&observed.identity),ProcessState::Same);
+    assert_eq!(fs::metadata(f.home.join(".aperture/logs/ws-hub.log")).unwrap().mode()&0o777,0o600);
+    drop(lease);drop(f); // exact own child cleanup/reap in the existing fixture
+}

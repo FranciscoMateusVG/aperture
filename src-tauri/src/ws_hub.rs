@@ -160,6 +160,33 @@ impl<'a> Supervisor<'a> {
         // race leaves the durable reservation and cannot trigger a blind retry.
         let free =
             TcpListener::bind(self.spec.endpoint).map_err(|_| "E_HUB_OCCUPIED_OR_UNVERIFIED")?;
+        // Validate and retain diagnostic FDs before the reservation or token
+        // rotation. Refused local permissions must not consume a launch intent.
+        // Creation of a private diagnostics directory/file is explicit setup,
+        // not daemon adoption or permission to repair an unsafe existing path.
+        let log_dir = self.spec.home.join(".aperture/logs");
+        crate::journal::ensure_private_dir(&log_dir)?;
+        let log_path = crate::journal::validate_component_path(&log_dir, "ws-hub.log", true)?;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(log_path)
+            .map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
+        let meta = log.metadata().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o077 != 0
+        {
+            return Err("E_HUB_LOG_UNSAFE".into());
+        }
+        let flags=unsafe{libc::fcntl(log.as_raw_fd(),libc::F_GETFL)};
+        if flags<0 || unsafe{libc::fcntl(log.as_raw_fd(),libc::F_SETFL,flags & !libc::O_NONBLOCK)}<0 {
+            return Err("E_HUB_LOG_UNSAFE".into());
+        }
+        let log_stdout=log.try_clone().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
         let reservation = registry.reserve(
             Endpoint::Hub {
                 port: self.spec.endpoint.port(),
@@ -186,33 +213,8 @@ impl<'a> Supervisor<'a> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Retain the existing hub diagnostic destination, without inherited
-        // pipe handles that die with the controller. Failure stays Unknown;
-        // never silently discard daemon diagnostics or retry this reservation.
-        let log_dir = self.spec.home.join(".aperture/logs");
-        crate::journal::ensure_private_dir(&log_dir)?;
-        let log_path = crate::journal::validate_component_path(&log_dir, "ws-hub.log", true)?;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(log_path)
-            .map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
-        let meta = log.metadata().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?;
-        if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.nlink() != 1
-            || meta.mode() & 0o077 != 0
-        {
-            return Err("E_HUB_LOG_UNSAFE".into());
-        }
-        let flags=unsafe{libc::fcntl(log.as_raw_fd(),libc::F_GETFL)};
-        if flags<0 || unsafe{libc::fcntl(log.as_raw_fd(),libc::F_SETFL,flags & !libc::O_NONBLOCK)}<0 {
-            return Err("E_HUB_LOG_UNSAFE".into());
-        }
         command
-            .stdout(log.try_clone().map_err(|_| "E_HUB_LOG_UNAVAILABLE")?)
+            .stdout(log_stdout)
             .stderr(log);
         #[cfg(test)]
         command.env("APERTURE_FIXTURE_MODE", &self.spec.fixture_mode);
