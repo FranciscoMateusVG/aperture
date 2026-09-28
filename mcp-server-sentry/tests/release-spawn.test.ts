@@ -11,6 +11,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const exported = process.env.E3_EXPORT_ROOT;
 const logRoot = process.env.E3_TEST_EVIDENCE;
+const builtDist = process.env.E3_DIST_ROOT;
 const token = "synthetic-e3-not-a-provider-token";
 const upstream = `
 import fs from 'node:fs';
@@ -53,6 +54,7 @@ test.skipIf(!exported)("real packaged wrapper selects local CLI, masks env, appl
   fs.chmodSync(root,0o700);
   const copy=path.join(root,"package");
   fs.cpSync(exported!,copy,{recursive:true,dereference:false,errorOnExist:true,force:false});
+  if(builtDist) fs.cpSync(builtDist,path.join(copy,"dist"),{recursive:true});
   const home=path.join(root,"home");fs.mkdirSync(home,{mode:0o700});
   const allow=path.join(home,"allowlist.yaml");
   fs.writeFileSync(allow,"project_allowlist: [synthetic-project]\nagent_default_on: [aperture-web-backend]\nagent_opt_in: []\n",{mode:0o600});
@@ -66,7 +68,8 @@ test.skipIf(!exported)("real packaged wrapper selects local CLI, masks env, appl
     SENTRY_MCP_UPSTREAM_CMD:"/__never_execute__",SENTRY_MCP_UPSTREAM_ARGS:"must not be parsed"
   }});
   let stderr="";
-  transport.stderr!.on("data",chunk=>{stderr+=String(chunk);if(stderr.length>65536)throw new Error("fixture stderr cap");});
+  let markReady!:()=>void; const ready=new Promise<void>(resolve=>{markReady=resolve;});
+  transport.stderr!.on("data",chunk=>{stderr+=String(chunk);if(stderr.includes("server ready on stdio"))markReady();if(stderr.length>65536)throw new Error("fixture stderr cap");});
   const client=new Client({name:"e3-wrapper-test",version:"1.0.0"});
   let child:ChildProcess|undefined; let exited:Promise<unknown[]>|undefined;
   let ledger: any[]=[];
@@ -76,6 +79,7 @@ test.skipIf(!exported)("real packaged wrapper selects local CLI, masks env, appl
     child=(transport as unknown as {_process?:ChildProcess})._process;
     expect(child?.pid).toBeTypeOf("number"); exited=once(child!,"exit");
     await bounded(connecting);
+    await bounded(ready);
     expect(client.getServerVersion()?.name).toBe("aperture-sentry");
     const listed=await client.listTools({}, {timeout:3000});
     expect(listed.tools.map(t=>t.name).sort()).toEqual(["search_issues","update_issue"]);
@@ -111,3 +115,128 @@ test.skipIf(!exported)("real packaged wrapper selects local CLI, masks env, appl
   }
   expect(stderr).not.toContain(token);
 },20000);
+
+// The same native SDK stdio channel, with fixture-owned file barriers. No sleep,
+// custom JSON-RPC reader, process census or production override is involved.
+function barrierUpstream(mode: "initialize" | "list" | "failure") {
+  return `
+import fs from 'node:fs';
+import path from 'node:path';
+import {Server} from '@modelcontextprotocol/sdk/server/index.js';
+import {StdioServerTransport} from '@modelcontextprotocol/sdk/server/stdio.js';
+import {InitializeRequestSchema,ListToolsRequestSchema,CallToolRequestSchema} from '@modelcontextprotocol/sdk/types.js';
+const home=process.env.HOME, mode=${JSON.stringify(mode)};
+const record=value=>fs.appendFileSync(path.join(home,'upstream.jsonl'),JSON.stringify(value)+'\\n');
+record({kind:'start',pid:process.pid});
+let release;
+function barrier(phase) {
+ return new Promise((resolve,reject)=>{
+  let done=false;
+  const finish=reason=>{if(done)return;done=true;watcher.close();clearTimeout(timer);record({kind:'released',phase,reason});resolve();};
+  const check=()=>{if(fs.existsSync(path.join(home,'release')))finish('fixture');};
+  const watcher=fs.watch(home,check);
+  const timer=setTimeout(()=>{if(done)return;done=true;watcher.close();record({kind:'barrier-timeout',phase});reject(new Error('fixture barrier deadline'));},5000);
+  release=()=>finish('caller-eof');
+  record({kind:'barrier',phase,pid:process.pid});check();
+ });
+}
+const server=new Server({name:'inert-barrier',version:'1.0.0'},{capabilities:{tools:{}}});
+server.setRequestHandler(InitializeRequestSchema,async request=>{
+ if(mode==='failure'){record({kind:'startup-failure'});throw new Error('synthetic startup failure');}
+ if(mode==='initialize')await barrier('initialize');
+ return {protocolVersion:request.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'inert-barrier',version:'1.0.0'}};
+});
+server.setRequestHandler(ListToolsRequestSchema,async()=>{
+ if(mode==='list')await barrier('list');
+ return {tools:[{name:'search_issues',inputSchema:{type:'object',properties:{project:{type:'string'}},required:['project']}}]};
+});
+server.setRequestHandler(CallToolRequestSchema,async()=>{record({kind:'call'});return {content:[{type:'text',text:'inert'}]};});
+process.stdin.once('end',()=>{release?.();void server.close().then(()=>record({kind:'closed',pid:process.pid}));});
+process.on('exit',code=>record({kind:'exit',pid:process.pid,code}));
+await server.connect(new StdioServerTransport());
+`;
+}
+
+function ledgerAt(home: string): any[] {
+  const file=path.join(home,"upstream.jsonl");
+  if(!fs.existsSync(file))return [];
+  // Only complete append records; a pending partial line is not success.
+  return fs.readFileSync(file,"utf8").split("\n").slice(0,-1).map(line=>JSON.parse(line));
+}
+function waitRecord(home:string, predicate:(rows:any[])=>boolean):Promise<void> {
+  return new Promise((resolve,reject)=>{
+    let done=false;
+    const finish=(error?:unknown)=>{if(done)return;done=true;watcher.close();clearTimeout(timer);error?reject(error):resolve();};
+    const check=()=>{try{if(predicate(ledgerAt(home)))finish();}catch(error){finish(error);}};
+    const watcher=fs.watch(home,check);
+    const timer=setTimeout(()=>finish(new Error("fixture record deadline")),6000);
+    check();
+  });
+}
+
+for(const scenario of ["initialize","list","failure","early-request"] as const) {
+  test.skipIf(!exported)(`real wrapper startup lifecycle: ${scenario}`,async()=>{
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"e3-startup-"));fs.chmodSync(root,0o700);
+    const copy=path.join(root,"package"),home=path.join(root,"home");
+    fs.cpSync(exported!,copy,{recursive:true,dereference:false,errorOnExist:true,force:false});
+    if(builtDist)fs.cpSync(builtDist,path.join(copy,"dist"),{recursive:true});
+    fs.mkdirSync(home,{mode:0o700});
+    const allow=path.join(home,"allowlist.yaml");
+    fs.writeFileSync(allow,"project_allowlist: [synthetic-project]\nagent_default_on: [aperture-web-backend]\nagent_opt_in: []\n",{mode:0o600});
+    fs.writeFileSync(path.join(copy,"node_modules/@sentry/mcp-server/dist/index.js"),barrierUpstream(scenario==="early-request"?"initialize":scenario));
+    const transport=new StdioClientTransport({command:process.execPath,args:[path.join(copy,"dist/src/index.js")],stderr:"pipe",env:{
+      HOME:home,AGENT_NAME:"aperture-web-backend",SENTRY_ACCESS_TOKEN:token,SENTRY_MCP_ALLOWLIST_PATH:allow,LOKI_URL:"disabled:",
+      PATH:"",SHELL:"",USER:"",LOGNAME:"",TERM:"",
+    }});
+    let stderr="";let markReady!:()=>void;
+    const ready=new Promise<void>(resolve=>{markReady=resolve;});
+    transport.stderr!.on("data",chunk=>{stderr+=String(chunk);if(stderr.length>65536)throw new Error("fixture stderr cap");if(stderr.includes("server ready on stdio"))markReady();});
+    const client=new Client({name:"e3-startup-test",version:"1.0.0"});
+    const connecting=client.connect(transport,{timeout:5000});
+    // Attach a rejection observer immediately; the assertion below still awaits it.
+    const connected=connecting.then(()=>({ok:true as const}),error=>({ok:false as const,error}));
+    const child=(transport as unknown as {_process?:ChildProcess})._process;
+    expect(child?.pid).toBeTypeOf("number");
+    const exited=once(child!,"exit");
+    let outcome:unknown[]|undefined;
+    try {
+      if(scenario==="failure") {
+        await waitRecord(home,rows=>rows.some(row=>row.kind==="startup-failure"));
+        outcome=await bounded(exited);
+        expect(outcome).toEqual([1,null]);
+      } else {
+        await waitRecord(home,rows=>rows.some(row=>row.kind==="barrier"));
+        expect(stderr).not.toContain("server ready on stdio");
+        if(scenario==="early-request") {
+          expect((await bounded(connected)).ok).toBe(true);
+          expect(client.getServerVersion()?.name).toBe("aperture-sentry");
+          expect(await client.ping({timeout:2000})).toEqual({});
+          const pending=await client.listTools({}, {timeout:2000});
+          expect(pending.tools.map(tool=>tool.name)).toEqual(["_unavailable"]);
+          const unavailable=await client.callTool({name:"_unavailable",arguments:{}},undefined,{timeout:2000});
+          expect(unavailable.isError).toBe(true);
+          fs.writeFileSync(path.join(home,"release"),"release",{flag:"wx",mode:0o600});
+          await bounded(ready);
+          expect((await client.listTools({}, {timeout:2000})).tools.map(tool=>tool.name)).toEqual(["search_issues"]);
+        }
+        // Close the owned caller pipe at the barrier, not a timeout-driven signal.
+        child!.stdin!.end();
+        outcome=await bounded(exited);
+        expect(outcome).toEqual([0,null]);
+      }
+      if(scenario!=="early-request")expect(stderr).not.toContain("server ready on stdio");
+      expect(stderr).not.toContain(token);
+    } finally {
+      await bounded(client.close());await bounded(transport.close());
+      outcome ??= await bounded(exited);
+      const ledger=ledgerAt(home),start=ledger.find(row=>row.kind==="start");
+      if(logRoot)fs.writeFileSync(path.join(logRoot,`startup-${scenario}.json`),JSON.stringify({scenario,root,wrapperPid:child?.pid,outcome,stderr,ledger},null,2));
+      expect(gone(child!.pid!)).toBe(true);
+      expect(start?.pid).toBeTypeOf("number");expect(gone(start.pid)).toBe(true);
+      expect(ledger.some(row=>row.kind==="closed")).toBe(true);
+      expect(ledger.some(row=>row.kind==="exit"&&row.code===0)).toBe(true);
+      expect(ledger.filter(row=>row.kind==="call"||row.kind==="barrier-timeout")).toEqual([]);
+      if(scenario!=="failure")expect(ledger.filter(row=>row.kind==="released").map(row=>row.reason)).toEqual([scenario==="early-request"?"fixture":"caller-eof"]);
+    }
+  },20000);
+}

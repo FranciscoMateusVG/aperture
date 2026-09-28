@@ -103,7 +103,50 @@ interface UpstreamTool {
 let upstreamClient: Client | null = null;
 let upstreamTools: UpstreamTool[] = [];
 
+// One lifecycle owner, including the interval before upstreamClient is published.
+let callerEnded = false;
+let phase: "starting" | "ready" | "closing" | "closed" = "starting";
+let ownedUpstream: { client: Client; transport: StdioClientTransport } | null = null;
+let cleanupFlight: Promise<void> | null = null;
+const callerTransport = new StdioServerTransport();
+
+function canStart(): boolean {
+  return !callerEnded && phase === "starting";
+}
+
+function shutdown(): Promise<void> {
+  if (cleanupFlight) return cleanupFlight;
+  phase = "closing";
+  upstreamClient = null;
+  cleanupFlight = (async () => {
+    // Each close is attempted even if another fails. SDK owns its exact child;
+    // no process discovery/group signal or alternate cleanup executor here.
+    const closes = [
+      () => ownedUpstream?.client.close(),
+      () => ownedUpstream?.transport.close(),
+      () => server.close(),
+      () => callerTransport.close(),
+    ];
+    for (const close of closes) {
+      try { await close(); }
+      catch (error) {
+        process.exitCode = 1;
+        process.stderr.write(redact(`[sentry-mcp] close failed: ${String(error)}\n`));
+      }
+    }
+    phase = "closed";
+  })();
+  return cleanupFlight;
+}
+
+function observeCallerClose(): void {
+  callerEnded = true;
+  void shutdown();
+}
+
+
 async function startUpstreamClient(): Promise<void> {
+  if (!canStart()) return;
   if (!sentryToken) {
     process.stderr.write(
       "[sentry-mcp] Sentry token unreachable — upstream NOT spawned. " +
@@ -158,15 +201,12 @@ async function startUpstreamClient(): Promise<void> {
     { name: "aperture-sentry-wrap", version: "1.1.0" },
     { capabilities: {} },
   );
-  let listed;
-  try {
-    await client.connect(transport, { timeout: 5000 });
-    listed = await client.listTools({}, { timeout: 5000 });
-  } catch (error) {
-    await client.close();
-    await transport.close();
-    throw error;
-  }
+  if (!canStart()) return;
+  ownedUpstream = { client, transport }; // Own both BEFORE connect can spawn.
+  await client.connect(transport, { timeout: 5000 });
+  if (!canStart()) { await shutdown(); return; }
+  const listed = await client.listTools({}, { timeout: 5000 });
+  if (!canStart()) { await shutdown(); return; }
   upstreamClient = client;
   upstreamTools = listed.tools.map((t) => ({
     name: t.name,
@@ -445,23 +485,22 @@ function registerProxiedTools(): void {
 // ── Boot ───────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  try {
-    await startUpstreamClient();
-  } catch (err) {
-    process.stderr.write(
-      redact(
-        `[sentry-mcp] upstream client start failed: ${(err as Error).message}\n`,
-      ),
-    );
+  // Register before ANY await/spawn. Native SDK stdio starts reading immediately
+  // below: merely observing `end` on a paused stream would miss pre-ready EOF.
+  // No resume/drain discards JSON-RPC: the real server handles early initialize,
+  // ping and a finite unavailable tool list while upstream startup is pending.
+  process.stdin.once("end", observeCallerClose);
+  process.stdin.once("close", observeCallerClose);
+  process.stdin.once("error", observeCallerClose);
+  if (process.stdin.readableEnded || process.stdin.destroyed) {
+    observeCallerClose();
+    await shutdown();
+    return;
   }
-  registerProxiedTools();
 
-  // Always expose at least a no-op probe tool so the MCP server surfaces
-  // its name even when the upstream failed to start — that lets agents
-  // see "sentry" in their tool list and get a useful 503-style error
-  // instead of "namespace doesn't exist".
-  if (upstreamTools.length === 0) {
-    server.tool(
+  // Expose an explicit unavailable response during startup/missing token;
+  // startup errors themselves are fatal and cleaned up, never marked ready.
+  const unavailable = server.tool(
       "_unavailable",
       "Sentry MCP is currently unavailable (token, allowlist, or upstream issue). See stderr.",
       { params: z.record(z.string(), z.unknown()).optional() },
@@ -478,26 +517,24 @@ async function main(): Promise<void> {
         isError: true,
       }),
     );
-  }
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  // A closed caller must not leave the private upstream child behind.
-  process.stdin.once("end", () => {
-    void (async () => {
-      await upstreamClient?.close();
-      await server.close();
-    })().catch((error: unknown) => {
-      process.stderr.write(redact(`[sentry-mcp] close failed: ${String(error)}\n`));
-      process.exitCode = 1;
-    });
-  });
+  await server.connect(callerTransport);
+  if (!canStart()) { await shutdown(); return; }
+  await startUpstreamClient();
+  if (!canStart()) { await shutdown(); return; }
+  registerProxiedTools();
+  if (upstreamTools.length > 0) unavailable.remove();
+  if (!canStart()) { await shutdown(); return; }
+  phase = "ready";
   process.stderr.write("[sentry-mcp] server ready on stdio\n");
 }
 
-main().catch((err) => {
-  process.stderr.write(
-    redact(`[sentry-mcp] fatal: ${(err as Error).message ?? err}\n`),
-  );
-  process.exit(1);
+main().catch(async (err: unknown) => {
+  // Caller EOF rejects in-flight SDK requests. It is normal shutdown, not a
+  // reason to publish readiness or force exit past the owned child's cleanup.
+  if (!callerEnded) {
+    process.exitCode = 1;
+    process.stderr.write(redact(`[sentry-mcp] fatal: ${String(err)}\n`));
+  }
+  await shutdown();
 });
