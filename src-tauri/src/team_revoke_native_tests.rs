@@ -44,6 +44,17 @@ fn fixture(
     response: serde_json::Value,
     reconnect: Option<u16>,
 ) -> (SocketAddr, thread::JoinHandle<usize>) {
+    fixture_with_frames(response, reconnect, vec![
+        serde_json::json!({"type":"presence","agent":"fixture","event":"idle","ts":"2026-09-29T00:00:00Z"}).to_string(),
+        snapshot_end().to_string(),
+    ])
+}
+fn snapshot_end() -> serde_json::Value {
+    serde_json::json!({"type":"subscriber_snapshot_end","protocol_version":1,"hub_pid":42,"snapshot_count":1})
+}
+fn fixture_with_frames(
+    response: serde_json::Value, reconnect: Option<u16>, initial: Vec<String>,
+) -> (SocketAddr, thread::JoinHandle<usize>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let handle = thread::spawn(move || {
@@ -77,7 +88,13 @@ fn fixture(
             request.get("token").is_none(),
             "mutation does not expose bearer as request field"
         );
-        ws.send(Message::Text(response.to_string())).unwrap();
+        // Real producer order: initial presence and completion precede ACK.
+        // Reads above ensure the single mutation was sent before any negative
+        // fixture closes; send errors after client denial are expected.
+        for text in initial {
+            if ws.send(Message::Text(text)).is_err() { break; }
+        }
+        if !response.is_null() { let _ = ws.send(Message::Text(response.to_string())); }
         drop(ws);
         if let Some(code) = reconnect {
             let (socket, _) = listener.accept().unwrap();
@@ -490,4 +507,45 @@ fn ready_reaffirm_bad_fresh_ack_cannot_be_replaced_by_historical_success() {
         .0
         .join(".aperture/run/hub-tokens/t1-worker.token")
         .exists());
+}
+
+#[test]
+fn snapshot_marker_is_strict_bounded_framing_never_ack_or_retry() {
+    let mut invalid = Vec::new();
+    for mode in 0..9 {
+        let mut v = snapshot_end();
+        match mode {
+            0 => v["protocol_version"] = 2.into(),
+            1 => v["hub_pid"] = 0.into(),
+            2 => v["hub_pid"] = (u32::MAX as u64 + 1).into(),
+            3 => v["snapshot_count"] = (super::super::SNAPSHOT_ENTRIES + 1).into(),
+            4 => v["extra"] = true.into(),
+            5 => { v.as_object_mut().unwrap().remove("snapshot_count"); },
+            6 => v["snapshot_count"] = (-1).into(),
+            7 => v["protocol_version"] = "1".into(),
+            _ => v["hub_pid"] = 1.5.into(),
+        }
+        invalid.push(vec![v.to_string()]);
+    }
+    invalid.push(vec![snapshot_end().to_string(), snapshot_end().to_string()]);
+    invalid.push(vec![r#"{"type":"subscriber_snapshot_end","protocol_version":1,"hub_pid":42,"hub_pid":43,"snapshot_count":1}"#.into()]);
+    invalid.push(vec!["{".into()]);
+    invalid.push(vec![" ".repeat(FRAME_CAP + 1)]);
+    invalid.push((0..FRAME_COUNT_CAP).map(|_| serde_json::json!({"type":"presence"}).to_string()).collect());
+    for initial in invalid {
+        let (address, server) = fixture_with_frames(ack(), None, initial);
+        assert!(matches!(exchange(address, &Bearer("a".repeat(64)), &Bearer("b".repeat(64)),
+            "t1-worker", 1, &"c".repeat(64)), Err(ReplacementError::RevocationUnverified)));
+        assert_eq!(server.join().unwrap(), 1, "no negative reconnect or second revoke");
+    }
+    // A valid completion alone is not proof. No ACK and no 4003 witness.
+    let (address, server) = fixture_with_frames(serde_json::Value::Null, None, vec![snapshot_end().to_string()]);
+    assert!(exchange(address, &Bearer("a".repeat(64)), &Bearer("b".repeat(64)),
+        "t1-worker", 1, &"c".repeat(64)).is_err());
+    assert_eq!(server.join().unwrap(), 1);
+    // The protocol marker remains optional for the older direct-ACK producer.
+    let (address, server) = fixture_with_frames(ack(), Some(4003), vec![]);
+    assert!(exchange(address, &Bearer("a".repeat(64)), &Bearer("b".repeat(64)),
+        "t1-worker", 1, &"c".repeat(64)).is_ok());
+    assert_eq!(server.join().unwrap(), 2);
 }
