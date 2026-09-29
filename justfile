@@ -404,6 +404,9 @@ ui-build node destination:
 # Personal local candidate only. No setup-all, launchd, existing app replacement,
 # runtime/current publication or process activation. Existing MCP outputs remain
 # explicit retained inputs; their dependency retention is not an immutable release.
+# Copying team-control does not select it for MCP: activation must explicitly use
+# APERTURE_TEAM_CONTROL_BIN=<absolute package>/bin/aperture-team-control, or root
+# must update the canonical ~/.aperture/bin/aperture-team-control separately.
 [positional-arguments]
 web-local-candidate node target destination bus_root sentry_root sentry_dist:
     #!/bin/sh
@@ -416,11 +419,12 @@ web-local-candidate node target destination bus_root sentry_root sentry_dist:
     test ! -e "$destination" && test ! -L "$destination"
     test -f "$bus/dist/index.js" && test -f "$bus/dist/ws-hub.js" && test -d "$bus/node_modules"
     test -f "$sentry/package.json" && test -d "$sentry/node_modules" && test -f "$sentry_dist/src/index.js"
-    /opt/homebrew/bin/cargo build --offline --locked --manifest-path src-tauri/Cargo.toml --release --bin aperture-server --bin aperture-boot --target-dir "$target"
+    /opt/homebrew/bin/cargo build --offline --locked --manifest-path src-tauri/Cargo.toml --release --bin aperture-server --bin aperture-boot --bin aperture-team-control --target-dir "$target"
     mkdir -m 700 "$destination"
     mkdir -m 700 "$destination/bin" "$destination/ui" "$destination/mcp-server" "$destination/mcp-server-sentry"
     cp "$target/release/aperture-server" "$destination/bin/aperture-server"
     cp "$target/release/aperture-boot" "$destination/bin/aperture-boot"
+    cp "$target/release/aperture-team-control" "$destination/bin/aperture-team-control"
     cp "$bus/package.json" "$destination/mcp-server/"
     cp -R "$bus/dist" "$bus/node_modules" "$destination/mcp-server/"
     cp "$sentry/package.json" "$destination/mcp-server-sentry/"
