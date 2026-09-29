@@ -349,6 +349,15 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
     for (const [name, entry] of presenceState) {
       send(ws, { type: "presence", agent: name, event: stateToEvent(entry.state), ts: new Date().toISOString() });
     }
+    // Additive completion marker, including an empty snapshot. This runs only
+    // after subscriber authentication. It does not authenticate the server's
+    // process identity or grant authority to adopt/signal a daemon.
+    send(ws, {
+      type: "subscriber_snapshot_end",
+      protocol_version: 1,
+      hub_pid: process.pid,
+      snapshot_count: presenceState.size,
+    });
   }
 
   if (role === "agent" && agent) {

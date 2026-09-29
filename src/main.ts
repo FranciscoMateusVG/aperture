@@ -6,6 +6,8 @@ import { createAgentList } from "./components/AgentList";
 import { createFooter } from "./components/Footer";
 import { commands } from "./services/tauri-commands";
 
+import { initializeBrowserSession } from "./services/web-session";
+
 import { terminalCommands } from "./services/team-terminal";
 
 const SESSION_NAME = "aperture";
@@ -49,4 +51,4 @@ async function init() {
   setInterval(() => agentList.refresh(), 3000);
 }
 
-init();
+void initializeBrowserSession().then(ready => { if (ready) return init(); });

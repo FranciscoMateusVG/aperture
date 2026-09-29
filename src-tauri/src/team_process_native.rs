@@ -495,7 +495,7 @@ fn coordination_closures<S: ProcessSource>(
     let mut used: HashSet<_> = target.processes.iter().map(|p| p.identity.pid).collect();
     used.extend(peers.iter().flat_map(|(_, nodes)| nodes.iter().map(|(id, _, _)| id.pid)));
     let mut result = Vec::new();
-    if roots.len() > 3 { return Err(ReplacementError::StopUnverified); }
+    if roots.len() > 4 { return Err(ReplacementError::StopUnverified); }
     for (name, root) in roots {
         source.deadline()?;
         let actual = table.iter().find(|p| p.identity.pid == root.pid)

@@ -788,3 +788,24 @@ fn coordination_root_cannot_overlap_a_managed_peer() {
     assert!(matches!(collect_with_roots(&f.target, &mut Fake::new(sibling_table()),
         Some(&peers), &[("glados".into(), id(200))]), Err(ReplacementError::UnownedProcess)));
 }
+
+#[test]
+fn coordination_cipher_four_bound_roots_never_expand_target_authority() {
+    let o = owner();
+    let mut table = sibling_table();
+    table.extend([meta(300, 1), meta(400, 1), meta(500, 1)]);
+    let roots = vec![("glados".into(), id(200)), ("peppy".into(), id(300)),
+        ("wheatley".into(), id(400)), ("cipher".into(), id(500))];
+    let old = collect(&o, &mut Fake::new(table.clone())).unwrap();
+    let new = collect_with_roots(&o, &mut Fake::new(table.clone()), None, &roots).unwrap();
+    assert_eq!(old.processes, new.processes);
+    assert!(new.unowned_matches.is_empty());
+    let without_cipher = collect_with_roots(&o, &mut Fake::new(table.clone()), None, &roots[..3]).unwrap();
+    assert_eq!(without_cipher.unowned_matches, vec![id(500)]);
+    let mut excess = roots.clone(); excess.push(("unknown".into(), id(600)));
+    assert!(collect_with_roots(&o, &mut Fake::new(table.clone()), None, &excess).is_err());
+    for state in [ProcessState::Recycled, ProcessState::Unreadable, ProcessState::Gone] {
+        let mut f = Fake::new(table.clone()); f.states.insert(500, state);
+        assert!(collect_with_roots(&o, &mut f, None, &roots).is_err());
+    }
+}

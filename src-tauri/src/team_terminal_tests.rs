@@ -147,7 +147,10 @@ fn readonly_open_missing_owner_does_not_create_client_or_worker() {
     let home = std::env::temp_dir().join(format!("aperture-terminal-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(open(&home, input()).is_err());
+    let runtime = crate::daemons::RuntimeOwner::new(crate::controller::ControllerLock::acquire(&home).unwrap());
+    let work = runtime.admit(None).unwrap();
+    assert!(open(&home, input(), &work).is_err());
+    drop(work); runtime.close().unwrap(); drop(runtime);
     assert!(!home.join(".aperture/run/terminals").exists());
     assert!(!home.join(".aperture/run/managed").exists());
     assert!(!home.join(".aperture/run/owner/test-dev.json").exists());
@@ -218,12 +221,14 @@ fn existing_client_reuse_requires_exact_binding_pid_birth_and_live_pane() {
             link: None,
         },
         runtime: "/fixture".into(),
-        executable: "/fixture/bin".into(),
-        executable_id: (3, 4),
+        client: crate::daemons::ToolPin::capture(&std::env::current_exe().unwrap()).unwrap(),
+        client_fingerprint: "f".repeat(64),
         pid: 42,
         birth: 123,
     };
     let c = Client {
+        client_path: b.client.path.clone(),
+        client_fingerprint: b.client_fingerprint.clone(),
         binding: b.hash.clone(),
         window: "@42".into(),
         pid,
@@ -982,4 +987,300 @@ fn coordination_recheck_rejects_team_marker_and_mutated_public_identity() {
     let proof = f.capture().unwrap();
     fs::write(f.home.join(".claude/aperture/glados/TEAM"), b"unexpected").unwrap();
     assert!(proof.recheck().is_err());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn coordination_cipher_requires_the_same_native_binding_and_recheck() {
+    let f = CoordinationFixture::new();
+    let agent = f.home.join(".claude/aperture/cipher");
+    fs::rename(f.home.join(".claude/aperture/glados"), &agent).unwrap();
+    fs::write(agent.join("manifest.json"), br#"{"name":"Cipher","enabled":true}"#).unwrap();
+    let socket = f.home.join(".aperture/run/cipher.sock");
+    fs::rename(f.socket(), &socket).unwrap();
+    let peers = capture_coordination_peers(&f.home).unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].seat, "cipher");
+    assert_eq!(peers[0].identity, team_process::observe(std::process::id()).unwrap().unwrap().identity);
+    peers[0].recheck().unwrap();
+    fs::write(agent.join("TEAM"), b"not-coordination").unwrap();
+    assert!(peers[0].recheck().is_err());
+    assert!(capture_coordination_peers(&f.home).is_err());
+    fs::remove_file(agent.join("TEAM")).unwrap();
+    fs::write(agent.join("manifest.json"), br#"{"name":"Other","enabled":true}"#).unwrap();
+    assert!(capture_coordination_peers(&f.home).is_err());
+    fs::remove_file(socket).unwrap();
+    assert!(capture_coordination_peers(&f.home).unwrap().is_empty());
+}
+
+#[test]
+fn c2b_native_pin_mapping_and_fixed_link_unlink_retain_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = SocketFixture::new();
+    // C2 native policy has a direct child of pinned /private/tmp; do not omit
+    // an intermediate fixture directory from the persisted parent order.
+    f.daemon = f.root.clone();
+    f.target = f.root.join("a".repeat(64));
+    let listener = std::os::unix::net::UnixListener::bind(&f.target).unwrap();
+    fs::set_permissions(&f.target, fs::Permissions::from_mode(0o600)).unwrap();
+    f._listener = listener;
+    f.relink(&f.target);
+    fs::create_dir_all(f.root.join(".aperture/run")).unwrap();
+    for p in [f.root.join(".aperture"), f.root.join(".aperture/run")] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let binding = f.pin().unwrap();
+    let values = codex_pin_values(&f.root, &f.link, &binding).unwrap();
+    assert_eq!(
+        values.parents,
+        coordination_runtime_dirs(&f.root)
+            .unwrap()
+            .iter()
+            .map(pin_value)
+            .collect::<Vec<_>>()
+    );
+    let target = values.native_target.unwrap();
+    assert_eq!(target.basename, "a".repeat(64));
+    let mut parents = system_tmp_pins().unwrap();
+    parents.push(PathPin::read(&f.daemon).unwrap());
+    assert_eq!(
+        target.parents,
+        parents.iter().map(pin_value).collect::<Vec<_>>()
+    );
+    assert_eq!(target.leaf, pin_value(&PathPin::read(&f.target).unwrap()));
+    assert_eq!(target.leaf.links, 1);
+    assert!(target.parents.iter().all(|p| p.links == 0));
+    let before = codex_unlink_calls();
+    assert!(
+        native_explicit_refusal(&f.target).is_err(),
+        "live listener never refusal"
+    );
+    assert_eq!(codex_unlink_calls(), before);
+    let old = std::mem::replace(
+        &mut f._listener,
+        std::os::unix::net::UnixListener::bind(f.root.join("other.sock")).unwrap(),
+    );
+    drop(old);
+    native_explicit_refusal(&f.target).unwrap();
+    let proof = CodexCleanup::new(f.link.clone(), binding).unwrap();
+    assert_eq!(
+        proof.unlink().unwrap(),
+        crate::daemon_registry::CleanupOutcomeV2::FixedLinkRemovedTargetRetained
+    );
+    assert!(!f.link.symlink_metadata().is_ok());
+    assert!(f.target.exists());
+    assert_eq!(codex_unlink_calls(), before + 1);
+}
+
+#[test]
+fn c2b_cleanup_fd_path_swap_absence_and_nonrefusal_never_unlink() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    for change in ["link", "parent", "parent-replaced", "leaf", "absent"] {
+        let f = SocketFixture::new();
+        let proof = CodexCleanup::new(f.link.clone(), f.pin().unwrap()).unwrap();
+        let before = codex_unlink_calls();
+        if change == "parent-replaced" {
+            let moved = f.root.with_extension("moved");
+            fs::rename(&f.root, &moved).unwrap();
+            fs::create_dir(&f.root).unwrap();
+            fs::set_permissions(&f.root, fs::Permissions::from_mode(0o700)).unwrap();
+            let denied = proof.unlink().is_err();
+            // Restore own tree before asserting, so fixture teardown is faithful.
+            fs::remove_dir(&f.root).unwrap();
+            fs::rename(moved, &f.root).unwrap();
+            assert!(denied);
+            assert_eq!(codex_unlink_calls(), before);
+            continue;
+        }
+        match change {
+            "link" => f.relink(&f.target),
+            "parent" => fs::set_permissions(&f.root, fs::Permissions::from_mode(0o755)).unwrap(),
+            "leaf" => fs::set_permissions(&f.target, fs::Permissions::from_mode(0o640)).unwrap(),
+            "absent" => fs::remove_file(&f.link).unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(proof.unlink().is_err());
+        assert_eq!(codex_unlink_calls(), before);
+    }
+    let f = SocketFixture::new();
+    assert!(native_explicit_refusal(&f.root.join("missing.sock")).is_err());
+    assert!(native_explicit_refusal(&f.root).is_err());
+    let live = UnixListener::bind(f.root.join("live.sock")).unwrap();
+    assert!(native_explicit_refusal(&f.root.join("live.sock")).is_err());
+    drop(live);
+    native_explicit_refusal(&f.root.join("live.sock")).unwrap();
+}
+
+#[test]
+fn local_attach_helper_is_adjacent_validated_and_never_checkout_fallback() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = SocketFixture::new();
+    let bin = f.root.join("bin"); fs::create_dir(&bin).unwrap();
+    let current = bin.join("aperture-server");
+    let helper = bin.join("aperture-boot");
+    // Even a valid checkout-looking file cannot substitute for a missing sibling.
+    let checkout = f.root.join("target/release"); fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("aperture-boot"), b"fixture").unwrap();
+    fs::set_permissions(checkout.join("aperture-boot"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err());
+    symlink(checkout.join("aperture-boot"), &helper).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err()); fs::remove_file(&helper).unwrap();
+    fs::write(&helper, b"own inert executable fixture").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o722)).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err());
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(boot_helper_adjacent(&current).is_err());
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(boot_helper_adjacent(&current).unwrap().path, helper);
+    assert!(boot_helper_adjacent(Path::new("relative/aperture-server")).is_err());
+}
+
+// Native filesystem/owner/socket proof remains production code. Only the
+// tmux executable and the last-boundary drift trigger are fixture-local.
+pub(super) struct OpenFixture {
+    home: PathBuf,
+    pub(super) current: PathBuf,
+    client: PathBuf,
+    tmux: PathBuf,
+    drift: std::cell::RefCell<Option<(&'static str, bool)>>,
+    listener: Option<std::os::unix::net::UnixListener>,
+    child: Option<(std::process::Child, crate::team_replacement::ProcessIdentity)>,
+}
+impl OpenFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let home = PathBuf::from(format!("/private/tmp/ato-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]));
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        for dir in ["bin", ".aperture/run/managed/test-dev/g1", ".aperture/run/owner", ".aperture/teams/test", ".claude/aperture/test-dev"] {
+            journal::ensure_private_dir(&home.join(dir)).unwrap();
+        }
+        let tuple = record().requested;
+        let snapshot = teams::TeamSnapshot {
+            schema_version: 1, team:"test".into(), project:"project:aperture".into(), repo:"aperture".into(),
+            mission:"inert terminal fixture".into(), acceptance:"no worker launch".into(),
+            preset:teams::PresetSnapshotRef{id:None,sha256:None}, lead:"test-dev".into(),
+            seats:vec![teams::TeamSeat{name:"test-dev".into(),role:"backend".into(),harness:tuple.harness,model:tuple.model,reasoning:tuple.reasoning}],
+            fallbacks:vec![],grants:vec![],created_at:"2026-09-28T00:00:00Z".into(),
+            creation_request_id:uuid::Uuid::new_v4().to_string(), staging_uuid:uuid::Uuid::new_v4().to_string(),
+        };
+        journal::write_private_json_atomic(&home.join(".aperture/teams/test/team.json"),&snapshot,false).unwrap();
+        journal::write_private_json_atomic(&home.join(".aperture/teams/test/state.json"),&teams::TeamStateFile {
+            schema_version:1,state:teams::TeamLifecycle::Active,generation:1,epic_id:Some("aperture-fixture".into()),failure:None,updated_at:snapshot.created_at.clone(),
+        },false).unwrap();
+        for leaf in ["TEAM",".complete"] { fs::write(home.join(".claude/aperture/test-dev").join(leaf),b"test").unwrap(); }
+        let current=home.join("bin/aperture-server");let client=home.join("client");let tmux=home.join("tmux-inert");
+        for p in [home.join("bin/aperture-boot"),client.clone()] {
+            fs::write(&p,b"owned executable fixture").unwrap(); fs::set_permissions(p,fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let script=format!("#!/bin/sh\nprintf '%s\n' \"$1\" >> '{}/events'\ncase \"$1\" in\n new-window) printf 'created' > '{}/pane'; printf '@42\n';;\n list-panes) test -f '{}/pane' || exit 9; printf '{}|0\n';;\n select-window) test -f '{}/pane' || exit 9;;\n *) exit 8;;\nesac\n",home.display(),home.display(),home.display(),std::process::id(),home.display());
+        fs::write(&tmux,script).unwrap();fs::set_permissions(&tmux,fs::Permissions::from_mode(0o700)).unwrap();
+        let listener=std::os::unix::net::UnixListener::bind(home.join(".aperture/run/test-dev.sock")).unwrap();
+        fs::set_permissions(home.join(".aperture/run/test-dev.sock"),fs::Permissions::from_mode(0o600)).unwrap();
+        let f=Self{home,current,client,tmux,drift:Default::default(),listener:Some(listener),child:None};f.publish_owner(std::process::id());f
+    }
+    fn publish_owner(&self,pid:u32) {
+        let observed=team_process::observe(pid).unwrap().unwrap();let birth=team_process::birth_micros(&observed.identity).unwrap();
+        let mut r=record();let i=r.incarnation.as_mut().unwrap();i.pid=pid;i.start_time=birth;i.processes[0].pid=pid;i.processes[0].start_time=birth;
+        let p=self.home.join(".aperture/run/owner/test-dev.json");let replace=p.exists();journal::write_private_json_atomic(&p,&r,replace).unwrap();
+    }
+    fn runtime(&self)->crate::daemons::RuntimeOwner {
+        let tools=crate::daemons::LocalTools::fixture(&self.home,&self.client);
+        crate::daemons::RuntimeOwner::local(crate::controller::ControllerLock::acquire(&self.home).unwrap(),tools).unwrap()
+    }
+    pub(super) fn tmux(&self,args:&[String])->Result<String> {
+        // Actual native bounded process call, with an inert script instead of tmux.
+        let mut command=Command::new(&self.tmux);command.args(args).env_clear().env("HOME",&self.home);
+        let bytes=crate::team_replacement::repository::bounded_command(command,Instant::now()+Duration::from_secs(3)).map_err(|_| "E_FIXTURE_TMUX_UNKNOWN".to_string())?;
+        String::from_utf8(bytes).map_err(|_|ERROR.into())
+    }
+    pub(super) fn before_dispatch(&self) {
+        use std::io::Write;
+        if let Some((target,replace))=self.drift.borrow_mut().take() {
+            let path=if target=="client" {self.client.clone()} else {self.home.join("bin/aperture-boot")};
+            let before=fs::metadata(&path).unwrap();
+            if replace {fs::rename(&path,path.with_extension("retained")).unwrap();fs::copy(path.with_extension("retained"),&path).unwrap();}
+            else {
+                let mut f=fs::OpenOptions::new().write(true).open(&path).unwrap();
+                f.write_all(&vec![b'X';before.len() as usize]).unwrap();
+                f.set_times(fs::FileTimes::new().set_modified(before.modified().unwrap())).unwrap();
+                let after=f.metadata().unwrap();assert_eq!((before.ino(),before.len(),before.mode(),before.mtime(),before.mtime_nsec()),(after.ino(),after.len(),after.mode(),after.mtime(),after.mtime_nsec()));
+            }
+        }
+    }
+    fn unlinked_server(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        drop(self.listener.take());fs::remove_file(self.home.join(".aperture/run/test-dev.sock")).unwrap();
+        let bin=self.home.join("old-appserver");fs::copy(std::env::current_exe().unwrap(),&bin).unwrap();
+        fs::set_permissions(&bin,fs::Permissions::from_mode(0o700)).unwrap();
+        let child=Command::new(&bin).args(["--exact","team_terminal::tests::local_terminal_inert_server_entry","--ignored","--test-threads=1"])
+            .env_clear().env("APERTURE_TERMINAL_FIXTURE_HOME",&self.home)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let identity=team_process::observe(child.id()).unwrap().unwrap().identity;self.child=Some((child,identity));
+        let until=Instant::now()+Duration::from_secs(5);
+        while !self.home.join("ready").exists() {assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(5));}
+        let pid=self.child.as_ref().unwrap().0.id();self.publish_owner(pid);
+        fs::remove_file(&bin).unwrap();assert!(!bin.exists());
+        assert_eq!(team_process::state(&self.child.as_ref().unwrap().1),crate::team_replacement::ProcessState::Same);
+    }
+}
+impl Drop for OpenFixture {
+    fn drop(&mut self) {
+        if let Some((child,id))=&mut self.child {
+            assert_eq!(team_process::state(id),crate::team_replacement::ProcessState::Same);
+            child.kill().unwrap();child.wait().unwrap();
+            assert_eq!(team_process::state(id),crate::team_replacement::ProcessState::Gone);
+        }
+        fs::remove_dir_all(&self.home).unwrap();
+    }
+}
+#[test]
+#[ignore="own inert AF_UNIX fixture child only"]
+fn local_terminal_inert_server_entry() {
+    use std::os::unix::{fs::PermissionsExt,net::UnixListener};
+    let home=PathBuf::from(std::env::var_os("APERTURE_TERMINAL_FIXTURE_HOME").unwrap());
+    assert!(home.starts_with("/private/tmp")&&home.file_name().unwrap().to_str().unwrap().starts_with("ato-"));
+    let socket=home.join(".aperture/run/test-dev.sock");let listener=UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(socket,fs::Permissions::from_mode(0o600)).unwrap();fs::write(home.join("ready"),b"ready").unwrap();
+    for stream in listener.incoming(){drop(stream.unwrap());}
+}
+#[test]
+fn local_terminal_separate_client_survives_unlinked_server_and_reuses_receipt() {
+    let mut f=OpenFixture::new();f.unlinked_server();let owner_before=fs::read(f.home.join(".aperture/run/owner/test-dev.json")).unwrap();
+    let runtime=f.runtime();let work=runtime.admit(None).unwrap();let body=work.body().unwrap();let dispatch=OpenDispatch{work:&work,fixture:Some(&f)};
+    let first=open_with(&f.home,input(),&dispatch).unwrap();assert_eq!(first.window_id,"@42");
+    let receipt_before=fs::read(client_path(&f.home,&input())).unwrap();let c:Client=serde_json::from_slice(&receipt_before).unwrap();
+    let selected=receipt_client(&c).unwrap();assert_eq!(selected.path,f.client);assert_eq!(selected.fingerprint().unwrap(),c.client_fingerprint);
+    assert_eq!(open_with(&f.home,input(),&dispatch).unwrap().window_id,"@42");
+    assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(),"new-window\nlist-panes\nselect-window\nlist-panes\nselect-window\n");
+    assert_eq!(fs::read(client_path(&f.home,&input())).unwrap(),receipt_before);
+    assert_eq!(fs::read(f.home.join(".aperture/run/owner/test-dev.json")).unwrap(),owner_before);
+    drop(body);drop(work);runtime.close().unwrap();
+}
+#[test]
+fn local_terminal_client_and_helper_drift_deny_before_real_dispatch() {
+    for target in ["client","helper"] {for replace in [false,true] {
+        let f=OpenFixture::new();let owner_before=fs::read(f.home.join(".aperture/run/owner/test-dev.json")).unwrap();
+        let runtime=f.runtime();let work=runtime.admit(None).unwrap();let body=work.body().unwrap();let dispatch=OpenDispatch{work:&work,fixture:Some(&f)};
+        *f.drift.borrow_mut()=Some((target,replace));
+        let e=open_with(&f.home,input(),&dispatch).err().unwrap();
+        assert_eq!(e,if target=="client" {"E_TERMINAL_CLIENT_CHANGED"} else {"E_TERMINAL_HELPER_CHANGED"});
+        assert!(!f.home.join("events").exists());assert!(!f.home.join("pane").exists());assert!(!client_path(&f.home,&input()).exists());
+        assert_eq!(fs::read(f.home.join(".aperture/run/owner/test-dev.json")).unwrap(),owner_before);
+        drop(body);drop(work);runtime.close().unwrap();
+    }}
+}
+#[test]
+fn local_terminal_legacy_or_drifted_receipt_denies_without_any_dispatch() {
+    let f=OpenFixture::new();let runtime=f.runtime();let work=runtime.admit(None).unwrap();let body=work.body().unwrap();let dispatch=OpenDispatch{work:&work,fixture:Some(&f)};
+    journal::ensure_private_dir(&f.home.join(".aperture/run/terminals")).unwrap();
+    let path=client_path(&f.home,&input());
+    let legacy=serde_json::json!({"binding":"a".repeat(64),"pid":std::process::id(),"birth":1,"window":"@42"});
+    journal::write_private_json_atomic(&path,&legacy,false).unwrap();
+    assert_eq!(open_with(&f.home,input(),&dispatch).err().unwrap(),"E_TERMINAL_CLIENT_RECEIPT_REQUIRED");
+    let mut stale=legacy.clone();stale["client_path"]=serde_json::json!(f.client);stale["client_fingerprint"]=serde_json::json!("0".repeat(64));
+    journal::write_private_json_atomic(&path,&stale,true).unwrap();
+    assert_eq!(open_with(&f.home,input(),&dispatch).err().unwrap(),"E_TERMINAL_CLIENT_CHANGED");
+    assert!(!f.home.join("events").exists());assert!(!f.home.join("pane").exists());
+    assert_eq!(journal::read_private_json::<serde_json::Value>(&path).unwrap(),stale);
+    drop(body);drop(work);runtime.close().unwrap();
 }

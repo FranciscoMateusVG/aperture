@@ -66,13 +66,13 @@ export function createAgentCard(
     const pending = agent.op_pending ?? null;
     card.className = [
       "agent-mini",
+      `agent-theme--${Object.prototype.hasOwnProperty.call(AGENT_THEME, agent.name) ? agent.name : "default"}`,
       isRunning ? "agent-mini--running" : "",
       wantsAttention ? "agent-mini--attention" : "",
       wantsAttention && agent.attention_reason === "crash" ? "agent-mini--crash" : "",
       pending ? "agent-mini--pending" : "",
     ].filter(Boolean).join(" ");
     card.dataset.agentName = agent.name;
-    card.style.setProperty("--agent-color", theme.color);
 
     // Presence dot — additive layer, only meaningful while a process
     // actually exists. Never rendered for a stopped agent (that would be

@@ -190,6 +190,52 @@ build-mcp-sentry:
     cd mcp-server-sentry && pnpm install && pnpm build
     @echo "✅ Sentry MCP wrap server built"
 
+# Local E3 laboratory recipes. TMPDIR is an explicit private scratch root;
+# destinations are new direct children. No publish/current/setup-all changes.
+[positional-arguments]
+e3-sentry-prepare node pnpm cache destination:
+    #!/bin/sh
+    set -eu
+    umask 077
+    node="$1"; pnpm="$2"; cache="$3"; destination="$4"
+    case "$node:$pnpm" in /*:/*) ;; *) exit 64;; esac
+    test -n "${HOME:-}"; test -n "${TMPDIR:-}"
+    test -d "$TMPDIR"; test ! -L "$TMPDIR"
+    test "$cache" = "$TMPDIR/store"; test -d "$cache"; test ! -L "$cache"
+    test "$destination" = "$TMPDIR/sentry-prepare"
+    /bin/mkdir -m 700 "$destination"
+    /bin/cp mcp-server-sentry/package.json mcp-server-sentry/pnpm-lock.yaml mcp-server-sentry/tsconfig.json mcp-server-sentry/vitest.config.ts "$destination/"
+    /bin/cp -R mcp-server-sentry/src mcp-server-sentry/tests "$destination/"
+    cd "$destination"
+    /usr/bin/env -i HOME="$HOME" TMPDIR="$TMPDIR" NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null "$node" "$pnpm" install --prod=false --frozen-lockfile --offline --ignore-scripts --package-import-method=copy --node-linker=hoisted --no-config.prefer-symlinked-executables --no-config.extend-node-path --store-dir "$cache"
+
+[positional-arguments]
+e3-sentry-build node prepared:
+    #!/bin/sh
+    set -eu
+    node="$1"; prepared="$2"
+    case "$node" in /*) ;; *) exit 64;; esac
+    test "$prepared" = "$TMPDIR/sentry-prepare"; test -d "$prepared"; test ! -L "$prepared"
+    test ! -e "$prepared/dist"; test ! -L "$prepared/dist"
+    /usr/bin/env -i HOME="$HOME" TMPDIR="$TMPDIR" "$node" "$prepared/node_modules/typescript/bin/tsc" --project "$prepared/tsconfig.json" --noEmitOnError
+
+[positional-arguments]
+e3-sentry-export node pnpm cache prepared destination:
+    #!/bin/sh
+    set -eu
+    umask 077
+    node="$1"; pnpm="$2"; cache="$3"; prepared="$4"; destination="$5"
+    case "$node:$pnpm" in /*:/*) ;; *) exit 64;; esac
+    test -d "$TMPDIR"; test ! -L "$TMPDIR"
+    test "$cache" = "$TMPDIR/store"; test -d "$cache"; test ! -L "$cache"
+    test "$prepared" = "$TMPDIR/sentry-prepare"; test -d "$prepared/dist"; test ! -L "$prepared"
+    test "$destination" = "$TMPDIR/sentry-export"
+    /bin/mkdir -m 700 "$destination"
+    /bin/cp "$prepared/package.json" "$prepared/pnpm-lock.yaml" "$destination/"
+    /bin/cp -R "$prepared/dist" "$destination/"
+    cd "$destination"
+    /usr/bin/env -i HOME="$HOME" TMPDIR="$TMPDIR" NPM_CONFIG_USERCONFIG=/dev/null NPM_CONFIG_GLOBALCONFIG=/dev/null "$node" "$pnpm" install --prod --frozen-lockfile --offline --ignore-scripts --package-import-method=copy --node-linker=hoisted --no-config.prefer-symlinked-executables --no-config.extend-node-path --store-dir "$cache"
+
 # Run the Sentry MCP wrap server's test suite
 test-mcp-sentry:
     @echo "🧪 Running Sentry MCP wrap server tests..."
@@ -339,3 +385,57 @@ retention-gate:
 # §7 retrieval gate: golden set → recall@5 (aperture-trgpo)
 recall-gate *ARGS:
     @node scripts/recall-gate.mjs {{ARGS}}
+
+# Local UI contract/component suite; no server, deployment, or runtime bootstrap.
+test-ui:
+    pnpm test
+
+# Build a new versioned UI directory only; no install, deployment or pointer move.
+[positional-arguments]
+ui-build node destination:
+    #!/bin/sh
+    set -eu
+    case "$1" in /*) ;; *) echo 'absolute Node required' >&2; exit 1;; esac
+    case "$2" in /*) ;; *) echo 'absolute new destination required' >&2; exit 1;; esac
+    test ! -e "$2" && test ! -L "$2"
+    "$1" node_modules/typescript/bin/tsc --noEmit
+    "$1" node_modules/vite/bin/vite.js build --mode web-release --outDir "$2"
+
+# Personal local candidate only. No setup-all, launchd, existing app replacement,
+# runtime/current publication or process activation. Existing MCP outputs remain
+# explicit retained inputs; their dependency retention is not an immutable release.
+# Copying team-control does not select it for MCP: activation must explicitly use
+# APERTURE_TEAM_CONTROL_BIN=<absolute package>/bin/aperture-team-control, or root
+# must update the canonical ~/.aperture/bin/aperture-team-control separately.
+[positional-arguments]
+web-local-candidate node target destination bus_root sentry_root sentry_dist:
+    #!/bin/sh
+    set -eu
+    umask 077
+    node="$1"; target="$2"; destination="$3"; bus="$4"; sentry="$5"; sentry_dist="$6"
+    for path in "$node" "$target" "$destination" "$bus" "$sentry" "$sentry_dist"; do
+        case "$path" in /*) ;; *) echo 'absolute local inputs required' >&2; exit 1;; esac
+    done
+    test ! -e "$destination" && test ! -L "$destination"
+    test -f "$bus/dist/index.js" && test -f "$bus/dist/ws-hub.js" && test -d "$bus/node_modules"
+    test -f "$sentry/package.json" && test -d "$sentry/node_modules" && test -f "$sentry_dist/src/index.js"
+    /opt/homebrew/bin/cargo build --offline --locked --manifest-path src-tauri/Cargo.toml --release --bin aperture-server --bin aperture-boot --bin aperture-team-control --target-dir "$target"
+    mkdir -m 700 "$destination"
+    mkdir -m 700 "$destination/bin" "$destination/ui" "$destination/mcp-server" "$destination/mcp-server-sentry"
+    cp "$target/release/aperture-server" "$destination/bin/aperture-server"
+    cp "$target/release/aperture-boot" "$destination/bin/aperture-boot"
+    cp "$target/release/aperture-team-control" "$destination/bin/aperture-team-control"
+    cp "$bus/package.json" "$destination/mcp-server/"
+    cp -R "$bus/dist" "$bus/node_modules" "$destination/mcp-server/"
+    cp "$sentry/package.json" "$destination/mcp-server-sentry/"
+    cp -R "$sentry/node_modules" "$destination/mcp-server-sentry/"
+    cp -R "$sentry_dist" "$destination/mcp-server-sentry/dist"
+    "$node" node_modules/typescript/bin/tsc --noEmit
+    "$node" node_modules/vite/bin/vite.js build --mode web-release --outDir "$destination/building-ui"
+    id=$(/usr/bin/plutil -extract ui_id raw -o - "$destination/building-ui/UI.json")
+    case "$id" in ''|*[!0-9a-f]*) echo 'invalid UI build id' >&2; exit 1;; esac
+    test "${#id}" -eq 32
+    mv "$destination/building-ui" "$destination/ui/$id"
+    ln -s "$id" "$destination/ui/current"
+    printf 'Candidate only: %s\nCopied MCP: %s\nCopied Sentry dependencies: %s\nPaired Sentry dist: %s\n' "$destination" "$bus" "$sentry" "$sentry_dist"
+    printf 'Activation after review: retain current HOME, set explicit APERTURE_NODE_BIN/TMUX_BIN/BD_BIN inputs, then bin/aperture-server and bin/aperture-server open. Ctrl-C drains this server; previous app remains untouched.\n'

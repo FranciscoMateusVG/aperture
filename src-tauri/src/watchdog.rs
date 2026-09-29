@@ -1,3 +1,7 @@
+//! D overlay: Respawn and trust auto-confirm are denied. Both Nudge producers
+//! use one durable intent/outcome actuator; DispatchAccepted is not recovery.
+//! Production tool selection and startup remain fenced pending E. The older
+//! design description below is historical context, not authorization.
 //! Liveness watchdog (aperture-wul6m) — the agent-side half of comms-v2
 //! reliability. Companion to the hub-side 256ru Volta-shim fix (#41).
 //!
@@ -38,9 +42,7 @@ use crate::state::AppState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tungstenite::Message;
 
-const HUB_URL: &str = "ws://127.0.0.1:4517";
 
 /// The one silence deadline — MUST equal the syepg boot SLA and Izzy's harness
 /// assertion (GLaDOS ruling): the deadline must match the boot budget or a
@@ -176,21 +178,88 @@ fn iso8601(t: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-fn run_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{}/.aperture/run", home)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KickoffRead {
+    Absent,
+    Millis(u64),
+    Unverified,
 }
 
-fn kickoff_path(name: &str) -> String {
-    format!("{}/{}.kickoff", run_dir(), name)
-}
-
-/// Read the kickoff-fired timestamp (epoch millis) the launcher persisted for
-/// this agent. `None` = never kicked off (not yet eligible).
-fn read_kickoff_millis(name: &str) -> Option<u64> {
-    std::fs::read_to_string(kickoff_path(name))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
+fn read_kickoff_millis(home: &std::path::Path, name: &str) -> KickoffRead {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Both existing writers emit raw decimal digits, but do not guarantee0600.
+    // Reading0640/0644 under run0700 is compatible; writable-to-others is not.
+    fn leaf_safe(m: &std::fs::Metadata) -> bool {
+        m.is_file() && m.uid() == unsafe { libc::geteuid() } && m.nlink() == 1
+            && m.mode() & 0o400 != 0 && m.mode() & 0o7022 == 0
+            && (1..=20).contains(&m.len())
+    }
+    fn parent_pin(m: &std::fs::Metadata) -> Option<(u64, u64, u32, u32)> {
+        (m.is_dir() && m.uid() == unsafe { libc::geteuid() }
+            && m.mode() & 0o7777 == 0o700 && m.nlink() > 0)
+            .then_some((m.dev(), m.ino(), m.uid(), m.mode()))
+    }
+    fn leaf_pin(m: &std::fs::Metadata) -> (u64,u64,u32,u32,u64,u64,i64,i64,i64,i64) {
+        (m.dev(),m.ino(),m.uid(),m.mode(),m.nlink(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec())
+    }
+    let read = || -> Result<Option<u64>, ()> {
+        if !crate::daemon_registry::valid_name(name) { return Err(()); }
+        let root = home.join(".aperture");
+        let run = root.join("run");
+        crate::controller::private_dir_readonly(&root).map_err(|_| ())?;
+        let before_parent = std::fs::symlink_metadata(&run).map_err(|_| ())?;
+        let pin = parent_pin(&before_parent).ok_or(())?;
+        let parent = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&run).map_err(|_| ())?;
+        let verify_parent = || -> Result<(), ()> {
+            crate::controller::private_dir_readonly(&root).map_err(|_| ())?;
+            if parent_pin(&parent.metadata().map_err(|_| ())?) != Some(pin)
+                || parent_pin(&std::fs::symlink_metadata(&run).map_err(|_| ())?) != Some(pin) {
+                return Err(());
+            }
+            Ok(())
+        };
+        verify_parent()?;
+        let basename = format!("{name}.kickoff");
+        let c_name = std::ffi::CString::new(basename.as_bytes()).map_err(|_| ())?;
+        // Only the validated fixed basename is resolved under this owned FD.
+        // NONBLOCK prevents FIFO open from hanging before fstat can reject it.
+        let raw = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            verify_parent()?;
+            return if error.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(()) };
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let before = file.metadata().map_err(|_| ())?;
+        if !leaf_safe(&before) { return Err(()); }
+        let mut bytes = [0u8; 21];
+        let mut count = 0;
+        while count < bytes.len() {
+            let got = file.read(&mut bytes[count..]).map_err(|_| ())?;
+            if got == 0 { break; }
+            count += got;
+        }
+        let after = file.metadata().map_err(|_| ())?;
+        verify_parent()?;
+        let named = std::fs::symlink_metadata(run.join(&basename)).map_err(|_| ())?;
+        if !leaf_safe(&after) || !leaf_safe(&named)
+            || leaf_pin(&before) != leaf_pin(&after) || leaf_pin(&after) != leaf_pin(&named)
+            || count == 0 || count > 20 || count as u64 != before.len()
+            || !bytes[..count].iter().all(u8::is_ascii_digit) { return Err(()); }
+        let value = bytes[..count].iter().try_fold(0u64, |n, b|
+            n.checked_mul(10).and_then(|n| n.checked_add(u64::from(b - b'0')))).ok_or(())?;
+        Ok(Some(value))
+    };
+    match read() {
+        Ok(None) => KickoffRead::Absent,
+        Ok(Some(value)) => KickoffRead::Millis(value),
+        Err(()) => KickoffRead::Unverified,
+    }
 }
 
 /// The four presence-dot states (docs/presence-dots-spec.md). `stuck`/`online`
@@ -281,38 +350,18 @@ fn turn_for(dot: Dot, presence: Option<&Presence>) -> Option<Turn> {
     }
 }
 
-/// Public entry: spawn the watchdog (subscriber thread + decision-loop thread).
-/// Called once from `lib.rs::run` after the hub is spawned.
-pub fn spawn_watchdog(app_state: Arc<Mutex<AppState>>) {
-    let shared = Arc::new(Mutex::new(Shared::new()));
-
-    // Subscriber thread — blocking sync WS client (tungstenite), quiet bounded
-    // reconnect. Owns only presence facts + the connected flag.
-    {
-        let shared = Arc::clone(&shared);
-        std::thread::spawn(move || subscriber_loop(shared));
-    }
-
-    // Decision-loop thread — recomputes dots and evaluates re-kicks on a tick.
-    {
-        let shared = Arc::clone(&shared);
-        let app_state = Arc::clone(&app_state);
-        std::thread::spawn(move || decision_loop(shared, app_state));
-    }
-
-    // Unread-age sweep thread (aperture-mler9) — the present-but-deaf guard.
-    // Presence-deafness (above) catches a DISCONNECTED monitor; this catches
-    // the connected-but-never-woken session: the hub forwards, the hub-client
-    // prints, the Monitor captures to its output file — and the harness never
-    // re-invokes the idle session (observed 2026-07-19 on opus/sonnet panes
-    // while fable panes woke fine). The agent sits green with unread messages
-    // aging indefinitely. Sweep: if a running, hub-online, non-codex agent's
-    // oldest unread BEADS message exceeds UNREAD_DEAF_AGE, type a tier-1
-    // inbox nudge into its pane (same actuator as the boot nudge). Isolated in
-    // its own thread so a slow/hung `bd` can only ever stall the sweep itself.
-    {
-        let shared = Arc::clone(&shared);
-        std::thread::spawn(move || unread_sweep_loop(shared, app_state));
+// Four-worker ownership lives in daemons::RuntimeOwner, never fire-and-forget.
+#[derive(Clone)]
+pub(crate) struct WatchdogState(Arc<Mutex<Shared>>);
+impl WatchdogState {
+    pub(crate) fn new() -> Self { Self(Arc::new(Mutex::new(Shared::new()))) }
+}
+pub(crate) fn run_owned_worker(name: &str, shared: WatchdogState, app: Arc<Mutex<AppState>>, worker: crate::daemons::WorkerContext) {
+    match name {
+        "subscriber" => subscriber_loop(shared.0, worker),
+        "decision" => decision_loop(shared.0, app, worker),
+        "unread" => unread_sweep_loop(shared.0, app, worker),
+        _ => {}
     }
 }
 
@@ -332,31 +381,19 @@ const UNREAD_RENUDGE_GAP: Duration = Duration::from_secs(300);
 const INBOX_NUDGE_TEXT: &str = "Inbox check (watchdog): unread BEADS messages are waiting for you — the push wake did not fire. Call get_messages now, process each message, then mark_as_read.";
 
 /// One pass result: recipient name → oldest unread message age.
-fn query_oldest_unread() -> Option<HashMap<String, Duration>> {
-    let home = std::env::var("HOME").ok()?;
-    let out = std::process::Command::new("bd")
-        .args(["query", "type=message AND status=open", "--json", "-n", "0"])
-        .env("BEADS_DIR", format!("{}/.aperture/.beads", home))
-        .env("BD_ACTOR", "watchdog")
-        .env(
-            "PATH",
-            format!(
-                "/opt/homebrew/bin:/usr/local/bin:{}",
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+fn query_oldest_unread(work: &crate::daemons::RuntimeWork) -> Option<HashMap<String, Duration>> {
+    let tools=work.tools().ok()?;
+    let input=work.client(&tools.bd,vec!["list".into(),"--status=open".into(),"--type=message".into(),"--json".into(),"--limit=513".into()]).ok()?;
+    let out = crate::daemons::run_client(work, input, Duration::from_secs(3), 1024*1024, 64*1024).ok()?;
+    if !out.accepted { return None; }
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+    if rows.len() > 512 { return None; }
     let at = now();
     let mut oldest: HashMap<String, Duration> = HashMap::new();
     for row in rows {
         // Title format: "[from->to] preview…" — recipient is between "->" and "]".
         let Some(title) = row.get("title").and_then(|v| v.as_str()) else {
-            continue;
+            return None;
         };
         let Some(recipient) = title
             .split(']')
@@ -364,15 +401,16 @@ fn query_oldest_unread() -> Option<HashMap<String, Duration>> {
             .and_then(|head| head.split("->").nth(1))
             .map(|r| r.trim().to_string())
         else {
-            continue;
+            return None;
         };
         let Some(created) = row
             .get("created_at")
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         else {
-            continue;
+            return None;
         };
+        if !crate::daemon_registry::valid_name(&recipient) {return None;}
         let created_st: SystemTime = UNIX_EPOCH + Duration::from_millis(created.timestamp_millis().max(0) as u64);
         let age = at.duration_since(created_st).unwrap_or_default();
         let entry = oldest.entry(recipient).or_default();
@@ -383,13 +421,20 @@ fn query_oldest_unread() -> Option<HashMap<String, Duration>> {
     Some(oldest)
 }
 
-fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>) {
+fn unread_online(shared: &Shared, name: &str) -> bool {
+    shared.subscriber_connected && shared.presence.get(name).is_some_and(|p| p.online)
+}
+
+fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>, worker: crate::daemons::WorkerContext) {
     let mut last_nudge: HashMap<String, SystemTime> = HashMap::new();
     loop {
-        std::thread::sleep(UNREAD_SWEEP_INTERVAL);
+        if worker.wait(UNREAD_SWEEP_INTERVAL) { return; }
 
-        let Some(oldest) = query_oldest_unread() else {
-            continue; // bd unavailable this pass — try again next interval.
+        let oldest = {
+            let Ok(work) = worker.admit(None) else { continue; };
+            let Ok(_body) = work.body() else { continue; };
+            let Some(oldest) = query_oldest_unread(&work) else { continue; };
+            oldest
         };
         if oldest.is_empty() {
             continue;
@@ -416,7 +461,7 @@ fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>
             // and nudging an empty pane is pointless.
             let online = {
                 let Ok(s) = shared.lock() else { continue };
-                s.presence.get(&name).map(|p| p.online).unwrap_or(false)
+                unread_online(&s, &name)
             };
             if !online {
                 continue;
@@ -429,14 +474,14 @@ fn unread_sweep_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>
             let Some(win) = window_id else {
                 continue;
             };
-            eprintln!(
-                "[watchdog] {name}: present-but-deaf — oldest unread {}s old, nudging inbox check",
-                age.as_secs()
-            );
-            let _ = crate::tmux::tmux_send_keys(win.clone(), INBOX_NUDGE_TEXT.into());
-            std::thread::sleep(Duration::from_millis(700));
-            let _ = crate::tmux::tmux_send_keys(win, String::new());
-            last_nudge.insert(name, at);
+            let _ = win; // target is resolved afresh by the one guarded actuator
+            if worker.stopped() { return; }
+            let Ok(work) = worker.admit(Some(&name)) else { continue; };
+            let Ok(_body) = work.body() else { continue; };
+            if matches!(work.nudge(&app_state, &name, NudgeProducer::UnreadNudge, NudgeInputs::production()), Ok(DispatchOutcome::DispatchAccepted)) {
+                last_nudge.insert(name, at);
+            }
+
         }
     }
 }
@@ -465,71 +510,46 @@ fn global_shared() -> Option<Arc<Mutex<Shared>>> {
     GLOBAL_SHARED.lock().ok().and_then(|g| g.clone())
 }
 
-fn subscriber_loop(shared: Arc<Mutex<Shared>>) {
-    // Register the global handle for stop_agent's on_agent_stopped hook.
-    if let Ok(mut g) = GLOBAL_SHARED.lock() {
-        *g = Some(Arc::clone(&shared));
-    }
-
+fn subscriber_loop(shared: Arc<Mutex<Shared>>, worker: crate::daemons::WorkerContext) {
+    if let Ok(mut g) = GLOBAL_SHARED.lock() { *g = Some(shared.clone()); }
     let mut backoff = Duration::from_secs(1);
-    loop {
-        match tungstenite::connect(HUB_URL) {
-            Ok((mut socket, _resp)) => {
-                let token_path = match crate::hub_auth::token_path("watchdog") {
-                    Ok(p) => p,
-                    Err(_) => { mark_disconnected(&shared); std::thread::sleep(backoff); continue; }
-                };
-                let token = match std::fs::read_to_string(token_path) {
-                    Ok(t) => t,
-                    Err(_) => { mark_disconnected(&shared); std::thread::sleep(backoff); continue; }
-                };
-                let hello = serde_json::json!({
-                    "type": "hello", "role": "subscriber", "agent": "watchdog", "token": token
-                }).to_string();
-                if socket.send(Message::Text(hello.into())).is_err() {
-                    mark_disconnected(&shared);
-                    std::thread::sleep(backoff);
-                    continue;
-                }
-                mark_connected(&shared);
-                backoff = Duration::from_secs(1); // reset on a good connect
-
-                // Blocking read loop — one presence frame per hub broadcast.
-                loop {
-                    match socket.read() {
-                        Ok(Message::Text(txt)) => handle_presence_frame(&shared, txt.as_str()),
-                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                        Ok(Message::Close(_)) => break,
-                        Ok(_) => {}
-                        Err(_) => break, // socket dropped → reconnect
+    while !worker.stopped() {
+        if let Ok(mut stream) = worker.subscriber() {
+            if let Ok(initial) = stream.take_initial() {
+                if worker.stopped() { break; }
+                let mut map = HashMap::new();
+                for update in initial { apply_presence_event(&mut map, &update.agent, &update.event, now()); }
+                if map.len() <= 256 {
+                    if let Ok(mut s) = shared.lock() {
+                        if !worker.stopped() {
+                            s.presence = map;
+                            s.subscriber_connected = true;
+                            s.connected_since = Some(now());
+                        }
+                    }
+                    backoff = Duration::from_secs(1);
+                    while !worker.stopped() {
+                        match worker.subscriber_next(&mut stream) {
+                            Ok(None) => continue,
+                            Ok(Some(update)) => {
+                                let Ok(mut s) = shared.lock() else { break; };
+                                if worker.stopped() { break; }
+                                if !s.presence.contains_key(&update.agent) && s.presence.len() >= 256 { break; }
+                                apply_presence_event(&mut s.presence, &update.agent, &update.event, now());
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
-                mark_disconnected(&shared);
-            }
-            Err(_) => {
-                // Hub down / unreachable. Quiet, bounded backoff (C1: never a
-                // tight reconnect loop, never a per-failure log flood).
-                mark_disconnected(&shared);
             }
         }
-        std::thread::sleep(backoff);
+        mark_disconnected(&shared);
+        if worker.wait(backoff) { break; }
         backoff = (backoff * 2).min(SUBSCRIBER_RECONNECT_MAX);
     }
-}
-
-fn mark_connected(shared: &Arc<Mutex<Shared>>) {
-    if let Ok(mut s) = shared.lock() {
-        if !s.subscriber_connected {
-            s.subscriber_connected = true;
-            s.connected_since = Some(now());
-            // On (re)connect the hub's presence is FRESH — nobody is registered
-            // until they re-hello. Clear stale presence so an agent that did NOT
-            // come back (genuinely dead across the bounce) can't retain a
-            // stale-online flag and escape re-kick (the deceptive-green failure
-            // this epic exists to kill). RECONNECT_GRACE gives live agents time
-            // to re-hello before re-kicks resume.
-            s.presence.clear();
-        }
+    mark_disconnected(&shared);
+    if let Ok(mut g) = GLOBAL_SHARED.lock() {
+        if g.as_ref().is_some_and(|v| Arc::ptr_eq(v, &shared)) { *g = None; }
     }
 }
 
@@ -540,30 +560,10 @@ fn mark_disconnected(shared: &Arc<Mutex<Shared>>) {
         // Turn-state is only as fresh as the last frame we received; with the
         // subscriber down nothing can refresh it, so drop it fleet-wide. The
         // online flag itself is left for the tick's trustworthiness gate
-        // (and is wiped outright by mark_connected on the next reconnect).
+        // (and is wiped outright by validated snapshot replacement on the next reconnect).
         for p in s.presence.values_mut() {
             p.turn = None;
         }
-    }
-}
-
-/// Parse one `{type:"presence", agent, event}` frame and fold it into presence.
-fn handle_presence_frame(shared: &Arc<Mutex<Shared>>, txt: &str) {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(txt) else {
-        return;
-    };
-    if val.get("type").and_then(|v| v.as_str()) != Some("presence") {
-        return;
-    }
-    let Some(agent) = val.get("agent").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let Some(event) = val.get("event").and_then(|v| v.as_str()) else {
-        return;
-    };
-
-    if let Ok(mut s) = shared.lock() {
-        apply_presence_event(&mut s.presence, agent, event, now());
     }
 }
 
@@ -596,17 +596,18 @@ fn apply_presence_event(presence: &mut HashMap<String, Presence>, agent: &str, e
     }
 }
 
-fn decision_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>) {
-    loop {
-        tick(&shared, &app_state);
-        std::thread::sleep(TICK_INTERVAL);
+fn decision_loop(shared: Arc<Mutex<Shared>>, app_state: Arc<Mutex<AppState>>, worker: crate::daemons::WorkerContext) {
+    while !worker.stopped() {
+        tick(&shared, &app_state, &worker);
+        if worker.wait(TICK_INTERVAL) { break; }
     }
 }
 
 /// One evaluation pass: recompute every running agent's dot, write it onto
 /// `AgentDef`, and fire a re-kick if the silence deadline (and this attempt's
 /// response window) has lapsed.
-fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
+fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &crate::daemons::WorkerContext) {
+    if worker.stopped() { return; }
     let at = now();
 
     // Snapshot the roster: (name, model, running, window_id). Locking AppState
@@ -631,7 +632,7 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
 
     // Managed seats have no legacy tmux/kickoff requirement. Classify outside
     // both mutexes: unknown membership is read-only/unknown, never a re-kick.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = worker.home().ok();
     let managed: HashMap<String, bool> = roster.iter().filter_map(|(name, _, _, _)| {
         let membership = home.as_deref().map(|home| crate::teams::classify_managed_seat(home, name));
         match membership {
@@ -640,6 +641,20 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
             _ => Some((name.clone(), false)),
         }
     }).collect();
+
+    // Bounded filesystem reads happen before Shared is acquired. Invalid input
+    // is not absence: leave that seat's budgets/projection/effects untouched.
+    let mut kickoffs = HashMap::new();
+    for (name, _, running, _) in &roster {
+        if worker.stopped() { return; }
+        if managed.contains_key(name) { continue; }
+        let value = if *running {
+            home.as_deref().map(|home| read_kickoff_millis(home, name))
+                .unwrap_or(KickoffRead::Unverified)
+        } else { KickoffRead::Absent };
+        kickoffs.insert(name.clone(), value);
+    }
+    if worker.stopped() { return; }
 
     // Is presence trustworthy right now? (§5 subscriber-down pause + grace.)
     let (subscriber_ok, past_grace) = {
@@ -656,6 +671,7 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
 
     {
         let mut s = shared.lock().unwrap();
+        if worker.stopped() { return; }
         for (name, model, running, window_id) in &roster {
             if let Some(active) = managed.get(name) {
                 dot_writes.push(managed_presence_write(name, *active,
@@ -663,7 +679,11 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
                 // Observation only: managed lifecycle is never a legacy watchdog action.
                 continue;
             }
-            let kickoff_millis = if *running { read_kickoff_millis(name) } else { None };
+            let kickoff_millis = match kickoffs.get(name) {
+                Some(KickoffRead::Millis(value)) => Some(*value),
+                Some(KickoffRead::Absent) => None,
+                Some(KickoffRead::Unverified) | None => continue,
+            };
 
             // Reset the attempt counter when a newer kickoff appears (fresh boot
             // or a prior re-kick that took) — a new kickoff is a clean slate.
@@ -777,9 +797,10 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
     } // shared lock dropped before any blocking actuator work.
 
     // Apply dot-field writes to AppState (frontend reads these on its 3s poll).
-    if !dot_writes.is_empty() {
+    if !worker.stopped() && !dot_writes.is_empty() {
         if let Ok(mut a) = app_state.lock() {
             for w in dot_writes {
+                if worker.stopped() { return; }
                 if let Some(agent) = a.agents.get_mut(&w.name) {
                     agent.dot_state = w.dot_state;
                     agent.dot_state_since = w.dot_state_since;
@@ -792,6 +813,7 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
 
     // Execute actuator orders (blocking tmux / boot work) with no locks held.
     for order in rekicks {
+        if worker.stopped() { return; }
         match order {
             RekickOrder::Rekick {
                 name,
@@ -799,8 +821,16 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>) {
                 window_id,
                 tier,
                 attempt,
-            } => execute_rekick(app_state, &name, is_codex, window_id.as_deref(), tier, attempt),
-            RekickOrder::RingOperator { name } => ring_operator(app_state, &name),
+            } => {
+                // Respawn remains denied. Nudge enters the SAME admitted
+                // journaled actuator as unread sweep, never the legacy helper.
+                if matches!(tier, RekickTier::Respawn) { continue; }
+                let _ = (is_codex, window_id, attempt);
+                let Ok(work) = worker.admit(Some(&name)) else { continue; };
+                let Ok(_body) = work.body() else { continue; };
+                let _ = work.nudge(app_state, &name, NudgeProducer::RekickNudge, NudgeInputs::production());
+            },
+            RekickOrder::RingOperator { name } => ring_operator(app_state, &name, worker),
         }
     }
 }
@@ -850,6 +880,7 @@ enum RekickOrder {
     },
 }
 
+#[cfg(test)]
 fn execute_rekick(
     app_state: &Arc<Mutex<AppState>>,
     name: &str,
@@ -866,6 +897,23 @@ fn execute_rekick(
         eprintln!("[watchdog] re-kick denied: E_TEAM_LIFECYCLE_REQUIRED");
         return;
     }
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return; };
+    execute_rekick_at(app_state, name, is_codex, window_id, tier, attempt, &home);
+}
+#[cfg(test)]
+fn execute_rekick_at(
+    app_state: &Arc<Mutex<AppState>>, name: &str, is_codex: bool,
+    window_id: Option<&str>, tier: RekickTier, attempt: u8, home: &std::path::Path,
+) {
+    // Unjoined watchdog work receives no positive Codex authority, including
+    // stale is_codex=false after a model change. No pane teardown on denial.
+    if crate::agents::detached_codex_denied_at(home, app_state, name, is_codex).is_err() { return; }
+    // C3: even Claude/no-history Respawn has no tracked internal authority.
+    // The external boot wrapper would reacquire RuntimeOwner's held lease only
+    // AFTER destructive pane effects. Deny the entire tier before those effects.
+    // D must replace this with tracked admission/drain/join, not pass an Arc or
+    // simply remove this fence. Nudge remains the existing non-lifecycle path.
+    if matches!(tier, RekickTier::Respawn) { return; }
     match tier {
         RekickTier::Nudge => {
             // Claude nudge: run the boot-routine turn in the EXISTING pane so the
@@ -878,37 +926,24 @@ fn execute_rekick(
                 return;
             };
             eprintln!("[watchdog] {name}: re-kick attempt {attempt} — NUDGE (send-keys boot turn)");
-            let _ = crate::tmux::tmux_send_keys(win.to_string(), crate::launcher::KICKOFF_TEXT.into());
+            let _ = rekick_tmux_send_keys(win.to_string(), crate::launcher::KICKOFF_TEXT.into());
             std::thread::sleep(Duration::from_millis(700));
-            let _ = crate::tmux::tmux_send_keys(win.to_string(), String::new());
+            let _ = rekick_tmux_send_keys(win.to_string(), String::new());
         }
         RekickTier::Respawn => {
-            // Respawn: a wedged agent won't answer a nudge, so tear the pane down
-            // and re-boot fresh (context is already forfeit). For Codex, a FULL
-            // app-server teardown forces the bridge to create + publish a fresh
-            // thread-id — sidestepping the surviving-app-server / stale-thread-id
-            // edge without a bridge change (GLaDOS's edge, wisp-gsrc0s).
+            // Retained legacy body is unreachable under the unconditional tier
+            // denial above; it is NOT a viable internal boot under RuntimeOwner.
             eprintln!("[watchdog] {name}: re-kick attempt {attempt} — RESPAWN");
             if let Some(win) = window_id {
-                let _ = crate::tmux::tmux_send_keys(win.to_string(), "C-c".into());
+                let _ = rekick_tmux_send_keys(win.to_string(), "C-c".into());
                 std::thread::sleep(Duration::from_millis(300));
-                let _ = crate::tmux::tmux_kill_window(win.to_string());
+                let _ = rekick_tmux_kill_window(win.to_string());
             }
-            if is_codex {
-                crate::codex_appserver::stop_app_server(name);
-                // Remove the socket + thread-id handoff files so the fresh boot's
-                // spawn_app_server probe (r8n62) can't reuse a stale/orphaned
-                // server and the pane won't read a stale thread id.
-                let base = format!("{}/{}", run_dir(), name);
-                let _ = std::fs::remove_file(format!("{base}.sock"));
-                let _ = std::fs::remove_file(format!("{base}.thread-id"));
-            }
+            // Codex (including retained history) was denied before any pane effect.
             std::thread::sleep(Duration::from_millis(300));
-            // In-process boot (keeps the child mapped — no new orphan) through
-            // the real spawn path: fresh window + kickoff, which rewrites the
-            // .kickoff file → the next tick sees a newer timestamp and resets
-            // this agent's attempt counter to a clean slate.
-            match crate::boot_agent_headless(name) {
+            // This external wrapper reacquires authority. D must replace the
+            // legacy path before Respawn can ever be admitted again.
+            match rekick_boot_agent_headless(name) {
                 Ok(win) => {
                     eprintln!("[watchdog] {name}: respawned, new window {win}");
                     // aperture-3x136: write the fresh window id back into
@@ -930,15 +965,63 @@ fn execute_rekick(
     }
 }
 
+// Test interception is at every native effect site, not a parallel decision
+// algorithm. These legacy C3 oracles compile only for tests; production
+// decision/unread paths use the single D admitted actuator above.
+#[cfg(test)]
+fn rekick_tmux_send_keys(window: String, text: String) -> Result<(), String> {
+    #[cfg(test)] {
+        let _ = (window, text);
+        C3_REKICK_EFFECTS.with(|v| { let mut e = v.borrow_mut(); e.pane_keys += 1; e.pane_sentinel = "keys-sent"; });
+        return Ok(());
+    }
+    #[cfg(not(test))] { crate::tmux::tmux_send_keys(window, text) }
+}
+#[cfg(test)]
+fn rekick_tmux_kill_window(window: String) -> Result<(), String> {
+    #[cfg(test)] {
+        let _ = window;
+        C3_REKICK_EFFECTS.with(|v| { let mut e = v.borrow_mut(); e.pane_kills += 1; e.pane_sentinel = "removed"; });
+        return Ok(());
+    }
+    #[cfg(not(test))] { crate::tmux::tmux_kill_window(window) }
+}
+#[cfg(test)]
+fn rekick_boot_agent_headless(name: &str) -> Result<String, String> {
+    #[cfg(test)] {
+        let _ = name;
+        C3_REKICK_EFFECTS.with(|v| v.borrow_mut().external_boots += 1);
+        return Err("E_FIXTURE_EXTERNAL_BOOT_INTERCEPTED".into());
+    }
+    #[cfg(not(test))] { crate::boot_agent_headless(name) }
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct C3RekickEffects {
+    pub pane_keys: usize,
+    pub pane_kills: usize,
+    pub external_boots: usize,
+    pub pane_sentinel: &'static str,
+}
+#[cfg(test)]
+impl Default for C3RekickEffects {
+    fn default() -> Self { Self { pane_keys: 0, pane_kills: 0, external_boots: 0, pane_sentinel: "owned-pane-intact" } }
+}
+#[cfg(test)]
+thread_local! {
+    static C3_REKICK_EFFECTS: std::cell::RefCell<C3RekickEffects> = std::cell::RefCell::new(C3RekickEffects::default());
+}
+
 /// After the attempt budget is spent with no hub-join, escalate to the operator:
 /// light the attention badge on the stuck agent's card (the idiomatic operator
 /// alert) and log loudly. The red dot is already showing; this is the extra ring.
-fn ring_operator(app_state: &Arc<Mutex<AppState>>, name: &str) {
+fn ring_operator(app_state: &Arc<Mutex<AppState>>, name: &str, worker: &crate::daemons::WorkerContext) {
     eprintln!(
         "[watchdog] {name}: STUCK after {MAX_ATTEMPTS} re-kick attempts with no hub presence — \
          latching red + ringing operator. Manual intervention needed."
     );
     if let Ok(mut a) = app_state.lock() {
+        if worker.stopped() { return; }
         if let Some(agent) = a.agents.get_mut(name) {
             // attention_reason = "crash" (aperture-ull4y); overwrites a lit
             // "message" badge — see agents::light_attention for the precedence.
@@ -1189,3 +1272,254 @@ mod managed_presence_tests {
         assert!(managed_presence_write("team-worker", true, true, Some(&joined), at).turn_state.is_none());
     }
 }
+
+#[cfg(test)]
+pub(crate) fn c3_rekick_fixture(state: &Arc<Mutex<AppState>>, name: &str, home: &std::path::Path, is_codex: bool) -> C3RekickEffects {
+    C3_REKICK_EFFECTS.with(|v| *v.borrow_mut() = C3RekickEffects::default());
+    execute_rekick_at(state, name, is_codex, Some("owned-fixture-pane"), RekickTier::Respawn, 1, home);
+    C3_REKICK_EFFECTS.with(|v| v.borrow().clone())
+}
+#[cfg(test)]
+pub(crate) fn c3_nudge_fixture(state: &Arc<Mutex<AppState>>, name: &str, home: &std::path::Path) -> C3RekickEffects {
+    C3_REKICK_EFFECTS.with(|v| *v.borrow_mut() = C3RekickEffects::default());
+    execute_rekick_at(state, name, false, Some("owned-fixture-pane"), RekickTier::Nudge, 1, home);
+    C3_REKICK_EFFECTS.with(|v| v.borrow().clone())
+}
+
+// D's local immutable effect facts. Team transaction journal/schema is untouched.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EffectTarget {
+    window: String, pane: String, pid: u32, birth: String, uid: u32,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NudgeProducer { RekickNudge, UnreadNudge }
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) enum DispatchOutcome { NoDispatch, DispatchAccepted, Unknown }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchObservation { spawned: bool, accepted: bool }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum EffectFact {
+    Intent { version: u8, id: String, seat: String, producer: NudgeProducer, payload: String,
+        target: EffectTarget, plan: String, at_ms: u64 },
+    Outcome { version: u8, id: String, seat: String, outcome: DispatchOutcome,
+        observations: Vec<DispatchObservation>, at_ms: u64 },
+}
+static EFFECT_SERIAL: Mutex<()> = Mutex::new(());
+struct EffectHistory { entries: usize, seats: usize, existing: bool, blocked: bool }
+fn effect_now() -> Result<u64, String> {
+    u64::try_from(now().duration_since(UNIX_EPOCH).map_err(|_| "E_WATCHDOG_CLOCK")?.as_millis())
+        .map_err(|_| "E_WATCHDOG_CLOCK".into())
+}
+fn effect_id(v: &str) -> bool { uuid::Uuid::parse_str(v).is_ok_and(|id| id.to_string() == v) }
+fn target_valid(t: &EffectTarget) -> bool {
+    fn tmux_id(s: &str, prefix: char) -> bool {
+        s.starts_with(prefix) && s.len() > 1 && s.len() <= 32 && s[1..].bytes().all(|b| b.is_ascii_digit())
+    }
+    tmux_id(&t.window, '@') && tmux_id(&t.pane, '%') && t.pid > 1 && t.pid <= i32::MAX as u32
+        && !t.birth.is_empty() && t.birth.len() <= 64 && t.birth.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && t.uid == unsafe { libc::geteuid() }
+}
+fn read_effect(path: &std::path::Path) -> Result<EffectFact, String> {
+    use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+    use std::io::Read;
+    let mut f = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path)
+        .map_err(|_| "E_WATCHDOG_FACT")?;
+    let m = f.metadata().map_err(|_| "E_WATCHDOG_FACT")?;
+    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o777 != 0o600
+        || m.nlink() != 1 || m.len() > 8192 { return Err("E_WATCHDOG_FACT".into()); }
+    let mut b = Vec::new();
+    (&mut f).take(8193).read_to_end(&mut b).map_err(|_| "E_WATCHDOG_FACT")?;
+    if b.len() > 8192 { return Err("E_WATCHDOG_FACT".into()); }
+    serde_json::from_slice(&b).map_err(|_| "E_WATCHDOG_FACT".into())
+}
+fn effect_history(root: &std::path::Path, seat: &str, at: u64) -> Result<EffectHistory, String> {
+    let mut h = EffectHistory { entries: 0, seats: 0, existing: false, blocked: false };
+    match std::fs::symlink_metadata(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(h),
+        Err(_) => return Err("E_WATCHDOG_PATH".into()),
+        Ok(_) => {}
+    }
+    crate::controller::private_dir_readonly(root)?;
+    for entry in std::fs::read_dir(root).map_err(|_| "E_WATCHDOG_PATH")? {
+        let entry = entry.map_err(|_| "E_WATCHDOG_PATH")?;
+        h.entries += 1; h.seats += 1;
+        if h.entries > 512 || h.seats > 128 { return Err("E_WATCHDOG_CAPACITY".into()); }
+        let name = entry.file_name().into_string().map_err(|_| "E_WATCHDOG_PATH")?;
+        if !crate::daemon_registry::valid_name(&name) { return Err("E_WATCHDOG_PATH".into()); }
+        crate::controller::private_dir_readonly(&entry.path())?;
+        let mut intents = HashMap::new();
+        let mut outcomes = HashMap::new();
+        for file in std::fs::read_dir(entry.path()).map_err(|_| "E_WATCHDOG_PATH")? {
+            h.entries += 1;
+            if h.entries > 512 { return Err("E_WATCHDOG_CAPACITY".into()); }
+            let file = file.map_err(|_| "E_WATCHDOG_PATH")?;
+            let fname = file.file_name().into_string().map_err(|_| "E_WATCHDOG_FACT")?;
+            match read_effect(&file.path())? {
+                EffectFact::Intent { version, id, seat, producer, payload, target, plan, at_ms } => {
+                    if version != 1 || !effect_id(&id) || seat != name || fname != format!("{id}.intent.json")
+                        || !target_valid(&target) || payload != match producer { NudgeProducer::RekickNudge => "boot_nudge", NudgeProducer::UnreadNudge => "inbox_nudge" }
+                        || plan.len() != 64 || !plan.bytes().all(|b| b.is_ascii_hexdigit())
+                        || intents.insert(id, at_ms).is_some() { return Err("E_WATCHDOG_FACT".into()); }
+                }
+                EffectFact::Outcome { version, id, seat, outcome, observations, at_ms } => {
+                    if version != 1 || !effect_id(&id) || seat != name || fname != format!("{id}.outcome.json")
+                        || observations.len() > 4
+                        || (outcome == DispatchOutcome::NoDispatch && observations.iter().any(|o| o.spawned))
+                        || (outcome == DispatchOutcome::DispatchAccepted && (observations.len() != 4 || observations.iter().any(|o| !o.spawned || !o.accepted)))
+                        || observations.iter().any(|o| o.accepted && !o.spawned)
+                        || outcomes.insert(id, (outcome, at_ms)).is_some() { return Err("E_WATCHDOG_FACT".into()); }
+                }
+            }
+        }
+        if intents.is_empty() || outcomes.iter().any(|(id, (_, time))| intents.get(id).is_none_or(|start| time < start)) { return Err("E_WATCHDOG_FACT".into()); }
+        if name == seat {
+            h.existing = true;
+            for id in intents.keys() {
+                match outcomes.get(id) {
+                    None | Some((DispatchOutcome::Unknown, _)) => h.blocked = true,
+                    Some((DispatchOutcome::DispatchAccepted, then)) if at < *then || at - then < 300_000 => h.blocked = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(h)
+}
+fn write_effect(path: &std::path::Path, fact: &EffectFact) -> Result<(), String> {
+    if serde_json::to_vec(fact).map_err(|_| "E_WATCHDOG_FACT")?.len() > 8192 { return Err("E_WATCHDOG_FACT".into()); }
+    crate::journal::write_private_json_atomic(path, fact, false)
+}
+#[cfg(test)]
+pub(crate) struct NudgeFixture {
+    target: EffectTarget,
+    clients: Vec<crate::daemons::ClientInput>,
+    // Actual dispatch-boundary scheduling hook; finite channel, not a policy mock.
+    pause: Option<(usize, std::sync::mpsc::SyncSender<()>, Mutex<std::sync::mpsc::Receiver<()>>)>,
+    target_after: Option<(usize, EffectTarget)>,
+    crash: Option<u8>,
+}
+pub(crate) struct NudgeInputs {
+    #[cfg(test)] fixture: Option<NudgeFixture>,
+}
+impl NudgeInputs {
+    pub(crate) fn production() -> Self { Self { #[cfg(test)] fixture: None } }
+    fn target(&self, work: &crate::daemons::RuntimeWork, index: usize, window:&str) -> Result<EffectTarget, String> {
+        #[cfg(test)] if let Some(f) = &self.fixture {
+            if let Some((after, changed)) = &f.target_after { if index >= *after { return Ok(changed.clone()); } }
+            return Ok(f.target.clone());
+        }
+        let _ = index;
+        if window.len()>16 || !window.starts_with('@') || window.len()<2 || !window[1..].bytes().all(|b|b.is_ascii_digit()){return Err("E_WATCHDOG_TARGET".into());}
+        let bytes=crate::tmux::local_output(work,vec!["display-message".into(),"-p".into(),"-t".into(),window.into(),"#{window_id}|#{pane_id}|#{pane_pid}".into()])?;
+        let text=std::str::from_utf8(&bytes).map_err(|_|"E_WATCHDOG_TARGET")?.trim_end_matches('\n');
+        let fields=text.split('|').collect::<Vec<_>>();
+        if fields.len()!=3 || fields[0]!=window{return Err("E_WATCHDOG_TARGET".into());}
+        let pid=fields[2].parse::<u32>().map_err(|_|"E_WATCHDOG_TARGET")?;
+        let native=crate::team_process::observe(pid).map_err(|_|"E_WATCHDOG_TARGET")?.ok_or("E_WATCHDOG_TARGET")?;
+        let target=EffectTarget{window:window.into(),pane:fields[1].into(),pid,birth:native.identity.start_time,uid:native.uid};
+        if !target_valid(&target){return Err("E_WATCHDOG_TARGET".into());}Ok(target)
+    }
+    fn client(&self, work:&crate::daemons::RuntimeWork,index: usize,target:&EffectTarget,producer:NudgeProducer) -> Result<crate::daemons::ClientInput, String> {
+        #[cfg(test)] if let Some(f) = &self.fixture { return f.clients.get(index).cloned().ok_or_else(|| "E_FIXTURE_CLIENT".into()); }
+        if index>=4{return Err("E_WATCHDOG_TARGET".into());}
+        let mut args=vec!["send-keys".into(),"-t".into(),target.pane.clone()];
+        if index%2==0 {
+            args.push("-l".into());
+            args.push(if index==2 {String::new()} else {match producer {NudgeProducer::RekickNudge=>crate::launcher::KICKOFF_TEXT.into(),NudgeProducer::UnreadNudge=>INBOX_NUDGE_TEXT.into()}});
+        } else {args.push("Enter".into());}
+        work.client(&work.tools()?.tmux,args)
+    }
+}
+fn effect_plan(agent: &crate::state::AgentDef) -> Result<String, String> {
+    use sha2::Digest;
+    let bytes = serde_json::to_vec(&(agent.name.as_str(), agent.model.as_str(), agent.role.as_str(),
+        agent.prompt_file.as_str(), agent.tmux_window_id.as_ref(), agent.status.as_str())).map_err(|_| "E_WATCHDOG_PLAN")?;
+    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+pub(crate) fn guarded_nudge(
+    lease: &crate::controller::ControllerLock, work: &crate::daemons::RuntimeWork,
+    state: &Arc<Mutex<AppState>>, seat: &str, producer: NudgeProducer, inputs: NudgeInputs,
+) -> Result<DispatchOutcome, String> {
+    work.check_open()?;
+    let home = lease.run_dir()?.parent().and_then(std::path::Path::parent).ok_or("E_WATCHDOG_PATH")?;
+    crate::agents::detached_codex_denied_at(home, state, seat, false)?;
+    let plan = state.lock().map_err(|_| "E_WATCHDOG_PLAN")?.agents.get(seat).ok_or("E_WATCHDOG_PLAN")?.clone();
+    let fingerprint = effect_plan(&plan)?;
+    let slot = lease.codex_slot(seat)?;
+    let _operation = slot.enter()?;
+    let _serial = EFFECT_SERIAL.lock().map_err(|_| "E_WATCHDOG_JOURNAL_UNAVAILABLE")?;
+    let target = inputs.target(work, 0,plan.tmux_window_id.as_deref().ok_or("E_WATCHDOG_TARGET")?)?;
+    if !target_valid(&target) || plan.tmux_window_id.as_deref() != Some(&target.window) { return Err("E_WATCHDOG_TARGET".into()); }
+    let recheck = |index| -> Result<(), String> {
+        work.check_open()?;
+        crate::agents::detached_codex_denied_at(home, state, seat, false)?;
+        let actual = state.lock().map_err(|_| "E_WATCHDOG_PLAN")?.agents.get(seat).ok_or("E_WATCHDOG_PLAN")?.clone();
+        if effect_plan(&actual)? != fingerprint || inputs.target(work, index,&target.window)? != target { return Err("E_WATCHDOG_TARGET".into()); }
+        let expected = crate::team_replacement::ProcessIdentity { pid: target.pid, start_time: target.birth.clone() };
+        if crate::team_process::state(&expected) != crate::team_replacement::ProcessState::Same
+            || !crate::team_process::observe(target.pid).ok().flatten().is_some_and(|p| p.identity == expected && p.uid == target.uid) { return Err("E_WATCHDOG_TARGET".into()); }
+        Ok(())
+    };
+    recheck(0)?;
+    let _trusted_input = inputs.client(work,0,&target,producer)?; // prerequisite before intent, no command spawned
+    let root = lease.run_dir()?.join("watchdog");
+    let at = effect_now()?;
+    let history = effect_history(&root, seat, at)?;
+    if history.blocked { return Err("E_WATCHDOG_UNRESOLVED_OR_COOLDOWN".into()); }
+    let needed = if history.existing { 2 } else { 3 };
+    if history.entries + needed > 512 || (!history.existing && history.seats >= 128) { return Err("E_WATCHDOG_CAPACITY".into()); }
+    crate::journal::ensure_private_dir(&root)?;
+    let dir = root.join(seat);
+    crate::journal::ensure_private_dir(&dir)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    write_effect(&dir.join(format!("{id}.intent.json")), &EffectFact::Intent {
+        version: 1, id: id.clone(), seat: seat.into(), producer,
+        payload: match producer { NudgeProducer::RekickNudge => "boot_nudge", NudgeProducer::UnreadNudge => "inbox_nudge" }.into(),
+        target: target.clone(), plan: fingerprint.clone(), at_ms: at,
+    })?;
+    #[cfg(test)] if inputs.fixture.as_ref().is_some_and(|f| f.crash == Some(0)) { std::process::exit(73); }
+    let until = std::time::Instant::now() + Duration::from_millis(8700);
+    let mut observations = Vec::new();
+    for index in 0..4 {
+        #[cfg(test)] if let Some((point, arrived, resume)) = inputs.fixture.as_ref().and_then(|f| f.pause.as_ref()) {
+            if *point == index {
+                arrived.send(()).map_err(|_| "E_FIXTURE_CHANNEL")?;
+                resume.lock().unwrap().recv_timeout(Duration::from_secs(3)).map_err(|_| "E_FIXTURE_DEADLINE")?;
+            }
+        }
+        if index == 2 && work.wait_open(Duration::from_millis(700)).is_err() { break; }
+        if recheck(index).is_err() { break; }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() { break; }
+        let input = match inputs.client(work,index,&target,producer) { Ok(v) => v, Err(_) => break };
+        match crate::daemons::run_client(work, input, left.min(Duration::from_secs(2)), 64*1024, 64*1024) {
+            Ok(result) => {
+                observations.push(DispatchObservation { spawned: result.spawned, accepted: result.accepted });
+                if !result.accepted { break; }
+            }
+            Err(_) => {
+                // Retention/setup failure after spawn cannot be proven NoDispatch.
+                observations.push(DispatchObservation { spawned: true, accepted: false });
+                break;
+            }
+        }
+    }
+    #[cfg(test)] if inputs.fixture.as_ref().is_some_and(|f| f.crash == Some(1)) { std::process::exit(74); }
+    let outcome = if !observations.iter().any(|o| o.spawned) { DispatchOutcome::NoDispatch }
+        else if observations.len() == 4 && observations.iter().all(|o| o.accepted) { DispatchOutcome::DispatchAccepted }
+        else { DispatchOutcome::Unknown };
+    lease.verify_live()?;
+    write_effect(&dir.join(format!("{id}.outcome.json")), &EffectFact::Outcome {
+        version: 1, id, seat: seat.into(), outcome, observations, at_ms: effect_now()?,
+    })?;
+    Ok(outcome)
+}
+
+#[cfg(test)]
+#[path = "watchdog_effect_tests.rs"]
+mod effect_tests;

@@ -590,3 +590,174 @@ fn retirement_explicit_readmission_preserves_failed_history_and_denies_any_effec
         assert_eq!(std::fs::read(a.dir.join("admitted.json")).unwrap(),before);
     }
 }
+
+// Same native reconciliation entry used by control; fixture facts only.
+fn stopped_history(f: &Fixture, ordinary: bool, root_failed: bool, attempts: usize) -> PathBuf {
+    let root = f.0.join(".aperture/teams/t1/runtime-attempts/t1-worker/g1");
+    let write_attempt = |dir: &Path, failed: bool, time: i64| {
+        ensure_private_dir(dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        write_private_json_atomic(&dir.join("admitted.json"), &Admission {
+            schema_version: 1, attempt_id: id.clone(), team: "t1".into(), seat: "t1-worker".into(),
+            old_generation: 1, admitted_at_ms: time, native_budget_ms: 170_000, cleanup_reserve_ms: 40_000,
+        }, false).unwrap();
+        write_private_json_atomic(&dir.join("terminal.json"), &Fact {schema_version:1, attempt_id:id.clone(),
+            kind:if failed {FactKind::Failed} else {FactKind::Unknown}}, false).unwrap();
+        if !failed { write_private_json_atomic(&dir.join("effects.json"), &Fact {
+            schema_version:1,attempt_id:id,kind:FactKind::EffectsMayHaveOccurred}, false).unwrap(); }
+    };
+    let old = chrono::Utc::now().timestamp_millis() - 200_000;
+    if ordinary { write_attempt(&root, false, old); return root; }
+    if root_failed { write_attempt(&root, true, old - 1000); }
+    let mut dir = root.join("retirement");
+    for n in 0..attempts {
+        write_attempt(&dir, n + 1 < attempts, old + n as i64);
+        if n + 1 < attempts { dir = dir.join("reprepare"); }
+    }
+    dir
+}
+fn history_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut paths: Vec<_> = std::fs::read_dir(root).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        for p in paths {
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() { walk(&p,out); }
+            else if m.file_type().is_symlink() { out.push((p.clone(),std::fs::read_link(p).unwrap().as_os_str().as_encoded_bytes().to_vec())); }
+            else { out.push((p.clone(),std::fs::read(p).unwrap())); }
+        }
+    }
+    let mut out=Vec::new();walk(root,&mut out);out
+}
+struct ReconcileEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+impl Drop for ReconcileEnv {
+    fn drop(&mut self) {
+        for (key,value) in [("HOME",&self.0),("APERTURE_AGENTS_DIR",&self.1)] {
+            if let Some(v)=value {std::env::set_var(key,v);} else {std::env::remove_var(key);}
+        }
+    }
+}
+fn reconcile_setup(f: &Fixture) -> (ReconcileEnv, AuthenticatedActor) {
+    let env=ReconcileEnv(std::env::var_os("HOME"),std::env::var_os("APERTURE_AGENTS_DIR"));
+    let agents=f.0.join(".claude/aperture");ensure_private_dir(&agents.join("glados")).unwrap();
+    write_private_json_atomic(&agents.join("glados/manifest.json"), &serde_json::json!({
+        "name":"GLaDOS","model":"sonnet","window":"glados","role":"orchestrator","enabled":true}),false).unwrap();
+    crate::journal::write_private_bytes_atomic(&agents.join("glados/prompt.md"),b"fixture",false).unwrap();
+    let tokens=f.0.join(".aperture/run/hub-tokens");ensure_private_dir(&tokens).unwrap();
+    crate::journal::write_private_bytes_atomic(&tokens.join("glados.token"),b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",false).unwrap();
+    std::env::set_var("HOME",&f.0);std::env::set_var("APERTURE_AGENTS_DIR",&agents);
+    let actor=crate::team_auth::authenticate_glados_control().unwrap();
+    // Own inert child with observed birth, EOF exit and reap; never signal.
+    let mut child=std::process::Command::new("/bin/cat").env_clear()
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let meta=crate::team_process::observe(child.id()).unwrap().unwrap();
+    let birth=crate::team_process::birth_micros(&meta.identity).unwrap();
+    drop(child.stdin.take());assert!(child.wait().unwrap().success());
+    assert_eq!(crate::team_process::state(&meta.identity),crate::team_replacement::ProcessState::Gone);
+    let owner_path=f.0.join(".aperture/run/owner/t1-worker.json");
+    let mut owner:OwnerRecord=read_private_json(&owner_path).unwrap();let i=owner.incarnation.as_mut().unwrap();
+    i.pid=meta.identity.pid;i.start_time=birth;
+    i.processes=vec![crate::owner::ProcessIdentity {pid:i.pid,start_time:birth,ppid:meta.ppid,pgid:meta.pgid,
+        cmdline_sha256:"b".repeat(64),cwd:f.0.to_string_lossy().into()}];
+    write_private_json_atomic(&owner_path,&owner,true).unwrap();
+    let floor=f.0.join(".aperture/run/revocations/t1-worker.json");ensure_private_dir(floor.parent().unwrap()).unwrap();
+    write_private_json_atomic(&floor,&serde_json::json!({"schema_version":1,"seat":"t1-worker",
+        "revoked_through_generation":1,"revoked_token_ids":["a".repeat(64)]}),false).unwrap();
+    (env,actor)
+}
+fn reconcile_fixture(f:&Fixture, actor:&AuthenticatedActor)->Result<(),String> {
+    crate::team_archive::retirement::reconcile_stopped(&f.0,actor,"t1","t1-worker",1,
+        crate::team_replacement::CheckpointRecovery::Valid,false)
+}
+fn retired_path(f:&Fixture)->PathBuf {f.0.join(".aperture/run/managed/t1-worker/g1/retired.json")}
+fn mutate_fact(path:&Path,key:&str,value:serde_json::Value) {
+    let mut v:serde_json::Value=read_private_json(path).unwrap();v[key]=value;
+    write_private_json_atomic(path,&v,true).unwrap();
+}
+#[test]
+fn expired_retirement_history_reconciles_once_without_rewriting_attempts_or_owner() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for (ordinary,root_failed,attempts) in [(true,false,1),(false,false,2),(false,true,2),(false,false,32)] {
+        let f=Fixture::new();f.managed();let (_env,actor)=reconcile_setup(&f);
+        stopped_history(&f,ordinary,root_failed,attempts);
+        let root=f.0.join(".aperture/teams/t1/runtime-attempts");let before=history_bytes(&root);
+        let owner_path=f.0.join(".aperture/run/owner/t1-worker.json");let owner=std::fs::read(&owner_path).unwrap();
+        let floor_path=f.0.join(".aperture/run/revocations/t1-worker.json");let floor=std::fs::read(&floor_path).unwrap();
+        assert!(expired_unknown_stop_locked(&f.0,"t1","t1-worker",1).is_ok());
+        reconcile_fixture(&f,&actor).unwrap();
+        let fact=std::fs::read(retired_path(&f)).unwrap();
+        assert!(reconcile_fixture(&f,&actor).is_err());
+        assert_eq!(std::fs::read(retired_path(&f)).unwrap(),fact);
+        assert_eq!(history_bytes(&root),before);assert_eq!(std::fs::read(owner_path).unwrap(),owner);
+        assert_eq!(std::fs::read(floor_path).unwrap(),floor);
+        assert!(!f.0.join(".aperture/run/hub-tokens/t1-worker.token").exists());
+        assert_eq!(std::fs::read_dir(retired_path(&f).parent().unwrap()).unwrap().count(),1);
+        // No RuntimeAttempt/new admission is returned by the reader; the
+        // native reconciliation entry reaches only its existing fact writer.
+    }
+}
+#[test]
+fn expired_retirement_history_rejects_grammar_drift_without_retirement_fact() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for mode in 0..27 {
+        let f=Fixture::new();f.managed();let (_env,actor)=reconcile_setup(&f);
+        let leaf=stopped_history(&f,false,mode==26,if mode==25 {33} else if mode==26 {32} else {2});let parent=leaf.parent().unwrap();
+        match mode {
+            0=>mutate_fact(&leaf.join("admitted.json"),"admitted_at_ms",chrono::Utc::now().timestamp_millis().into()),
+            1=>mutate_fact(&parent.join("terminal.json"),"kind","unknown".into()),
+            2=>{std::fs::copy(leaf.join("effects.json"),parent.join("effects.json")).unwrap();},
+            3=>mutate_fact(&leaf.join("effects.json"),"attempt_id",uuid::Uuid::new_v4().to_string().into()),
+            4=>mutate_fact(&leaf.join("admitted.json"),"team","other".into()),
+            5=>mutate_fact(&parent.join("admitted.json"),"seat","other".into()),
+            6=>mutate_fact(&parent.join("admitted.json"),"old_generation",2.into()),
+            7=>mutate_fact(&parent.join("admitted.json"),"native_budget_ms",1.into()),
+            8=>mutate_fact(&parent.join("admitted.json"),"cleanup_reserve_ms",1.into()),
+            9=>mutate_fact(&parent.join("admitted.json"),"attempt_id","invalid".into()),
+            10=>mutate_fact(&leaf.join("terminal.json"),"kind","ready".into()),
+            11=>mutate_fact(&leaf.join("terminal.json"),"kind","active".into()),
+            12=>mutate_fact(&leaf.join("terminal.json"),"kind","smoke_cleaned".into()),
+            13=>mutate_fact(&leaf.join("terminal.json"),"kind","stopped_reconciled".into()),
+            14=>{std::fs::remove_file(leaf.join("effects.json")).unwrap();},
+            15=>{ensure_private_dir(&leaf.join("reprepare")).unwrap();},
+            16=>{ensure_private_dir(&parent.join("unexpected")).unwrap();},
+            17=>{std::fs::rename(leaf.join("terminal.json"),leaf.join("original.json")).unwrap();symlink("original.json",leaf.join("terminal.json")).unwrap();},
+            18=>{let moved=f.0.join("saved");std::fs::rename(&leaf,&moved).unwrap();symlink(&moved,&leaf).unwrap();},
+            19=>mutate_fact(&parent.join("admitted.json"),"admitted_at_ms",0.into()),
+            20=>mutate_fact(&parent.join("admitted.json"),"admitted_at_ms",i64::MAX.into()),
+            21=>mutate_fact(&leaf.join("effects.json"),"kind","failed".into()),
+            22=>mutate_fact(&leaf.join("terminal.json"),"attempt_id",uuid::Uuid::new_v4().to_string().into()),
+            23=>{std::fs::set_permissions(parent,std::fs::Permissions::from_mode(0o755)).unwrap();},
+            24=>{std::fs::remove_file(parent.join("terminal.json")).unwrap();},
+            _=>{},
+        }
+        let owner_before=std::fs::read(f.0.join(".aperture/run/owner/t1-worker.json")).unwrap();
+        let before=history_bytes(&f.0.join(".aperture/teams/t1/runtime-attempts"));
+        assert!(reconcile_fixture(&f,&actor).is_err(),"mode {mode}");
+        assert!(!retired_path(&f).exists(),"mode {mode}");
+        assert_eq!(history_bytes(&f.0.join(".aperture/teams/t1/runtime-attempts")),before);
+        assert_eq!(std::fs::read(f.0.join(".aperture/run/owner/t1-worker.json")).unwrap(),owner_before);
+    }
+}
+#[test]
+fn retirement_history_never_substitutes_for_gone_floor_token_or_authority() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for mode in 0..9 {
+        let f=Fixture::new();f.managed();let (_env,actor)=reconcile_setup(&f);stopped_history(&f,false,false,2);
+        let owner=f.0.join(".aperture/run/owner/t1-worker.json");
+        match mode {
+            0=>{let live=crate::team_process::observe(std::process::id()).unwrap().unwrap();let birth=crate::team_process::birth_micros(&live.identity).unwrap();let mut v:serde_json::Value=read_private_json(&owner).unwrap();v["incarnation"]["pid"]=live.identity.pid.into();v["incarnation"]["start_time"]=birth.into();v["incarnation"]["processes"][0]["pid"]=live.identity.pid.into();v["incarnation"]["processes"][0]["start_time"]=birth.into();write_private_json_atomic(&owner,&v,true).unwrap();},
+            1=>mutate_fact(&f.0.join(".aperture/run/revocations/t1-worker.json"),"revoked_token_ids",serde_json::json!(["b".repeat(64)])),
+            2=>{crate::journal::write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/t1-worker.token"),b"fixture-only",false).unwrap();},
+            3=>mutate_fact(&owner,"generation",2.into()),
+            4=>mutate_fact(&owner,"state","quarantined".into()),
+            5=>mutate_fact(&f.0.join(".aperture/run/revocations/t1-worker.json"),"revoked_through_generation",2.into()),
+            6=>{let mut v:serde_json::Value=read_private_json(&owner).unwrap();let p=v["incarnation"]["processes"][0].clone();v["incarnation"]["processes"].as_array_mut().unwrap().push(p);write_private_json_atomic(&owner,&v,true).unwrap();},
+            _=>{},
+        }
+        let before=std::fs::read(&owner).unwrap();
+        let result=if mode==7 {reconcile_fixture(&f,&AuthenticatedActor::launcher())}
+            else if mode==8 {crate::team_archive::retirement::reconcile_stopped(&f.0,&actor,"t1","t1-worker",1,crate::team_replacement::CheckpointRecovery::None,false)}
+            else {reconcile_fixture(&f,&actor)};
+        assert!(result.is_err(),"mode {mode}");assert!(!retired_path(&f).exists());assert_eq!(std::fs::read(owner).unwrap(),before);
+    }
+}

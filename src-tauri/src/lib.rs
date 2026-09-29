@@ -1,3 +1,9 @@
+mod runtime_release;
+mod controller;
+mod daemon_registry;
+mod daemons;
+mod web_auth;
+pub mod web_server;
 mod team_claude_launch;
 mod team_claude_inbox;
 mod team_claude_kickoff;
@@ -70,22 +76,39 @@ pub use team_terminal::attach_existing as attach_managed_terminal;
 /// harness (aperture-xt16e) and the watchdog re-kick (aperture-wul6m). Returns
 /// the new tmux window id.
 pub fn boot_agent_headless(name: &str) -> Result<String, String> {
-    let state = config::default_state();
-    let agent = state
-        .agents
-        .get(name)
-        .ok_or_else(|| format!("agent '{}' not found in registry (check APERTURE_AGENTS_DIR)", name))?;
-    let tmux_session = std::env::var("APERTURE_TMUX_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| state.tmux_session.clone());
-    agents::boot_agent_process(
-        agent,
-        tmux_session,
-        state.mcp_server_path.clone(),
-        state.mcp_sentry_server_path.clone(),
-        state.project_dir.clone(),
-    )
+    agents::require_legacy_lifecycle(name)?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("home unavailable")?;
+    let mut initial = config::default_state();
+    if initial.agents.get(name).is_some_and(|a| a.model.starts_with("codex/")) {
+        return Err(agents::LifecycleRefusal::InputsUnverified.code().into());
+    }
+    if let Some(session) = std::env::var("APERTURE_TMUX_SESSION").ok().filter(|s| !s.is_empty()) { initial.tmux_session = session; }
+    let state = Arc::new(Mutex::new(initial));
+    boot_agent_headless_external(&home, name, &state)
+}
+// Same synchronous external path used by the public binary wrapper and inert
+// fixtures. No production executable/environment override is accepted here.
+pub(crate) fn boot_agent_headless_external(
+    home: &std::path::Path, name: &str, state: &Arc<Mutex<state::AppState>>,
+) -> Result<String, String> {
+    // Deny Codex input before acquiring/creating controller files when possible.
+    let agent = state.lock().map_err(|e| e.to_string())?.agents.get(name).ok_or("agent not found")?.clone();
+    if agent.model.starts_with("codex/") {
+        return Err(agents::LifecycleRefusal::InputsUnverified.code().into());
+    }
+    let lease = controller::ControllerLock::acquire(home)?;
+    let tools=daemons::LocalTools::resolve(home)?;
+    let runtime = daemons::RuntimeOwner::local(lease,tools)?;
+    let result = {
+        let work = runtime.admit(Some(name))?;
+        let _body = work.body()?;
+        let context = work.lifecycle(name)?;
+        agents::start_agent_shared(name.to_string(), state, &context)?;
+        state.lock().map_err(|e| e.to_string())?.agents.get(name)
+            .and_then(|v| v.tmux_window_id.clone()).ok_or_else(|| "boot has no window".into())
+    };
+    runtime.close()?;
+    result
 }
 
 /// Authenticated, headless V4 team activation. The request carries selectors
@@ -164,6 +187,12 @@ fn repair_gui_path() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The fallback GUI must acquire the same lease before any initialization.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).expect("home unavailable");
+    let _controller = match controller::ControllerLock::acquire(&home) {
+        Ok(lease) => lease,
+        Err(error) => { eprintln!("[aperture] {error}"); return; }
+    };
     // Must run before anything that spawns subprocesses (BEADS init, poller,
     // WS hub, codex app-servers) — they all resolve binaries via PATH.
     repair_gui_path();
@@ -214,34 +243,16 @@ pub fn run() {
         }
     }
 
-    // Start the operator-mailbox sweep (attention badges only — agent
-    // message delivery is owned by the WS hub / codex-bridge, see poller.rs)
-    let poller_state = Arc::clone(&app_state);
-    std::thread::spawn(move || {
-        poller::run_message_poller(poller_state);
-    });
-
-    if let Err(e) = hub_auth::provision_token("watchdog") {
-        eprintln!("[aperture] fatal: cannot provision hub watchdog token: {e}");
+    let tools=match daemons::LocalTools::resolve(std::path::Path::new(&home)){Ok(t)=>t,Err(e)=>{eprintln!("[aperture] local tools: {e}");return;}};
+    let runtime = match daemons::RuntimeOwner::local(_controller,tools){Ok(r)=>Arc::new(r),Err(e)=>{eprintln!("[aperture] local runtime: {e}");return;}};
+    if let Err(error) = runtime.start(Arc::clone(&app_state)) {
+        eprintln!("[aperture] daemon startup refused: {error}");
         return;
     }
 
-    // Start the aperture-bus WS hub daemon (Comms Layer v2, Phase 1 —
-    // docs/superpowers/specs/2026-07-19-comms-layer-v2-design.md). Claude
-    // message delivery now flows through this hub instead of the poller's
-    // tmux injection. Skips with a warning if ws-hub.js isn't built yet.
-    let project_dir = app_state.lock().unwrap().project_dir.clone();
-    ws_hub::spawn_ws_hub(project_dir);
-
-    // Start the liveness watchdog (aperture-wul6m) — the agent-side half of
-    // comms-v2 reliability. Subscribes to the hub's presence stream and re-kicks
-    // any expected-present agent that goes silent past the 60s deadline (a hub
-    // bounce killed its exit-on-drop inbox monitor and it couldn't self-heal).
-    // Also computes the presence-dot state the launcher polls via list_agents.
-    watchdog::spawn_watchdog(Arc::clone(&app_state));
-
     tauri::Builder::default()
         .manage(app_state)
+        .manage(runtime)
         .invoke_handler(tauri::generate_handler![
             // Launcher essentials — start/stop/list agents and configure model.
             agents::start_agent,
@@ -274,12 +285,18 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
-            // Kill the WS hub child on app exit so it doesn't outlive the
-            // launcher and hold port 4517 across restarts. Same for the
-            // per-agent codex app-servers (Comms v2 Phase 2) so stale
-            // processes never squat on ~/.aperture/run/*.sock.
+        .run(|app_handle, event| {
+            // Detach only; D still owes admission closure and task joins.
+            // No daemon/port kill or unlink is authority granted by GUI exit.
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                use tauri::Manager;
+                let runtime = app_handle.state::<Arc<daemons::RuntimeOwner>>();
+                if runtime.close().is_err() { api.prevent_exit(); }
+            }
             if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                let runtime = app_handle.state::<Arc<daemons::RuntimeOwner>>();
+                if let Err(error) = runtime.close() { eprintln!("[aperture] runtime drain incomplete: {error}"); }
                 ws_hub::shutdown();
                 codex_appserver::shutdown();
             }

@@ -92,6 +92,13 @@ pub(crate) fn expired_unknown_stop_locked(
     if generation == 0 { return Err(deny()); }
     let dir = home.join(".aperture/teams").join(team).join("runtime-attempts")
         .join(seat).join(format!("g{generation}"));
+    // Ordinary UNKNOWN stays on the original exact-three-fact path. Only the
+    // canonical retirement child selects the separate closed history grammar.
+    match std::fs::symlink_metadata(dir.join("retirement")) {
+        Ok(_) => return expired_retirement_stop_locked(&dir, team, seat, generation),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return Err(deny()),
+    }
     let a: Admission = read_private_json(&dir.join("admitted.json")).map_err(|_| deny())?;
     let e: Fact = read_private_json(&dir.join("effects.json")).map_err(|_| deny())?;
     let t: Fact = read_private_json(&dir.join("terminal.json")).map_err(|_| deny())?;
@@ -113,6 +120,104 @@ pub(crate) fn expired_unknown_stop_locked(
     if names.len() != 3 || names.iter().any(|name| !["admitted.json", "effects.json", "terminal.json"]
         .iter().any(|expected| name == expected)) { return Err(deny()); }
     Ok(())
+}
+
+// Read-only, closed retirement grammar. No RuntimeAttempt/UUID, writer or
+// effect authority is created. Callers retain the team/seat locks throughout.
+fn expired_retirement_stop_locked(
+    root: &Path, team: &str, seat: &str, generation: u64,
+) -> Result<(), ReplacementError> {
+    use std::os::unix::fs::MetadataExt;
+    let deny = || ReplacementError::OutcomeUnknown;
+    // Keep directory identities/names and exact file bytes for a final recheck.
+    // This detects drift; it is not an atomic filesystem transaction.
+    let mut directories = Vec::new();
+    let mut facts = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut previous_time = 0;
+    let mut dir = root.to_path_buf();
+    let mut found_unknown = false;
+    for level in 0..=32 {
+        let meta = std::fs::symlink_metadata(&dir).map_err(|_| deny())?;
+        if !meta.is_dir() || meta.file_type().is_symlink()
+            || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0
+        { return Err(deny()); }
+        let mut names = std::fs::read_dir(&dir).map_err(|_| deny())?.take(5)
+            .map(|e| e.map(|e| e.file_name()).map_err(|_| deny()))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        let matches = |expected: &[&str]| names.len() == expected.len()
+            && expected.iter().all(|n| names.iter().any(|actual| actual == n));
+        directories.push((dir.clone(), meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec(),
+            meta.ctime(), meta.ctime_nsec(), names.clone()));
+        if level == 0 && matches(&["retirement"]) {
+            dir = dir.join("retirement");
+            continue;
+        }
+        let child = if level == 0 { "retirement" } else { "reprepare" };
+        let failed = matches(&["admitted.json", "terminal.json", child]);
+        let unknown = level > 0 && matches(&["admitted.json", "effects.json", "terminal.json"]);
+        if !failed && !unknown { return Err(deny()); }
+        let mut read = |name: &str| -> Result<Vec<u8>, ReplacementError> {
+            use std::io::Read;
+            let path = dir.join(name);
+            // Existing nofollow private-file/ancestor validation; facts are
+            // bounded independently of the maximum private JSON record size.
+            let mut file = crate::journal::open_private_file_nofollow(&path).map_err(|_| deny())?;
+            let before = file.metadata().map_err(|_| deny())?;
+            let mut bytes = Vec::new();
+            (&mut file).take(16 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| deny())?;
+            let after = file.metadata().map_err(|_| deny())?;
+            if bytes.len() > 16 * 1024 || before.len() != bytes.len() as u64
+                || history_pin(&before) != history_pin(&after) { return Err(deny()); }
+            facts.push((path, history_pin(&after), bytes.clone()));
+            Ok(bytes)
+        };
+        let a: Admission = serde_json::from_slice(&read("admitted.json")?).map_err(|_| deny())?;
+        let t: Fact = serde_json::from_slice(&read("terminal.json")?).map_err(|_| deny())?;
+        if a.schema_version != 1 || a.team != team || a.seat != seat || a.old_generation != generation
+            || !crate::team_claude_launch::canonical_uuid(&a.attempt_id) || !seen_ids.insert(a.attempt_id.clone()) || seen_ids.len() > 32
+            || a.native_budget_ms != TOTAL.as_millis() as u64 || a.cleanup_reserve_ms != CLEANUP.as_millis() as u64
+            || a.admitted_at_ms <= 0 || a.admitted_at_ms > now || a.admitted_at_ms < previous_time
+            || t.schema_version != 1 || t.attempt_id != a.attempt_id
+        { return Err(deny()); }
+        previous_time = a.admitted_at_ms;
+        if unknown {
+            let e: Fact = serde_json::from_slice(&read("effects.json")?).map_err(|_| deny())?;
+            if t.kind != FactKind::Unknown || e.schema_version != 1 || e.attempt_id != a.attempt_id
+                || e.kind != FactKind::EffectsMayHaveOccurred
+                || a.admitted_at_ms.checked_add(TOTAL.as_millis() as i64 + 10_000).is_none_or(|end| now <= end)
+            { return Err(deny()); }
+            found_unknown = true;
+            break;
+        }
+        if t.kind != FactKind::Failed { return Err(deny()); }
+        dir = dir.join(child);
+    }
+    if !found_unknown { return Err(deny()); }
+    for (path, pin, bytes) in facts {
+        use std::io::Read;
+        let mut file = crate::journal::open_private_file_nofollow(&path).map_err(|_| deny())?;
+        if history_pin(&file.metadata().map_err(|_| deny())?) != pin { return Err(deny()); }
+        let mut actual = Vec::new();
+        (&mut file).take(16 * 1024 + 1).read_to_end(&mut actual).map_err(|_| deny())?;
+        if actual != bytes || history_pin(&file.metadata().map_err(|_| deny())?) != pin { return Err(deny()); }
+    }
+    for (path, dev, ino, mt, mn, ct, cn, names) in directories {
+        let m = std::fs::symlink_metadata(&path).map_err(|_| deny())?;
+        let mut actual = std::fs::read_dir(&path).map_err(|_| deny())?.take(5)
+            .map(|e| e.map(|e| e.file_name()).map_err(|_| deny())).collect::<Result<Vec<_>, _>>()?;
+        actual.sort();
+        if !m.is_dir() || m.file_type().is_symlink() || m.uid() != unsafe { libc::geteuid() }
+            || m.mode() & 0o077 != 0 || (m.dev(),m.ino(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()) != (dev,ino,mt,mn,ct,cn)
+            || actual != names { return Err(deny()); }
+    }
+    Ok(())
+}
+fn history_pin(m: &std::fs::Metadata) -> (u64,u64,u32,u32,u64,u64,i64,i64,i64,i64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(),m.ino(),m.uid(),m.mode(),m.nlink(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec())
 }
 
 /// Read-only handle to an EXPIRED bootstrap, never a renewed RuntimeAttempt.

@@ -165,6 +165,23 @@ struct Ack {
     sockets_close_requested: u64,
     sockets_closed_verified: u64,
 }
+// Initial subscriber completion is framing only, never revocation evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotEnd {
+    #[serde(rename = "type")]
+    kind: String,
+    protocol_version: u32,
+    hub_pid: u32,
+    snapshot_count: usize,
+}
+fn validate_snapshot_end(text: &str) -> Result<(), ReplacementError> {
+    let end: SnapshotEnd = serde_json::from_str(text).map_err(|_| failure())?;
+    if end.kind != "subscriber_snapshot_end" || end.protocol_version != 1
+        || end.hub_pid == 0 || end.snapshot_count > super::SNAPSHOT_ENTRIES
+    { return Err(failure()); }
+    Ok(())
+}
 fn validate_ack(
     value: serde_json::Value,
     seat: &str,
@@ -239,6 +256,7 @@ fn exchange_optional_until(
         deadline,
     )?;
     let mut proof = None;
+    let mut snapshot_ended = false;
     for _ in 0..FRAME_COUNT_CAP {
         match read_before(&mut control, deadline)? {
             Message::Text(text) => {
@@ -246,6 +264,13 @@ fn exchange_optional_until(
                     serde_json::from_str(&text).map_err(|_| failure())?;
                 match value.get("type").and_then(|v| v.as_str()) {
                     Some("presence") => continue,
+                    Some("subscriber_snapshot_end") => {
+                        if snapshot_ended { return Err(failure()); }
+                        validate_snapshot_end(&text)?;
+                        snapshot_ended = true;
+                        // Same loop/deadline/frame cap; no proof and no early success.
+                        continue;
+                    }
                     Some("ok") => {
                         proof = Some(validate_ack(value, seat, generation)?);
                         break;

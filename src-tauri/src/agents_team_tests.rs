@@ -72,36 +72,37 @@ fn standing_registry_remains_allowed_but_orphan_or_broken_marker_denies() {
 #[test]
 fn all_legacy_entrypoints_guard_before_state_or_native_effects() {
     let source = include_str!("agents.rs");
-    for name in [
-        "start_agent",
-        "stop_agent",
-        "restart_agent",
-        "update_agent_model",
-    ] {
+    // Supplemental source oracle: these thin wrappers have a column-zero
+    // closing brace. Bound the selected function before inspecting statements;
+    // a guard in a later function/comment cannot satisfy this assertion.
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
         let signature = format!("pub fn {name}(");
-        let body = source
-            .split(&signature)
-            .nth(1)
-            .unwrap()
-            .split("-> Result<(), String> {")
-            .nth(1)
-            .unwrap();
-        assert!(
-            body.trim_start()
-                .starts_with("require_legacy_lifecycle(&name)?;"),
-            "unguarded {name}"
-        );
+        let start = source.lines().position(|line| line.starts_with(&signature)).unwrap();
+        let offset = source.split_inclusive('\n').take(start).map(str::len).sum::<usize>();
+        let function = source[offset..].split_once("\n}").unwrap().0;
+        assert!(!function.contains("\npub fn "));
+        function.split_once(" {\n").unwrap().1
     }
-    let body = source
-        .split("pub fn boot_agent_process(")
-        .nth(1)
-        .unwrap()
-        .split("-> Result<String, String> {")
-        .nth(1)
-        .unwrap();
-    assert!(body
-        .trim_start()
-        .starts_with("require_legacy_lifecycle(&agent.name)?;"));
+    for name in ["start_agent", "stop_agent", "restart_agent", "update_agent_model"] {
+        let body = function_body(source, name);
+        let statements: Vec<_> = body.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+        let call = if name == "update_agent_model" {
+            "update_agent_model_shared(name.clone(), model, state.inner(), &work.lifecycle(&name)?)".to_string()
+        } else {
+            format!("{name}_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)")
+        };
+        // Exact statements also reject extra effects or a textual match in a
+        // comment. Runtime admission/body are RO lifecycle accounting; membership
+        // still precedes the first shared/native/state-effect entry.
+        assert_eq!(statements, vec![
+            "let work = runtime.admit(Some(&name))?;",
+            "let _body = work.body()?;",
+            "require_legacy_lifecycle(&name)?;",
+            call.as_str(),
+        ], "unguarded or unaccounted {name}");
+    }
+    assert!(function_body(source, "boot_agent_process")
+        .trim_start().starts_with("require_legacy_lifecycle(&agent.name)?;"));
 }
 
 #[test]
@@ -125,8 +126,9 @@ fn watchdog_guard_precedes_nudge_teardown_and_shared_boot() {
     let gate = body.find("if crate::agents::require_legacy_lifecycle(name).is_err()").unwrap();
     let after_gate = &body[gate..];
     assert!(after_gate.find("return;").unwrap() < after_gate.find("match tier").unwrap());
-    for effect in ["tmux_send_keys(", "tmux_kill_window(", "stop_app_server(",
-                   "remove_file(", "boot_agent_headless("] {
+    let detached = body.find("detached_codex_denied_at(").unwrap();
+    for effect in ["tmux_send_keys(", "tmux_kill_window(", "boot_agent_headless("] {
+        assert!(detached < body.find(effect).unwrap());
         assert!(gate < body.find(effect).unwrap(), "effect before guard: {effect}");
     }
 }

@@ -14,7 +14,7 @@ use crate::state::AgentDef;
 #[path = "team_legacy_guard.rs"]
 pub(crate) mod legacy_lifecycle_guard;
 
-fn require_legacy_lifecycle_at(
+pub(crate) fn require_legacy_lifecycle_at(
     home: &std::path::Path,
     agents_root: &std::path::Path,
     name: &str,
@@ -41,6 +41,334 @@ pub(crate) fn require_legacy_lifecycle(name: &str) -> Result<(), String> {
     require_legacy_lifecycle_at(&home, &agents_root, name)
 }
 
+// C3 is a fenced caller boundary, not permission to activate Codex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleRefusal { InputsUnverified, PlanChanged, ContextMismatch }
+impl LifecycleRefusal {
+    pub(crate) fn code(self) -> &'static str { match self {
+        Self::InputsUnverified => "E_CODEX_LAUNCH_INPUTS_UNVERIFIED",
+        Self::PlanChanged => "E_LIFECYCLE_PLAN_CHANGED",
+        Self::ContextMismatch => "E_LIFECYCLE_CONTEXT_MISMATCH",
+    } }
+}
+pub(crate) struct LifecycleContext<'a> {
+    lease: &'a crate::controller::ControllerLock,
+    work: Option<&'a crate::daemons::RuntimeWork>,
+    home: std::path::PathBuf,
+    roots: std::path::PathBuf,
+    #[cfg(test)] pub(crate) fixture: Option<&'a LifecycleFixture>,
+}
+impl<'a> LifecycleContext<'a> {
+    pub(crate) fn new(lease: &'a crate::controller::ControllerLock) -> Result<Self, String> {
+        let home = lease.run_dir()?.parent().and_then(std::path::Path::parent)
+            .ok_or(LifecycleRefusal::ContextMismatch.code())?.to_path_buf();
+        let roots = std::env::var_os("APERTURE_AGENTS_DIR").filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from).unwrap_or_else(|| home.join(".claude/aperture"));
+        Ok(Self { roots, home, lease, work: None,
+            #[cfg(test)] fixture: None })
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_context(lease: &'a crate::controller::ControllerLock) -> Result<Self, String> {
+        let mut context = Self::new(lease)?;
+        context.roots = context.home.join(".claude/aperture");
+        Ok(context)
+    }
+    fn require_tools(&self) -> Result<(), String> {
+        #[cfg(test)] if self.fixture.is_some() { return Ok(()); }
+        self.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?.require_tools()
+    }
+    pub(crate) fn accounted(mut self, work: &'a crate::daemons::RuntimeWork) -> Self {
+        self.work = Some(work); self
+    }
+    fn check_open(&self) -> Result<(), String> {
+        self.lease.verify_live()?;
+        if let Some(work) = self.work { work.check_open()?; }
+        Ok(())
+    }
+    fn classify(&self, name: &str) -> Result<(), String> {
+        self.check_open()?;
+        if let Some(work) = self.work { work.check_seat(name)?; }
+        require_legacy_lifecycle_at(&self.home, &self.roots, name)
+    }
+    fn has_codex_history(&self, name: &str) -> Result<bool, String> {
+        if !crate::daemon_registry::valid_name(name) { return Err(LifecycleRefusal::ContextMismatch.code().into()); }
+        // Read-only rejection: any leaf (including malformed/symlink) is history,
+        // never enrollment or adoption. No Registry::open on a denial path.
+        let root = self.lease.run_dir()?.join("daemons");
+        match fs::symlink_metadata(&root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(LifecycleRefusal::InputsUnverified.code().into()),
+            Ok(_) => crate::controller::private_dir_readonly(&root)?,
+        }
+        match fs::symlink_metadata(root.join(format!("codex-{name}"))) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(LifecycleRefusal::InputsUnverified.code().into()),
+        }
+    }
+}
+pub(crate) fn detached_codex_denied_at(home: &std::path::Path, state: &Arc<Mutex<AppState>>, name: &str, is_codex: bool) -> Result<(), String> {
+    require_legacy_lifecycle_at(home, &home.join(".claude/aperture"), name)?;
+    let agent = state.lock().map_err(|_| LifecycleRefusal::PlanChanged.code())?.agents.get(name)
+        .ok_or(LifecycleRefusal::PlanChanged.code())?.clone();
+    if is_codex || agent.model.starts_with("codex/") {
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    let history = home.join(".aperture/run/daemons").join(format!("codex-{name}"));
+    match fs::symlink_metadata(history) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(LifecycleRefusal::InputsUnverified.code().into()),
+    }
+}
+fn same_lifecycle_plan(a: &AgentDef, b: &AgentDef) -> bool {
+    a.name == b.name && a.model == b.model && a.role == b.role && a.prompt_file == b.prompt_file
+        && a.status == b.status && a.tmux_window_id == b.tmux_window_id
+}
+fn verify_plan(state: &Arc<Mutex<AppState>>, expected: &AgentDef) -> Result<(), String> {
+    let state = state.lock().map_err(|_| LifecycleRefusal::PlanChanged.code())?;
+    if !state.agents.get(&expected.name).is_some_and(|v| same_lifecycle_plan(v, expected)) {
+        return Err(LifecycleRefusal::PlanChanged.code().into());
+    }
+    Ok(())
+}
+#[derive(Clone)]
+pub(crate) enum LifecycleAction { Start, Stop, Restart, Model(String) }
+fn with_lifecycle_plan(
+    name: &str, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, action: LifecycleAction,
+    execute: impl FnOnce(&AgentDef, &mut crate::controller::CodexOperation<'_>) -> Result<(), String>,
+) -> Result<(), String> {
+    context.classify(name)?;
+    let advisory = state.lock().map_err(|e| e.to_string())?.agents.get(name)
+        .ok_or_else(|| format!("Agent '{name}' not found"))?.clone();
+    #[cfg(test)]
+    if let Some(pause) = context.fixture.and_then(|f| f.pause.as_ref()) {
+        pause.arrived.send(()).map_err(|_| "E_FIXTURE_CHANNEL")?;
+        pause.resume.lock().unwrap().recv_timeout(std::time::Duration::from_secs(3)).map_err(|_| "E_FIXTURE_DEADLINE")?;
+    }
+    // NEVER wait on a seat while holding AppState.
+    let slot = context.lease.codex_slot(name)?;
+    let mut op = slot.enter()?;
+    context.classify(name)?;
+    verify_plan(state, &advisory)?;
+    if let LifecycleAction::Model(ref requested) = action {
+        if requested == &advisory.model { return Ok(()); } // verified effect-free no-op, not persistence
+    }
+    let codex = advisory.model.starts_with("codex/")
+        || matches!(&action, LifecycleAction::Model(v) if v.starts_with("codex/"));
+    let history = context.has_codex_history(name)?;
+    if context.work.is_some_and(|w| w.tools().is_ok()) && matches!(action,LifecycleAction::Stop|LifecycleAction::Restart) {
+        return Err("E_LIFECYCLE_DESCENDANTS_UNVERIFIED: stop/restart is unavailable for this local installation".into());
+    }
+    if codex || history {
+        if matches!(action,LifecycleAction::Start) && advisory.model.starts_with("codex/")
+            && context.work.is_some_and(|w|w.tools().is_ok()) {
+            return start_codex_local(state,&advisory,context,&mut op);
+        }
+        #[cfg(test)]
+        if matches!(action, LifecycleAction::Start) && !history {
+            if let Some(fixture) = context.fixture.filter(|f| f.spec.is_some()) {
+                let registry = crate::daemon_registry::Registry::open(context.lease)?;
+                let plan = PreparedCaller { state, expected: &advisory, fixture };
+                let spec = fixture.spec.as_ref().unwrap();
+                let supervisor = crate::codex_appserver::NativeCodexSupervisor::new(context.lease, &registry, spec.copy_fixture())?;
+                supervisor.prepared_fixture(&mut op, &plan)?;
+                return Ok(());
+            }
+        }
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    verify_plan(state, &advisory)?;
+    execute(&advisory, &mut op)
+}
+
+// Production preparation is borrowed by the SAME held supervisor operation.
+// Existing login/home is an explicit prerequisite: never copy credentials or
+// manufacture trust/auth in order to make a fresh installation look ready.
+pub(crate) struct LocalCodexPreparation<'a> {
+    context: &'a LifecycleContext<'a>, state:&'a Arc<Mutex<AppState>>, expected:&'a AgentDef,
+    codex_home:std::path::PathBuf, bus:String, sentry:String, project:String,
+    bus_pin:LocalInputPin, sentry_pin:LocalInputPin,
+    #[cfg(test)] drift_point: Option<&'static str>,
+}
+impl LocalCodexPreparation<'_> {
+    pub(crate) fn seat(&self)->&str{&self.expected.name}
+    pub(crate) fn recheck(&self)->Result<(),String>{
+        self.context.classify(&self.expected.name)?;self.context.require_tools()?;
+        verify_plan(self.state,self.expected)?;
+        crate::controller::private_dir_readonly(&self.codex_home)?;
+        let state=self.state.lock().map_err(|_|"E_RUNTIME_STATE")?;
+        if state.mcp_server_path!=self.bus || state.mcp_sentry_server_path!=self.sentry || state.project_dir!=self.project {
+            return Err(LifecycleRefusal::PlanChanged.code().into());
+        }
+        self.bus_pin.recheck(std::path::Path::new(&self.bus))?;
+        self.sentry_pin.recheck(std::path::Path::new(&self.sentry))?;
+        Ok(())
+    }
+    fn configuration(&self)->Result<(toml::Value,LocalInputPin),String>{
+        self.recheck()?;
+        let path=self.codex_home.join("config.toml");
+        let (bytes,pin)=local_pinned_bytes(&path,256*1024)?;
+        use std::os::unix::fs::MetadataExt;
+        if pin.mode&0o777!=0o600 {
+            return Err("E_LOCAL_CODEX_CONFIG_PRIVATE_REQUIRED".into());
+        }
+        let config:toml::Value=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_CODEX_CONFIG")?.parse().map_err(|_|"E_LOCAL_CODEX_CONFIG")?;
+        let table=config.as_table().ok_or("E_LOCAL_CODEX_CONFIG")?;
+        let servers=table.get("mcp_servers").and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
+        for name in ["aperture-bus","sentry"] {
+            let server=servers.get(name).and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
+            if server.get("env").is_some_and(|v|!v.is_table()){return Err("E_LOCAL_CODEX_CONFIG".into());}
+        }
+        Ok((config,pin))
+    }
+    pub(crate) fn prepare(&self)->Result<(),String>{
+        let (mut config,config_pin)=self.configuration()?;
+        let config_path=self.codex_home.join("config.toml");
+        let table=config.as_table_mut().ok_or("E_LOCAL_CODEX_CONFIG")?;
+        // Preserve operator trust/approvals/provider configuration verbatim in
+        // value; only the selected model and local MCP executable paths change.
+        table.insert("model".into(),toml::Value::String(self.expected.model.trim_start_matches("codex/").into()));
+        let tools=self.context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?.tools()?;
+        let servers=table.get_mut("mcp_servers").and_then(toml::Value::as_table_mut).ok_or("E_LOCAL_CODEX_CONFIG")?;
+        for name in ["aperture-bus","sentry"]{
+            let server=servers.get(name).and_then(toml::Value::as_table).ok_or("E_LOCAL_CODEX_CONFIG")?;
+            if server.get("env").is_some_and(|v|!v.is_table()){return Err("E_LOCAL_CODEX_CONFIG".into());}
+        }
+        // All shape/path/plan checks precede token rotation and the config write.
+        self.recheck()?;
+        #[cfg(test)] lifecycle_tests::local_config_drift(self,"before-token");
+        config_pin.recheck(&config_path)?;
+        let token=hub_auth::provision_under_lease(self.context.lease,&self.expected.name)?;
+        for (name,path) in [("aperture-bus",&self.bus),("sentry",&self.sentry)] {
+            let server=servers.get_mut(name).and_then(toml::Value::as_table_mut).ok_or("E_LOCAL_CODEX_CONFIG")?;
+            server.insert("command".into(),toml::Value::String(tools.node.path.to_string_lossy().into_owned()));
+            server.insert("args".into(),toml::Value::Array(vec![toml::Value::String(path.clone())]));
+            let env=server.entry("env").or_insert_with(||toml::Value::Table(Default::default())).as_table_mut().ok_or("E_LOCAL_CODEX_CONFIG")?;
+            for (key,value) in tools.environment(){env.insert(key,toml::Value::String(value));}
+            if name=="aperture-bus"{env.insert("APERTURE_HUB_TOKEN_FILE".into(),toml::Value::String(token.to_string_lossy().into_owned()));}
+        }
+        let output=toml::to_string(&config).map_err(|_|"E_LOCAL_CODEX_CONFIG")?;
+        self.recheck()?;
+        #[cfg(test)] lifecycle_tests::local_config_drift(self,"before-replace");
+        config_pin.recheck(&config_path)?;
+        crate::journal::write_private_bytes_atomic(&config_path,output.as_bytes(),true)
+    }
+}
+#[derive(Clone,Debug,PartialEq,Eq)]
+struct LocalInputPin {dev:u64,ino:u64,uid:u32,mode:u32,nlink:u64,len:u64,mtime:(i64,i64),ctime:(i64,i64)}
+impl LocalInputPin {
+    fn of(m:&fs::Metadata)->Self {use std::os::unix::fs::MetadataExt;Self{dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),nlink:m.nlink(),len:m.len(),mtime:(m.mtime(),m.mtime_nsec()),ctime:(m.ctime(),m.ctime_nsec())}}
+    fn recheck(&self,path:&std::path::Path)->Result<(),String>{
+        let f=local_input_fd(path,self.len)?;
+        if Self::of(&f.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?)!=*self {return Err("E_LOCAL_INPUT_DRIFT".into());}Ok(())
+    }
+}
+fn local_input_fd(path:&std::path::Path,cap:u64)->Result<fs::File,String>{
+    use std::os::unix::fs::{OpenOptionsExt,MetadataExt};
+    let file=fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map_err(|_|"E_LOCAL_INPUT_MISSING")?;
+    let m=file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
+    if !m.is_file() || m.nlink()!=1 || m.uid()!=unsafe{libc::geteuid()} || m.mode()&0o7022!=0 || m.mode()&0o400==0 || m.len()>cap {return Err("E_LOCAL_INPUT_UNVERIFIED".into());}Ok(file)
+}
+fn local_pinned_bytes(path:&std::path::Path,cap:u64)->Result<(Vec<u8>,LocalInputPin),String>{
+    use std::io::Read;
+    let mut file=local_input_fd(path,cap)?;
+    let pin=LocalInputPin::of(&file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?);
+    let mut bytes=Vec::new();(&mut file).take(cap+1).read_to_end(&mut bytes).map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?;
+    if bytes.len() as u64!=pin.len || bytes.len() as u64>cap || LocalInputPin::of(&file.metadata().map_err(|_|"E_LOCAL_INPUT_UNVERIFIED")?)!=pin {return Err("E_LOCAL_INPUT_DRIFT".into());}
+    pin.recheck(path)?;Ok((bytes,pin))
+}
+fn local_regular_bytes(path:&std::path::Path,cap:u64)->Result<Vec<u8>,String>{local_pinned_bytes(path,cap).map(|(bytes,_)|bytes)}
+fn shell_quote(value:&str)->String{format!("'{}'",value.replace('\'',"'\\''"))}
+fn wait_local_thread(path:&std::path::Path,work:&crate::daemons::RuntimeWork)->Result<String,String>{
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(60);
+    loop {
+        work.check_open()?;
+        match fs::symlink_metadata(path){
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Ok(_)=>{
+                let bytes=local_regular_bytes(path,128)?;
+                let thread=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
+                let id=uuid::Uuid::parse_str(thread).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
+                if id.to_string()!=thread{return Err("E_LOCAL_THREAD_UNVERIFIED".into());}
+                return Ok(thread.into());
+            },
+            Err(_)=>return Err("E_LOCAL_THREAD_UNVERIFIED".into()),
+        }
+        if std::time::Instant::now()>=until{return Err("E_LOCAL_THREAD_UNVERIFIED".into());}
+        work.wait_open(std::time::Duration::from_millis(50))?;
+    }
+}
+
+fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&LifecycleContext<'_>,op:&mut crate::controller::CodexOperation<'_>)->Result<(),String>{
+    let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;let tools=work.tools()?;
+    let executable=tools.codex.as_ref().ok_or("E_LOCAL_CODEX_MISSING")?;executable.recheck()?;
+    let home=std::path::PathBuf::from(format!("/private/tmp/aperture-codex-{}",expected.name));
+    crate::controller::private_dir_readonly(&home).map_err(|_|"E_LOCAL_CODEX_HOME_REQUIRED: existing configured private per-agent home required")?;
+    let (bus,sentry,project,session)={let s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;(s.mcp_server_path.clone(),s.mcp_sentry_server_path.clone(),s.project_dir.clone(),s.tmux_session.clone())};
+    let bus_pin=local_pinned_bytes(std::path::Path::new(&bus),8*1024*1024)?.1;
+    let sentry_pin=local_pinned_bytes(std::path::Path::new(&sentry),8*1024*1024)?.1;
+    let plan=LocalCodexPreparation{context,state,expected,codex_home:home.clone(),bus,sentry,project,bus_pin,sentry_pin,#[cfg(test)]drift_point:None};
+    plan.configuration()?; // input shape/modes before registry or durable intent
+    let registry=crate::daemon_registry::Registry::open(context.lease)?;
+    if registry.codex_snapshot(&expected.name)?.is_none() {
+        match fs::symlink_metadata(context.lease.run_dir()?.join(format!("{}.thread-id",expected.name))) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            _=>return Err("E_LOCAL_THREAD_HISTORY_UNVERIFIED".into()),
+        }
+    }
+    let spec=crate::codex_appserver::NativeCodexSpec{seat:expected.name.clone(),executable:executable.path.clone(),codex_home:home.clone(),provenance:crate::daemon_registry::Provenance::LegacyUnknown,
+        #[cfg(test)]fixture:None,#[cfg(test)]fault:None};
+    let supervisor=crate::codex_appserver::NativeCodexSupervisor::new(context.lease,&registry,spec)?;
+    supervisor.prepared_local(op,&plan)?; // adoption skips prepare entirely
+    plan.recheck()?;
+    // Do not duplicate a live attached window or rewrite adopted configuration.
+    let windows=tmux::list_windows_local(&session,work)?;
+    let window=if let Some(existing)=find_running_window(&windows,&expected.name){existing.window_id.clone()}else{
+        let thread_path=context.lease.run_dir()?.join(format!("{}.thread-id",expected.name));
+        let thread=wait_local_thread(&thread_path,work)?;
+        supervisor.recheck_held(op)?;
+        let window=tmux::create_window_local(&session,&expected.name,work)?;
+        let socket=context.lease.run_dir()?.join(format!("{}.sock",expected.name));
+        let command=format!("/usr/bin/env -i HOME={} CODEX_HOME={} TERM=xterm-256color {} resume {} --remote {}",shell_quote(&context.home.to_string_lossy()),shell_quote(&home.to_string_lossy()),shell_quote(&executable.path.to_string_lossy()),shell_quote(&thread),shell_quote(&format!("unix://{}",socket.display())));
+        executable.recheck()?;work.check_open()?;tmux::send_local(&window,&command,work)?;window
+    };
+    verify_plan(state,expected)?;
+    let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;let agent=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
+    agent.tmux_window_id=Some(window);agent.status="running".into();Ok(())
+}
+
+#[cfg(test)]
+pub(crate) struct LifecyclePause {
+    pub arrived: std::sync::mpsc::SyncSender<()>,
+    pub resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+#[cfg(test)]
+pub(crate) struct LifecycleFixture {
+    pub spec: Option<crate::codex_appserver::NativeCodexSpec>,
+    pub preparation_file: std::path::PathBuf,
+    pub fail_preparation: bool,
+    pub preparation_count: std::sync::atomic::AtomicUsize,
+    pub effects: Mutex<Vec<&'static str>>,
+    pub pause: Option<LifecyclePause>,
+}
+#[cfg(test)]
+pub(crate) struct PreparedCaller<'a> {
+    pub state: &'a Arc<Mutex<AppState>>,
+    pub expected: &'a AgentDef,
+    pub fixture: &'a LifecycleFixture,
+}
+#[cfg(test)]
+impl PreparedCaller<'_> {
+    pub(crate) fn recheck(&self) -> Result<(), String> { verify_plan(self.state, self.expected) }
+    pub(crate) fn prepare(&self) -> Result<(), String> {
+        self.recheck()?;
+        self.fixture.preparation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.fixture.effects.lock().unwrap().push("prepare");
+        fs::write(&self.fixture.preparation_file, b"owned synthetic preparation").map_err(|_| "E_FIXTURE_PREPARE")?;
+        if self.fixture.fail_preparation { Err("E_FIXTURE_PREPARE".into()) } else { Ok(()) }
+    }
+}
+
 /// One assignee's resolved current-work summary (aperture-nr65b).
 struct CurrentTask {
     id: String,
@@ -64,33 +392,12 @@ struct CurrentTask {
 /// outcome). `Some(map)` with an assignee absent from the map means idle;
 /// `None` means suppress the summary line entirely, same as before this
 /// feature shipped.
-fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
-    let output = Command::new("bd")
-        .args(["list", "--status=in_progress", "--json", "--no-pager", "--limit", "0"])
-        .env(
-            "PATH",
-            format!(
-                "/opt/homebrew/bin:/usr/local/bin:{}",
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            eprintln!(
-                "[aperture] warn: `bd list --status=in_progress` exited non-zero ({}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return None;
-        }
-        Err(e) => {
-            eprintln!("[aperture] warn: failed to spawn `bd` for current-task resolution: {}", e);
-            return None;
-        }
-    };
+fn resolve_current_tasks(work: Option<&crate::daemons::RuntimeWork>) -> Option<HashMap<String, CurrentTask>> {
+    let work=work?;
+    let tools=work.tools().ok()?;
+    let input=work.client(&tools.bd,vec!["list".into(),"--status=in_progress".into(),"--json".into(),"--no-pager".into(),"--limit".into(),"512".into()]).ok()?;
+    let output=crate::daemons::run_client(work,input,std::time::Duration::from_secs(3),1024*1024,64*1024).ok()?;
+    if !output.accepted {return None;}
 
     let issues: Vec<serde_json::Value> = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
@@ -131,8 +438,21 @@ fn resolve_current_tasks() -> Option<HashMap<String, CurrentTask>> {
 }
 
 #[tauri::command]
-pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
+    start_agent_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)
+}
+
+pub(crate) fn start_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Start, |expected, op| {
+        verify_plan(state, expected)?;
+        start_agent_held(name.clone(), state, context, op)
+    })
+}
+fn start_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     // Extract all needed data while holding the lock briefly, then release it
     // before doing any expensive I/O (subprocess calls, file writes). This
     // prevents the global state mutex from blocking list_agents polling and
@@ -158,7 +478,8 @@ pub fn start_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) 
         )
     }; // ← mutex released here; all I/O below is lock-free
 
-    let window_id = boot_agent_process(
+    let window_id = boot_agent_process_held(
+        context, op,
         &agent,
         tmux_session,
         mcp_server_path,
@@ -194,13 +515,106 @@ pub fn boot_agent_process(
     project_dir: String,
 ) -> Result<String, String> {
     require_legacy_lifecycle(&agent.name)?;
+    if agent.model.starts_with("codex/") { return Err(LifecycleRefusal::InputsUnverified.code().into()); }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("home unavailable")?;
+    let lease = crate::controller::ControllerLock::acquire(&home)?;
+    let context = LifecycleContext::new(&lease)?;
+    let slot = lease.codex_slot(&agent.name)?;
+    let mut op = slot.enter()?;
+    boot_agent_process_held(&context, &mut op, agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir)
+}
+struct LocalClaudeStaging {root:std::path::PathBuf, directory:fs::File, identity:(u64,u64,u32,u32), written:std::cell::RefCell<Vec<(String,LocalInputPin)>>}
+impl LocalClaudeStaging {
+    fn prepare(context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>,seat:&str)->Result<Self,String>{
+        use std::os::unix::fs::MetadataExt;
+        context.classify(seat)?;op.verify_for(context.lease)?;
+        if op.seat()!=seat{return Err("E_LIFECYCLE_CONTEXT_MISMATCH".into());}
+        use std::os::{fd::{AsRawFd,FromRawFd},unix::fs::OpenOptionsExt};
+        fn child(parent:&fs::File,name:&str)->Result<fs::File,String>{
+            let name=std::ffi::CString::new(name).map_err(|_|"E_LOCAL_STAGING")?;
+            let flags=libc::O_RDONLY|libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC;
+            let mut fd=unsafe{libc::openat(parent.as_raw_fd(),name.as_ptr(),flags)};
+            if fd<0 && std::io::Error::last_os_error().raw_os_error()==Some(libc::ENOENT){
+                if unsafe{libc::mkdirat(parent.as_raw_fd(),name.as_ptr(),0o700)}!=0{return Err("E_LOCAL_STAGING".into());}
+                fd=unsafe{libc::openat(parent.as_raw_fd(),name.as_ptr(),flags)};
+            }
+            if fd<0{return Err("E_LOCAL_STAGING".into());}let f=unsafe{fs::File::from_raw_fd(fd)};
+            let m=f.metadata().map_err(|_|"E_LOCAL_STAGING")?;
+            if !m.is_dir()||m.uid()!=unsafe{libc::geteuid()}||m.mode()&0o7777!=0o700{return Err("E_LOCAL_STAGING".into());}Ok(f)
+        }
+        let run=context.lease.run_dir()?;
+        let run_fd=fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC).open(&run).map_err(|_|"E_LOCAL_STAGING")?;
+        let parent=child(&run_fd,"launch")?;let directory=child(&parent,seat)?;
+        let root=run.join("launch").join(seat);let m=directory.metadata().map_err(|_|"E_LOCAL_STAGING")?;
+        let out=Self{root,directory,identity:(m.dev(),m.ino(),m.uid(),m.mode()),written:Default::default()};
+        out.recheck_empty(context,op)?;Ok(out)
+    }
+    fn recheck(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        use std::os::unix::fs::MetadataExt;
+        context.classify(op.seat())?;op.verify_for(context.lease)?;
+        crate::controller::private_dir_readonly(&self.root)?;
+        for m in [self.directory.metadata().map_err(|_|"E_LOCAL_STAGING")?,fs::symlink_metadata(&self.root).map_err(|_|"E_LOCAL_STAGING")?]{
+            if (m.dev(),m.ino(),m.uid(),m.mode())!=self.identity{return Err("E_LOCAL_STAGING_DRIFT".into());}
+        }Ok(())
+    }
+    fn recheck_empty(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        self.recheck(context,op)?;
+        for name in ["mcp.json","prompt.md","launch.sh"]{match fs::symlink_metadata(self.root.join(name)){
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},_=>return Err("E_LOCAL_STAGING_EXISTS".into())
+        }}Ok(())
+    }
+    fn write_new(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>,name:&str,bytes:&[u8],mode:u32)->Result<(),String>{
+        use std::os::fd::{AsRawFd,FromRawFd};use std::io::Write;
+        if !matches!((name,mode),("mcp.json",0o600)|("prompt.md",0o600)|("launch.sh",0o700)){return Err("E_LOCAL_STAGING".into());}
+        self.recheck(context,op)?;let leaf=std::ffi::CString::new(name).map_err(|_|"E_LOCAL_STAGING")?;
+        let fd=unsafe{libc::openat(self.directory.as_raw_fd(),leaf.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC,mode)};
+        if fd<0{return Err("E_LOCAL_STAGING_EXISTS".into());}let mut f=unsafe{fs::File::from_raw_fd(fd)};
+        let initial=LocalInputPin::of(&f.metadata().map_err(|_|"E_LOCAL_STAGING")?);
+        if initial.uid!=unsafe{libc::geteuid()} || initial.nlink!=1 || initial.mode&0o7777!=mode || initial.mode&libc::S_IFMT as u32!=libc::S_IFREG as u32{return Err("E_LOCAL_STAGING".into());}
+        f.write_all(bytes).and_then(|_|f.sync_all()).map_err(|_|"E_LOCAL_STAGING")?;
+        let pin=LocalInputPin::of(&f.metadata().map_err(|_|"E_LOCAL_STAGING")?);pin.recheck(&self.root.join(name))?;
+        self.recheck(context,op)?;self.written.borrow_mut().push((name.into(),pin));Ok(())
+    }
+    fn recheck_written(&self,context:&LifecycleContext<'_>,op:&crate::controller::CodexOperation<'_>)->Result<(),String>{
+        self.recheck(context,op)?;
+        if self.written.borrow().len()!=3{return Err("E_LOCAL_STAGING_INCOMPLETE".into());}
+        for (name,pin) in self.written.borrow().iter(){pin.recheck(&self.root.join(name))?;}Ok(())
+    }
+}
+fn boot_agent_process_held(
+    context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>,
+    agent: &AgentDef, tmux_session: String, mcp_server_path: String,
+    mcp_sentry_server_path: String, project_dir: String,
+) -> Result<String, String> {
+    context.classify(&agent.name)?;
+    if op.seat() != agent.name { return Err(LifecycleRefusal::ContextMismatch.code().into()); }
+    op.verify_for(context.lease)?;
+    if agent.model.starts_with("codex/") || context.has_codex_history(&agent.name)? {
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    #[cfg(test)] if let Some(f) = context.fixture {
+        f.effects.lock().unwrap().push("legacy-boot");
+        return Ok("fixture-pane".into());
+    }
+    context.require_tools()?;
     let name = agent.name.clone();
 
     // Create a dedicated tmux window for this agent
-    let window_id = tmux::tmux_create_window(tmux_session, name.clone())?;
-    // From this point onward every failure must remove the already-created
-    // window. Otherwise the watchdog sees a half-booted agent and respawns it
-    // repeatedly, leaving orphan panes behind.
+    let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;
+    let tools=work.tools()?;
+    let claude=tools.claude.as_ref().ok_or("E_LOCAL_CLAUDE_MISSING")?;claude.recheck()?;
+    // Launch exclusion is not UI liveness: a retained shell also owns this
+    // exact seat name. Never recreate/reuse it after an uncertain attempt.
+    if tmux::list_windows_local(&tmux_session,work)?.iter().any(|window|window.name==name){
+        return Err("E_LOCAL_PANE_ALREADY_PRESENT".into());
+    }
+    let staging=LocalClaudeStaging::prepare(context,op,&name)?;
+    let bus_pin=local_pinned_bytes(std::path::Path::new(&mcp_server_path),8*1024*1024)?.1;
+    let sentry_pin=local_pinned_bytes(std::path::Path::new(&mcp_sentry_server_path),8*1024*1024)?.1;
+    let window_id = tmux::create_window_local(&tmux_session,&name,work)?;
+    // Every subsequent failure retains the pane; the next Start consults the
+    // real window list above, including shells. External removal/rename is not
+    // durable reconciliation and is deliberately outside this bounded guard.
     let boot_result = (|| -> Result<String, String> {
 
     // Ensure agent's mailbox directory exists
@@ -223,19 +637,24 @@ pub fn boot_agent_process(
     // byte-identical to the historical inline templates. The env reads live
     // here (side-effecting layer); the pure builders in launcher.rs only see
     // plain values.
-    let claude_bin = std::env::var("APERTURE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let claude_bin = claude.path.to_string_lossy().into_owned();
     let pane_codex_bin = std::env::var("APERTURE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let launcher_path_prefix = std::env::var("APERTURE_LAUNCHER_PATH_PREFIX").ok();
-    let hub_token_path = hub_auth::provision_token(&name)?;
+    staging.recheck_empty(context,op)?;
+    bus_pin.recheck(std::path::Path::new(&mcp_server_path))?;
+    sentry_pin.recheck(std::path::Path::new(&mcp_sentry_server_path))?;
+    let hub_token_path = hub_auth::provision_under_lease(context.lease,&name)?;
     let hub_token_path = hub_token_path.to_string_lossy().into_owned();
 
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "aperture-bus": {
                 "type": "stdio",
-                "command": "node",
+                "command": tools.node.path,
                 "args": [&mcp_server_path],
                 "env": {
+                    "PATH": tools.environment().into_iter().find(|(k,_)|k=="PATH").map(|(_,v)|v).unwrap_or_default(),
+                    "HOME": &home_dir,
                     "AGENT_NAME": &name,
                     "AGENT_ROLE": &agent.role,
                     "AGENT_MODEL": &agent.model,
@@ -253,7 +672,7 @@ pub fn boot_agent_process(
             // and other tools (aperture-bus, mempalace) still work.
             "sentry": {
                 "type": "stdio",
-                "command": "node",
+                "command": tools.node.path,
                 "args": [&mcp_sentry_server_path],
                 "env": {
                     "AGENT_NAME": &name,
@@ -275,7 +694,7 @@ pub fn boot_agent_process(
         }
     });
 
-    let launcher_path = format!("/tmp/aperture-launch-{}.sh", name);
+    let launcher_path = staging.root.join("launch.sh").to_string_lossy().into_owned();
     let launcher_script = if agent.model.starts_with("codex/") {
         let bare_model = agent.model.trim_start_matches("codex/");
         let codex_home = format!("/tmp/aperture-codex-{}", name);
@@ -387,12 +806,8 @@ pub fn boot_agent_process(
             &sock_path,
         )
     } else {
-        let config_path = format!("/tmp/aperture-mcp-{}.json", name);
-        fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&mcp_config).unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
+        let config_path = staging.root.join("mcp.json").to_string_lossy().into_owned();
+        staging.write_new(context,op,"mcp.json",serde_json::to_string_pretty(&mcp_config).map_err(|_|"E_LOCAL_MCP_CONFIG")?.as_bytes(),0o600)?;
 
         // Read prompt and inject agent-specific skills. Resident/lazy split
         // parity with the Codex path (aperture-g4hku): when resident.txt
@@ -403,28 +818,22 @@ pub fn boot_agent_process(
         let prompt_content = fs::read_to_string(&agent.prompt_file)
             .map_err(|e| format!("Failed to read prompt file '{}': {}", agent.prompt_file, e))?;
         let prompt_content = inject_skills(prompt_content, &name);
-        let prompt_path = format!("/tmp/aperture-prompt-{}.md", name);
-        fs::write(&prompt_path, &prompt_content).map_err(|e| e.to_string())?;
+        let prompt_path = staging.root.join("prompt.md").to_string_lossy().into_owned();
+        staging.write_new(context,op,"prompt.md",prompt_content.as_bytes(),0o600)?;
 
-        launcher::build_claude_launcher(
-            &claude_bin,
-            launcher_path_prefix.as_deref(),
-            &project_dir,
-            &prompt_path,
-            &agent.model,
-            &config_path,
-            &name,
-            true, // fresh_session — resume support arrives with aperture-syepg
-        )
+        let mut env=tools.environment();
+        env.push(("APERTURE_HUB_TOKEN_FILE".into(),hub_token_path.clone()));
+        env.push(("APERTURE_PROJECT_DIR".into(),project_dir.clone()));
+        let assignments=env.iter().map(|(k,v)|shell_quote(&format!("{k}={v}"))).collect::<Vec<_>>().join(" ");
+        format!("#!/bin/sh\nset -eu\ncd {}\nPROMPT=$(/bin/cat {})\nexec /usr/bin/env -i {} {} --dangerously-skip-permissions --model {} --system-prompt \"$PROMPT\" --mcp-config {} --name {} {}\n",
+            shell_quote(&project_dir),shell_quote(&prompt_path),assignments,shell_quote(&claude_bin),shell_quote(&agent.model),shell_quote(&config_path),shell_quote(&name),shell_quote(launcher::KICKOFF_TEXT))
     };
-    fs::write(&launcher_path, &launcher_script).map_err(|e| e.to_string())?;
-
-    std::process::Command::new("chmod")
-        .args(["+x", &launcher_path])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    tmux::tmux_send_keys(window_id.clone(), launcher_path)?;
+    staging.write_new(context,op,"launch.sh",launcher_script.as_bytes(),0o700)?;
+    staging.recheck_written(context,op)?;
+    bus_pin.recheck(std::path::Path::new(&mcp_server_path))?;
+    sentry_pin.recheck(std::path::Path::new(&mcp_sentry_server_path))?;
+    claude.recheck()?;work.check_open()?;
+    tmux::send_local(&window_id,&shell_quote(&launcher_path),work)?;
 
     // aperture-syepg: record the kickoff-fired timestamp for Claude — the
     // kickoff positional is baked into the launcher we just fired, so this
@@ -450,39 +859,17 @@ pub fn boot_agent_process(
     // codex-bridge via the app-server socket. (Historical: the pre-v2
     // codex_harness pane-scraping monitor was deleted in Phase 3.)
 
-    // Auto-confirm the workspace trust prompt — but ONLY when the dialog is
-    // actually visible. Sending Enter blindly at fixed intervals would stomp
-    // on whatever the user is typing in the terminal (the agent window is
-    // focused right after creation). Instead, poll pane content every 500ms
-    // and send Enter exactly once when the trust prompt appears.
-    let window_id_clone = window_id.clone();
-    std::thread::spawn(move || {
-        // Max 30 polls × 500ms = 15 seconds total timeout
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Ok(content) = tmux::tmux_capture_pane(&window_id_clone) {
-                // Match the actual Claude workspace trust dialog text
-                if content.contains("Do you trust the files")
-                    || content.contains("Trust workspace")
-                    || content.contains("trust the files in")
-                {
-                    let _ = tmux::tmux_send_keys(window_id_clone.clone(), "".into());
-                    break; // sent exactly once — done
-                }
-                // Claude is already past the trust step — stop polling
-                if content.contains("> ") || content.contains("claude>") || content.contains("✓") {
-                    break;
-                }
-            }
-        }
-    });
+    // D: no detached capture/Enter worker. Trust approval is not automatic
+    // lifecycle authority; it requires separately approved operator interaction.
 
     Ok(window_id.clone())
     })();
 
     if boot_result.is_err() {
-        let _ = tmux::tmux_kill_window(window_id);
-        codex_appserver::stop_app_server(&name);
+        // Partial native launch is Unknown. Never destroy the pane/descendants
+        // to manufacture rollback or permit an automatic second attempt.
+        eprintln!("[aperture] partial local launch; retained pane {}",window_id);
+        // Codex never entered this legacy attempt; no daemon rollback authority.
     }
 
     boot_result
@@ -494,7 +881,8 @@ pub fn boot_agent_process(
 /// kickoff file, and clear the watchdog's in-memory state — see the comments
 /// inline. Does NOT touch AppState; callers write `status`/`tmux_window_id`
 /// themselves under a fresh lock.
-fn teardown_agent(name: &str, window_id: Option<String>) {
+fn teardown_agent(name: &str, window_id: Option<String>, context: &LifecycleContext<'_>) {
+    #[cfg(test)] if let Some(f) = context.fixture { f.effects.lock().unwrap().push("legacy-teardown"); return; }
     if let Some(window_id) = window_id {
         let _ = tmux::tmux_send_keys(window_id.clone(), "C-c".into());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -505,7 +893,7 @@ fn teardown_agent(name: &str, window_id: Option<String>) {
 
     // Comms Layer v2, Phase 2: kill this agent's supervised codex app-server
     // (no-op for Claude agents, which never register one).
-    codex_appserver::stop_app_server(name);
+    // Codex teardown was denied at ingress. Do not infer daemon stop from a void call.
 
     // aperture-wul6m: clear watchdog eligibility for a DELIBERATE stop so it is
     // never fought. Removing the kickoff file drops the agent below the
@@ -520,8 +908,21 @@ fn teardown_agent(name: &str, window_id: Option<String>) {
 }
 
 #[tauri::command]
-pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
+    stop_agent_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)
+}
+
+pub(crate) fn stop_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Stop, |expected, op| {
+        verify_plan(state, expected)?;
+        stop_agent_held(name.clone(), state, context, op)
+    })
+}
+fn stop_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     // Extract needed data and release the lock before the blocking sleep calls
     let (window_id_opt, is_running) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
@@ -537,7 +938,8 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
         return Err(format!("Agent '{}' is not running", name));
     }
 
-    teardown_agent(&name, window_id_opt);
+    context.require_tools()?;
+    teardown_agent(&name, window_id_opt, context);
 
     // Re-acquire to update status
     {
@@ -567,8 +969,22 @@ pub fn stop_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -
 /// every blocking step (tmux probe, teardown sleeps, boot), re-lock only to
 /// write the outcome.
 #[tauri::command]
-pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
+    restart_agent_shared(name.clone(), state.inner(), &work.lifecycle(&name)?)
+}
+
+pub(crate) fn restart_agent_shared(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Restart, |expected, op| {
+        verify_plan(state, expected)?;
+        restart_agent_held(name.clone(), state, context, op)
+    })
+}
+fn restart_agent_held(name: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>, op: &mut crate::controller::CodexOperation<'_>) -> Result<(), String> {
+    context.classify(&name)?;
+    context.require_tools()?;
     let (agent, tmux_session, mcp_server_path, mcp_sentry_server_path, project_dir) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         let agent = app_state
@@ -593,10 +1009,10 @@ pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>
     };
 
     if live_window.is_some() {
-        teardown_agent(&name, live_window);
+        teardown_agent(&name, live_window, context);
     } else {
         eprintln!("[aperture] restart_agent: '{}' is not running — skipping stop, booting fresh", name);
-        teardown_agent(&name, None);
+        teardown_agent(&name, None, context);
     }
 
     // Reflect the stopped state before the (possibly failing) boot so a boot
@@ -609,7 +1025,8 @@ pub fn restart_agent(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>
         }
     }
 
-    let window_id = boot_agent_process(
+    let window_id = boot_agent_process_held(
+        context, op,
         &agent,
         tmux_session,
         mcp_server_path,
@@ -675,7 +1092,20 @@ fn merge_fresh_registry(
 }
 
 #[tauri::command]
-pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<AgentDef>, String> {
+pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<Vec<AgentDef>, String> {
+    let work = runtime.admit(None)?;
+    let _body = work.body()?;
+    work.require_tools()?;
+    list_agents_local(state.inner(), &work)
+}
+
+pub(crate) fn list_agents_shared(state: &Arc<Mutex<AppState>>) -> Result<Vec<AgentDef>, String> {
+    list_agents_impl(state,None)
+}
+pub(crate) fn list_agents_local(state:&Arc<Mutex<AppState>>,work:&crate::daemons::RuntimeWork)->Result<Vec<AgentDef>,String>{
+    work.require_tools()?;list_agents_impl(state,Some(work))
+}
+fn list_agents_impl(state:&Arc<Mutex<AppState>>,work:Option<&crate::daemons::RuntimeWork>)->Result<Vec<AgentDef>,String>{
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
 
     // V4 P0: the filesystem registry is authoritative and activation/archive
@@ -689,7 +1119,7 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
     app_state.agents = merge_fresh_registry(fresh, &app_state.agents, &overrides);
 
     // Cross-reference with actual tmux windows to detect agents started outside the UI
-    if let Ok(windows) = tmux::tmux_list_windows(app_state.tmux_session.clone()) {
+    if let Some(Ok(windows)) = work.map(|w| tmux::list_windows_local(&app_state.tmux_session,w)) {
         for agent in app_state.agents.values_mut() {
             let running_window = find_running_window(&windows, &agent.name);
 
@@ -714,7 +1144,7 @@ pub fn list_agents(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
     // common state that must render as "idle," not as missing data). The
     // sentinel for idle is current_task_id = Some("") with no title — see
     // the doc comment on AgentDef::current_task_id in state.rs.
-    let current_tasks = resolve_current_tasks();
+    let current_tasks = resolve_current_tasks(work);
     for agent in app_state.agents.values_mut() {
         if agent.status != "running" {
             agent.current_task_id = None;
@@ -782,11 +1212,15 @@ pub fn light_attention(agent: &mut AgentDef, reason: AttentionReason) {
 }
 
 #[tauri::command]
-pub fn clear_attention(
-    name: String,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+pub fn clear_attention(name: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(None)?;
+    let _body = work.body()?;
+    clear_attention_shared(name, state.inner(), &work)
+}
+
+pub(crate) fn clear_attention_shared(name: String, state: &Arc<Mutex<AppState>>, work: &crate::daemons::RuntimeWork) -> Result<(), String> {
     let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    work.check_open()?;
     if let Some(agent) = app_state.agents.get_mut(&name) {
         agent.attention = false;
         agent.attention_reason = None;
@@ -809,12 +1243,25 @@ pub fn is_valid_model(model: &str) -> bool {
 }
 
 #[tauri::command]
-pub fn update_agent_model(
-    name: String,
-    model: String,
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+pub fn update_agent_model(name: String, model: String, state: tauri::State<'_, Arc<Mutex<AppState>>>, runtime: tauri::State<'_, Arc<crate::daemons::RuntimeOwner>>) -> Result<(), String> {
+    let work = runtime.admit(Some(&name))?;
+    let _body = work.body()?;
     require_legacy_lifecycle(&name)?;
+    update_agent_model_shared(name.clone(), model, state.inner(), &work.lifecycle(&name)?)
+}
+
+pub(crate) fn update_agent_model_shared(name: String, model: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    context.classify(&name)?;
+    if !is_valid_model(&model) {
+        return Err(format!("Invalid model '{}'. Must be one of {} or codex/<model>", model, CLAUDE_MODEL_ALIASES.join("/")));
+    }
+    with_lifecycle_plan(&name, state, context, LifecycleAction::Model(model.clone()), |expected, _op| {
+        verify_plan(state, expected)?;
+        update_agent_model_held(name.clone(), model.clone(), state, context)
+    })
+}
+fn update_agent_model_held(name: String, model: String, state: &Arc<Mutex<AppState>>, context: &LifecycleContext<'_>) -> Result<(), String> {
+    context.classify(&name)?;
     if !is_valid_model(&model) {
         return Err(format!(
             "Invalid model '{}'. Must be one of {} or codex/<model>",
@@ -829,6 +1276,14 @@ pub fn update_agent_model(
         .get_mut(&name)
         .ok_or(format!("Agent '{}' not found", name))?;
 
+    if agent.model.starts_with("codex/") || model.starts_with("codex/") {
+        return Err(LifecycleRefusal::InputsUnverified.code().into());
+    }
+    #[cfg(test)] if let Some(f) = context.fixture {
+        f.effects.lock().unwrap().push("legacy-model");
+        return Ok(());
+    }
+    context.check_open()?;
     agent.model = model.clone();
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -1496,3 +1951,7 @@ mod tests {
 #[cfg(test)]
 #[path = "agents_team_tests.rs"]
 mod team_lifecycle_guard_tests;
+
+#[cfg(test)]
+#[path = "agents_lifecycle_tests.rs"]
+pub(crate) mod lifecycle_tests;

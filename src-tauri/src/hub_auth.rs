@@ -101,6 +101,12 @@ pub fn provision_token(name: &str) -> Result<PathBuf, String> {
     provision_token_in(&token_dir(), name)
 }
 
+/// New-start provisioning only. Caller must not rotate on adoption/readback.
+pub(crate) fn provision_under_lease(lease:&crate::controller::ControllerLock,name:&str)->Result<PathBuf,String>{
+    lease.verify_live()?;
+    provision_token_in(&lease.run_dir()?.join("hub-tokens"),name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

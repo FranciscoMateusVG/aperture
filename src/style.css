@@ -816,3 +816,18 @@ html, body {
   opacity: 0.5;
   cursor: default;
 }
+
+/* Fixed palette classes instead of CSP-forbidden inline styles. */
+.agent-theme--glados { --agent-color: #9b59b6; }
+.agent-theme--wheatley { --agent-color: #3498db; }
+.agent-theme--peppy { --agent-color: #1abc9c; }
+.agent-theme--izzy { --agent-color: #e91e63; }
+.agent-theme--vance { --agent-color: #ff6b9d; }
+.agent-theme--rex { --agent-color: #e74c3c; }
+.agent-theme--scout { --agent-color: #27ae60; }
+.agent-theme--cipher { --agent-color: #7f8c8d; }
+.agent-theme--sage { --agent-color: #17a589; }
+.agent-theme--atlas { --agent-color: #8e44ad; }
+.agent-theme--sterling { --agent-color: #d4af37; }
+.agent-theme--default { --agent-color: #f39c12; }
+ .web-session { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; font-size: .75rem; }
