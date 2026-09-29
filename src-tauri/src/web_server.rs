@@ -406,7 +406,7 @@ fn execute(
         }
         Command::Archive => teams::inspect_archive(&engine, &decode(value)?).and_then(serialize),
         Command::Open => {
-            crate::team_terminal::open_shared(&s.home, decode(value)?).and_then(serialize)
+            crate::team_terminal::open_shared(&s.home, decode(value)?, work).and_then(serialize)
         }
     }
 }

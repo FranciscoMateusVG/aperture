@@ -33,6 +33,13 @@ impl ToolPin {
         }
         Ok(Self { path:path.to_path_buf(),dev:m.dev(),ino:m.ino(),uid:m.uid(),mode:m.mode(),len:m.len(),modified:(m.mtime(),m.mtime_nsec()),changed:(m.ctime(),m.ctime_nsec()) })
     }
+    pub(crate) fn fingerprint(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        self.recheck()?;
+        let bytes = serde_json::to_vec(&(&self.path, self.dev, self.ino, self.uid, self.mode,
+            self.len, self.modified, self.changed)).map_err(|_| "E_LOCAL_TOOL_PIN")?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
     pub(crate) fn recheck(&self) -> Result<(), String> {
         if &Self::capture(&self.path)?!=self { return Err("E_LOCAL_TOOL_CHANGED".into()); }
         Ok(())

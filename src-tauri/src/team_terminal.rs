@@ -39,6 +39,8 @@ struct Client {
     window: String,
     pid: u32,
     birth: u64,
+    client_path: PathBuf,
+    client_fingerprint: String,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Binding {
@@ -47,8 +49,8 @@ struct Binding {
     socket: PathBuf,
     socket_binding: SocketBinding,
     runtime: PathBuf,
-    executable: PathBuf,
-    executable_id: (u64, u64),
+    client: crate::daemons::ToolPin,
+    client_fingerprint: String,
     pid: u32,
     birth: u64,
 }
@@ -1015,36 +1017,6 @@ fn private_chain(home: &Path, relative: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-fn executable(path: &Path) -> Result<(u64, u64)> {
-    let m = fs::symlink_metadata(path).map_err(|_| ERROR)?;
-    if !m.is_file()
-        || m.file_type().is_symlink()
-        || m.nlink() != 1
-        || ![0, unsafe { libc::geteuid() }].contains(&m.uid())
-        || m.mode() & 0o022 != 0
-        || m.mode() & 0o111 == 0
-    {
-        return Err(ERROR.into());
-    }
-    Ok((m.dev(), m.ino()))
-}
-#[cfg(target_os = "macos")]
-fn process_executable(pid: u32) -> Result<PathBuf> {
-    let mut bytes = vec![0u8; 4096];
-    let n =
-        unsafe { libc::proc_pidpath(pid as i32, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
-    if n <= 0 {
-        return Err(ERROR.into());
-    }
-    let end = bytes.iter().position(|b| *b == 0).ok_or(ERROR)?;
-    Ok(PathBuf::from(
-        std::str::from_utf8(&bytes[..end]).map_err(|_| ERROR)?,
-    ))
-}
-#[cfg(not(target_os = "macos"))]
-fn process_executable(_: u32) -> Result<PathBuf> {
-    Err(ERROR.into())
-}
 fn live(pid: u32, birth: u64) -> Result<()> {
     let expected = team_process::identity_from_owner(pid, birth).map_err(|_| ERROR)?;
     let p = team_process::observe(pid)
@@ -1147,7 +1119,7 @@ fn socket_peer(path: &Path, expected_pid: u32) -> Result<()> {
     }
     Ok(())
 }
-fn binding(home: &Path, input: &OpenSeatInput, store: &OwnerStore) -> Result<Binding> {
+fn binding(home: &Path, input: &OpenSeatInput, store: &OwnerStore, client: &crate::daemons::ToolPin) -> Result<Binding> {
     match teams::classify_managed_seat(home, &input.seat).map_err(|_| ERROR)? {
         Some(ManagedSeatState::Active { team, .. }) if team == input.team => {}
         _ => return Err(ERROR.into()),
@@ -1166,13 +1138,12 @@ fn binding(home: &Path, input: &OpenSeatInput, store: &OwnerStore) -> Result<Bin
     )?;
     let socket = run.join(format!("{}.sock", input.seat));
     let socket_binding = verified_socket(&socket, i.pid)?;
-    let bin = process_executable(i.pid)?;
-    let executable_id = executable(&bin)?;
     live(i.pid, i.start_time)?;
-    // Carry socket/executable pins across parent-to-helper admission as well as
-    // repeated checks within each process. An old owner-only receipt cannot bind
-    // a newly replaced endpoint.
-    let bytes = serde_json::to_vec(&(&r, &socket_binding, &runtime, &bin, executable_id))
+    let client_fingerprint = client.fingerprint().map_err(|_| "E_TERMINAL_CLIENT_CHANGED")?;
+    // Server identity comes from owner + native PID/birth/socket, not its old
+    // executable pathname (a package manager may have unlinked that image).
+    // The separately approved TUI client pin is mandatory in the receipt/hash.
+    let bytes = serde_json::to_vec(&(&r, &socket_binding, &runtime, &client.path, &client_fingerprint))
         .map_err(|_| ERROR)?;
     Ok(Binding {
         hash: format!("{:x}", Sha256::digest(bytes)),
@@ -1180,8 +1151,8 @@ fn binding(home: &Path, input: &OpenSeatInput, store: &OwnerStore) -> Result<Bin
         socket: socket_binding.path.clone(),
         socket_binding,
         runtime,
-        executable: bin,
-        executable_id,
+        client: client.clone(),
+        client_fingerprint,
         pid: i.pid,
         birth: i.start_time,
     })
@@ -1207,17 +1178,20 @@ fn args(xs: &[&str]) -> Vec<String> {
 fn window_id(s: &str) -> bool {
     s.starts_with('@') && s.len() > 1 && s.len() < 24 && s[1..].bytes().all(|b| b.is_ascii_digit())
 }
-fn pane(window: &str) -> Result<(u32, bool)> {
-    if !window_id(window) {
-        return Err(ERROR.into());
-    }
-    let out = tmux(&args(&[
+fn pane_args(window: &str) -> Result<Vec<String>> {
+    if !window_id(window) { return Err(ERROR.into()); }
+    Ok(args(&[
         "list-panes",
         "-t",
         window,
         "-F",
         "#{pane_pid}|#{pane_dead}",
-    ]))?;
+    ]))
+}
+fn pane(window: &str) -> Result<(u32, bool)> {
+    parse_pane(&tmux(&pane_args(window)?)?)
+}
+fn parse_pane(out: &str) -> Result<(u32, bool)> {
     if out.lines().count() != 1 {
         return Err(ERROR.into());
     }
@@ -1238,7 +1212,9 @@ fn client_path(home: &Path, input: &OpenSeatInput) -> PathBuf {
     ))
 }
 fn reusable(c: &Client, b: &Binding, pid: u32, dead: bool) -> bool {
-    c.binding == b.hash && c.pid == pid && !dead && live(c.pid, c.birth).is_ok()
+    c.binding == b.hash && c.client_path == b.client.path
+        && c.client_fingerprint == b.client_fingerprint
+        && c.pid == pid && !dead && live(c.pid, c.birth).is_ok()
 }
 fn tui_args(thread: &str, socket: &Path) -> Vec<String> {
     vec![
@@ -1248,17 +1224,46 @@ fn tui_args(thread: &str, socket: &Path) -> Vec<String> {
         format!("unix://{}", socket.display()),
     ]
 }
-fn boot_helper_adjacent(current_exe: &Path) -> Result<PathBuf> {
+fn boot_helper_adjacent(current_exe: &Path) -> Result<crate::daemons::ToolPin> {
     if !current_exe.is_absolute() { return Err(ERROR.into()); }
     let p = current_exe.parent().ok_or(ERROR)?.join("aperture-boot");
-    executable(&p)?;
-    Ok(p)
+    crate::daemons::ToolPin::capture(&p).map_err(|_| "E_TERMINAL_HELPER_UNAVAILABLE".into())
 }
-fn boot_helper() -> Result<PathBuf> {
-    boot_helper_adjacent(&std::env::current_exe().map_err(|_| ERROR)?)
+struct OpenDispatch<'a> {
+    work: &'a crate::daemons::RuntimeWork,
+    #[cfg(test)] fixture: Option<&'a tests::OpenFixture>,
+}
+impl OpenDispatch<'_> {
+    fn helper(&self) -> Result<crate::daemons::ToolPin> {
+        #[cfg(test)] if let Some(f) = self.fixture { return boot_helper_adjacent(&f.current); }
+        boot_helper_adjacent(&std::env::current_exe().map_err(|_| ERROR)?)
+    }
+    fn tmux(&self, args: &[String]) -> Result<String> {
+        self.work.check_open()?;
+        #[cfg(test)] if let Some(f) = self.fixture { return f.tmux(args); }
+        tmux(args)
+    }
+    fn pane(&self, window: &str) -> Result<(u32, bool)> {
+        parse_pane(&self.tmux(&pane_args(window)?)?)
+    }
+    fn before_dispatch(&self) {
+        #[cfg(test)] if let Some(f) = self.fixture { f.before_dispatch(); }
+    }
+}
+fn receipt_client(c: &Client) -> Result<crate::daemons::ToolPin> {
+    let pin = crate::daemons::ToolPin::capture(&c.client_path)
+        .map_err(|_| "E_TERMINAL_CLIENT_UNAVAILABLE")?;
+    if pin.fingerprint().map_err(|_| "E_TERMINAL_CLIENT_CHANGED")? != c.client_fingerprint {
+        return Err("E_TERMINAL_CLIENT_CHANGED".into());
+    }
+    Ok(pin)
 }
 /// Called only by the GUI's operator command. Selectors are never shell input.
-pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
+pub(crate) fn open(home: &Path, input: OpenSeatInput, work: &crate::daemons::RuntimeWork) -> Result<OpenSeatView> {
+    open_with(home, input, &OpenDispatch { work, #[cfg(test)] fixture: None })
+}
+fn open_with(home: &Path, input: OpenSeatInput, dispatch: &OpenDispatch<'_>) -> Result<OpenSeatView> {
+    dispatch.work.check_open()?;
     selectors(&input)?;
     let _team = owner::try_lock(&home.join(".aperture/run/team-locks"), &input.team)?;
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
@@ -1275,24 +1280,29 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
             &input,
         );
     }
-    let before = binding(home, &input, &store)?;
+    let client = dispatch.work.tools()?.codex.as_ref().ok_or("E_TERMINAL_CLIENT_UNAVAILABLE")?;
+    let before = binding(home, &input, &store, client)?;
     let dir = home.join(".aperture/run/terminals");
     journal::ensure_private_dir(&dir)?;
     let path = client_path(home, &input);
     let old = match fs::symlink_metadata(&path) {
-        Ok(_) => Some(journal::read_private_json::<Client>(&path)?),
+        Ok(_) => Some(journal::read_private_json::<Client>(&path)
+            .map_err(|_| "E_TERMINAL_CLIENT_RECEIPT_REQUIRED")?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Err(ERROR.into()),
     };
     if let Some(c) = old.as_ref() {
+        let recorded_client = receipt_client(c)?;
+        if recorded_client != *client { return Err("E_TERMINAL_CLIENT_CHANGED".into()); }
         // A dead/missing client can be replaced. A live but differently bound
         // client is never silently reused or killed.
-        if let Ok((pid, dead)) = pane(&c.window) {
+        if let Ok((pid, dead)) = dispatch.pane(&c.window) {
             if reusable(c, &before, pid, dead) {
-                if binding(home, &input, &store)? != before {
+                if binding(home, &input, &store, client)? != before {
                     return Err(ERROR.into());
                 }
-                tmux(&args(&["select-window", "-t", &c.window]))?;
+                client.recheck().map_err(|_| "E_TERMINAL_CLIENT_CHANGED")?;
+                dispatch.tmux(&args(&["select-window", "-t", &c.window]))?;
                 return Ok(OpenSeatView {
                     team: input.team,
                     seat: input.seat,
@@ -1307,11 +1317,15 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
             return Err(ERROR.into());
         }
     }
-    let helper = boot_helper()?;
-    if binding(home, &input, &store)? != before {
+    let helper = dispatch.helper()?;
+    if binding(home, &input, &store, client)? != before {
         return Err(ERROR.into());
     }
-    let out = tmux(&vec![
+    dispatch.before_dispatch(); // cfg(test) drift occurs at the real dispatch boundary.
+    dispatch.work.check_open()?;
+    client.recheck().map_err(|_| "E_TERMINAL_CLIENT_CHANGED")?;
+    helper.recheck().map_err(|_| "E_TERMINAL_HELPER_CHANGED")?;
+    let out = dispatch.tmux(&vec![
         "new-window".into(),
         "-d".into(),
         "-t".into(),
@@ -1321,7 +1335,7 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
         "-P".into(),
         "-F".into(),
         "#{window_id}".into(),
-        helper.to_string_lossy().into(),
+        helper.path.to_string_lossy().into(),
         "--attach-managed".into(),
         input.team.clone(),
         input.seat.clone(),
@@ -1329,7 +1343,7 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
         before.hash.clone(),
     ])?;
     let window = out.trim().to_string();
-    let (pid, dead) = pane(&window)?;
+    let (pid, dead) = dispatch.pane(&window)?;
     if dead {
         return Err(ERROR.into());
     }
@@ -1339,6 +1353,8 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
     let birth = team_process::birth_micros(&p.identity).map_err(|_| ERROR)?;
     let c = Client {
         binding: before.hash,
+        client_path: client.path.clone(),
+        client_fingerprint: before.client_fingerprint,
         window: window.clone(),
         pid,
         birth,
@@ -1346,7 +1362,7 @@ pub(crate) fn open(home: &Path, input: OpenSeatInput) -> Result<OpenSeatView> {
     journal::write_private_json_atomic(&path, &c, old.is_some())?;
     // Child is waiting for these locks. It validates this receipt and all native
     // evidence again before exec. No failed path launches a second worker.
-    tmux(&args(&["select-window", "-t", &window]))?;
+    dispatch.tmux(&args(&["select-window", "-t", &window]))?;
     Ok(OpenSeatView {
         team: input.team,
         seat: input.seat,
@@ -1384,11 +1400,11 @@ pub fn attach_existing(
     };
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
     let _seat = store.lock(&input.seat)?;
-    let b = binding(&home, &input, &store)?;
-    if b.hash != expected_hash {
-        return Err(ERROR.into());
-    }
-    let c: Client = journal::read_private_json(&client_path(&home, &input))?;
+    let c: Client = journal::read_private_json(&client_path(&home, &input))
+        .map_err(|_| "E_TERMINAL_CLIENT_RECEIPT_REQUIRED")?;
+    let client = receipt_client(&c)?;
+    let b = binding(&home, &input, &store, &client)?;
+    if b.hash != expected_hash { return Err(ERROR.into()); }
     if c.pid != std::process::id() || c.binding != b.hash {
         return Err(ERROR.into());
     }
@@ -1397,10 +1413,11 @@ pub fn attach_existing(
     if pid != c.pid || dead {
         return Err(ERROR.into());
     }
-    if binding(&home, &input, &store)? != b {
+    if binding(&home, &input, &store, &client)? != b {
         return Err(ERROR.into());
     }
-    let error = Command::new(&b.executable)
+    client.recheck().map_err(|_| "E_TERMINAL_CLIENT_CHANGED")?;
+    let error = Command::new(&client.path)
         .args(tui_args(&b.thread, &b.socket))
         .env("CODEX_HOME", &b.runtime)
         .env_remove("CODEX_THREAD_ID")
@@ -1425,7 +1442,7 @@ pub async fn team_open_seat(
         })?;
     tauri::async_runtime::spawn_blocking(move || {
         let _body = work.body().map_err(|message| teams::TeamError { code: "E_RUNTIME_UNAVAILABLE".into(), message })?;
-        open_shared(&home, input)
+        open_shared(&home, input, &work)
     })
         .await
         .map_err(|_| teams::TeamError {
@@ -1435,8 +1452,8 @@ pub async fn team_open_seat(
 }
 
 /// Mechanical headless seam; native Active/identity checks are unchanged.
-pub(crate) fn open_shared(home: &Path, input: OpenSeatInput) -> std::result::Result<OpenSeatView, teams::TeamError> {
-    open(home, input)
+pub(crate) fn open_shared(home: &Path, input: OpenSeatInput, work: &crate::daemons::RuntimeWork) -> std::result::Result<OpenSeatView, teams::TeamError> {
+    open(home, input, work)
         .map_err(|e| teams::TeamError {
             code: e
                 .split(':')
