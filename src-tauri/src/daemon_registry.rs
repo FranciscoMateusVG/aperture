@@ -796,6 +796,24 @@ impl<'a> Registry<'a> {
         }
         self.verify_read_context()
     }
+    /// Keep the complete incarnation history; only a verified coordinator
+    /// closure can free the canonical slot for a new explicit Start.
+    pub(crate) fn retire_closed_codex(&self,op:&crate::controller::CodexOperation<'_>,
+        before:&CodexSnapshot,closed:&crate::agents::coordinator_lifecycle::Closed)->Result<()> {
+        let _admission=self.lease.registry_admission()?;
+        self.verify_operation(op)?;self.recheck_snapshot(op.seat(),before)?;
+        if before.phase!=CodexPhaseV2::ReadyMetadataOnly{return Err(fail("E_CODEX_OPERATION_UNKNOWN"));}
+        closed.verifies(op.seat(),before.identity.as_ref().ok_or_else(||fail("E_CODEX_METADATA"))?)?;
+        crate::team_terminal::codex_pristine_endpoint(self,op)?;
+        let retired=self.lease.run_dir()?.join("coordinator-retired");
+        journal::ensure_private_dir(&retired)?;
+        if fs::read_dir(&retired).map_err(|_|fail("E_DAEMON_PATH"))?.take(4097).count()>=4096{return Err(fail("E_DAEMON_CAPACITY"));}
+        let slot=Endpoint::CodexAppServer{seat:op.seat().into()}.slot()?;
+        let dest=retired.join(format!("{}-{}",op.seat(),before.incarnation));
+        self.recheck_snapshot(op.seat(),before)?;closed.recheck()?;
+        journal::rename_no_replace(&self.root.join(slot),&dest)?;
+        journal::sync_dir(&self.root)?;journal::sync_dir(&retired)?;closed.recheck()
+    }
     /// Metadata intent only. First C2a writer: one pristine incarnation forever.
     /// No external-effect callback exists; full future operation budget is paid
     /// before this intent, including current and terminal outcome files.

@@ -791,12 +791,12 @@ mod process_table {
 }
 #[cfg(all(target_os = "macos", target_pointer_width = "64", target_endian = "little",
     any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn native_table(deadline: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
+pub(crate) fn native_table(deadline: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
     process_table::read(deadline)
 }
 #[cfg(not(all(target_os = "macos", target_pointer_width = "64", target_endian = "little",
     any(target_arch = "aarch64", target_arch = "x86_64"))))]
-fn native_table(_: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
+pub(crate) fn native_table(_: Instant) -> Result<Vec<ProcessMetadata>, ReplacementError> {
     Err(ReplacementError::StopUnverified)
 }
 

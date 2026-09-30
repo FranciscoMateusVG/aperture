@@ -385,3 +385,37 @@ fn local_claude_staging_denies_existing_leaves_before_effects_and_writes_private
     assert!(staging.write_new(&ctx,&op,"mcp.json",b"overwrite denied",0o600).is_err());
     drop(op);drop(slot);drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
 }
+
+#[test]
+fn coordinator_stop_real_ingress_reaps_only_selected_native_pane() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmux=Path::new("/opt/homebrew/bin/tmux");
+    assert!(tmux.is_file(),"native tmux is required for this macOS regression");
+    let h=Home::new();let label=format!("yvcnp-{}",uuid::Uuid::new_v4());
+    struct Cleanup<'a>(&'a Path,String);
+    impl Drop for Cleanup<'_>{fn drop(&mut self){let _=std::process::Command::new(self.0).args(["-L",&self.1,"kill-server"]).output();}}
+    let _cleanup=Cleanup(tmux,label.clone());
+    let invoke=|args:&[&str]|{
+        let output=std::process::Command::new(tmux).env_clear().env("HOME",&h.0).env("PATH","/usr/bin:/bin")
+            .args(["-L",&label,"-f","/dev/null"]).args(args).output().unwrap();
+        assert!(output.status.success(),"own tmux status {:?}",output.status);output.stdout
+    };
+    invoke(&["new-session","-d","-s","inert","-n","fixture","/bin/sleep 60"]);
+    invoke(&["new-window","-d","-t","inert:","-n","unrelated","/bin/sleep 60"]);
+    let tool=h.0.join("tmux-own-server");
+    fs::write(&tool,format!("#!/bin/sh\nexec '{}' -L '{}' \"$@\"\n",tmux.display(),label)).unwrap();
+    fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();
+    let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),crate::daemons::LocalTools::fixture(&h.0,&tool)).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    let app=state("fixture","opus");
+    let before=local_panes("inert","fixture",&work).unwrap();assert_eq!(before.len(),1);
+    let id=crate::team_process::observe(before[0].pid).unwrap().unwrap().identity;
+    // Deliberately stopped cached status: native facts, not stale UI, govern Stop.
+    stop_agent_shared("fixture".into(),&app,&ctx).unwrap();
+    assert_eq!(crate::team_process::state(&id),crate::team_replacement::ProcessState::Gone);
+    assert!(local_panes("inert","fixture",&work).unwrap().is_empty());
+    let unrelated=local_panes("inert","unrelated",&work).unwrap();assert_eq!(unrelated.len(),1);
+    assert!(crate::team_process::observe(unrelated[0].pid).unwrap().is_some());
+    assert_eq!(app.lock().unwrap().agents["fixture"].status,"stopped");
+    drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
