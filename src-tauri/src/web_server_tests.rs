@@ -1821,11 +1821,13 @@ fn legacy_error_allowlist_is_the_agreed_closed_set() {
     let mut expected = vec![
         "E_CODEX_HOME_UNVERIFIED",
         "E_CODEX_LAUNCH_INPUTS_UNVERIFIED",
+        "E_CODEX_WAIT_UNKNOWN",
         "E_COORDINATOR_SELF_STOP",
         "E_LIFECYCLE_DESCENDANTS_UNVERIFIED",
         "E_LIFECYCLE_OUTCOME_UNKNOWN",
         "E_LIFECYCLE_PROCESS_UNKNOWN",
         "E_LOCAL_PROMPT_UNAVAILABLE",
+        "E_LOCAL_THREAD_UNVERIFIED",
         "E_LOCAL_TOOL_MISSING",
         "E_RUNTIME_SELECTOR",
         "E_TMUX_OUTCOME_UNKNOWN",

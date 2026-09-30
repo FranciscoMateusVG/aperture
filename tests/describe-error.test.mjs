@@ -51,3 +51,8 @@ test("operator copy names the real consequence", () => {
   assert.equal(describeError({ code: "E_LIFECYCLE_OUTCOME_UNKNOWN", message: FIXED }), "lifecycle outcome unknown; inspect before retry (E_LIFECYCLE_OUTCOME_UNKNOWN)");
   assert.equal(describeError({ code: "E_TMUX_OUTCOME_UNKNOWN", message: FIXED }), "tmux outcome unknown; inspect before retry (E_TMUX_OUTCOME_UNKNOWN)");
 });
+
+test("codes added at integration have operator copy", () => {
+  assert.equal(describeError({ code: "E_CODEX_WAIT_UNKNOWN", message: FIXED }), "previous codex process has not been reaped; inspect before retry (E_CODEX_WAIT_UNKNOWN)");
+  assert.equal(describeError({ code: "E_LOCAL_THREAD_UNVERIFIED", message: FIXED }), "retained conversation thread could not be verified (E_LOCAL_THREAD_UNVERIFIED)");
+});
