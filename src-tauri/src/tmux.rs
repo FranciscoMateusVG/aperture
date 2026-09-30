@@ -63,11 +63,31 @@ pub(crate) fn list_windows_local(session:&str,work:&crate::daemons::RuntimeWork)
     Ok(windows)
 }
 fn window_selector(s:&str)->bool{s.len()>1 && s.len()<=16 && s.starts_with('@') && s[1..].bytes().all(|v|v.is_ascii_digit())}
+/// `new-window` argv with a SESSION-ONLY target (`<session>:`). A bare
+/// `<session>` is resolved by tmux as a window target with name-prefix
+/// matching, so any window whose name starts with the session name (e.g.
+/// `aperture-web-backend-g1` in session `aperture`) makes tmux try that
+/// window's index and fail with "index N in use" (aperture-fr859, live
+/// failure 2026-09-29). The trailing colon names the session and lets tmux
+/// allocate the next free index; no `-a`, so existing windows are never
+/// shifted or renumbered.
+pub(crate) fn new_window_args(session:&str,name:&str)->Vec<String>{
+    vec!["new-window".into(),"-t".into(),format!("{session}:"),"-n".into(),name.into(),"-P".into(),"-F".into(),"#{window_id}".into()]
+}
+/// Validate a `new-window -P -F '#{window_id}'` outcome into a window id.
+/// tmux stderr (which carries indices, names and paths) is never reflected.
+pub(crate) fn new_window_result(out:std::process::Output)->Result<String,String>{
+    if !out.status.success(){return Err("E_TMUX_UNVERIFIED".into());}
+    window_id_from_stdout(&out.stdout)
+}
+fn window_id_from_stdout(bytes:&[u8])->Result<String,String>{
+    let window=std::str::from_utf8(bytes).map_err(|_|"E_TMUX_UNVERIFIED")?.trim_end_matches('\n');
+    if !window_selector(window){return Err("E_TMUX_UNVERIFIED".into());}Ok(window.into())
+}
 pub(crate) fn create_window_local(session:&str,name:&str,work:&crate::daemons::RuntimeWork)->Result<String,String>{
     if !crate::daemon_registry::valid_name(session)||!crate::daemon_registry::valid_name(name){return Err("E_RUNTIME_SELECTOR".into());}
-    let bytes=local_output(work,vec!["new-window".into(),"-t".into(),session.into(),"-n".into(),name.into(),"-P".into(),"-F".into(),"#{window_id}".into()])?;
-    let window=std::str::from_utf8(&bytes).map_err(|_|"E_TMUX_UNVERIFIED")?.trim_end_matches('\n');
-    if !window_selector(window){return Err("E_TMUX_UNVERIFIED".into());}Ok(window.into())
+    let bytes=local_output(work,new_window_args(session,name))?;
+    window_id_from_stdout(&bytes)
 }
 pub(crate) fn send_local(window:&str,text:&str,work:&crate::daemons::RuntimeWork)->Result<(),String>{
     if !window_selector(window)||text.len()>65536{return Err("E_RUNTIME_SELECTOR".into());}
@@ -111,26 +131,17 @@ pub fn tmux_list_windows(session_name: String) -> Result<Vec<WindowInfo>, String
 
 #[tauri::command]
 pub fn tmux_create_window(session_name: String, window_name: String) -> Result<String, String> {
-    let output = cmd("tmux")
-        .args([
-            "new-window",
-            "-t",
-            &session_name,
-            "-n",
-            &window_name,
-            "-P",
-            "-F",
-            "#{window_id}",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    if !crate::daemon_registry::valid_name(&session_name) || !crate::daemon_registry::valid_name(&window_name) {
+        return Err("E_RUNTIME_SELECTOR".into());
     }
-
-    let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(window_id)
+    // Same session-only target and stderr-free outcome as create_window_local
+    // (aperture-fr859): the raw tmux message ("index 6 in use", paths) used
+    // to be returned verbatim and surfaced in the UI.
+    let output = cmd("tmux")
+        .args(new_window_args(&session_name, &window_name))
+        .output()
+        .map_err(|_| "E_TMUX_UNVERIFIED".to_string())?;
+    new_window_result(output)
 }
 
 #[tauri::command]
@@ -263,4 +274,137 @@ pub fn tmux_pane_process(window_id: &str) -> Result<PaneProcess, String> {
         return Err("E_STOP_UNVERIFIED".into());
     }
     parse_pane_process(window_id, &out.stdout)
+}
+
+#[cfg(test)]
+mod window_target_tests {
+    use super::*;
+    use std::process::{Command, Output};
+    use std::sync::{Arc, Mutex};
+
+    /// Pure argv contract: a session-only target (`<session>:`) lets tmux pick
+    /// the next free index; a bare `<session>` is resolved as a WINDOW target
+    /// with name-prefix matching and collides with any window whose name
+    /// starts with the session name ("index N in use"). No `-a`: never
+    /// renumber or shift existing windows.
+    #[test]
+    fn new_window_args_use_session_only_target_without_renumbering() {
+        let args = new_window_args("aperture", "glados");
+        assert_eq!(
+            args,
+            vec!["new-window", "-t", "aperture:", "-n", "glados", "-P", "-F", "#{window_id}"]
+        );
+        assert!(!args.iter().any(|a| a == "-a"));
+    }
+
+    #[test]
+    fn new_window_result_never_reflects_tmux_stderr() {
+        let failed = Output {
+            status: exit_status(1),
+            stdout: Vec::new(),
+            stderr: b"create window failed: index 6 in use\n".to_vec(),
+        };
+        let err = new_window_result(failed).unwrap_err();
+        assert_eq!(err, "E_TMUX_UNVERIFIED");
+        assert!(!err.contains("index"));
+    }
+
+    #[test]
+    fn new_window_result_returns_validated_window_id() {
+        let ok = Output { status: exit_status(0), stdout: b"@12\n".to_vec(), stderr: Vec::new() };
+        assert_eq!(new_window_result(ok).unwrap(), "@12");
+        let garbage = Output { status: exit_status(0), stdout: b"12\n".to_vec(), stderr: Vec::new() };
+        assert_eq!(new_window_result(garbage).unwrap_err(), "E_TMUX_UNVERIFIED");
+    }
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        Command::new("sh").arg("-c").arg(format!("exit {code}")).status().unwrap()
+    }
+
+    /// Private tmux server (own `-L` socket, never the shared `aperture`
+    /// daemon). Killed on drop AND by a deadline thread so a hung tmux can
+    /// never outlive the test.
+    struct PrivateTmux {
+        socket: String,
+        killed: Arc<Mutex<bool>>,
+    }
+    impl PrivateTmux {
+        fn start() -> Option<Self> {
+            Command::new("tmux").arg("-V").output().ok().filter(|o| o.status.success())?;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let socket = format!("fr859-{}-{nanos}", std::process::id());
+            let killed = Arc::new(Mutex::new(false));
+            let (deadline_socket, deadline_flag) = (socket.clone(), Arc::clone(&killed));
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                if !*deadline_flag.lock().unwrap() {
+                    let _ = Command::new("tmux").args(["-L", &deadline_socket, "kill-server"]).output();
+                }
+            });
+            Some(Self { socket, killed })
+        }
+        fn run(&self, args: &[&str]) -> Output {
+            Command::new("tmux").arg("-L").arg(&self.socket).args(args).output().expect("spawn tmux")
+        }
+        fn ok(&self, args: &[&str]) -> String {
+            let out = self.run(args);
+            assert!(out.status.success(), "tmux {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        }
+        fn windows(&self) -> Vec<(String, String, String)> {
+            self.ok(&["list-windows", "-t", "aperture", "-F", "#{window_index}||#{window_id}||#{window_name}"])
+                .lines()
+                .map(|l| {
+                    let f: Vec<&str> = l.split("||").collect();
+                    (f[0].into(), f[1].into(), f[2].into())
+                })
+                .collect()
+        }
+    }
+    impl Drop for PrivateTmux {
+        fn drop(&mut self) {
+            *self.killed.lock().unwrap() = true;
+            let _ = self.run(&["kill-server"]);
+        }
+    }
+
+    /// Isolated native regression for the live failure (operator 2026-09-29):
+    /// session `aperture` already had window 6 named `aperture-web-backend-g1`;
+    /// `new-window -t aperture` matched that window by name prefix and died
+    /// with "index 6 in use". The session-only target must allocate a fresh
+    /// index and leave every existing window's index/id/name untouched.
+    #[test]
+    fn new_window_survives_window_named_with_session_prefix() {
+        let Some(t) = PrivateTmux::start() else {
+            eprintln!("skip: tmux not available");
+            return;
+        };
+        t.ok(&["new-session", "-d", "-s", "aperture", "-n", "w0"]);
+        t.ok(&["new-window", "-t", "aperture:", "-n", "aperture-web-backend-g1"]);
+        t.ok(&["select-window", "-t", "aperture:0"]);
+        let before = t.windows();
+        assert_eq!(before.len(), 2);
+
+        // The bare-session form is the bug: it must fail on this layout, so the
+        // test is proven to exercise the collision and not a trivially empty session.
+        let bare = t.run(&["new-window", "-t", "aperture", "-n", "glados", "-P", "-F", "#{window_id}"]);
+        assert!(!bare.status.success(), "bare -t <session> unexpectedly succeeded");
+        assert_eq!(t.windows(), before, "failed bare form must not mutate the session");
+
+        let args = new_window_args("aperture", "glados");
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let window = new_window_result(t.run(&refs)).expect("session-only target creates the window");
+
+        let after = t.windows();
+        assert_eq!(after.len(), before.len() + 1);
+        for row in &before {
+            assert!(after.contains(row), "existing window changed: {row:?}");
+        }
+        let created = after.iter().find(|(_, id, _)| *id == window).expect("new window listed");
+        assert_eq!(created.2, "glados");
+        assert!(!before.iter().any(|(idx, _, _)| *idx == created.0), "new index must be free");
+    }
 }
