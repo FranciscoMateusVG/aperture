@@ -326,7 +326,17 @@ mod window_target_tests {
     /// never outlive the test.
     struct PrivateTmux {
         socket: String,
+        /// Synthetic private HOME so the server never sees the operator's
+        /// real ~/.tmux.conf or state; removed on drop.
+        home: std::path::PathBuf,
         killed: Arc<Mutex<bool>>,
+    }
+    /// Every invocation: `-f /dev/null` (no config file at all) + `-L` private
+    /// socket + synthetic HOME. The shared `aperture` server is never addressed.
+    fn private_tmux(socket: &str, home: &std::path::Path) -> Command {
+        let mut c = Command::new("tmux");
+        c.args(["-f", "/dev/null", "-L", socket]).env("HOME", home).env_remove("TMUX");
+        c
     }
     impl PrivateTmux {
         fn start() -> Option<Self> {
@@ -336,18 +346,23 @@ mod window_target_tests {
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
             let socket = format!("fr859-{}-{nanos}", std::process::id());
+            let home = std::env::temp_dir().join(format!("aperture-{socket}-home"));
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(&home).ok()?;
+            }
             let killed = Arc::new(Mutex::new(false));
-            let (deadline_socket, deadline_flag) = (socket.clone(), Arc::clone(&killed));
+            let (deadline_socket, deadline_home, deadline_flag) = (socket.clone(), home.clone(), Arc::clone(&killed));
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(20));
                 if !*deadline_flag.lock().unwrap() {
-                    let _ = Command::new("tmux").args(["-L", &deadline_socket, "kill-server"]).output();
+                    let _ = private_tmux(&deadline_socket, &deadline_home).arg("kill-server").output();
                 }
             });
-            Some(Self { socket, killed })
+            Some(Self { socket, home, killed })
         }
         fn run(&self, args: &[&str]) -> Output {
-            Command::new("tmux").arg("-L").arg(&self.socket).args(args).output().expect("spawn tmux")
+            private_tmux(&self.socket, &self.home).args(args).output().expect("spawn tmux")
         }
         fn ok(&self, args: &[&str]) -> String {
             let out = self.run(args);
@@ -368,6 +383,7 @@ mod window_target_tests {
         fn drop(&mut self) {
             *self.killed.lock().unwrap() = true;
             let _ = self.run(&["kill-server"]);
+            let _ = std::fs::remove_dir_all(&self.home);
         }
     }
 
