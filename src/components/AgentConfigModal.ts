@@ -1,6 +1,7 @@
 import type { AgentDef } from "../types";
 import { commands } from "../services/tauri-commands";
 import { escapeHtml } from "../utils/html";
+import { describeError } from "../services/describe-error";
 
 // value = what the CLI accepts; label = what the operator sees.
 // Claude aliases resolve to the current generation (fable → Fable 5, sonnet → Sonnet 5, haiku → Haiku 4.5, opus → Opus 4.8).
@@ -152,7 +153,7 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
     try {
       await commands.updateAgentModel(agent.name, model);
     } catch (err) {
-      statusEl.textContent = `Error: ${err}`;
+      statusEl.textContent = `Error: ${describeError(err)}`;
       saveBtn.disabled = false;
       return;
     }
@@ -188,7 +189,7 @@ export function createAgentConfigModal(onSave: () => void): AgentConfigModal {
     } catch (err) {
       // Only touch the modal if it's still showing this agent.
       if (currentAgent !== agent) return;
-      restartStatusEl.textContent = `Error: ${err}`;
+      restartStatusEl.textContent = `Error: ${describeError(err)}`;
       restartNowBtn.disabled = false;
       laterBtn.disabled = false;
     }

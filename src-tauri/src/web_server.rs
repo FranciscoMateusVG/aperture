@@ -252,10 +252,38 @@ fn wire_error() -> teams::TeamError {
 fn serialize<T: serde::Serialize>(v: T) -> Result<Value, teams::TeamError> {
     serde_json::to_value(v).map_err(|_| wire_error())
 }
+/// Closed allowlist of legacy (`Result<T, String>`) error codes that may cross
+/// the wire as the discriminant (aperture-fr859). Everything else collapses to
+/// `E_WEB_COMMAND_FAILED`, so the UI can distinguish e.g. a lifecycle refusal
+/// from a tmux failure without any raw detail (paths, indices, config) leaking.
+const LEGACY_ERROR_CODES: &[&str] = &[
+    "E_CODEX_HOME_UNVERIFIED",
+    "E_CODEX_LAUNCH_INPUTS_UNVERIFIED",
+    "E_COORDINATOR_SELF_STOP",
+    "E_LIFECYCLE_DESCENDANTS_UNVERIFIED",
+    "E_LIFECYCLE_OUTCOME_UNKNOWN",
+    "E_LIFECYCLE_PROCESS_UNKNOWN",
+    "E_LOCAL_PROMPT_UNAVAILABLE",
+    "E_LOCAL_TOOL_MISSING",
+    "E_RUNTIME_SELECTOR",
+    "E_TMUX_OUTCOME_UNKNOWN",
+    "E_TMUX_UNVERIFIED",
+];
+const LEGACY_ERROR_MESSAGE: &str = "command could not be completed; refresh before retry";
+/// Legacy errors are `CODE` or `CODE: detail`. Match only an exact allowlisted
+/// CODE followed by end-of-string or ':'; the detail is never inspected or
+/// reflected, and the message is always the fixed string.
+fn legacy_error_code(raw: &str) -> &'static str {
+    LEGACY_ERROR_CODES
+        .iter()
+        .copied()
+        .find(|code| matches!(raw.strip_prefix(code), Some(rest) if rest.is_empty() || rest.starts_with(':')))
+        .unwrap_or("E_WEB_COMMAND_FAILED")
+}
 fn legacy<T: serde::Serialize>(r: Result<T, String>) -> Result<Value, teams::TeamError> {
-    r.map_err(|_| teams::TeamError {
-        code: "E_WEB_COMMAND_FAILED".into(),
-        message: "command could not be completed; refresh before retry".into(),
+    r.map_err(|raw| teams::TeamError {
+        code: legacy_error_code(&raw).into(),
+        message: LEGACY_ERROR_MESSAGE.into(),
     })
     .and_then(serialize)
 }

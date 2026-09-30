@@ -5,6 +5,7 @@ import type { CardLifecycle } from "./AgentCard";
 import { createAgentConfigModal } from "./AgentConfigModal";
 import { deriveDotState, deriveStateChip } from "../services/hub-presence";
 import { sortAgents } from "../services/roster";
+import { describeError } from "../services/describe-error";
 
 type PendingOp = NonNullable<AgentDef["op_pending"]>;
 
@@ -18,10 +19,6 @@ const OP_VERB: Record<PendingOp, string> = {
   stopping: "stop",
   restarting: "restart",
 };
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 function clock(): string {
   // HH:MM:SS, locale-independent.
@@ -121,7 +118,7 @@ export function createAgentList(container: HTMLElement) {
       else await commands.restartAgent(name);
     } catch (err) {
       console.error(`Failed to ${OP_VERB[op]} agent ${name}:`, err);
-      showLifecycleError(`${OP_VERB[op]} failed for ${name}: ${errMsg(err)}`);
+      showLifecycleError(`${OP_VERB[op]} failed for ${name}: ${describeError(err)}`);
       throw err;
     } finally {
       pendingOps.delete(name);
