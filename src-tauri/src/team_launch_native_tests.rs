@@ -53,7 +53,7 @@ impl Fixture {
         for p in [
             "mcp-server/start.sh",
             "mcp-server/dist/index.js",
-            "mcp-server-sentry/dist/index.js",
+            "mcp-server-sentry/dist/src/index.js",
         ] {
             f.write(&format!("infra/{p}"), b"fixture output");
         }
@@ -96,7 +96,7 @@ impl Fixture {
             &selected(),
             self.cwd.clone(),
             &Deadline::new(),
-            self.infra.clone(),
+            crate::local_package::root_for_executable(&self.infra.join("bin/aperture-team-control")).unwrap(),
             self.executable.clone(),
         )
     }
@@ -161,7 +161,7 @@ fn generated_config_is_exact_toml_and_values_are_not_syntax_or_argv() {
         let script = if server == "aperture-bus" {
             "mcp-server/dist/index.js"
         } else {
-            "mcp-server-sentry/dist/index.js"
+            "mcp-server-sentry/dist/src/index.js"
         };
         assert_eq!(
             parsed["mcp_servers"][server]["args"][0].as_str(),
@@ -461,5 +461,20 @@ fn node_removed_or_no_longer_executable_invalidates_preflight() {
             std::fs::set_permissions(&p.node, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert!(p.revalidate(&Deadline::new()).is_err());
+    }
+}
+
+#[test]
+fn packaged_codex_assets_are_required_without_checkout_fallback() {
+    for leaf in [crate::local_package::BUS, crate::local_package::SENTRY] {
+        let f = Fixture::new();
+        assert!(!f.cwd.join("mcp-server/dist/index.js").exists());
+        let binding = f.plan().unwrap();
+        assert!(binding.pins.contains_key(&f.infra.join(leaf)));
+        std::fs::remove_file(f.infra.join(leaf)).unwrap();
+        f.write("projects/aperture/mcp-server/dist/index.js", b"decoy");
+        f.write("infra/mcp-server-sentry/dist/index.js", b"obsolete");
+        assert!(f.plan().is_err());
+        assert!(!f.home.join(".aperture/run/managed").exists());
     }
 }

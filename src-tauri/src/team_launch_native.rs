@@ -293,8 +293,8 @@ fn config(
     .collect::<Vec<_>>()
     .join(", ");
     Ok(PrivateBytes(format!("model = {}\nmodel_reasoning_effort = {}\nmodel_instructions_file = {}\napproval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n\n[projects.{}]\ntrust_level = \"trusted\"\n\n[mcp_servers.aperture-bus]\ncommand = {}\nargs = [{}]\nenv = {{ {} }}\n\n[mcp_servers.sentry]\ncommand = {}\nargs = [{}]\nenv = {{ {} }}\n",
-        quote(&tuple.model),quote(r),p(&codex_home.join("prompt.md"))?,p(cwd)?,p(node)?,p(&infra.join("mcp-server/dist/index.js"))?,env,
-        p(node)?,p(&infra.join("mcp-server-sentry/dist/index.js"))?,env).into_bytes()))
+        quote(&tuple.model),quote(r),p(&codex_home.join("prompt.md"))?,p(cwd)?,p(node)?,p(&infra.join(crate::local_package::BUS))?,env,
+        p(node)?,p(&infra.join(crate::local_package::SENTRY))?,env).into_bytes()))
 }
 pub(crate) struct NativeLaunchBinding {
     home: PathBuf,
@@ -353,10 +353,7 @@ impl NativeLaunchBinding {
             .map_err(|_| error())?,
             None => repo.bootstrap_cwd().map_err(|_| error())?,
         };
-        let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(error)?
-            .to_path_buf();
+        let infra = crate::local_package::for_process().map_err(|_| error())?;
         let executable = binary(home)?;
         let mut bound =
             Self::preflight_at(home, team, seat, tuple, cwd, budget, infra, executable)?;
@@ -435,8 +432,8 @@ impl NativeLaunchBinding {
         for p in [
             executable.clone(),
             node.clone(),
-            infra.join("mcp-server/dist/index.js"),
-            infra.join("mcp-server-sentry/dist/index.js"),
+            infra.join(crate::local_package::BUS),
+            infra.join(crate::local_package::SENTRY),
         ] {
             pins.insert(p.clone(), installed_pin(&p, &executable)?);
         }

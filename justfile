@@ -406,7 +406,8 @@ ui-build node destination:
 # explicit retained inputs; their dependency retention is not an immutable release.
 # Copying team-control does not select it for MCP: activation must explicitly use
 # APERTURE_TEAM_CONTROL_BIN=<absolute package>/bin/aperture-team-control, or root
-# must update the canonical ~/.aperture/bin/aperture-team-control separately.
+# must install canonical control + boot + both complete MCP trees together.
+# See docs/local-managed-package.md; copying just the control binary is insufficient.
 [positional-arguments]
 web-local-candidate node target destination bus_root sentry_root sentry_dist:
     #!/bin/sh
@@ -417,7 +418,7 @@ web-local-candidate node target destination bus_root sentry_root sentry_dist:
         case "$path" in /*) ;; *) echo 'absolute local inputs required' >&2; exit 1;; esac
     done
     test ! -e "$destination" && test ! -L "$destination"
-    test -f "$bus/dist/index.js" && test -f "$bus/dist/ws-hub.js" && test -d "$bus/node_modules"
+    test -f "$bus/dist/index.js" && test -f "$bus/dist/ws-hub.js" && test -f "$bus/dist/hub-client.js" && test -d "$bus/node_modules"
     test -f "$sentry/package.json" && test -d "$sentry/node_modules" && test -f "$sentry_dist/src/index.js"
     /opt/homebrew/bin/cargo build --offline --locked --manifest-path src-tauri/Cargo.toml --release --bin aperture-server --bin aperture-boot --bin aperture-team-control --target-dir "$target"
     mkdir -m 700 "$destination"

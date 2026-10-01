@@ -530,10 +530,7 @@ impl ClaudeBinding {
             None => repo.bootstrap_cwd(),
         }
         .map_err(|_| ClaudeError::Unsafe)?;
-        let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or(ClaudeError::Unsafe)?
-            .to_path_buf();
+        let infra = crate::local_package::for_process().map_err(|_| ClaudeError::Unsafe)?;
         let executable = select_binary(&[
             home.join(".local/bin/claude"),
             home.join(".npm-global/bin/claude"),
@@ -562,7 +559,7 @@ impl ClaudeBinding {
     ) -> Result<Self, ClaudeError> {
         exact_tuple(tuple)?;
         valid_selector(team, seat, 1)?;
-        let helper = home.join(".aperture/bin/aperture-boot");
+        let helper = infra.join(crate::local_package::BOOT);
         installed(&helper, true)?;
         let node = common::node_binary(home, budget).map_err(|_| ClaudeError::Unsafe)?;
         let runtime = validate_component_path(&home.join(".claude/aperture"), seat, false)
@@ -610,9 +607,9 @@ impl ClaudeBinding {
             pins.insert(p.clone(), installed(p, true)?);
         }
         for p in [
-            infra.join("mcp-server/dist/index.js"),
-            infra.join("mcp-server/dist/hub-client.js"),
-            infra.join("mcp-server-sentry/dist/index.js"),
+            infra.join(crate::local_package::BUS),
+            infra.join(crate::local_package::HUB_CLIENT),
+            infra.join(crate::local_package::SENTRY),
         ] {
             pins.insert(p.clone(), installed(&p, false)?);
         }
@@ -831,7 +828,7 @@ impl ClaudeBinding {
             return Err(ClaudeError::Unsafe);
         }
         let mut env = serde_json::json!({"HOME":self.home,"AGENT_NAME":self.seat,"AGENT_ROLE":self.role,"AGENT_MODEL":self.tuple.model,"APERTURE_TEAM_GENERATION":res.generation.to_string(),"APERTURE_HUB_TOKEN_FILE":token.path(),"BEADS_DIR":self.home.join(".aperture/.beads"),"BD_ACTOR":self.seat,"BEADS_DOLT_PASSWORD":password,"APERTURE_MAILBOX":self.home.join(".aperture/mailbox")});
-        let mut mcp = serde_json::json!({"mcpServers":{"aperture-bus":{"command":self.node,"args":[self.infra.join("mcp-server/dist/index.js")],"env":env},"sentry":{"command":self.node,"args":[self.infra.join("mcp-server-sentry/dist/index.js")],"env":env}}});
+        let mut mcp = serde_json::json!({"mcpServers":{"aperture-bus":{"command":self.node,"args":[self.infra.join(crate::local_package::BUS)],"env":env},"sentry":{"command":self.node,"args":[self.infra.join(crate::local_package::SENTRY)],"env":env}}});
         let config = PrivateBytes(serde_json::to_vec(&mcp).map_err(|_| ClaudeError::Invalid)?);
         if config.0.len() > PRIVATE_CAP {
             return Err(ClaudeError::Invalid);
@@ -1374,7 +1371,7 @@ fn validate_record_staged(
         || !canonical_uuid(&r.session_id)
         || r.pins.len() > 32
         || r.private_pins.len() != 3
-        || r.helper != home.join(".aperture/bin/aperture-boot")
+        || r.helper != infra.join(crate::local_package::BOOT)
     {
         return Err(ClaudeError::Invalid);
     }
@@ -1427,9 +1424,9 @@ fn validate_record_staged(
         r.node.clone(),
         r.helper.clone(),
         r.tmux.clone(),
-        infra.join("mcp-server/dist/index.js"),
-        infra.join("mcp-server/dist/hub-client.js"),
-        infra.join("mcp-server-sentry/dist/index.js"),
+        infra.join(crate::local_package::BUS),
+        infra.join(crate::local_package::HUB_CLIENT),
+        infra.join(crate::local_package::SENTRY),
     ];
     for p in &allowed_installed {
         if !r.pins.contains_key(p) {
@@ -1519,15 +1516,49 @@ fn kickoff_tmux_at(
     Ok((tmux.to_path_buf(), pin))
 }
 
+fn spawn_command(home: &Path, r: &LaunchRecord) -> Command {
+    let mut cmd = Command::new(&r.tmux);
+    cmd.env_clear()
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+        "new-window",
+        "-d",
+        "-t",
+        "aperture:",
+        "-n",
+        &format!("{}-g{}", r.seat, r.generation),
+        "-P",
+        "-F",
+        "#{window_id}|#{pane_id}|#{pane_pid}",
+        "-c",
+        ])
+        .arg(&r.cwd)
+        .arg("/usr/bin/env")
+        .arg("-i")
+        .arg(format!("HOME={}", home.display()))
+        .arg("PATH=/usr/bin:/bin")
+        .arg("TERM=xterm-256color")
+        .arg(&r.helper)
+        .args([
+        "--managed-claude-gate",
+        "--team",
+        &r.team,
+        "--seat",
+        &r.seat,
+        "--generation",
+        &r.generation.to_string(),
+        ]);
+    cmd
+}
+
 impl PublishedClaude {
     pub(crate) fn session_id(&self) -> &str {
         &self.record.session_id
     }
     pub(crate) fn spawn(self, budget: &Deadline) -> Result<PendingClaude, ClaudeError> {
-        let infra = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or(ClaudeError::Unsafe)?;
-        self.spawn_at(budget, infra)
+        let infra = crate::local_package::for_process().map_err(|_| ClaudeError::Unsafe)?;
+        self.spawn_at(budget, &infra)
     }
     fn spawn_at(self, budget: &Deadline, infra: &Path) -> Result<PendingClaude, ClaudeError> {
         validate_record_at(&self.home, &self.record, budget, infra)?;
@@ -1548,38 +1579,7 @@ impl PublishedClaude {
             false,
         )
         .map_err(|_| ClaudeError::Closed)?;
-        let mut cmd = Command::new(&r.tmux);
-        cmd.env_clear()
-            .env("HOME", &self.home)
-            .env("PATH", "/usr/bin:/bin")
-            .args([
-                "new-window",
-                "-d",
-                "-t",
-                "aperture",
-                "-n",
-                &format!("{}-g{}", r.seat, r.generation),
-                "-P",
-                "-F",
-                "#{window_id}|#{pane_id}|#{pane_pid}",
-                "-c",
-            ])
-            .arg(&r.cwd)
-            .arg("/usr/bin/env")
-            .arg("-i")
-            .arg(format!("HOME={}", self.home.display()))
-            .arg("PATH=/usr/bin:/bin")
-            .arg("TERM=xterm-256color")
-            .arg(&r.helper)
-            .args([
-                "--managed-claude-gate",
-                "--team",
-                &r.team,
-                "--seat",
-                &r.seat,
-                "--generation",
-                &r.generation.to_string(),
-            ]);
+        let cmd = spawn_command(&self.home, r);
         let output = repository::bounded_command(
             cmd,
             budget
@@ -1643,8 +1643,8 @@ impl PendingClaude {
         budget: &Deadline,
         runtime_attempt_id: &str,
     ) -> Result<LaunchDiagnostics, ClaudeError> {
-        let infra = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or(ClaudeError::Unsafe)?;
-        self.release_at(res, budget, runtime_attempt_id, infra)
+        let infra = crate::local_package::for_process().map_err(|_| ClaudeError::Unsafe)?;
+        self.release_at(res, budget, runtime_attempt_id, &infra)
     }
     fn release_at(&self, res: &StartReservation, budget: &Deadline, runtime_attempt_id: &str, infra: &Path)
         -> Result<LaunchDiagnostics, ClaudeError> {
@@ -1719,9 +1719,9 @@ pub(crate) fn gate_native(
     valid_selector(team, seat, generation)?;
     let until = Instant::now() + GATE_WAIT;
     let diagnostics = LaunchDiagnostics::for_gate(home, team, seat, generation, until)?;
-    let infra = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or(ClaudeError::Unsafe)?;
+    let infra = crate::local_package::for_process().map_err(|_| ClaudeError::Unsafe)?;
     preserve_gate_result(&diagnostics, || gate_with_diagnostics(
-        home, team, seat, generation, until, &diagnostics, infra,
+        home, team, seat, generation, until, &diagnostics, &infra,
         |mut cmd| { let _error = cmd.exec(); Err(ClaudeError::Io) },
     ))
 }
@@ -1878,7 +1878,7 @@ fn gate_command(home: &Path, r: &LaunchRecord) -> Result<Command, ClaudeError> {
         .env("AGENT_NAME", &r.seat)
         .env("APERTURE_HUB_TOKEN_FILE", home.join(".aperture/run/hub-tokens").join(format!("{}.token", r.seat)))
         .env("APERTURE_TEAM_GENERATION", r.generation.to_string())
-        .env(crate::team_claude_inbox::MANAGED_HUB_CLIENT_ENV, Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("native repo parent").join("mcp-server/dist/hub-client.js"));
+        .env(crate::team_claude_inbox::MANAGED_HUB_CLIENT_ENV, crate::local_package::root_for_executable(&r.helper).map_err(|_| ClaudeError::Unsafe)?.join(crate::local_package::HUB_CLIENT));
     Ok(cmd)
 }
 
@@ -2044,7 +2044,7 @@ mod gate_tests {
         assert!(identity.status.success());
         let username = String::from_utf8(identity.stdout).unwrap();
         assert!(actual.lines().any(|line| line == format!("USER={}", username.trim())));
-        assert!(actual.lines().any(|line| line == format!("APERTURE_MANAGED_HUB_CLIENT={}", Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("mcp-server/dist/hub-client.js").display())));
+        assert!(actual.lines().any(|line| line == format!("APERTURE_MANAGED_HUB_CLIENT={}", Path::new("/fixture/.aperture/mcp-server/dist/hub-client.js").display())));
         assert!(actual.lines().any(|line| line == format!("APERTURE_HUB_TOKEN_FILE=/fixture/.aperture/run/hub-tokens/{}.token", inert.seat)));
     }
     #[test]
@@ -2058,6 +2058,17 @@ mod gate_tests {
             .output()
             .unwrap();
         assert!(result.status.success(), "inert gate must use OS identity, not inherited USER");
+    }
+    #[test]
+    fn managed_spawn_uses_session_only_target_and_recorded_sibling_helper() {
+        let (r, _, _) = fixture();
+        let cmd = spawn_command(Path::new("/fixture"), &r);
+        let args: Vec<_> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(cmd.get_program(), r.tmux.as_os_str());
+        assert_eq!(&args[..4], &["new-window", "-d", "-t", "aperture:"]);
+        assert!(!args.contains(&"-a"));
+        assert!(args.contains(&r.helper.to_str().unwrap()));
+        assert!(!args.contains(&"aperture"));
     }
     #[test]
     fn tmux_response_is_exact_id_metadata_not_untrusted_shell_or_multiline() {
@@ -2110,7 +2121,7 @@ mod publication_tests {
                 "tools/claude",
                 "tools/node",
                 "tools/tmux",
-                ".aperture/bin/aperture-boot",
+                "infra/bin/aperture-boot",
             ] {
                 f.write(p, b"synthetic executable never run");
                 std::fs::set_permissions(f.home.join(p), std::fs::Permissions::from_mode(0o700))
@@ -2132,7 +2143,7 @@ mod publication_tests {
             for p in [
                 "infra/mcp-server/dist/index.js",
                 "infra/mcp-server/dist/hub-client.js",
-                "infra/mcp-server-sentry/dist/index.js",
+                "infra/mcp-server-sentry/dist/src/index.js",
             ] {
                 f.write(p, b"fixture JS never executed");
             }
@@ -2179,7 +2190,7 @@ mod publication_tests {
                 self.cwd.clone(),
                 None,
                 &Deadline::new(),
-                self.infra.clone(),
+                crate::local_package::root_for_executable(&self.infra.join("bin/aperture-team-control")).unwrap(),
                 self.home.join("tools/claude"),
                 self.home.join("tools/tmux"),
             )
@@ -2207,6 +2218,24 @@ mod publication_tests {
     }
     include!("team_claude_launch_diagnostics_tests.rs");
 
+    #[test]
+    fn packaged_claude_assets_and_helper_are_required_without_checkout_fallback() {
+        for leaf in [crate::local_package::BUS, crate::local_package::SENTRY,
+            crate::local_package::HUB_CLIENT, crate::local_package::BOOT] {
+            let f = Fixture::new();
+            assert!(!f.cwd.join("mcp-server/dist/index.js").exists());
+            assert!(!f.home.join(".aperture/bin/aperture-boot").exists());
+            let binding = f.binding().unwrap();
+            assert_eq!(binding.helper, f.infra.join(crate::local_package::BOOT));
+            assert!(binding.pins.contains_key(&f.infra.join(leaf)));
+            std::fs::remove_file(f.infra.join(leaf)).unwrap();
+            // Even an existing obsolete / checkout-shaped leaf is not a fallback.
+            f.write("projects/aperture/mcp-server/dist/index.js", b"decoy");
+            f.write("infra/mcp-server-sentry/dist/index.js", b"obsolete");
+            assert!(f.binding().is_err());
+            assert!(!f.home.join(".aperture/run/managed").exists());
+        }
+    }
     #[test]
     fn pre_spawn_collision_denies_before_native_tmux_admission() {
         let f = Fixture::new();
@@ -2289,8 +2318,15 @@ mod publication_tests {
         }
         assert_eq!(
             config["mcpServers"]["aperture-bus"]["args"],
-            json!([f.infra.join("mcp-server/dist/index.js")])
+            json!([f.infra.join(crate::local_package::BUS)])
         );
+        assert_eq!(config["mcpServers"]["sentry"]["args"],
+            json!([f.infra.join(crate::local_package::SENTRY)]));
+        validate_record_at(&f.home, &p.record, &Deadline::new(), &f.infra).unwrap();
+        assert!(validate_record_at(&f.home, &p.record, &Deadline::new(), &f.cwd).is_err());
+        let command = gate_command(&f.home, &p.record).unwrap();
+        assert!(command.get_envs().any(|(key, value)| key == crate::team_claude_inbox::MANAGED_HUB_CLIENT_ENV
+            && value == Some(f.infra.join(crate::local_package::HUB_CLIENT).as_os_str())));
         assert_eq!(p.record.args[1], MODEL);
         assert_eq!(p.record.args[3], p.session_id());
         assert_eq!(p.record.args.len(), 11);
@@ -2339,7 +2375,7 @@ mod publication_tests {
     fn managed_hub_script_is_required_and_pinned_before_publication() {
         let f=Fixture::new();
         let binding=f.binding().unwrap();
-        let hub=f.infra.join("mcp-server/dist/hub-client.js");
+        let hub=f.infra.join(crate::local_package::HUB_CLIENT);
         assert_eq!(binding.pins.get(&hub),Some(&installed(&hub,false).unwrap()));
         let (r,t)=f.reservation();
         f.write("infra/mcp-server/dist/hub-client.js",b"changed fixture script");

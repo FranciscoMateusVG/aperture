@@ -604,12 +604,12 @@ fn router(s: WebState) -> Router {
 
 /// Production composition. Never invokes the Tauri GUI or initializes a database.
 fn local_package_paths(executable:&std::path::Path)->Result<(PathBuf,PathBuf,PathBuf),String>{
-    let package=executable.parent().and_then(std::path::Path::parent).ok_or("E_LOCAL_PACKAGE")?;
+    let package=crate::local_package::root_for_executable(executable)?;
     let ui=package.join("ui");
     if !std::fs::symlink_metadata(&ui).is_ok_and(|m|m.is_dir()&&!m.file_type().is_symlink()){return Err("E_LOCAL_UI_MISSING".into());}
-    let bus=package.join("mcp-server/dist/index.js");
-    let sentry=package.join("mcp-server-sentry/dist/src/index.js");
-    for path in [&bus,&sentry,&package.join("mcp-server/dist/ws-hub.js")]{
+    let bus=package.join(crate::local_package::BUS);
+    let sentry=package.join(crate::local_package::SENTRY);
+    for path in [&bus,&sentry,&package.join(crate::local_package::HUB)]{
         let m=std::fs::symlink_metadata(path).map_err(|_|"E_LOCAL_MCP_OUTPUT_MISSING")?;
         if !m.is_file()||m.file_type().is_symlink(){return Err("E_LOCAL_MCP_OUTPUT_MISSING".into());}
     }
