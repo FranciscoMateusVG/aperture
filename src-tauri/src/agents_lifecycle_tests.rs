@@ -282,7 +282,15 @@ fn local_thread_resume_requires_exact_existing_uuid_and_close_cancels_wait(){
     let work=owner.admit(None).unwrap();let path=h.0.join("thread-id");
     fs::write(&path,b"00000000-0000-4000-8000-000000000001").unwrap();
     assert_eq!(wait_local_thread(&path,&work).unwrap(),"00000000-0000-4000-8000-000000000001");
-    fs::write(&path,b"bad;command").unwrap();assert!(wait_local_thread(&path,&work).is_err());
+    // codex-bridge::publishThreadReady writes exactly `${threadId}\n`.
+    let published=b"00000000-0000-4000-8000-000000000001\n";
+    fs::write(&path,published).unwrap();
+    let pin=LocalInputPin::of(&fs::symlink_metadata(&path).unwrap());
+    assert_eq!(wait_local_thread(&path,&work).unwrap(),"00000000-0000-4000-8000-000000000001");
+    assert_eq!(fs::read(&path).unwrap(),published);pin.recheck(&path).unwrap();
+    for invalid in ["bad;command", "00000000-0000-4000-8000-000000000001\n\n", "00000000-0000-4000-8000-000000000001\r\n", " 00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001 ", "00000000-0000-4000-8000-000000000001\nother", "\n"] {
+        fs::write(&path,invalid).unwrap();assert_eq!(wait_local_thread(&path,&work).unwrap_err(),"E_LOCAL_THREAD_UNVERIFIED");
+    }
     fs::remove_file(&path).unwrap();
     std::thread::scope(|scope|{
         let task=scope.spawn(||wait_local_thread(&path,&work));

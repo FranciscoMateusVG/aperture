@@ -294,7 +294,10 @@ fn wait_local_thread(path:&std::path::Path,work:&crate::daemons::RuntimeWork)->R
             Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
             Ok(_)=>{
                 let bytes=local_regular_bytes(path,128)?;
-                let thread=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
+                // The bridge publishes a canonical UUID followed by ONE LF.
+                // Accept legacy bare UUIDs too, but never trim arbitrary input.
+                let payload=bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+                let thread=std::str::from_utf8(payload).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
                 let id=uuid::Uuid::parse_str(thread).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
                 if id.to_string()!=thread{return Err("E_LOCAL_THREAD_UNVERIFIED".into());}
                 return Ok(thread.into());
