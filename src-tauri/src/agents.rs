@@ -317,6 +317,11 @@ fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&Lif
     let plan=LocalCodexPreparation{context,state,expected,codex_home:home.clone(),bus,sentry,project,bus_pin,sentry_pin,#[cfg(test)]drift_point:None};
     plan.configuration()?; // input shape/modes before registry or durable intent
     let registry=crate::daemon_registry::Registry::open(context.lease)?;
+    if let Some(snapshot)=registry.codex_snapshot(&expected.name)? {
+        if snapshot.identity.as_ref().is_some_and(|id| matches!(crate::team_process::state(id),crate::team_replacement::ProcessState::Gone|crate::team_replacement::ProcessState::Recycled)) {
+            return local_stop_or_restart(state,expected,context,op,true);
+        }
+    }
     let fresh=registry.codex_snapshot(&expected.name)?.is_none();
     // A retained UUID is conversation continuity, not process authority. The
     // supervisor independently proves the endpoint pristine before spawning.
@@ -375,23 +380,35 @@ fn local_stop_or_restart(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:
     let registry=crate::daemon_registry::Registry::open(context.lease)?;
     let snapshot=registry.codex_snapshot(&expected.name)?;
     let mut roots=Vec::new();
+    let mut recovered=None;
     if let Some(s)=&snapshot {
         if s.phase!=crate::daemon_registry::CodexPhaseV2::ReadyMetadataOnly{return Err("E_LIFECYCLE_PROCESS_UNKNOWN".into());}
-        crate::team_terminal::codex_live_pins(&registry,op,s,&crate::team_terminal::CodexSocketResolver::production())?;
-        roots.push(s.identity.clone().ok_or("E_LIFECYCLE_PROCESS_UNKNOWN")?);
+        let id=s.identity.clone().ok_or("E_LIFECYCLE_PROCESS_UNKNOWN")?;
+        if matches!(crate::team_process::state(&id),crate::team_replacement::ProcessState::Gone|crate::team_replacement::ProcessState::Recycled){
+            let proof=coordinator_lifecycle::previous_closed(context.lease,&expected.name)?;
+            proof.verifies(&expected.name,&id)?;recovered=Some(proof);
+        }else{
+            crate::team_terminal::codex_live_pins(&registry,op,s,&crate::team_terminal::CodexSocketResolver::production())?;
+            roots.push(id);
+        }
     } else if expected.model.starts_with("codex/") {
         crate::team_terminal::codex_pristine_endpoint(&registry,op)?;
     }
-    for p in panes.iter().filter(|p|!p.dead){
+    for p in panes.iter().filter(|p|!p.dead && recovered.is_none()){
         let native=crate::team_process::observe(p.pid).map_err(|_|"E_LIFECYCLE_PROCESS_UNKNOWN")?.ok_or("E_LIFECYCLE_PROCESS_UNKNOWN")?;
         if native.uid!=unsafe{libc::geteuid()}{return Err("E_LIFECYCLE_PROCESS_UNKNOWN".into());}
         roots.push(native.identity);
     }
     // The second read binds roots to exact panes before the first signal.
     if local_panes(&session,&expected.name,work)?!=panes{return Err("E_LIFECYCLE_PROCESS_UNKNOWN".into());}
-    let closed=coordinator_lifecycle::stop(context.lease,op,roots,||{
+    let closed=if let Some(proof)=recovered {proof}else{coordinator_lifecycle::stop(context.lease,op,roots,||{
         context.classify(&expected.name)?;verify_plan(state,expected)
-    })?;
+    })?};
+    // Observed Gone is truth even if later socket/window cleanup refuses.
+    crate::watchdog::on_agent_stopped(&expected.name);
+    let next={let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;
+        let a=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
+        a.status="stopped".into();a.tmux_window_id=None;a.clone()};
     if let Some(s)=&snapshot {
         crate::team_terminal::codex_cleanup_closed(&registry,op,s,&closed)?;
         registry.retire_closed_codex(op,s,&closed)?;
@@ -411,10 +428,6 @@ fn local_stop_or_restart(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:
         Ok(_)=>{let (_,pin)=local_pinned_bytes(&kickoff,21)?;pin.recheck(&kickoff)?;fs::remove_file(&kickoff).map_err(|_|"E_LIFECYCLE_OUTCOME_UNKNOWN")?;},
         Err(_)=>return Err("E_LIFECYCLE_OUTCOME_UNKNOWN".into()),
     }
-    crate::watchdog::on_agent_stopped(&expected.name);
-    let next={let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;
-        let a=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
-        a.status="stopped".into();a.tmux_window_id=None;a.clone()};
     if !restart{return Ok(());}
     if next.model.starts_with("codex/"){return start_codex_local(state,&next,context,op);}
     let (bus,sentry,project)={let s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;(s.mcp_server_path.clone(),s.mcp_sentry_server_path.clone(),s.project_dir.clone())};

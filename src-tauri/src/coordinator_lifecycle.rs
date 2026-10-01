@@ -25,6 +25,8 @@ struct StopRecord {
     roots: Vec<ProcessIdentity>,
     processes: Vec<ProcessIdentity>,
     outcome: String,
+    closure_complete: bool,
+    kill_complete: bool,
 }
 fn record_path(lease: &ControllerLock, seat: &str) -> Result<PathBuf, String> {
     if !crate::daemon_registry::valid_name(seat) {
@@ -41,8 +43,13 @@ pub(super) fn check_start(lease: &ControllerLock, seat: &str) -> Result<(), Stri
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(ERROR.into()),
         Ok(_) => {
-            let r: StopRecord = crate::journal::read_private_json(&path)?;
-            if r.schema != 1 || r.seat != seat || r.outcome != "gone" {
+            let mut r: StopRecord = crate::journal::read_private_json(&path)?;
+            if r.schema != 1
+                || r.seat != seat
+                || !r.closure_complete
+                || !r.kill_complete
+                || !matches!(r.outcome.as_str(), "gone" | "unknown")
+            {
                 return Err(OUTCOME.into());
             }
             for id in &r.processes {
@@ -53,9 +60,31 @@ pub(super) fn check_start(lease: &ControllerLock, seat: &str) -> Result<(), Stri
                     return Err(OUTCOME.into());
                 }
             }
+            if r.outcome == "unknown" {
+                // An explicit lifecycle request may finish observing a stop
+                // whose entire closed set was already kill-dispatched. Never
+                // infer closure from an incomplete pre-freeze observation.
+                let archive =
+                    path.with_file_name(format!("{}-unknown-{}.json", seat, uuid::Uuid::new_v4()));
+                crate::journal::rename_no_replace(&path, &archive)?;
+                r.outcome = "gone".into();
+                crate::journal::write_private_json_atomic(&path, &r, false)?;
+            }
             Ok(())
         }
     }
+}
+pub(super) fn previous_closed(lease: &ControllerLock, seat: &str) -> Result<Closed, String> {
+    check_start(lease, seat)?;
+    let path = record_path(lease, seat)?;
+    let r: StopRecord = crate::journal::read_private_json(&path)?;
+    let closed = Closed {
+        seat: seat.into(),
+        ids: r.processes,
+        path,
+    };
+    closed.recheck()?;
+    Ok(closed)
 }
 /// Value cannot be constructed by a caller from a PID list or receipt JSON.
 pub(crate) struct Closed {
@@ -72,14 +101,21 @@ impl Closed {
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
         let r: StopRecord = crate::journal::read_private_json(&self.path)?;
-        if r.schema != 1 || r.seat != self.seat || r.outcome != "gone" || r.processes != self.ids {
+        if r.schema != 1
+            || r.seat != self.seat
+            || r.outcome != "gone"
+            || !r.closure_complete
+            || !r.kill_complete
+            || r.processes != self.ids
+        {
             return Err(OUTCOME.into());
         }
-        if self
-            .ids
-            .iter()
-            .any(|p| team_process::state(p) != ProcessState::Gone)
-        {
+        if self.ids.iter().any(|p| {
+            !matches!(
+                team_process::state(p),
+                ProcessState::Gone | ProcessState::Recycled
+            )
+        }) {
             return Err(OUTCOME.into());
         }
         Ok(())
@@ -210,6 +246,8 @@ pub(crate) fn stop(
         roots,
         processes: ids,
         outcome: "unknown".into(),
+        closure_complete: false,
+        kill_complete: false,
     };
     crate::journal::write_private_json_atomic(&path, &record, false)?;
     let mut frozen = Vec::new();
@@ -254,12 +292,16 @@ pub(crate) fn stop(
         }
         check()?;
         op.verify_for(lease)?;
+        record.closure_complete = true;
+        crate::journal::write_private_json_atomic(&path, &record, true)?;
         // Force-stop is deliberate. Resuming a TERM handler could fork after
         // the closed snapshot. Never advertise this as graceful persistence of
         // outstanding provider/build work. Children first; no group signal.
         for id in record.processes.iter().rev() {
             signal(id, libc::SIGKILL)?;
         }
+        record.kill_complete = true;
+        crate::journal::write_private_json_atomic(&path, &record, true)?;
         let until = Instant::now() + Duration::from_secs(4);
         loop {
             op.try_wait()?;
@@ -283,7 +325,9 @@ pub(crate) fn stop(
             path: path.clone(),
         })
     })();
-    if result.is_err() {
+    if result.is_err() && !record.kill_complete {
+        record.closure_complete = false;
+        let _ = crate::journal::write_private_json_atomic(&path, &record, true);
         // Do not leave a preflight failure freezing a live agent forever. Only
         // identities we stopped may be resumed; unknown journal blocks retry.
         for id in frozen {
@@ -413,7 +457,24 @@ mod native_tests {
         let mut record: StopRecord = crate::journal::read_private_json(&closed.path).unwrap();
         record.outcome = "unknown".into();
         crate::journal::write_private_json_atomic(&closed.path, &record, true).unwrap();
+        let history_bytes = fs::read(&closed.path).unwrap();
+        check_start(&lease, "fixture").unwrap();
+        let archived = fs::read_dir(closed.path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().contains("-unknown-"))
+            .unwrap();
+        assert_eq!(fs::read(archived.path()).unwrap(), history_bytes);
+        record.processes = vec![lease.identity().unwrap().clone()];
+        crate::journal::write_private_json_atomic(&closed.path, &record, true).unwrap();
         assert!(check_start(&lease, "fixture").is_err());
+        record.processes = vec![];
+        record.kill_complete = false;
+        crate::journal::write_private_json_atomic(&closed.path, &record, true).unwrap();
+        assert!(
+            check_start(&lease, "fixture").is_err(),
+            "incomplete Unknown never converts to closure"
+        );
         fs::remove_dir_all(home).unwrap();
     }
     #[test]

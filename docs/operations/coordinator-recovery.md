@@ -35,3 +35,24 @@ existing `just` recipe, with the matching versioned UI. Do not launch the server
 as a child of an agent being stopped, and do not terminate the existing server
 while it owns the current control session without an explicit handoff. No
 production merge or team retirement is implied by this local repair.
+
+## Recovering after Unknown
+
+The last stop is `~/.aperture/run/coordinator-stops/<seat>.json`. A later explicit
+Start/Stop/Restart may reconcile it only if the full frozen closure was recorded,
+every exact identity was kill-dispatched, and every recorded PID/birth is now
+Gone (or the PID has been recycled). It preserves the original Unknown receipt
+under a unique `*-unknown-*.json` name and records the completed observation;
+this does not replay signals. A same/live, unreadable or incomplete closure
+still refuses. In that case inspect the exact recorded identities and live
+native ancestry; do not delete the receipt or infer that an empty pane is Gone.
+If anything remains uncertain, preserve it for a specifically scoped recovery.
+
+Before the first operator Stop of a manually restored pane, normalize only its
+verified exact tmux window ID to the registered seat name (for example the
+manually named `glados-` window). No prefix match is used to broaden signal
+ownership. A concurrently appearing foreign pane is left alone, reports Unknown,
+and does not cause an already-dead old worker to be displayed as running.
+
+TOML updates preserve values, including trust/approval/provider/unknown keys, but
+serialization may reorder keys and drop comments. Authentication is untouched.

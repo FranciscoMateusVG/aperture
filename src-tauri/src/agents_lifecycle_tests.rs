@@ -419,3 +419,25 @@ fn coordinator_stop_real_ingress_reaps_only_selected_native_pane() {
     assert_eq!(app.lock().unwrap().agents["fixture"].status,"stopped");
     drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
 }
+
+#[test]
+fn coordinator_foreign_pane_after_gone_reports_unknown_but_not_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let h=Home::new();let tool=h.0.join("tmux-inert");let count=h.0.join("count");
+    // First two observations prove no old pane. A concurrent new pane appears
+    // only at the post-stop sweep; it must not inherit any signal authority.
+    let mut foreign=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let id=crate::team_process::observe(foreign.id()).unwrap().unwrap().identity;
+    fs::write(&tool,format!("#!/bin/sh\nn=0; test ! -f '{}' || read n < '{}'\nn=$((n+1)); printf '%s' \"$n\" > '{}'\nif test \"$n\" -ge 3; then printf '@9||fixture||%%9||{}||0\\n'; fi\n",count.display(),count.display(),count.display(),foreign.id())).unwrap();
+    fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();
+    let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),crate::daemons::LocalTools::fixture(&h.0,&tool)).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    let app=state("fixture","opus");app.lock().unwrap().agents.get_mut("fixture").unwrap().status="running".into();
+    let result=stop_agent_shared("fixture".into(),&app,&ctx);
+    let observed=crate::team_process::state(&id);foreign.kill().unwrap();foreign.wait().unwrap();
+    assert_eq!(result.unwrap_err(),"E_LIFECYCLE_OUTCOME_UNKNOWN");
+    assert_eq!(observed,crate::team_replacement::ProcessState::Same);
+    assert_eq!(app.lock().unwrap().agents["fixture"].status,"stopped");
+    assert!(app.lock().unwrap().agents["fixture"].tmux_window_id.is_none());
+    drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
