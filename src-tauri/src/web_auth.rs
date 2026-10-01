@@ -94,8 +94,11 @@ impl BrowserAuth {
             false
         }
     }
+    pub fn native_operator(&self, capability: &str) -> bool {
+        digest(capability).is_some_and(|k| same(&self.open, &k))
+    }
     pub fn mint_open(&mut self, capability: &str) -> Result<String, u16> {
-        if !digest(capability).is_some_and(|k| same(&self.open, &k)) {
+        if !self.native_operator(capability) {
             return Err(401);
         }
         self.mint(None)

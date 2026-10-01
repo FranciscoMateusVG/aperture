@@ -439,3 +439,16 @@ web-local-candidate node target destination bus_root sentry_root sentry_dist:
     ln -s "$id" "$destination/ui/current"
     printf 'Candidate only: %s\nCopied MCP: %s\nCopied Sentry dependencies: %s\nPaired Sentry dist: %s\n' "$destination" "$bus" "$sentry" "$sentry_dist"
     printf 'Activation after review: retain current HOME, set explicit APERTURE_NODE_BIN/TMUX_BIN/BD_BIN inputs, then bin/aperture-server and bin/aperture-server open. Ctrl-C drains this server; previous app remains untouched.\n'
+
+# Lightweight native macOS icon. Builds a NEW app only; no installation or daemon effect.
+web-launcher-build destination server node:
+    /usr/bin/python3 macos-launcher/build.py "{{destination}}" "{{server}}" "{{node}}"
+
+# Pure launcher flow tests; never starts the operational server.
+web-launcher-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target=$(mktemp -d "${TMPDIR:-/tmp}/aperture-launcher-tests.XXXXXX")
+    trap 'rm -rf "$target"' EXIT
+    /usr/bin/swiftc macos-launcher/LauncherCore.swift macos-launcher/tests.swift -o "$target/tests"
+    "$target/tests"
