@@ -1613,7 +1613,13 @@ async fn c3_http_codex_mutators_reach_fenced_shared_ingress_without_effects() {
     let before=tree(&f.root);
     for (route,body) in [("start",json!({"name":"fixture"})),("stop",json!({"name":"fixture"})),("restart",json!({"name":"fixture"})),("model",json!({"name":"fixture","model":"opus"}))] {
         let (code,_,text)=f.api("POST",&format!("/api/agents/fixture/{route}"),&session,&body.to_string()).await;
-        assert_ne!(code,200);assert!(text.contains("E_WEB_COMMAND_FAILED"));
+        assert_ne!(code,200);
+        // aperture-fr859: the wire code is the allowlisted discriminant (or the
+        // generic fallback); the message is always the fixed string, never detail.
+        let body:Value=serde_json::from_str(&text).unwrap();
+        let wire_code=body["code"].as_str().unwrap();
+        assert!(wire_code=="E_WEB_COMMAND_FAILED"||LEGACY_ERROR_CODES.contains(&wire_code),"route={route} code={wire_code}");
+        assert_eq!(body["message"].as_str().unwrap(),LEGACY_ERROR_MESSAGE,"route={route}");
         assert_eq!(tree(&f.root),before);
         assert_eq!(serde_json::to_value(&f.state.app.lock().unwrap().agents["fixture"]).unwrap(),serde_json::to_value(&agent).unwrap());
     }
@@ -1782,4 +1788,56 @@ fn local_package_ui_and_actual_mcp_entrypoints_are_adjacent_not_ambient() {
     std::fs::remove_file(&sentry).unwrap();std::fs::write(root.join("mcp-server-sentry/dist/index.js"),b"obsolete layout").unwrap();
     assert!(local_package_paths(&exe).is_err(),"obsolete Sentry dist/index.js is not a fallback");
     std::fs::remove_dir_all(&root).unwrap();assert!(!root.exists());
+}
+
+/// aperture-fr859: legacy String errors arrive as `CODE` or `CODE: detail`.
+/// Only an exact allowlisted CODE (followed by end or ':') becomes the wire
+/// `code`; the `message` is always the fixed string and never echoes detail.
+#[test]
+fn legacy_error_code_passes_only_exact_allowlisted_prefix_with_fixed_message() {
+    const FIXED: &str = "command could not be completed; refresh before retry";
+    let e = legacy::<()>(Err("E_LIFECYCLE_DESCENDANTS_UNVERIFIED".into())).unwrap_err();
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("E_LIFECYCLE_DESCENDANTS_UNVERIFIED", FIXED));
+
+    let e = legacy::<()>(Err("E_TMUX_UNVERIFIED: /Users/op/.aperture/run/glados.sock".into())).unwrap_err();
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("E_TMUX_UNVERIFIED", FIXED));
+
+    for raw in [
+        "E_TMUX_UNVERIFIEDX",
+        "E_TMUX_UNVERIFIED_EXTRA: x",
+        "E_NOT_IN_ALLOWLIST",
+        "create window failed: index 6 in use",
+        "xE_TMUX_UNVERIFIED",
+        "",
+    ] {
+        let e = legacy::<()>(Err(raw.into())).unwrap_err();
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("E_WEB_COMMAND_FAILED", FIXED), "raw={raw:?}");
+    }
+    assert_eq!(legacy(Ok(5u8)).unwrap(), json!(5));
+}
+
+#[test]
+fn legacy_error_allowlist_is_the_agreed_closed_set() {
+    let mut expected = vec![
+        "E_CODEX_HOME_UNVERIFIED",
+        "E_CODEX_LAUNCH_INPUTS_UNVERIFIED",
+        "E_CODEX_WAIT_UNKNOWN",
+        "E_COORDINATOR_SELF_STOP",
+        "E_LIFECYCLE_DESCENDANTS_UNVERIFIED",
+        "E_LIFECYCLE_OUTCOME_UNKNOWN",
+        "E_LIFECYCLE_PROCESS_UNKNOWN",
+        "E_LOCAL_PROMPT_UNAVAILABLE",
+        "E_LOCAL_THREAD_UNVERIFIED",
+        "E_LOCAL_TOOL_MISSING",
+        "E_RUNTIME_SELECTOR",
+        "E_TMUX_OUTCOME_UNKNOWN",
+        "E_TMUX_UNVERIFIED",
+    ];
+    expected.sort_unstable();
+    let mut actual = LEGACY_ERROR_CODES.to_vec();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    for code in LEGACY_ERROR_CODES {
+        assert!(code.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'), "{code}");
+    }
 }

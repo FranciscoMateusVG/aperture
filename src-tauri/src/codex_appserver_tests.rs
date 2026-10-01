@@ -1751,3 +1751,31 @@ fn c3_held_wrong_selector_and_missing_home_deny_before_intent_or_preparation() {
         assert_eq!(super::C2_SIGNAL_CALLS.with(|v|v.get()),signals);assert_eq!(crate::team_terminal::codex_unlink_calls(),unlinks);
     }
 }
+
+#[test]
+fn coordinator_closed_stop_preserves_history_and_allows_explicit_successor() {
+    let f=C2Fixture::new();let lease=f.inner.lease();let registry=Registry::open(&lease).unwrap();
+    let supervisor=super::NativeCodexSupervisor::new(&lease,&registry,f.spec(None)).unwrap();
+    let first=supervisor.reconcile().unwrap();
+    let before=registry.codex_snapshot("fixture").unwrap().unwrap();
+    let history=snapshot(&f.inner.home);
+    {
+        let slot=lease.codex_slot("fixture").unwrap();let mut op=slot.enter().unwrap();
+        let closed=crate::agents::coordinator_lifecycle::stop(&lease,&mut op,vec![first.identity.clone()],||Ok(())).unwrap();
+        crate::team_terminal::codex_cleanup_closed(&registry,&op,&before,&closed).unwrap();
+        registry.retire_closed_codex(&op,&before,&closed).unwrap();op.release_exited().unwrap();
+        assert!(registry.codex_snapshot("fixture").unwrap().is_none());
+        let archived=lease.run_dir().unwrap().join("coordinator-retired").join(format!("fixture-{}",before.incarnation));
+        for (path,(_,_,_,bytes)) in history {
+            if let Ok(relative)=path.strip_prefix(".aperture/run/daemons/codex-fixture") {
+                if !relative.as_os_str().is_empty()&&archived.join(relative).is_file(){assert_eq!(fs::read(archived.join(relative)).unwrap(),bytes);}
+            }
+        }
+    }
+    // Preserve the owned fixture's create-only PID publication before a second
+    // native child; this is not a production registry/config repair.
+    fs::rename(f.inner.root.join("c2-pid.json"),f.inner.root.join("c2-first-pid.json")).unwrap();
+    let second=supervisor.reconcile().unwrap();
+    assert!(second.created);assert_ne!(first.identity,second.identity);
+    assert_ne!(registry.codex_snapshot("fixture").unwrap().unwrap().incarnation,before.incarnation);
+}

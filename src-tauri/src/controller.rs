@@ -380,6 +380,15 @@ impl CodexOperation<'_> {
         self.state.child = Some(child);
         Ok(())
     }
+    /// Successor admission only after the retained child has really reaped.
+    pub(crate) fn release_exited(&mut self) -> Result<(), String> {
+        self.lease.verify_live()?;
+        if let Some(child) = self.state.child.as_mut() {
+            if child.try_wait().map_err(|_| "E_CODEX_WAIT_UNKNOWN")?.is_none() { return Err("E_CODEX_WAIT_UNKNOWN".into()); }
+            if self.state.identity.as_ref().is_none_or(|id|crate::team_process::state(id)!=crate::team_replacement::ProcessState::Gone) { return Err("E_CODEX_WAIT_UNKNOWN".into()); }
+        }
+        self.state.child=None;self.state.identity=None;Ok(())
+    }
     pub(crate) fn try_wait(&mut self) -> Result<WaitObservation, String> {
         self.lease.verify_live()?;
         match self.state.child.as_mut() {

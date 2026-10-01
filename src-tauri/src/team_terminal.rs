@@ -650,6 +650,31 @@ pub(crate) fn codex_cleanup_fixed(
     Ok(result)
 }
 
+/// Separate coordinator closure path: immutable Gone proof, no inference from
+/// the old "daemon gone, descendants unverified" status.
+pub(crate) fn codex_cleanup_closed(registry:&crate::daemon_registry::Registry<'_>,
+    op:&crate::controller::CodexOperation<'_>,snapshot:&crate::daemon_registry::CodexSnapshot,
+    closed:&crate::agents::coordinator_lifecycle::Closed)->Result<()>
+{
+    closed.verifies(op.seat(),snapshot.identity.as_ref().ok_or(ERROR)?)?;
+    registry.recheck_snapshot(op.seat(),snapshot)?;
+    let (home,socket,guards)=codex_fixed_context(registry,op)?;
+    match fs::symlink_metadata(&socket){
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{
+            for guard in guards{guard.recheck()?;}
+            return closed.recheck();
+        },
+        Err(_)=>return Err(ERROR.into()),Ok(_)=>{},
+    }
+    let binding=CodexSocketResolver::production().resolve(&socket)?;
+    if snapshot.pins.as_ref()!=Some(&codex_pin_values(&home,&socket,&binding)?){return Err(ERROR.into());}
+    let proof=CodexCleanup::new(socket,binding)?;
+    native_explicit_refusal(&proof.binding.path)?;
+    closed.recheck()?;registry.recheck_snapshot(op.seat(),snapshot)?;
+    for guard in guards{guard.recheck()?;}
+    proof.unlink()?;closed.recheck()
+}
+
 #[cfg(test)]
 pub(crate) fn registered_socket_test_observation(
     registry: &crate::daemon_registry::Registry<'_>,

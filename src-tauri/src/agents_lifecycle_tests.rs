@@ -282,7 +282,15 @@ fn local_thread_resume_requires_exact_existing_uuid_and_close_cancels_wait(){
     let work=owner.admit(None).unwrap();let path=h.0.join("thread-id");
     fs::write(&path,b"00000000-0000-4000-8000-000000000001").unwrap();
     assert_eq!(wait_local_thread(&path,&work).unwrap(),"00000000-0000-4000-8000-000000000001");
-    fs::write(&path,b"bad;command").unwrap();assert!(wait_local_thread(&path,&work).is_err());
+    // codex-bridge::publishThreadReady writes exactly `${threadId}\n`.
+    let published=b"00000000-0000-4000-8000-000000000001\n";
+    fs::write(&path,published).unwrap();
+    let pin=LocalInputPin::of(&fs::symlink_metadata(&path).unwrap());
+    assert_eq!(wait_local_thread(&path,&work).unwrap(),"00000000-0000-4000-8000-000000000001");
+    assert_eq!(fs::read(&path).unwrap(),published);pin.recheck(&path).unwrap();
+    for invalid in ["bad;command", "00000000-0000-4000-8000-000000000001\n\n", "00000000-0000-4000-8000-000000000001\r\n", " 00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001 ", "00000000-0000-4000-8000-000000000001\nother", "\n"] {
+        fs::write(&path,invalid).unwrap();assert_eq!(wait_local_thread(&path,&work).unwrap_err(),"E_LOCAL_THREAD_UNVERIFIED");
+    }
     fs::remove_file(&path).unwrap();
     std::thread::scope(|scope|{
         let task=scope.spawn(||wait_local_thread(&path,&work));
@@ -384,4 +392,60 @@ fn local_claude_staging_denies_existing_leaves_before_effects_and_writes_private
     assert_eq!(fs::metadata(&staging.root).unwrap().mode()&0o7777,0o700);staging.recheck_written(&ctx,&op).unwrap();
     assert!(staging.write_new(&ctx,&op,"mcp.json",b"overwrite denied",0o600).is_err());
     drop(op);drop(slot);drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
+
+#[test]
+fn coordinator_stop_real_ingress_reaps_only_selected_native_pane() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmux=Path::new("/opt/homebrew/bin/tmux");
+    assert!(tmux.is_file(),"native tmux is required for this macOS regression");
+    let h=Home::new();let label=format!("yvcnp-{}",uuid::Uuid::new_v4());
+    struct Cleanup<'a>(&'a Path,String);
+    impl Drop for Cleanup<'_>{fn drop(&mut self){let _=std::process::Command::new(self.0).args(["-L",&self.1,"kill-server"]).output();}}
+    let _cleanup=Cleanup(tmux,label.clone());
+    let invoke=|args:&[&str]|{
+        let output=std::process::Command::new(tmux).env_clear().env("HOME",&h.0).env("PATH","/usr/bin:/bin")
+            .args(["-L",&label,"-f","/dev/null"]).args(args).output().unwrap();
+        assert!(output.status.success(),"own tmux status {:?}",output.status);output.stdout
+    };
+    invoke(&["new-session","-d","-s","inert","-n","fixture","/bin/sleep 60"]);
+    invoke(&["new-window","-d","-t","inert:","-n","unrelated","/bin/sleep 60"]);
+    let tool=h.0.join("tmux-own-server");
+    fs::write(&tool,format!("#!/bin/sh\nexec '{}' -L '{}' \"$@\"\n",tmux.display(),label)).unwrap();
+    fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();
+    let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),crate::daemons::LocalTools::fixture(&h.0,&tool)).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    let app=state("fixture","opus");
+    let before=local_panes("inert","fixture",&work).unwrap();assert_eq!(before.len(),1);
+    let id=crate::team_process::observe(before[0].pid).unwrap().unwrap().identity;
+    // Deliberately stopped cached status: native facts, not stale UI, govern Stop.
+    stop_agent_shared("fixture".into(),&app,&ctx).unwrap();
+    assert_eq!(crate::team_process::state(&id),crate::team_replacement::ProcessState::Gone);
+    assert!(local_panes("inert","fixture",&work).unwrap().is_empty());
+    let unrelated=local_panes("inert","unrelated",&work).unwrap();assert_eq!(unrelated.len(),1);
+    assert!(crate::team_process::observe(unrelated[0].pid).unwrap().is_some());
+    assert_eq!(app.lock().unwrap().agents["fixture"].status,"stopped");
+    drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
+}
+
+#[test]
+fn coordinator_foreign_pane_after_gone_reports_unknown_but_not_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let h=Home::new();let tool=h.0.join("tmux-inert");let count=h.0.join("count");
+    // First two observations prove no old pane. A concurrent new pane appears
+    // only at the post-stop sweep; it must not inherit any signal authority.
+    let mut foreign=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let id=crate::team_process::observe(foreign.id()).unwrap().unwrap().identity;
+    fs::write(&tool,format!("#!/bin/sh\nn=0; test ! -f '{}' || read n < '{}'\nn=$((n+1)); printf '%s' \"$n\" > '{}'\nif test \"$n\" -ge 3; then printf '@9||fixture||%%9||{}||0\\n'; fi\n",count.display(),count.display(),count.display(),foreign.id())).unwrap();
+    fs::set_permissions(&tool,fs::Permissions::from_mode(0o700)).unwrap();
+    let owner=crate::daemons::RuntimeOwner::local(ControllerLock::acquire(&h.0).unwrap(),crate::daemons::LocalTools::fixture(&h.0,&tool)).unwrap();
+    let work=owner.admit(Some("fixture")).unwrap();let body=work.body().unwrap();let ctx=work.lifecycle("fixture").unwrap();
+    let app=state("fixture","opus");app.lock().unwrap().agents.get_mut("fixture").unwrap().status="running".into();
+    let result=stop_agent_shared("fixture".into(),&app,&ctx);
+    let observed=crate::team_process::state(&id);foreign.kill().unwrap();foreign.wait().unwrap();
+    assert_eq!(result.unwrap_err(),"E_LIFECYCLE_OUTCOME_UNKNOWN");
+    assert_eq!(observed,crate::team_replacement::ProcessState::Same);
+    assert_eq!(app.lock().unwrap().agents["fixture"].status,"stopped");
+    assert!(app.lock().unwrap().agents["fixture"].tmux_window_id.is_none());
+    drop(ctx);drop(body);drop(work);owner.close().unwrap();drop(owner);
 }

@@ -433,6 +433,8 @@ pub(crate) fn rollback(
             true,
         )?;
         let expected = match approval.category {
+            crate::journal::ArchiveCategory::Retirement
+                if owner_states.get(seat).map(String::as_str) == Some("quarantined") => OwnerState::Quarantined,
             crate::journal::ArchiveCategory::Mission | crate::journal::ArchiveCategory::Retirement => OwnerState::Stale,
             crate::journal::ArchiveCategory::DiagnosticRetirement => OwnerState::Quarantined,
         };
@@ -575,7 +577,8 @@ fn finalize_inner(
     let approved_post: std::collections::BTreeMap<_, _> =
         approval.owner_post_sha256.iter().cloned().collect();
     let category_states_valid = approved_states.values().all(|s| match approval.category {
-        crate::journal::ArchiveCategory::Mission | crate::journal::ArchiveCategory::Retirement => matches!(s.as_str(), "active" | "stale"),
+        crate::journal::ArchiveCategory::Mission => matches!(s.as_str(), "active" | "stale"),
+        crate::journal::ArchiveCategory::Retirement => matches!(s.as_str(), "active" | "stale" | "quarantined"),
         crate::journal::ArchiveCategory::DiagnosticRetirement => s == "quarantined",
     });
     if approved.len() != seats.len() || approved_states.len() != seats.len() || !category_states_valid {

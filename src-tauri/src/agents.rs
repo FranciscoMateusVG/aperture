@@ -13,6 +13,10 @@ use crate::state::AgentDef;
 
 #[path = "team_legacy_guard.rs"]
 pub(crate) mod legacy_lifecycle_guard;
+#[path = "coordinator_prompt.rs"]
+mod coordinator_prompt;
+#[path = "coordinator_lifecycle.rs"]
+pub(crate) mod coordinator_lifecycle;
 
 pub(crate) fn require_legacy_lifecycle_at(
     home: &std::path::Path,
@@ -156,8 +160,11 @@ fn with_lifecycle_plan(
     let codex = advisory.model.starts_with("codex/")
         || matches!(&action, LifecycleAction::Model(v) if v.starts_with("codex/"));
     let history = context.has_codex_history(name)?;
-    if context.work.is_some_and(|w| w.tools().is_ok()) && matches!(action,LifecycleAction::Stop|LifecycleAction::Restart) {
-        return Err("E_LIFECYCLE_DESCENDANTS_UNVERIFIED: stop/restart is unavailable for this local installation".into());
+    if context.work.is_some_and(|w| w.tools().is_ok()) {
+        coordinator_lifecycle::check_start(context.lease, name)?;
+        if matches!(action,LifecycleAction::Stop|LifecycleAction::Restart) {
+            return local_stop_or_restart(state,&advisory,context,&mut op,matches!(action,LifecycleAction::Restart));
+        }
     }
     if codex || history {
         if matches!(action,LifecycleAction::Start) && advisory.model.starts_with("codex/")
@@ -287,7 +294,10 @@ fn wait_local_thread(path:&std::path::Path,work:&crate::daemons::RuntimeWork)->R
             Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
             Ok(_)=>{
                 let bytes=local_regular_bytes(path,128)?;
-                let thread=std::str::from_utf8(&bytes).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
+                // The bridge publishes a canonical UUID followed by ONE LF.
+                // Accept legacy bare UUIDs too, but never trim arbitrary input.
+                let payload=bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+                let thread=std::str::from_utf8(payload).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
                 let id=uuid::Uuid::parse_str(thread).map_err(|_|"E_LOCAL_THREAD_UNVERIFIED")?;
                 if id.to_string()!=thread{return Err("E_LOCAL_THREAD_UNVERIFIED".into());}
                 return Ok(thread.into());
@@ -302,7 +312,7 @@ fn wait_local_thread(path:&std::path::Path,work:&crate::daemons::RuntimeWork)->R
 fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&LifecycleContext<'_>,op:&mut crate::controller::CodexOperation<'_>)->Result<(),String>{
     let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;let tools=work.tools()?;
     let executable=tools.codex.as_ref().ok_or("E_LOCAL_CODEX_MISSING")?;executable.recheck()?;
-    let home=std::path::PathBuf::from(format!("/private/tmp/aperture-codex-{}",expected.name));
+    let home=coordinator_prompt::configured_home(&context.home,&expected.name)?;
     crate::controller::private_dir_readonly(&home).map_err(|_|"E_LOCAL_CODEX_HOME_REQUIRED: existing configured private per-agent home required")?;
     let (bus,sentry,project,session)={let s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;(s.mcp_server_path.clone(),s.mcp_sentry_server_path.clone(),s.project_dir.clone(),s.tmux_session.clone())};
     let bus_pin=local_pinned_bytes(std::path::Path::new(&bus),8*1024*1024)?.1;
@@ -310,12 +320,17 @@ fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&Lif
     let plan=LocalCodexPreparation{context,state,expected,codex_home:home.clone(),bus,sentry,project,bus_pin,sentry_pin,#[cfg(test)]drift_point:None};
     plan.configuration()?; // input shape/modes before registry or durable intent
     let registry=crate::daemon_registry::Registry::open(context.lease)?;
-    if registry.codex_snapshot(&expected.name)?.is_none() {
-        match fs::symlink_metadata(context.lease.run_dir()?.join(format!("{}.thread-id",expected.name))) {
-            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
-            _=>return Err("E_LOCAL_THREAD_HISTORY_UNVERIFIED".into()),
+    if let Some(snapshot)=registry.codex_snapshot(&expected.name)? {
+        if snapshot.identity.as_ref().is_some_and(|id| matches!(crate::team_process::state(id),crate::team_replacement::ProcessState::Gone|crate::team_replacement::ProcessState::Recycled)) {
+            return local_stop_or_restart(state,expected,context,op,true);
         }
     }
+    let fresh=registry.codex_snapshot(&expected.name)?.is_none();
+    // A retained UUID is conversation continuity, not process authority. The
+    // supervisor independently proves the endpoint pristine before spawning.
+    let thread_path=context.lease.run_dir()?.join(format!("{}.thread-id",expected.name));
+    if thread_path.exists(){wait_local_thread(&thread_path,work)?;}
+    coordinator_prompt::ensure(&context.home,&context.roots,&expected.name,std::path::Path::new(&expected.prompt_file),&home,fresh)?;
     let spec=crate::codex_appserver::NativeCodexSpec{seat:expected.name.clone(),executable:executable.path.clone(),codex_home:home.clone(),provenance:crate::daemon_registry::Provenance::LegacyUnknown,
         #[cfg(test)]fixture:None,#[cfg(test)]fault:None};
     let supervisor=crate::codex_appserver::NativeCodexSupervisor::new(context.lease,&registry,spec)?;
@@ -335,6 +350,94 @@ fn start_codex_local(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&Lif
     verify_plan(state,expected)?;
     let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;let agent=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
     agent.tmux_window_id=Some(window);agent.status="running".into();Ok(())
+}
+
+
+#[derive(Clone,Debug,PartialEq,Eq)]
+struct LocalPane {window:String,pane:String,pid:u32,dead:bool}
+fn local_panes(session:&str,seat:&str,work:&crate::daemons::RuntimeWork)->Result<Vec<LocalPane>,String>{
+    if !crate::daemon_registry::valid_name(session)||!crate::daemon_registry::valid_name(seat){return Err("E_RUNTIME_SELECTOR".into());}
+    let bytes=tmux::local_output(work,vec!["list-panes".into(),"-s".into(),"-t".into(),format!("{session}:"),"-F".into(),"#{window_id}||#{window_name}||#{pane_id}||#{pane_pid}||#{pane_dead}".into()])?;
+    let text=std::str::from_utf8(&bytes).map_err(|_|"E_TMUX_UNVERIFIED")?;
+    let mut out=Vec::new();
+    for (n,line) in text.lines().enumerate(){
+        let f=line.split("||").collect::<Vec<_>>();
+        if n>=512||f.len()!=5 {return Err("E_TMUX_UNVERIFIED".into());}
+        if !f[1].eq_ignore_ascii_case(seat){continue;}
+        if !f[0].starts_with('@')||!f[0][1..].bytes().all(|b|b.is_ascii_digit())
+            ||!f[2].starts_with('%')||!f[2][1..].bytes().all(|b|b.is_ascii_digit())
+            ||!matches!(f[4],"0"|"1"){return Err("E_TMUX_UNVERIFIED".into());}
+        let pid=f[3].parse::<u32>().map_err(|_|"E_TMUX_UNVERIFIED")?;
+        if pid<=1{return Err("E_TMUX_UNVERIFIED".into());}
+        out.push(LocalPane{window:f[0].into(),pane:f[2].into(),pid,dead:f[4]=="1"});
+    }
+    Ok(out)
+}
+fn local_stop_or_restart(state:&Arc<Mutex<AppState>>,expected:&AgentDef,context:&LifecycleContext<'_>,
+    op:&mut crate::controller::CodexOperation<'_>,restart:bool)->Result<(),String>
+{
+    let work=context.work.ok_or("E_RUNTIME_TOOLS_UNVERIFIED")?;
+    context.require_tools()?;
+    let session=state.lock().map_err(|_|"E_RUNTIME_STATE")?.tmux_session.clone();
+    let panes=local_panes(&session,&expected.name,work)?;
+    let registry=crate::daemon_registry::Registry::open(context.lease)?;
+    let snapshot=registry.codex_snapshot(&expected.name)?;
+    let mut roots=Vec::new();
+    let mut recovered=None;
+    if let Some(s)=&snapshot {
+        if s.phase!=crate::daemon_registry::CodexPhaseV2::ReadyMetadataOnly{return Err("E_LIFECYCLE_PROCESS_UNKNOWN".into());}
+        let id=s.identity.clone().ok_or("E_LIFECYCLE_PROCESS_UNKNOWN")?;
+        if matches!(crate::team_process::state(&id),crate::team_replacement::ProcessState::Gone|crate::team_replacement::ProcessState::Recycled){
+            let proof=coordinator_lifecycle::previous_closed(context.lease,&expected.name)?;
+            proof.verifies(&expected.name,&id)?;recovered=Some(proof);
+        }else{
+            crate::team_terminal::codex_live_pins(&registry,op,s,&crate::team_terminal::CodexSocketResolver::production())?;
+            roots.push(id);
+        }
+    } else if expected.model.starts_with("codex/") {
+        crate::team_terminal::codex_pristine_endpoint(&registry,op)?;
+    }
+    for p in panes.iter().filter(|p|!p.dead && recovered.is_none()){
+        let native=crate::team_process::observe(p.pid).map_err(|_|"E_LIFECYCLE_PROCESS_UNKNOWN")?.ok_or("E_LIFECYCLE_PROCESS_UNKNOWN")?;
+        if native.uid!=unsafe{libc::geteuid()}{return Err("E_LIFECYCLE_PROCESS_UNKNOWN".into());}
+        roots.push(native.identity);
+    }
+    // The second read binds roots to exact panes before the first signal.
+    if local_panes(&session,&expected.name,work)?!=panes{return Err("E_LIFECYCLE_PROCESS_UNKNOWN".into());}
+    let closed=if let Some(proof)=recovered {proof}else{coordinator_lifecycle::stop(context.lease,op,roots,||{
+        context.classify(&expected.name)?;verify_plan(state,expected)
+    })?};
+    // Observed Gone is truth even if later socket/window cleanup refuses.
+    crate::watchdog::on_agent_stopped(&expected.name);
+    let next={let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;
+        let a=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
+        a.status="stopped".into();a.tmux_window_id=None;a.clone()};
+    if let Some(s)=&snapshot {
+        crate::team_terminal::codex_cleanup_closed(&registry,op,s,&closed)?;
+        registry.retire_closed_codex(op,s,&closed)?;
+        op.release_exited()?;
+    }
+    // remain-on-exit panes can be removed, but never a replacement/live pane.
+    let after=local_panes(&session,&expected.name,work)?;
+    for p in &after {
+        if !p.dead||!panes.iter().any(|old|old.window==p.window&&old.pane==p.pane&&old.pid==p.pid){return Err("E_LIFECYCLE_OUTCOME_UNKNOWN".into());}
+    }
+    let windows:std::collections::BTreeSet<_>=after.iter().map(|p|p.window.clone()).collect();
+    for window in windows {tmux::local_output(work,vec!["kill-window".into(),"-t".into(),window])?;}
+    closed.recheck()?;
+    let kickoff=context.lease.run_dir()?.join(format!("{}.kickoff",expected.name));
+    match fs::symlink_metadata(&kickoff){
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+        Ok(_)=>{let (_,pin)=local_pinned_bytes(&kickoff,21)?;pin.recheck(&kickoff)?;fs::remove_file(&kickoff).map_err(|_|"E_LIFECYCLE_OUTCOME_UNKNOWN")?;},
+        Err(_)=>return Err("E_LIFECYCLE_OUTCOME_UNKNOWN".into()),
+    }
+    if !restart{return Ok(());}
+    if next.model.starts_with("codex/"){return start_codex_local(state,&next,context,op);}
+    let (bus,sentry,project)={let s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;(s.mcp_server_path.clone(),s.mcp_sentry_server_path.clone(),s.project_dir.clone())};
+    let window=boot_agent_process_held(context,op,&next,session,bus,sentry,project)?;
+    let mut s=state.lock().map_err(|_|"E_RUNTIME_STATE")?;
+    let a=s.agents.get_mut(&expected.name).ok_or("E_RUNTIME_STATE")?;
+    a.status="running".into();a.tmux_window_id=Some(window);Ok(())
 }
 
 #[cfg(test)]
