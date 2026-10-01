@@ -108,7 +108,7 @@ test("a synthetic bootstrap click is inert: no command, no status change, no loc
   assert.equal(reads, 1); assert.equal(f.status.textContent, before); assert.equal(f.refresh.disabled, false); assert.equal(button.disabled, false);
  });
 });
-test("active card is compact by default: one row per seat, diagnostics and advanced actions only inside closed details", async () => {
+test("active team is collapsed by default: seat actions and diagnostics are inside the team disclosure", async () => {
  const t = startableTeam();
  await setup({ api: { list: async () => [t] } }, async f => {
   const html = f.teams.innerHTML;
@@ -119,10 +119,13 @@ test("active card is compact by default: one row per seat, diagnostics and advan
    assert.ok(html.lastIndexOf("<details", at) > html.lastIndexOf("</details>", at), `${inside} sits inside a details element`);
   }
   assert.match(html, /2 agentes · 0 trabalhando · 0 aguardando/); assert.match(html, /backend · líder/); assert.match(html, /data-action="open-seat" data-team="t1" data-seat="t1-backend"/);
-  const openAt = html.indexOf('data-action="open-seat"'); assert.ok(html.lastIndexOf("<details", openAt) < html.lastIndexOf("</details>", openAt) || html.lastIndexOf("<details", openAt) === -1, "Open stays on the seat row, outside details");
+  const summaryEnd = html.indexOf("</summary>");
+  const openAt = html.indexOf('data-action="open-seat"');
+  assert.ok(openAt > summaryEnd, "seat Open is revealed only after expanding the whole team");
+  assert.ok(openAt < html.indexOf('data-details="seat:t1:t1-backend"'), "Open stays outside the nested seat details");
  });
 });
-test("pending card keeps cancel visible and hides worker rows and worker actions", async () => {
+test("pending team keeps cancellation available after expansion and has no worker actions", async () => {
  await setup({}, async f => {
   const html = f.teams.innerHTML;
   assert.match(html, /data-action="cancel-pending"/); assert.match(html, /1 agentes|2 agentes/);
@@ -303,8 +306,8 @@ test("compact seat row keeps short identity, honest status and Open; full facts 
  assert.match(rows[1], /data-status="quarantined">Quarentena/);
  assert.match(rows[1], /data-seat="t1-qa" disabled title="Agente não disponível para abrir">Abrir<\/button>$/);
  for (const row of rows) assert.doesNotMatch(row, /gpt-6-astra|sonnet|codex|claude|· g1|v4-meta|repository|epic|v4-seat__role/);
- const head = html.slice(0, html.indexOf("</div></div>"));
- assert.match(head, /<h2 title="t1">t1<\/h2><p class="v4-meta">2 agentes · 1 trabalhando · 0 aguardando<\/p>/);
+ const head = html.slice(0, html.indexOf("</summary>"));
+ assert.match(head, /class="v4-team__name" title="t1">t1<\/span><span class="v4-meta"[^>]*>2 agentes · 1 trabalhando · 0 aguardando<\/span>/);
  assert.match(head, /v4-status">active<\/span>/); assert.doesNotMatch(head, /repository|epic|lead:|· g1|gpt-6-astra/);
  for (const inside of ["repository: aperture (immutable)", "lead: t1-backend", "generation: g1", "epic: aperture-epic1", "codex · gpt-6-astra · high", "active · g1", "<dt>Agente / função</dt><dd>t1-backend · backend</dd>", "Inicialização coordenada por GLaDOS"]) {
   const at = html.indexOf(inside); assert.ok(at > 0, inside);
@@ -324,10 +327,59 @@ test("long and repeated-role names stay distinct with full identity available an
  assert.match(renderTeamGroup(t), /title="t1-qa-2">qa-2<\/span>/);
  const css = await readFile(new URL("../src/teams.css", import.meta.url), "utf8");
  const rule = sel => { const at = css.indexOf(`\n${sel} {`); assert.ok(at >= 0, sel); return css.slice(at, css.indexOf("}", at)); };
- for (const sel of [".v4-seat__name", ".v4-team__title h2, .v4-team__title .v4-meta"]) { assert.match(rule(sel), /text-overflow: ellipsis/); assert.match(rule(sel), /white-space: nowrap/); assert.match(rule(sel), /overflow-wrap: normal/); }
+ for (const sel of [".v4-seat__name", ".v4-team__name, .v4-team__title .v4-meta"]) { assert.match(rule(sel), /text-overflow: ellipsis/); assert.match(rule(sel), /white-space: nowrap/); assert.match(rule(sel), /overflow-wrap: normal/); }
  assert.match(rule(".v4-seat__name"), /min-width: 0/); assert.match(rule(".v4-seat__row"), /flex-wrap: nowrap/);
  assert.doesNotMatch(css, /\.v4-seat__row \.v4-meta|\.v4-seat__name \{ flex: 1 1 100%/);
  assert.match(rule(".v4-button--small"), /min-height: var\(--v4-target\)/); assert.match(css, /--v4-target: 44px/);
  assert.match(rule(".v4-seat > .v4-seat__details > summary"), /width: 44px/);
  assert.match(rule(".v4-seat > .v4-seat__details > summary"), /height: 44px/);
+});
+
+
+test("whole team is one closed native disclosure; quarantine remains visible before expansion", () => {
+ const t = team("active");
+ t.seats[1].observed_owner = ownerIn("quarantined", 2);
+ const html = renderTeamGroup(t);
+ assert.match(html, /^<details class="v4-card v4-team" data-details="group:t1"><summary class="v4-team__head">/);
+ assert.match(html, /<\/div><\/details>$/);
+ const head = html.slice(0, html.indexOf("</summary>"));
+ assert.match(head, /title="t1">t1/);
+ assert.match(head, /2 agentes · 0 trabalhando · 0 aguardando/);
+ assert.match(head, /v4-status">active/);
+ assert.match(head, /v4-team__warning">1 em quarentena/);
+ assert.doesNotMatch(head, /button|data-action|data-seat-row|Acceptance|mission/);
+ assert.ok(html.indexOf('data-seat-row="t1-backend"') > html.indexOf("</summary>"));
+ assert.doesNotMatch(html, /<details[^>]*\sopen/);
+ const pending = renderTeamGroup(team());
+ assert.match(pending.slice(0, pending.indexOf("</summary>")), /v4-status">pending/);
+ const failed = team("failed"); failed.state.failure = "E_TEST";
+ assert.match(renderTeamGroup(failed).slice(0, renderTeamGroup(failed).indexOf("</summary>")), /v4-status">failed/);
+});
+
+test("team row sizing contract is 56px including border without shrinking the disclosure target", async () => {
+ const css = await readFile(new URL("../src/teams.css", import.meta.url), "utf8");
+ assert.match(css, /\.v4-team \{ padding: 0; \}/);
+ assert.match(css, /\.v4-team > \.v4-team__head \{[^}]*min-height: 54px;[^}]*box-sizing: border-box;/);
+ assert.match(css, /\.v4-card \{[^}]*border: 1px solid/);
+ assert.match(css, /\.v4 \[data-teams\] \{ gap: 6px; \}/);
+ assert.match(css, /\.v4-team__head:focus-visible \{/);
+ assert.doesNotMatch(css, /\.v4-team__body[^}]*display:\s*(?:block|grid|flex)\s*!important/);
+});
+
+test("refresh preserves the expanded team and its summary focus, not just seat details", async () => {
+ const t = startableTeam(); let busy = false;
+ await setup({ api: { list: async () => [t] }, listAgents: async () => [{ name: "t1-backend", turn_state: busy ? "busy" : "idle" }] }, async f => {
+  const details = new f.El(); details.dataset.details = "group:t1"; details.open = true;
+  const summary = new f.El(); summary.closest = () => details;
+  f.teams.detailsEls = [details]; f.teams.contains = el => el === summary;
+  f.doc.activeElement = summary;
+  const fresh = new f.El(); fresh.dataset.details = "group:t1"; fresh.open = false;
+  const newSummary = new f.El(); let focused = 0; newSummary.focus = () => { focused++; };
+  let html = f.teams.innerHTML;
+  Object.defineProperty(f.teams, "innerHTML", { get: () => html, set: v => { html = v; f.teams.detailsEls = [fresh]; } });
+  f.teams.querySelector = sel => sel === 'details[data-details="group:t1"] > summary' ? newSummary : null;
+  busy = true; await f.instance.refresh();
+  assert.equal(fresh.open, true);
+  assert.equal(focused, 1);
+ });
 });
