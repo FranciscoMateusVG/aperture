@@ -78,7 +78,9 @@ impl Fixture {
         let lease = crate::controller::ControllerLock::acquire(&root).unwrap();
         lease.rotate_open_capability(&open).unwrap();
         let runtime = Arc::new(crate::daemons::RuntimeOwner::new(lease));
+        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let state = WebState {
+            shutdown,
             runtime,
             authority: address.clone(),
             origin: format!("http://{address}"),
@@ -94,7 +96,9 @@ impl Fixture {
         };
         let app = router(state.clone());
         let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = shutdown_rx.wait_for(|stop| *stop).await;
+            }).await.unwrap();
         });
         Self {
             state,
@@ -1839,5 +1843,52 @@ fn legacy_error_allowlist_is_the_agreed_closed_set() {
     assert_eq!(actual, expected);
     for code in LEGACY_ERROR_CODES {
         assert!(code.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'), "{code}");
+    }
+}
+
+#[tokio::test]
+async fn launcher_native_control_authority_and_shutdown() {
+    let mut f = Fixture::new().await;
+    let browser = format!("Bearer {}", f.session().await);
+    let native = format!("Bearer {}", f.open);
+    for path in ["/session/status", "/session/shutdown"] {
+        for headers in [vec![], vec![("Authorization", browser.as_str())],
+            vec![("Authorization", native.as_str()), ("Origin", f.state.origin.as_str())],
+            vec![("Authorization", native.as_str()), ("Sec-Fetch-Site", "none")]] {
+            let (code, _, _) = f.request("POST", path, &headers, "").await;
+            assert!(code == 401 || code == 403);
+            assert!(!*f.state.shutdown.borrow());
+        }
+        assert_eq!(f.request("POST", path, &[("Authorization", &native), ("Host", "evil.invalid")], "").await.0, 421);
+        assert_eq!(f.request("POST", path, &[("Authorization", &native)], "unexpected").await.0, 400);
+        assert!(!*f.state.shutdown.borrow());
+    }
+    assert_eq!(server_status(&f.root, &f.state.authority).await.unwrap(), "running");
+    let reply = native_control(&f.root, &f.state.authority, NativeControl::Stop).await.unwrap().unwrap();
+    assert_eq!(reply["state"], "stopping");
+    tokio::time::timeout(Duration::from_secs(3), &mut f.task).await.unwrap().unwrap();
+    // The listener is Gone but the fixture deliberately still owns the lease.
+    assert!(server_status(&f.root, &f.state.authority).await.is_err());
+    assert_eq!(std::fs::read(f.root.join(".aperture/run/owner/sentinel")).unwrap(), b"unchanged");
+    let (root, addr) = (f.root.clone(), f.state.authority.clone());
+    f.preserve = true;
+    drop(f);
+    assert_eq!(server_status(&root, &addr).await.unwrap(), "stopped");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn launcher_native_client_wrong_service_is_not_stopped() {
+    let f = Fixture::new().await;
+    for response in ["HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut input = [0; 1024]; stream.read(&mut input).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        assert!(server_status(&f.root, &address).await.is_err());
+        task.await.unwrap();
     }
 }

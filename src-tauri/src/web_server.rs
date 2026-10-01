@@ -21,6 +21,7 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-
 const BODY_LIMIT: usize = 16 * 1024;
 #[derive(Clone)]
 struct WebState {
+    shutdown: tokio::sync::watch::Sender<bool>,
     authority: String,
     origin: String,
     auth: Arc<Mutex<BrowserAuth>>,
@@ -143,7 +144,7 @@ async fn bootstrap_denied() -> Response {
 async fn session(State(s): State<WebState>, request: Request) -> Response {
     let path = request.uri().path().to_owned();
     let h = request.headers();
-    if path == "/session/mint" {
+    if matches!(path.as_str(), "/session/mint" | "/session/status" | "/session/shutdown") {
         if h.contains_key("origin") || h.keys().any(|k| k.as_str().starts_with("sec-fetch-")) {
             return error(403, "E_WEB_ORIGIN", "native open request required");
         }
@@ -163,6 +164,11 @@ async fn session(State(s): State<WebState>, request: Request) -> Response {
         Ok(a) => a,
         Err(_) => return auth_error(503),
     };
+    if matches!(path.as_str(), "/session/status" | "/session/shutdown") {
+        if !auth.native_operator(&credential) { return auth_error(401); }
+        if path == "/session/shutdown" { s.shutdown.send_replace(true); }
+        return Json(json!({"state": if *s.shutdown.borrow() { "stopping" } else { "running" }})).into_response();
+    }
     let result = match path.as_str() {
         "/session/mint" => auth.mint_open(&credential).map(|v| json!({"exchange":v})),
         "/session" => {
@@ -587,6 +593,8 @@ fn router(s: WebState) -> Router {
         .route_layer(middleware::from_fn_with_state(s.clone(), api_gate));
     api.route("/session", post(session))
         .route("/session/mint", post(session))
+        .route("/session/status", post(session))
+        .route("/session/shutdown", post(session))
         .route("/session/link", post(session))
         .route("/session/logout", post(session))
         .fallback(static_file)
@@ -631,7 +639,9 @@ pub async fn serve() -> Result<(), String> {
         state.mcp_sentry_server_path=sentry.to_string_lossy().into_owned();
     }
     let runtime = Arc::new(crate::daemons::RuntimeOwner::local(lease,tools)?);
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let s = WebState {
+        shutdown,
         runtime: runtime.clone(),
         authority: "127.0.0.1:4519".into(),
         origin: "http://127.0.0.1:4519".into(),
@@ -655,7 +665,10 @@ pub async fn serve() -> Result<(), String> {
     let closing = runtime.clone();
     let result = axum::serve(listener, router(s))
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = shutdown_rx.wait_for(|stop| *stop) => {},
+            }
             // Close admission before waiting for HTTP request futures. The
             // synchronous collector must not occupy the async worker.
             let _ = tokio::task::spawn_blocking(move || closing.close()).await;
@@ -671,57 +684,84 @@ pub async fn serve() -> Result<(), String> {
     Ok(())
 }
 
-/// CLI-only open flow. Capability stays in memory/header, never argv/environment/output.
-pub async fn open() -> Result<(), String> {
+/// CLI capabilities stay in memory/header, never argv/environment/output.
+fn operator_capability(home: &std::path::Path) -> Result<String, String> {
     use std::io::Read;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("home unavailable")?;
     let root = home.join(".aperture");
-    if !root.is_dir() {
-        return Err("operator capability unavailable".into());
-    }
-    crate::journal::ensure_private_dir(&root).map_err(|_| "operator capability unavailable")?;
+    crate::controller::private_dir_readonly(&root).map_err(|_| "operator capability unavailable")?;
     let path = crate::journal::validate_component_path(&root, "run/operator.token", false)
         .map_err(|_| "operator capability unavailable")?;
     let mut value = String::new();
     crate::journal::open_private_file_nofollow(&path)
-        .map_err(|_| "operator capability unavailable")?
-        .take(44)
-        .read_to_string(&mut value)
+        .map_err(|_| "operator capability unavailable")?.take(44).read_to_string(&mut value)
         .map_err(|_| "operator capability unavailable")?;
-    if value.len() != 43
-        || !value
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-    {
+    if value.len() != 43 || !value.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)) {
         return Err("operator capability unavailable".into());
     }
-    let exchange=tokio::time::timeout(Duration::from_secs(5),async {
-        let mut stream=tokio::net::TcpStream::connect("127.0.0.1:4519").await.map_err(|_|())?;
-        let request=format!("POST /session/mint HTTP/1.1\r\nHost: 127.0.0.1:4519\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",value);
-        stream.write_all(request.as_bytes()).await.map_err(|_|())?;
-        let mut bytes=Vec::new(); stream.take(8192).read_to_end(&mut bytes).await.map_err(|_|())?;
-        let text=std::str::from_utf8(&bytes).map_err(|_|())?;
-        if !text.starts_with("HTTP/1.1 200 ") { return Err(()); }
-        let (_,body)=text.split_once("\r\n\r\n").ok_or(())?;
-        let data:Value=serde_json::from_str(body).map_err(|_|())?;
-        let exchange=data.get("exchange").and_then(Value::as_str).ok_or(())?;
-        if exchange.len()!=43 || !exchange.bytes().all(|c|c.is_ascii_alphanumeric()||b"-_".contains(&c)) { return Err(()); }
-        Ok(exchange.to_owned())
-    }).await.map_err(|_|"open request timed out")?.map_err(|_|"open request failed")?;
+    Ok(value)
+}
+#[derive(Clone, Copy)]
+enum NativeControl { Open, Status, Stop }
+async fn native_control(home: &std::path::Path, authority: &str, action: NativeControl) -> Result<Option<Value>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = match tokio::net::TcpStream::connect(authority).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
+            Err(_) => return Err("local server status unavailable".into()),
+        };
+        let capability = operator_capability(home)?;
+        let path = match action { NativeControl::Open => "mint", NativeControl::Status => "status", NativeControl::Stop => "shutdown" };
+        let request = format!("POST /session/{path} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {capability}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.map_err(|_| "native request failed")?;
+        let mut bytes = Vec::new();
+        stream.take(8193).read_to_end(&mut bytes).await.map_err(|_| "native response failed")?;
+        if bytes.len() > 8192 { return Err("native response exceeds limit".into()); }
+        let text = std::str::from_utf8(&bytes).map_err(|_| "native response invalid")?;
+        if !text.starts_with("HTTP/1.1 200 ") { return Err("native request refused; reopen or check the server version".into()); }
+        let (_,body) = text.split_once("\r\n\r\n").ok_or("native response invalid")?;
+        let value = serde_json::from_str(body).map_err(|_| "native response invalid")?;
+        Ok(Some(value))
+    }).await.map_err(|_| "native request timed out".to_string())?
+}
+fn local_home() -> Result<PathBuf, String> {
+    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| "home unavailable".into())
+}
+async fn server_status(home: &std::path::Path, authority: &str) -> Result<&'static str, String> {
+    match native_control(home, authority, NativeControl::Status).await? {
+        None if crate::controller::available(home)? => Ok("stopped"),
+        None => Err("controller busy; server may be starting or draining".into()),
+        Some(v) => match v.get("state").and_then(Value::as_str) {
+            Some("running") => Ok("running"), Some("stopping") => Ok("stopping"),
+            _ => Err("native status invalid".into()),
+        }
+    }
+}
+pub async fn status() -> Result<&'static str, String> { server_status(&local_home()?, "127.0.0.1:4519").await }
+/// One authenticated shutdown request, then read-only observation. Never sends
+/// a process signal or retries a mutation; hub/agent lifetimes are unchanged.
+pub async fn stop() -> Result<(), String> {
+    let home = local_home()?;
+    if let Some(v) = native_control(&home, "127.0.0.1:4519", NativeControl::Stop).await? {
+        if v.get("state").and_then(Value::as_str) != Some("stopping") { return Err("shutdown not acknowledged".into()); }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if matches!(server_status(&home, "127.0.0.1:4519").await, Ok("stopped")) { return Ok(()); }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("shutdown not confirmed; no retry or force-stop was attempted".into())
+}
+pub async fn open() -> Result<(), String> {
+    let v = native_control(&local_home()?, "127.0.0.1:4519", NativeControl::Open).await?
+        .ok_or("local server is stopped")?;
+    let exchange = v.get("exchange").and_then(Value::as_str).ok_or("open response invalid")?;
+    if exchange.len()!=43 || !exchange.bytes().all(|c| c.is_ascii_alphanumeric()||b"-_".contains(&c)) { return Err("open response invalid".into()); }
     let status = std::process::Command::new("/usr/bin/open")
         .arg(format!("http://127.0.0.1:4519/#t={exchange}"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|_| "browser unavailable")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("browser unavailable".into())
-    }
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().map_err(|_| "browser unavailable")?;
+    if status.success() { Ok(()) } else { Err("browser unavailable".into()) }
 }
 
 #[cfg(test)]

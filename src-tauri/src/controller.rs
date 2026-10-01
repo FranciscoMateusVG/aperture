@@ -49,6 +49,33 @@ pub(crate) fn private_dir_readonly(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+/// Read-only native launcher probe. A refused HTTP connection does not prove
+/// shutdown while the real controller lease is still held (startup/drain).
+/// No directory/lock creation or record mutation; never identifies a kill target.
+pub(crate) fn available(home: &Path) -> Result<bool, String> {
+    let root = home.join(".aperture");
+    for directory in [&root, &root.join("run")] {
+        match std::fs::symlink_metadata(directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(_) => return Err("controller directory unavailable".into()),
+            Ok(_) => private_dir_readonly(directory)?,
+        }
+    }
+    let path = root.join("run/daemons.lock");
+    let file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(_) => return Err("controller lock unavailable".into()),
+    };
+    let m = file.metadata().map_err(|_| "controller lock unavailable")?;
+    let p = std::fs::symlink_metadata(&path).map_err(|_| "controller lock unavailable")?;
+    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.nlink() != 1 || m.mode() & 0o777 != 0o600
+        || p.file_type().is_symlink() || (m.dev(),m.ino()) != (p.dev(),p.ino()) { return Err("controller lock unsafe".into()); }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { return Ok(true); }
+    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock { Ok(false) }
+    else { Err("controller lock unavailable".into()) }
+}
+
 impl ControllerLock {
     pub fn acquire(home: &Path) -> Result<Self, String> {
         let root = home.join(".aperture");
@@ -408,6 +435,24 @@ impl CodexOperation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn launcher_probe_is_readonly_and_distinguishes_held_unsafe_and_free() {
+        let home = std::env::temp_dir().join(format!("aperture-launcher-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&home).unwrap();
+        assert!(available(&home).unwrap());
+        assert!(!home.join(".aperture").exists());
+        let lease = ControllerLock::acquire(&home).unwrap();
+        let path = home.join(".aperture/run/daemons.lock");
+        let before = std::fs::read(&path).unwrap();
+        assert!(!available(&home).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(lease);
+        assert!(available(&home).unwrap());
+        std::fs::rename(&path, path.with_extension("saved")).unwrap();
+        std::os::unix::fs::symlink(path.with_extension("saved"), &path).unwrap();
+        assert!(available(&home).is_err());
+        std::fs::remove_dir_all(home).unwrap();
+    }
     #[test]
     fn second_controller_cannot_rotate_or_mutate() {
         let home =
