@@ -590,7 +590,8 @@ fn valid_journal(journal: &Journal) -> bool {
                 && approval.owner_post_sha256.len() == approval.owner_sha256.len()
                 && approval.owner_states.iter().all(|(seat, state)| {
                     !seat.is_empty() && match approval.category {
-                        ArchiveCategory::Mission | ArchiveCategory::Retirement => matches!(state.as_str(), "active" | "stale"),
+                        ArchiveCategory::Mission => matches!(state.as_str(), "active" | "stale"),
+                        ArchiveCategory::Retirement => matches!(state.as_str(), "active" | "stale" | "quarantined"),
                         ArchiveCategory::DiagnosticRetirement => state == "quarantined",
                     }
                 })

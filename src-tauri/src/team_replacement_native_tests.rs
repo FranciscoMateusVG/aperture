@@ -1493,3 +1493,146 @@ fn claude_diagnostic_poll_early_failure_timeout_and_unknown_stay_distinct() {
         process: ProcessState::Same, end: None, exec_boundary: false,
     }), false), Err(ReplacementError::OutcomeUnknown));
 }
+
+/// The actual mixed-team shape: a stopped observed Codex g1 peer and a
+/// quarantined unobserved Claude g2. No new generation is created to withdraw.
+impl Recovery {
+    fn mixed_retirement() -> Self {
+        use sha2::Digest;
+        let mut r = Self::at(2);
+        let path = r.home().join(".aperture/teams/t1/team.json");
+        let mut snapshot: TeamSnapshot = read_private_json(&path).unwrap();
+        snapshot.seats.push(serde_json::from_value(serde_json::json!({
+            "name":"t1-peer","role":"backend","harness":"codex",
+            "model":"gpt-6-astra","reasoning":"high"
+        })).unwrap());
+        r.f.write(".aperture/teams/t1/team.json", &serde_json::to_value(&snapshot).unwrap());
+        r.raw_sha = format!("{:x}", sha2::Sha256::digest(std::fs::read(&path).unwrap()));
+        r.typed_sha = smoke_hash(&snapshot).unwrap();
+        r.attempt.snapshot_sha256 = r.raw_sha.clone();
+        r.attempt_file(|_| {}); r.launch(|_| {}); r.release(|_| {});
+        let mut peer = r.owner_value();
+        peer["seat"] = "t1-peer".into(); peer["generation"] = 1.into();
+        peer["state"] = "active".into(); peer["provisional_token_id"] = serde_json::Value::Null;
+        peer["requested"] = serde_json::json!({"harness":"codex","model":"gpt-6-astra","reasoning":"high"});
+        let i = &mut peer["incarnation"];
+        i["pid"] = 900003.into(); i["thread_id"] = uuid::Uuid::new_v4().to_string().into();
+        i["observed"] = true.into(); i["harness"] = "codex".into();
+        i["model"] = "gpt-6-astra".into(); i["reasoning"] = "high".into();
+        i["token_id"] = "c".repeat(64).into();
+        i["processes"][0]["pid"] = 900003.into(); i["processes"][0]["pgid"] = 900003.into();
+        r.f.write(".aperture/run/owner/t1-peer.json", &peer);
+        r.f.write(".aperture/run/revocations/t1-peer.json", &serde_json::json!({
+            "schema_version":1,"seat":"t1-peer","revoked_through_generation":1,"revoked_token_ids":["c".repeat(64)]
+        }));
+        r.f.write(".claude/aperture/t1-qa/manifest.json", &serde_json::json!({
+            "name":"t1-qa","window":"t1-qa","role":"qa","model":crate::team_claude_launch::MODEL,"enabled":true
+        }));
+        r.f.write(".claude/aperture/t1-peer/TEAM", &serde_json::json!({"schema_version":1,"team":"t1","role":"backend"}));
+        r.f.write(".claude/aperture/t1-peer/manifest.json", &serde_json::json!({
+            "name":"t1-peer","window":"t1-peer","role":"backend","model":"gpt-6-astra","enabled":true
+        }));
+        write_private_bytes_atomic(&r.home().join(".claude/aperture/t1-peer/.complete"), b"complete\n", false).unwrap();
+        r
+    }
+}
+struct RetirementEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl Drop for RetirementEnv {
+    fn drop(&mut self) {
+        for (k,v) in &self.0 { match v { Some(v) => std::env::set_var(k,v), None => std::env::remove_var(k) } }
+    }
+}
+fn retirement_auth(r: &Recovery) -> (RetirementEnv, AuthenticatedActor) {
+    let env = RetirementEnv(["HOME", "APERTURE_AGENTS_DIR"].into_iter().map(|k|(k,std::env::var_os(k))).collect());
+    r.f.write(".claude/aperture/glados/manifest.json", &serde_json::json!({
+        "name":"GLaDOS","role":"orchestrator","model":"sonnet","enabled":true,"window":"glados"
+    }));
+    write_private_bytes_atomic(&r.home().join(".claude/aperture/glados/prompt.md"), b"fixture", false).unwrap();
+    write_private_bytes_atomic(&r.home().join(".aperture/run/hub-tokens/glados.token"), b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false).unwrap();
+    std::env::set_var("HOME",r.home());
+    std::env::set_var("APERTURE_AGENTS_DIR",r.home().join(".claude/aperture"));
+    (env, crate::team_auth::authenticate_glados_control().unwrap())
+}
+fn retirement_control(action: &str) -> Result<crate::teams::TeamControlResponse, crate::teams::TeamError> {
+    crate::teams::team_control_headless(&serde_json::json!({"action":action,"input":{
+        "team":"t1","seat":"t1-qa","expected_generation":2,"accept_checkpoint_loss":true
+    }}).to_string())
+}
+
+#[test]
+fn retirement_quarantined_mixed_team_archives_and_rolls_back_without_start_or_history_loss() {
+    let _lock = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    let r = Recovery::mixed_retirement();
+    let (_env, actor) = retirement_auth(&r);
+    let history = r.history_bytes(); let current = r.current_bytes();
+    let owner = r.file_bytes(".aperture/run/owner/t1-qa.json");
+    let floor = r.file_bytes(".aperture/run/revocations/t1-qa.json");
+    let response = retirement_control("retire_seat").unwrap();
+    let response = serde_json::to_value(response).unwrap();
+    assert_eq!(response["result"]["owner_state"], "quarantined");
+    assert_eq!(response["result"]["mission"], "unknown");
+    assert_eq!(r.history_bytes(),history); assert_eq!(r.current_bytes(),current);
+    assert_eq!(r.file_bytes(".aperture/run/owner/t1-qa.json"),owner);
+    assert_eq!(r.file_bytes(".aperture/run/revocations/t1-qa.json"),floor);
+    assert!(!r.home().join(Recovery::runtime_dir(2)).exists());
+    assert!(!r.home().join(Recovery::managed_dir(3)).exists());
+    assert!(!r.home().join(".aperture/run/hub-tokens/t1-qa.token").exists());
+    assert!(retirement_control("retire_seat").is_err(), "fact is create-only");
+    // A partial set never falls through to a mission/diagnostic approval.
+    let archive = || crate::teams::team_control_headless(r#"{"action":"archive","input":{"team":"t1","expected_generation":1}}"#);
+    assert!(archive().is_err());
+    crate::team_archive::retirement::record_stopped(&r.home(),&actor,"t1","t1-peer",1,CheckpointRecovery::None,true).unwrap();
+    let fact = r.file_bytes(".aperture/run/managed/t1-qa/g2/retired.json");
+    let response = serde_json::to_value(archive().unwrap()).unwrap();
+    assert_eq!(response["result"]["state"],"archived");
+    assert_eq!(response["result"]["checks"]["worktrees"],"unknown");
+    assert_eq!(r.file_bytes(".aperture/run/owner/t1-qa.json"),owner);
+    assert_eq!(r.file_bytes(".aperture/run/managed/t1-qa/g2/retired.json"),fact);
+    assert_eq!(read_private_json::<OwnerRecord>(&r.home().join(".aperture/run/owner/t1-peer.json")).unwrap().state,OwnerState::Stale);
+    let plan = crate::journal::read_journal(&r.home().join(".aperture/run/archive-manifests/t1.json")).unwrap();
+    assert_eq!(plan.archive_approval.as_ref().unwrap().category,crate::journal::ArchiveCategory::Retirement);
+    crate::team_archive_finalize::rollback(&r.home(),&actor,"t1",1).unwrap();
+    assert_eq!(r.history_bytes(),history); assert_eq!(r.current_bytes(),current);
+    assert_eq!(r.file_bytes(".aperture/run/owner/t1-qa.json"),owner);
+    assert!(!r.home().join(Recovery::runtime_dir(2)).exists());
+}
+
+#[test]
+fn retirement_quarantined_denies_without_exact_failed_bootstrap_proof_and_no_effects() {
+    let _lock = crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for mode in 0..13 {
+        let r = Recovery::mixed_retirement(); let (_env,actor) = retirement_auth(&r);
+        match mode {
+            0 => r.owner(|v| v["incarnation"]["observed"]=true.into()),
+            1 => r.owner(|v| v["incarnation"]["thread_id"]="bound".into()),
+            2 => r.owner(|v| v["provisional_token_id"]="f".repeat(64).into()),
+            3 => r.revocations(|v| v["revoked_through_generation"]=1.into()),
+            4 => write_private_bytes_atomic(&r.home().join(".aperture/run/hub-tokens/t1-qa.token"),b"fixture-token",false).unwrap(),
+            5 => r.launch(|v| v["mode"]="pre_input".into()),
+            6 => r.release(|v| v["attempt_sha256"]="f".repeat(64).into()),
+            7 => r.f.write(&format!("{}/terminal.json",Recovery::runtime_dir(1)), &serde_json::json!({"schema_version":1,"attempt_id":"foreign","kind":"ready"})),
+            8 => r.owner(|v| v["reservation_nonce_sha256"]="f".repeat(64).into()),
+            9 => { r.f.write(".aperture/run/managed/t1-qa/g3/foreign.json", &serde_json::json!({})); },
+            10 => {
+                let current = team_process::observe(std::process::id()).unwrap().unwrap();
+                let birth = team_process::birth_micros(&current.identity).unwrap();
+                r.owner(|v| {
+                    let i = &mut v["incarnation"];
+                    i["pid"]=current.identity.pid.into(); i["start_time"]=birth.into();
+                    i["processes"][0]["pid"]=current.identity.pid.into();
+                    i["processes"][0]["start_time"]=birth.into();
+                });
+            },
+            11 | 12 => {},
+            _ => unreachable!()
+        }
+        let before = r.history_bytes(); let owner = r.file_bytes(".aperture/run/owner/t1-qa.json");
+        let result = if mode == 11 {
+            stop_for_retirement(&r.home(), &AuthenticatedActor::operator_ui(),"t1","t1-qa",2,true)
+        } else { stop_for_retirement(&r.home(),&actor,"t1","t1-qa",2,mode!=12) };
+        assert!(result.is_err(),"mode {mode}");
+        assert!(!r.home().join(".aperture/run/managed/t1-qa/g2/retired.json").exists());
+        assert!(!r.home().join(Recovery::runtime_dir(2)).exists());
+        assert_eq!(r.history_bytes(),before); assert_eq!(r.file_bytes(".aperture/run/owner/t1-qa.json"),owner);
+    }
+}

@@ -1906,6 +1906,16 @@ pub(crate) fn stop_for_archive(
     Ok(CheckpointRecovery::Valid)
 }
 
+/// Reuse the complete failed-bootstrap proof without constructing a recovery
+/// admission, reserving a generation, or granting any process/token effect.
+/// Caller holds team -> seat locks; retirement writer/inspector recheck it.
+pub(crate) fn verify_unobserved_retirement_locked(
+    home: &Path, team: &str, seat: &str, owner: &OwnerRecord,
+) -> Result<(), ReplacementError> {
+    RecoveryAdmission::proof_locked(home, team, seat, owner, owner.generation,
+        RecoveryPhase::PreAdmission).map(|_| ())
+}
+
 /// Explicit, root-authorized retirement; no replacement, checkpoint, or mission PASS is invented.
 pub(crate) fn stop_for_retirement(
     home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
@@ -1915,6 +1925,19 @@ pub(crate) fn stop_for_retirement(
     actor.revalidate_before_mutation().map_err(|_| ReplacementError::AuthorizationRequired)?;
     let target = remote::RemoteTarget {team:team.into(), seat:seat.into(), expected_generation};
     selectors(&target)?;
+    // A failed, already revoked bootstrap needs no new worker or stop attempt.
+    // Only the locked full failed-bootstrap proof can publish its retirement.
+    let owner = OwnerStore::new(home.join(".aperture/run/owner"))
+        .read_owner(seat).map_err(|_| ReplacementError::GenerationMismatch)?;
+    if owner.generation != expected_generation {
+        return Err(ReplacementError::GenerationMismatch);
+    }
+    if owner.state == OwnerState::Quarantined {
+        if !accept_checkpoint_loss { return Err(ReplacementError::CheckpointUnavailable); }
+        crate::team_archive::retirement::record_unobserved(home, actor, team, seat,
+            expected_generation).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        return Ok(CheckpointRecovery::None);
+    }
     let budget = deadline::Deadline::new();
     let binding = require_repository_binding(home, &target, &budget)?;
     let authority = ReplacementAuthority::GladosRetirement(actor);

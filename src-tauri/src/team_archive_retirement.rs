@@ -57,6 +57,7 @@ fn token_absent(home: &Path, seat: &str) -> Result<(), String> {
     }
 }
 fn bound_owner(
+    home: &Path,
     snapshot: &TeamSnapshot,
     state: &TeamStateFile,
     owner: &OwnerRecord,
@@ -73,10 +74,15 @@ fn bound_owner(
         || rows.len() != 1
         || owner.schema_version != 1
         || owner.generation == 0
-        || owner.state != OwnerState::Active
         || owner.reservation_nonce_sha256.is_some()
-        || owner.provisional_token_id.is_some()
     {
+        return Err(fail());
+    }
+    if owner.state == OwnerState::Quarantined {
+        return crate::team_replacement::native::verify_unobserved_retirement_locked(
+            home, &snapshot.team, &owner.seat, owner).map_err(|_| fail());
+    }
+    if owner.state != OwnerState::Active || owner.provisional_token_id.is_some() {
         return Err(fail());
     }
     let configured = ExecutionTuple {
@@ -132,7 +138,7 @@ pub(crate) fn record_stopped(
     recovery: CheckpointRecovery,
     accepted_checkpoint_loss: bool,
 ) -> Result<(), String> {
-    record_stopped_checked(home, actor, team, seat, generation, recovery, accepted_checkpoint_loss, false)
+    record_stopped_checked(home, actor, team, seat, generation, recovery, accepted_checkpoint_loss, RetirementMode::Stopped)
 }
 
 /// Explicit post-stop reconciliation. No signals, start permit, attempt retry,
@@ -141,13 +147,25 @@ pub(crate) fn reconcile_stopped(
     home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
     generation: u64, recovery: CheckpointRecovery, accepted_checkpoint_loss: bool,
 ) -> Result<(), String> {
-    record_stopped_checked(home, actor, team, seat, generation, recovery, accepted_checkpoint_loss, true)
+    record_stopped_checked(home, actor, team, seat, generation, recovery, accepted_checkpoint_loss, RetirementMode::Reconcile)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetirementMode { Stopped, Reconcile, Unobserved }
+
+/// No collector/signal/revoke/admission: the failed bootstrap is already Gone
+/// and revoked. Preserve quarantine/history; write only the retirement fact.
+pub(crate) fn record_unobserved(
+    home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str, generation: u64,
+) -> Result<(), String> {
+    record_stopped_checked(home, actor, team, seat, generation,
+        CheckpointRecovery::None, true, RetirementMode::Unobserved)
 }
 
 fn record_stopped_checked(
     home: &Path, actor: &AuthenticatedActor, team: &str, seat: &str,
     generation: u64, recovery: CheckpointRecovery, accepted_checkpoint_loss: bool,
-    reconcile: bool,
+    mode: RetirementMode,
 ) -> Result<(), String> {
     if !actor.is_glados() {
         return Err(fail());
@@ -173,8 +191,12 @@ fn record_stopped_checked(
     if snapshot.team != team || owner.seat != seat || owner.generation != generation {
         return Err(fail());
     }
-    bound_owner(&snapshot, &state, &owner)?;
-    if reconcile {
+    if (mode == RetirementMode::Unobserved && owner.state != OwnerState::Quarantined)
+        || (mode != RetirementMode::Unobserved && owner.state != OwnerState::Active) {
+        return Err(fail());
+    }
+    bound_owner(home, &snapshot, &state, &owner)?;
+    if mode == RetirementMode::Reconcile {
         crate::team_replacement::deadline::expired_unknown_stop_locked(home, team, seat, generation)
             .map_err(|_| fail())?;
     }
@@ -285,10 +307,11 @@ fn inspect_with(
     }
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
     let mut owners = Vec::new();
+    let mut owner_states = Vec::new();
     let mut evidence = Vec::new();
     for seat in names {
         let owner = store.read_owner_locked(&seat)?;
-        bound_owner(snapshot, state, &owner)?;
+        bound_owner(home, snapshot, state, &owner)?;
         let fact: RetirementFact = read_private_json(&fact_path(home, &seat, owner.generation))?;
         let i = owner.incarnation.as_ref().ok_or_else(fail)?;
         if fact.schema_version != 1
@@ -313,6 +336,9 @@ fn inspect_with(
                 .join(".aperture/run/revocations")
                 .join(format!("{seat}.json")),
         )?;
+        owner_states.push((seat.clone(), if owner.state == OwnerState::Quarantined {
+            "quarantined".into()
+        } else { "active".into() }));
         owners.push((seat.clone(), hash(&owner)?));
         evidence.push((seat, hash(&(fact, floor))?));
     }
@@ -327,10 +353,7 @@ fn inspect_with(
         record_sha256: hash(&("retirement-facts-v1", &evidence))?,
         inventory_sha256: hash(&("retirement-seats-v1", snapshot, state, &owners))?,
         native_sha256: hash(&("retirement-cleanup-v1", &owners, &evidence))?,
-        owner_states: owners
-            .iter()
-            .map(|(s, _)| (s.clone(), "active".into()))
-            .collect(),
+        owner_states,
         owner_sha256: owners,
         owner_post_sha256: vec![],
         transition_at: String::new(),

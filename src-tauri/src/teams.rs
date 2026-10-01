@@ -2009,8 +2009,14 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
     if view.state.state != TeamLifecycle::Active || view.state.generation != input.expected_generation {
         return Err(TeamError::new("E_GENERATION_MISMATCH", "archive team generation changed"));
     }
+    if crate::team_archive::retirement::has_facts(&engine.paths.home,&view.snapshot).map_err(TeamError::from_message)? {
+        let approval=crate::team_archive::retirement::inspect(&engine.paths.home,&view.snapshot,&view.state)
+            .map_err(TeamError::from_message)?;
+        return Ok(ArchiveInspection {view:ArchiveView {team:input.team.clone(),generation:input.expected_generation,
+            state:"pending".into(),checks:diagnostic_archive_checks(),blockers:vec![]},approval,snapshot:view.snapshot,state:view.state});
+    }
     // A Quarantined owner selects a verification path, never grants authority.
-    // Mixed/normal teams fail there; no caller can select diagnostic retirement.
+    // Without complete retirement facts, mixed/normal teams still fail there.
     let owners = OwnerStore::new(engine.paths.owners.clone());
     let quarantined = view.snapshot.seats.iter().map(|s| owners.read_owner(&s.name))
         .collect::<Result<Vec<_>, _>>().map_err(TeamError::from_message)?
@@ -2023,12 +2029,6 @@ fn collect_archive(engine: &TeamEngine, input: &ArchiveTeamInput) -> TeamResult<
                 state: "pending".into(), checks: diagnostic_archive_checks(), blockers: vec![]},
             approval, snapshot: view.snapshot, state: view.state,
         });
-    }
-    if crate::team_archive::retirement::has_facts(&engine.paths.home,&view.snapshot).map_err(TeamError::from_message)? {
-        let approval=crate::team_archive::retirement::inspect(&engine.paths.home,&view.snapshot,&view.state)
-            .map_err(TeamError::from_message)?;
-        return Ok(ArchiveInspection {view:ArchiveView {team:input.team.clone(),generation:input.expected_generation,
-            state:"pending".into(),checks:diagnostic_archive_checks(),blockers:vec![]},approval,snapshot:view.snapshot,state:view.state});
     }
     let epic = view.state.epic_id.as_deref().ok_or_else(|| TeamError::new("E_RECONCILIATION_INCOMPLETE", "active team epic is unavailable"))?;
     let seats: Vec<_> = view.snapshot.seats.iter().map(|s| s.name.clone()).collect();
@@ -2230,7 +2230,7 @@ fn retire_seat_checked(engine:&TeamEngine,actor:&AuthenticatedActor,input:Retire
     let recovery=operation(&engine.paths.home,actor,&input.team,&input.seat,
         input.expected_generation,input.accept_checkpoint_loss).map_err(replacement_error)?;
     let owner=owner_summary(&engine.paths.home,&input.seat)?;
-    if owner.generation!=input.expected_generation || owner.state!=OwnerState::Active {return Err(TeamError::new("E_CONTROL_UNKNOWN","retirement readback changed"));}
+    if owner.generation!=input.expected_generation || !matches!(owner.state, OwnerState::Active | OwnerState::Quarantined) {return Err(TeamError::new("E_CONTROL_UNKNOWN","retirement readback changed"));}
     Ok(RetireSeatView {team:input.team,seat:input.seat,generation:owner.generation,owner_state:owner.state,
         process_stop:RuntimeCheckState::Verified,revocation:RuntimeCheckState::Verified,mission:RuntimeCheckState::Unknown,checkpoint_recovery:recovery})
 }
