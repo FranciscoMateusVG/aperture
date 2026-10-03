@@ -801,3 +801,117 @@ test("managed MCP startup deadline is finite and never releases a pending catalo
   assert.equal(s.server.callsOf("initialize").length, 1);
   assert.ok(s.logs.some(x => x.code === "E_MCP_STARTUP_TIMEOUT"));
 });
+
+
+test("transient startup during read proof revalidates same owner/thread before one delivery", async t => {
+  const s = await activeMcpScenario(t, { delays: { "mcpServer/tool/call": 120 } });
+  await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "first proof");
+  const ownerBefore = readFileSync(join(TMP, "owner", `${s.agent}.json`));
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "starting" });
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "sentry", status: "starting" });
+  for (let n = 0; n < 6; n++) s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  await waitFor(() => s.server.turnCallsContaining("m-ready-proof").length === 1, "stable revalidation releases unread");
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 2, "invalidated RO proof is repeated exactly once");
+  assert.equal(s.server.callsOf("thread/resume").length, 1, "no extra resume for revalidation");
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), ownerBefore);
+  assert.equal(s.bridge.boundThreadId, "t-mcp-existing");
+  assert.equal(s.bridge.mcpReadiness, "ready");
+});
+
+for (const status of ["failed", "cancelled", "malformed"]) {
+  test(`terminal ${status} during proof cannot be cleared by ready or connected catalog`, async t => {
+    const s = await activeMcpScenario(t, { delays: { "mcpServer/tool/call": 120 } });
+    await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "proof");
+    s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status });
+    s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+    await delay(300);
+    s.bridge.deliver(); await delay(100);
+    assert.equal(s.bridge.isBound, false);
+    assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1);
+    assert.equal(s.server.callsOf("turn/start").length, 0);
+    assert.equal(s.server.callsOf("initialize").length, 1);
+  });
+}
+
+test("managed MCP verification is singleflight for the exact socket and owner", async t => {
+  const s = await activeMcpScenario(t, { delays: { "mcpServer/tool/call": 120 } });
+  await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "proof");
+  const first = s.bridge.verifyManagedMcp(s.bridge.ws, s.bridge.managedMcpOwner);
+  const second = s.bridge.verifyManagedMcp(s.bridge.ws, s.bridge.managedMcpOwner);
+  assert.equal(first, second);
+  assert.equal(await first, true);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1);
+});
+
+
+async function expiredTransientAdmission(t) {
+  const now = Date.now.bind(Date);
+  let offset = 0;
+  t.mock.method(Date, "now", () => now() + offset);
+  const s = await scenario(t);
+  makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "t-mcp-existing" });
+  s.server.mcpStatus.data[0].runtimeStatus = "starting";
+  setUnread([msgRow("m-after-transient", "glados", s.agent, "held until tools proved")]);
+  s.bridge.start();
+  await waitFor(() => s.server.callsOf("mcpServerStatus/list").length > 0, "startup pending");
+  offset += 20_001;
+  await waitFor(() => s.bridge.mcpReadiness === "blocked", "initial finite budget spent");
+  assert.equal(s.bridge.isBound, false);
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
+  assert.ok(s.logs.some(x => x.code === "E_MCP_STARTUP_TIMEOUT"));
+  return { ...s, expire: () => { offset += 20_001; } };
+}
+
+test("late ready permits only one singleflight reentry on the same unbound thread", async t => {
+  const s = await expiredTransientAdmission(t);
+  const count = s.server.callsOf("mcpServerStatus/list").length;
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "other-thread", name: "aperture-bus", status: "ready" });
+  await delay(40);
+  assert.equal(s.server.callsOf("mcpServerStatus/list").length, count);
+  s.server.mcpStatus.data[0].runtimeStatus = "connected";
+  s.server.delays["mcpServer/tool/call"] = 120;
+  for (let i = 0; i < 12; i++) s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+  await waitFor(() => s.server.callsOf("mcpServer/tool/call").length === 1, "single RO reentry");
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  await waitFor(() => s.server.turnCallsContaining("m-after-transient").length === 1, "same thread recovered");
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1);
+  assert.equal(s.server.callsOf("thread/resume").length, 1);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.equal(s.bridge.boundThreadId, "t-mcp-existing");
+});
+
+test("ready storms never renew either finite admission budget or retry an exhausted recovery", async t => {
+  const s = await expiredTransientAdmission(t);
+  const count = s.server.callsOf("mcpServerStatus/list").length;
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+  await waitFor(() => s.server.callsOf("mcpServerStatus/list").length > count, "single recovery began");
+  s.expire();
+  for (let i = 0; i < 12; i++) s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+  await waitFor(() => s.bridge.mcpReadiness === "blocked", "recovery budget spent");
+  const finalCount = s.server.callsOf("mcpServerStatus/list").length;
+  s.server.mcpStatus.data[0].runtimeStatus = "connected";
+  for (let i = 0; i < 12; i++) s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+  await delay(250);
+  assert.equal(s.server.callsOf("mcpServerStatus/list").length, finalCount);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+});
+
+test("late ready cannot recover a changed owner even with a connected catalog", async t => {
+  const s = await expiredTransientAdmission(t);
+  s.server.mcpStatus.data[0].runtimeStatus = "connected";
+  const count = s.server.callsOf("mcpServerStatus/list").length;
+  mutateManagedOwner(s.agent, o => { o.generation++; });
+  s.server.notify("mcpServer/startupStatus/updated", { threadId: "t-mcp-existing", name: "aperture-bus", status: "ready" });
+  await delay(200);
+  assert.equal(s.bridge.isBound, false);
+  assert.equal(s.server.callsOf("mcpServerStatus/list").length, count);
+  assert.equal(s.server.callsOf("turn/start").length, 0);
+  assert.ok(s.logs.some(x => x.code === "E_MCP_OWNER_CHANGED"));
+});

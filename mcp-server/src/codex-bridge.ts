@@ -405,6 +405,10 @@ export class CodexBridgeClient {
   private managedMcpOwner: ManagedActiveRuntime | null = null;
   private managedMcpProven = false;
   private managedMcpEpoch = 0;
+  private managedMcpTerminal = false;
+  private managedMcpRecoverable = false;
+  private managedMcpRecoveryUsed = false;
+  private managedMcpFlight: { ws: WebSocket; owner: ManagedActiveRuntime; promise: Promise<boolean> } | null = null;
   private managedMcpState: "not_checked" | "checking" | "ready" | "blocked" = "not_checked";
 
   get mcpReadiness(): string { return this.managedMcpState; }
@@ -449,6 +453,7 @@ export class CodexBridgeClient {
     this.managedMcpProven = false;
     this.managedMcpState = "not_checked";
     this.managedMcpEpoch++;
+    this.managedMcpRecoverable = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -797,9 +802,22 @@ export class CodexBridgeClient {
 
   /** Codex 0.155.1 native protocol, exact thread only. No reload, turn,
    * config mutation or pre-Active tool call. Error bodies/catalogs are private;
-   * only finite categories/counts leave this seam. Failed admission stays held
-   * on this connection; it does not reconnect/restart to manufacture success. */
-  private async verifyManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime): Promise<boolean> {
+   * only finite categories/counts leave this seam. Terminal failure stays held;
+   * transient startup is bounded to 20s plus at most one ready-triggered 20s
+   * re-entry on this connection, never a reconnect/restart to manufacture success. */
+  private verifyManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime): Promise<boolean> {
+    const flight = this.managedMcpFlight;
+    if (flight) return flight.ws === ws && sameActiveRuntime(owner, flight.owner)
+      ? flight.promise : Promise.resolve(false);
+    const promise = this.checkManagedMcp(ws, owner).finally(() => {
+      if (this.managedMcpFlight?.promise === promise) this.managedMcpFlight = null;
+    });
+    this.managedMcpFlight = { ws, owner, promise };
+    return promise;
+  }
+
+  private async checkManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime): Promise<boolean> {
+    this.managedMcpRecoverable = false;
     const proofOwner = this.managedMcpOwner;
     this.managedMcpState = "checking";
     this.managedMcpOwner = owner;
@@ -815,17 +833,21 @@ export class CodexBridgeClient {
     };
     const rpc = async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
       if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
+      if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw new Error(code);
       const result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
       if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
+      if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
       if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error(code);
       return result as Record<string, unknown>;
     };
     try {
       // Only pending startup is polled; terminal failure never reloads/restarts.
       admission: while (true) {
+        if (Date.now() >= deadline) throw new Error(code);
         epoch = this.managedMcpEpoch;
+        code = "E_MCP_STATUS_UNAVAILABLE";
         const rows = new Map<string, Record<string, unknown>>();
         let cursor: string | null = null;
         const cursors = new Set<string>();
@@ -868,27 +890,66 @@ export class CodexBridgeClient {
             code = "E_MCP_REQUIRED_TOOL_MISSING"; throw new Error(code);
           }
         }
-        break;
+        // Notifications may invalidate a coherent-looking catalog or arrive
+        // during the RO probe. Re-read both within the SAME deadline, never
+        // bless the stale epoch. A failed/cancelled/unknown event stays terminal.
+        if (epoch === this.managedMcpEpoch) {
+          // Catalog alone is not callable proof; inbox body never leaves here.
+          if (!this.managedMcpProven || !proofOwner || !sameActiveRuntime(owner, proofOwner)) {
+            server = "aperture-bus"; code = "E_MCP_READ_PROBE_FAILED";
+            const result = await rpc("mcpServer/tool/call", { threadId: owner.threadId, server, tool: "get_messages", arguments: {} });
+            if (!Array.isArray(result.content) || result.content.length === 0 || (result.isError !== undefined && result.isError !== false)) throw new Error(code);
+          }
+          if (epoch === this.managedMcpEpoch && current()) break;
+        }
+        code = "E_MCP_READINESS_CHANGED";
+        if (this.managedMcpTerminal || Date.now() + 200 >= deadline) throw new Error(code);
+        await delay(200);
       }
-      // A catalog alone is not a callable proof. Read only the authenticated
-      // seat's inbox, do not ack/send or return its body to logs/the model.
-      if (!this.managedMcpProven || !proofOwner || !sameActiveRuntime(owner, proofOwner)) {
-        server = "aperture-bus"; code = "E_MCP_READ_PROBE_FAILED";
-        const result = await rpc("mcpServer/tool/call", { threadId: owner.threadId, server, tool: "get_messages", arguments: {} });
-        if (!Array.isArray(result.content) || result.content.length === 0 || (result.isError !== undefined && result.isError !== false)) throw new Error(code);
-      }
-      if (epoch !== this.managedMcpEpoch || !current()) { code = "E_MCP_READINESS_CHANGED"; throw new Error(code); }
       this.managedMcpOwner = owner;
       this.managedMcpProven = true;
       this.managedMcpState = "ready";
       this.hooks.log("codex_managed_mcp_ready", { agent: this.agent, generation: owner.generation, requiredServers: 2, readProbe: true });
       return true;
     } catch {
+      if (this.ws !== ws || this.stopped) return false;
       this.managedMcpProven = false;
       this.managedMcpState = "blocked";
+      this.managedMcpRecoverable = !this.managedMcpTerminal && !this.threadId &&
+        (code === "E_MCP_STARTUP_TIMEOUT" || code === "E_MCP_READINESS_CHANGED");
       this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: owner.generation, code, server });
       return false;
     }
+  }
+
+  /** One ready-triggered re-entry after a transient initial admission timeout.
+   * No new thread/resume/kickoff, no renewed budget per notification, no retry
+   * of terminal errors. Delivery still revalidates before sending unread work. */
+  private async recoverManagedMcp(): Promise<void> {
+    const ws = this.ws;
+    const owner = this.managedMcpOwner;
+    if (!ws || !owner || this.stopped || this.threadId || this.managedMcpFlight ||
+        !this.managedMcpRecoverable || this.managedMcpRecoveryUsed || this.managedMcpTerminal) return;
+    this.managedMcpRecoveryUsed = true;
+    this.managedMcpRecoverable = false;
+    if (!(await this.verifyManagedMcp(ws, owner))) return;
+    // The await boundary is not authority: re-read before publishing the bind.
+    try {
+      const current = readManagedActiveRuntime(this.agent);
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN || this.stopped ||
+          this.managedMcpTerminal || this.managedMcpState !== "ready" ||
+          loadSeatRegistry().seats.get(this.agent)?.group !== "team" ||
+          current === null || !sameActiveRuntime(owner, current)) throw new Error();
+    } catch {
+      if (this.ws === ws && !this.stopped) {
+        this.managedMcpProven = false;
+        this.managedMcpState = "blocked";
+        this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: owner.generation, code: "E_MCP_OWNER_CHANGED", server: "unknown" });
+      }
+      return;
+    }
+    this.bindToThread(owner.threadId, "thread_list");
+    if (!this.hooks.skipReplay) this.deliver();
   }
 
   /** Make a known thread the bridge's sole delivery target and announce it once. */
@@ -1009,6 +1070,10 @@ export class CodexBridgeClient {
     this.managedMcpProven = false;
     this.managedMcpState = "not_checked";
     this.managedMcpEpoch++;
+    this.managedMcpTerminal = false;
+    this.managedMcpRecoverable = false;
+    this.managedMcpRecoveryUsed = false;
+    this.managedMcpFlight = null;
     this.threadId = null;
     this.clearThreadReady();
     this.clearInjectRetry();
@@ -1125,10 +1190,15 @@ export class CodexBridgeClient {
 
     switch (method) {
       case "mcpServer/startupStatus/updated":
-        if (this.managedMcpOwner && (p.name === "aperture-bus" || p.name === "sentry") && p.status !== "ready") {
+        if (this.managedMcpOwner && (p.name === "aperture-bus" || p.name === "sentry")) {
+          if (p.status === "ready") {
+            void this.recoverManagedMcp();
+            return;
+          }
           this.managedMcpProven = false;
           this.managedMcpEpoch++;
-          this.managedMcpState = "blocked";
+          if (p.status !== "starting") this.managedMcpTerminal = true;
+          this.managedMcpState = this.managedMcpTerminal ? "blocked" : "checking";
           this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: this.managedMcpOwner.generation, code: "E_MCP_STARTUP_CHANGED", server: p.name });
         }
         return;
