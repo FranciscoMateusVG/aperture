@@ -1636,3 +1636,148 @@ fn retirement_quarantined_denies_without_exact_failed_bootstrap_proof_and_no_eff
         assert_eq!(r.history_bytes(),before); assert_eq!(r.file_bytes(".aperture/run/owner/t1-qa.json"),owner);
     }
 }
+
+fn codex_recovery_fixture(f:&Fixture)->(AuthenticatedActor,CodexRecoveryAdmission,std::path::PathBuf,deadline::RecoveryJournal) {
+    let actor=smoke_fixture(f);
+    let mut snapshot=team();snapshot.lead="t1-worker".into();snapshot.seats[0].role="lead".into();snapshot.fallbacks.clear();
+    snapshot.creation_request_id=uuid::Uuid::new_v4().to_string();snapshot.staging_uuid=uuid::Uuid::new_v4().to_string();
+    f.write(".aperture/teams/t1/team.json",&serde_json::to_value(snapshot).unwrap());
+    f.revocation();
+    let path=f.0.join(".aperture/run/owner/t1-worker.json");
+    let mut owner:OwnerRecord=read_private_json(&path).unwrap();
+    owner.incarnation.as_mut().unwrap().processes=vec![crate::owner::ProcessIdentity {pid:900001,start_time:42,ppid:1,pgid:900001,
+        cmdline_sha256:"a".repeat(64),cwd:"/fixture".into()}];
+    write_private_json_atomic(&path,&owner,true).unwrap();
+    let input=RecoverCodexInput {team:"t1".into(),seat:"t1-worker".into(),expected_generation:1,
+        expected_owner_sha256:recovery_digest(&std::fs::read(&path).unwrap()),expected_thread_id:"old-thread".into(),
+        operation_id:uuid::Uuid::new_v4().to_string(),accept_context_loss:true,accept_unverified_effects:true,mission_withdrawn:true};
+    let dir=f.0.join(".aperture/teams/t1/runtime-attempts/t1-worker/g1/codex-recovery");
+    let admission=recovery_admission(&f.0,&actor,&input,&dir).unwrap();
+    let journal=deadline::RecoveryJournal::open(dir.clone(),&input.operation_id).unwrap();
+    (actor,admission,dir,journal)
+}
+fn codex_recovery_observed(f:&Fixture,actor:&AuthenticatedActor,a:&CodexRecoveryAdmission,dir:&Path,j:&deadline::RecoveryJournal)
+    ->(deadline::RuntimeAttempt,StartReservation) {
+    let store=OwnerStore::new(f.0.join(".aperture/run/owner"));let launcher=AuthenticatedActor::launcher();
+    let mut old=a.owner.clone();old.state=OwnerState::Quarantined;old.writer="glados".into();
+    write_private_json_atomic(&store.record_path("t1-worker"),&old,true).unwrap();
+    for step in ["stop-complete","revocation","socket-release","quarantine"] {
+        j.phase(step,||Ok(true),||panic!("fixture already stopped")).unwrap();
+    }
+    write_private_json_atomic(&dir.join("quarantined-owner.json"),&old,false).unwrap();
+    let proof=ReadmissionProof {home:f.0.clone(),dir:dir.into(),admission:a.clone(),quarantined:old};
+    let attempt=deadline::RuntimeAttempt::begin_readmission(&f.0,actor,&proof,deadline::Deadline::new()).unwrap();
+    let mut reserved=None;
+    assert!(j.start_unreserved(&proof,&f.0,actor,||{
+        let res=store.reserve_start(&launcher,"t1-worker",1,a.owner.requested.clone()).unwrap();
+        let token=crate::hub_auth::managed::provision(&f.0,"t1",&launcher,&res).unwrap();
+        // Observe this test process, never launch/signals/tmux/provider. The old
+        // fixture PID is Gone and the new root has a genuine kernel PID+birth.
+        let p=team_process::observe(std::process::id()).unwrap().unwrap();
+        let birth=team_process::birth_micros(&p.identity).unwrap();
+        let inc=Incarnation {pid:p.identity.pid,start_time:birth,thread_id:String::new(),token_id:token.token_id().into(),
+            harness:Harness::Codex,model:a.owner.requested.model.clone(),reasoning:a.owner.requested.reasoning.clone(),observed:false,
+            processes:vec![crate::owner::ProcessIdentity {pid:p.identity.pid,start_time:birth,ppid:p.ppid,pgid:p.pgid,
+                cmdline_sha256:"b".repeat(64),cwd:"/fixture".into()}]};
+        store.record_start_candidate(&launcher,&res,inc).unwrap();
+        let thread=uuid::Uuid::new_v4().to_string();
+        for (suffix,value) in [
+            ("managed-start-attempt",serde_json::json!({"schema_version":1,"seat":"t1-worker","generation":2,"token_id":token.token_id(),"root_pid":p.identity.pid,"root_start_time_us":birth,"requested_model":a.owner.requested.model,"requested_reasoning":"high"})),
+            ("managed-observation",serde_json::json!({"schema_version":1,"seat":"t1-worker","generation":2,"token_id":token.token_id(),"root_pid":p.identity.pid,"root_start_time_us":birth,"thread_id":thread,"actual_model":a.owner.requested.model,"actual_reasoning":"high","observed_at_ms":chrono::Utc::now().timestamp_millis()}))] {
+            write_private_json_atomic(&f.0.join(format!(".aperture/run/t1-worker.g2.{suffix}.json")),&value,false).unwrap();
+        }
+        let observation=model_observation::read_native(&f.0,"t1",&res).unwrap().into_runtime_observation();
+        store.record_runtime_observation(&launcher,&res,observation).unwrap();
+        reserved=Some(res);
+        // Simulate the control dying after observed Starting, before commit.
+        Err(ReplacementError::OutcomeUnknown)
+    }).is_err());
+    (attempt,reserved.unwrap())
+}
+#[test]
+fn codex_recovery_observed_crash_completes_once_without_nonce_or_spawn() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);
+    let (actor,a,dir,j)=codex_recovery_fixture(&f);
+    let old=std::fs::read(dir.join("recovery-admitted.json")).unwrap();
+    let (attempt,reservation)=codex_recovery_observed(&f,&actor,&a,&dir,&j);drop(reservation);drop(attempt);
+    let store=OwnerStore::new(f.0.join(".aperture/run/owner"));
+    let before=store.read_owner("t1-worker").unwrap();assert_eq!(before.state,OwnerState::Starting);
+    let result=finish_codex_readmission(&f.0,&actor,&a,&dir,&j,&deadline::Deadline::new()).unwrap();
+    assert_eq!(result.generation,2);assert!(result.model_verified);
+    let active=std::fs::read(store.record_path("t1-worker")).unwrap();
+    assert_eq!(store.read_owner("t1-worker").unwrap().state,OwnerState::Active);
+    let again=finish_codex_readmission(&f.0,&actor,&a,&dir,&j,&deadline::Deadline::new()).unwrap();
+    assert_eq!(again.thread_id,result.thread_id);assert_eq!(std::fs::read(store.record_path("t1-worker")).unwrap(),active);
+    assert_eq!(std::fs::read(dir.join("recovery-admitted.json")).unwrap(),old);
+    assert!(!f.0.join(".aperture/run/managed/t1-worker/g2").exists()); // no spawn/publish callback
+}
+#[test]
+fn codex_recovery_observed_drift_missing_receipt_or_phase_is_not_commit() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for mode in 0..9 {
+        let f=Fixture::new();let _env=SmokeEnv::set(&f);let (actor,a,dir,j)=codex_recovery_fixture(&f);
+        let (_attempt,_res)=codex_recovery_observed(&f,&actor,&a,&dir,&j);
+        let owner=f.0.join(".aperture/run/owner/t1-worker.json");
+        let receipt=f.0.join(".aperture/run/t1-worker.g2.managed-observation.json");
+        match mode {
+            0=>{std::fs::remove_file(&receipt).unwrap();},
+            1|2|3=>{let mut v:serde_json::Value=read_private_json(&receipt).unwrap();let key=["token_id","thread_id","actual_model"][mode-1];v[key]="wrong".into();write_private_json_atomic(&receipt,&v,true).unwrap();},
+            4=>{std::fs::remove_file(dir.join("start.intent.json")).unwrap();},
+            5=>{std::fs::remove_file(dir.join("quarantine.done.json")).unwrap();},
+            6=>{std::fs::remove_file(f.0.join(".aperture/run/hub-tokens/t1-worker.token")).unwrap();},
+            7=>{write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/glados.token"),b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",true).unwrap();},
+            _=>{let mut v:serde_json::Value=read_private_json(&owner).unwrap();v["incarnation"]["observed"]=false.into();write_private_json_atomic(&owner,&v,true).unwrap();},
+        }
+        let before=std::fs::read(&owner).unwrap();
+        assert!(finish_codex_readmission(&f.0,&actor,&a,&dir,&j,&deadline::Deadline::new()).is_err(),"mode {mode}");
+        assert_eq!(std::fs::read(owner).unwrap(),before,"mode {mode}");assert!(!j.has("start",true).unwrap());
+    }
+}
+#[test]
+fn codex_recovery_admission_requires_explicit_loss_and_exact_old_binding() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);
+    let (actor,a,dir,_)=codex_recovery_fixture(&f);
+    let bytes=std::fs::read(dir.join("recovery-admitted.json")).unwrap();
+    for mode in 0..9 {
+        let mut r=a.request.clone();
+        match mode {0=>r.accept_context_loss=false,1=>r.accept_unverified_effects=false,2=>r.mission_withdrawn=false,
+            3=>r.expected_generation=0,4=>r.team="../x".into(),5=>r.expected_thread_id="different".into(),
+            6=>r.expected_owner_sha256="c".repeat(64),7=>r.operation_id=uuid::Uuid::new_v4().to_string(),_=>r.seat="other".into()}
+        assert!(recovery_admission(&f.0,&actor,&r,&dir).is_err(),"mode {mode}");
+    }
+    assert!(recovery_admission(&f.0,&AuthenticatedActor::operator_ui(),&a.request,&dir).is_err());
+    assert!(recovery_admission(&f.0,&AuthenticatedActor::launcher(),&a.request,&dir).is_err());
+    assert_eq!(std::fs::read(dir.join("recovery-admitted.json")).unwrap(),bytes);
+}
+
+#[test]
+fn codex_recovery_start_intent_resumes_only_before_actual_reservation() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();let f=Fixture::new();let _env=SmokeEnv::set(&f);
+    let (actor,a,dir,j)=codex_recovery_fixture(&f);let store=OwnerStore::new(f.0.join(".aperture/run/owner"));
+    let mut old=a.owner.clone();old.state=OwnerState::Quarantined;old.writer="glados".into();
+    write_private_json_atomic(&store.record_path("t1-worker"),&old,true).unwrap();
+    for phase in ["stop-complete","revocation","socket-release","quarantine"] {j.phase(phase,||Ok(true),||panic!("fixture")).unwrap();}
+    write_private_json_atomic(&dir.join("quarantined-owner.json"),&old,false).unwrap();
+    let proof=ReadmissionProof {home:f.0.clone(),dir:dir.clone(),admission:a.clone(),quarantined:old.clone()};
+    // Crash after intent but before reserve is provably pre-effect (old owner
+    // exact, no g2 artefacts). It does not consume another generation/nonce.
+    assert!(j.phase("start",||Ok(false),||Err(ReplacementError::OutcomeUnknown)).is_err());
+    let count=std::cell::Cell::new(0);
+    j.start_unreserved(&proof,&f.0,&actor,||{
+        count.set(count.get()+1);store.reserve_start(&AuthenticatedActor::launcher(),"t1-worker",1,a.owner.requested.clone()).unwrap();Ok(())
+    }).unwrap();
+    assert!(j.start_unreserved(&proof,&f.0,&actor,||{count.set(count.get()+1);Ok(())}).is_err());
+    assert_eq!(count.get(),1);assert_eq!(store.read_owner("t1-worker").unwrap().generation,2);
+}
+#[test]
+fn codex_recovery_owner_checks_allow_only_captured_process_union_not_incarnation_drift() {
+    let f=Fixture::new();f.revocation();let old:OwnerRecord=read_private_json(&f.0.join(".aperture/run/owner/t1-worker.json")).unwrap();
+    assert!(recovery_owner_matches(&old,&old));
+    for mode in 0..8 {
+        let mut now=old.clone();match mode {0=>now.generation+=1,1=>now.incarnation.as_mut().unwrap().thread_id="other".into(),
+            2=>now.incarnation.as_mut().unwrap().token_id="b".repeat(64),3=>now.requested.model="other".into(),
+            4=>now.incarnation.as_mut().unwrap().pid+=1,5=>now.incarnation.as_mut().unwrap().start_time+=1,
+            6=>now.state=OwnerState::Starting,_=>now.reservation_nonce_sha256=Some("a".repeat(64))}
+        assert!(!recovery_owner_matches(&old,&now),"mode {mode}");
+    }
+}

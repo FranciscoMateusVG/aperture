@@ -133,3 +133,24 @@ test('recovery selector 2 admits only the quarantined unobserved g2 Claude owner
  const asOne=started();asOne.result.generation=3;asOne.result.owner={...asOne.result.owner,generation:3,configured:claude,actual:claude};
  assert.throws(()=>parseBootstrapStarted(asOne,recovery(1),claude),/E_CONTROL_UNKNOWN/);
 });
+
+test('explicit Codex recovery binds loss acceptance and operation; readiness is never inferred',async()=>{
+ const {recoverCodexSchema,parseCodexRecovered}=await import('../dist/team-bootstrap.js');
+ const req={team:'mural',seat:seat.name,expected_generation:1,expected_owner_sha256:'a'.repeat(64),expected_thread_id:'old-thread',
+  operation_id:'12345678-1234-4234-9234-123456789012',accept_context_loss:true,accept_unverified_effects:true,mission_withdrawn:true};
+ assert.deepEqual(recoverCodexSchema.parse(req),req);assert.equal(teamControlWatchdogMs('recover_codex'),180000);
+ for(const delta of [{accept_context_loss:false},{accept_unverified_effects:false},{mission_withdrawn:false},{actor:'glados'},
+  {nonce:'fake'},{expected_generation:0},{expected_owner_sha256:'bad'},{path:'/tmp'},{expected_thread_id:'../x'},{operation_id:'bad'}])
+  assert.equal(recoverCodexSchema.safeParse({...req,...delta}).success,false);
+ const r={action:'recover_codex',result:{team:req.team,seat:req.seat,operation_id:req.operation_id,previous_generation:1,generation:2,
+  phase:'started',mission:'wait_go',readiness:'not_verified',previous_effects:'unknown_accepted',
+  owner:{...owner(),generation:2,state:'active',actual:tuple,configured:tuple,process_count:1,thread_bound:true}}};
+ assert.equal(parseCodexRecovered(r,req).result.readiness,'not_verified');
+ for(const change of [v=>v.readiness='ready',v=>v.mission='resume',v=>v.generation=3,v=>v.previous_effects='none',
+   v=>v.owner.actual=null,v=>v.owner.thread_bound=false,v=>v.operation_id='22345678-1234-4234-9234-123456789012']){
+  const changed=structuredClone(r);change(changed.result);assert.throws(()=>parseCodexRecovered(changed,req));
+ }
+ const source=readFileSync(new URL('../src/index.ts',import.meta.url),'utf8');
+ const handler=source.slice(source.indexOf('"team_recover_codex"'),source.indexOf('"team_bootstrap_seat"'));
+ assert.ok(handler.indexOf('gladosControlDenied()')<handler.indexOf('recoverCodexSchema.parse(input)'));
+});

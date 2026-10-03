@@ -83,7 +83,7 @@ pub struct Incarnation {
 }
 
 impl Incarnation {
-    fn execution_tuple(&self) -> Option<ExecutionTuple> {
+    pub(crate) fn execution_tuple(&self) -> Option<ExecutionTuple> {
         self.observed.then(|| ExecutionTuple {
             harness: self.harness.clone(),
             model: self.model.clone(),
@@ -488,6 +488,34 @@ impl OwnerStore {
         record.since = now();
         record.writer = actor.principal().into();
         self.write_unlocked(&record, true)?;
+        Ok(record)
+    }
+
+    /// Explicit loss-accepting Codex recovery only, not a generic stale/reset.
+    /// Old owner bytes are retained by the native admission before this CAS.
+    pub(crate) fn quarantine_recovered_codex(
+        &self, actor: &AuthenticatedActor,
+        proof: &crate::team_replacement::native::StoppedCodexRecoveryProof,
+    ) -> Result<OwnerRecord, String> {
+        let mut record = proof.verified_owner(&self.root,actor)
+            .map_err(|_| "E_RECONCILIATION_INVALID: recovery proof changed".to_string())?;
+        record.state = OwnerState::Quarantined;
+        record.reservation_nonce_sha256 = None;
+        record.provisional_token_id = None;
+        record.since = now();
+        record.writer = actor.principal().into();
+        self.write_unlocked(&record,true)?;
+        Ok(record)
+    }
+
+    pub(crate) fn commit_recovered_codex(&self,actor:&AuthenticatedActor,
+        proof:&crate::team_replacement::native::RecoveryCommitProof)->Result<OwnerRecord,String> {
+        let mut record=proof.verified_owner(&self.root,actor).map_err(|_|"E_MODEL_UNVERIFIED: recovery observation changed".to_string())?;
+        if record.state==OwnerState::Active {return Ok(record);}
+        if record.state!=OwnerState::Starting {return Err("E_STATE_CONFLICT: recovery owner changed".into());}
+        record.state=OwnerState::Active; record.reservation_nonce_sha256=None;record.provisional_token_id=None;
+        record.since=now(); record.writer="launcher".into();
+        self.write_unlocked(&record,true)?;
         Ok(record)
     }
 

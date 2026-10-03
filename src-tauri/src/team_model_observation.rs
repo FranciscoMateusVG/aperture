@@ -172,30 +172,73 @@ where
     N: FnOnce() -> i64,
     F: FnOnce(),
 {
+    read_checked_mode(home,team,&reservation.seat,reservation.generation,Some(reservation),None,state,now,before_recheck)
+}
+/// Opaque recovery admission, never a replacement for ordinary nonce checks.
+pub(crate) struct RecoveryReadProof { observation:RuntimeObservation, pins:[String;2] }
+impl RecoveryReadProof {
+    pub(crate) fn observation(&self)->&RuntimeObservation { &self.observation }
+    pub(crate) fn recheck_locked(&self,home:&Path,proof:&crate::team_replacement::native::RecoveryObservationCandidate)
+        ->Result<(),ObservationError> {
+        if recovery_receipt_pins(home,proof)? != self.pins {return Err(ObservationError::Invalid);}
+        token_current(home,proof.seat(),proof.generation(),&self.observation.token_id)?;
+        let identity=team_process::identity_from_owner(self.observation.pid,self.observation.start_time).map_err(|_|ObservationError::Process)?;
+        if team_process::state(&identity)!=ProcessState::Same {return Err(ObservationError::Process);}
+        Ok(())
+    }
+}
+fn recovery_receipt_pins(home:&Path,proof:&crate::team_replacement::native::RecoveryObservationCandidate)->Result<[String;2],ObservationError> {
+    let mut pins=Vec::new();
+    for suffix in ["managed-start-attempt","managed-observation"] {
+        let path=home.join(".aperture/run").join(format!("{}.g{}.{}.json",proof.seat(),proof.generation(),suffix));
+        let file=open_private_file_nofollow(&path).map_err(|_|ObservationError::Unsafe)?;
+        let mut raw=Vec::new();file.take(CAP+1).read_to_end(&mut raw).map_err(|_|ObservationError::Unsafe)?;
+        if raw.len() as u64>CAP {return Err(ObservationError::Invalid);}
+        pins.push(digest(&raw));
+    }
+    pins.try_into().map_err(|_|ObservationError::Invalid)
+}
+pub(crate) fn read_recovery(home:&Path, proof:&crate::team_replacement::native::RecoveryObservationCandidate)
+    ->Result<RecoveryReadProof,ObservationError> {
+    let pins=recovery_receipt_pins(home,proof)?;
+    let observation=read_checked_mode(home,proof.team(),proof.seat(),proof.generation(),None,Some(proof),
+        team_process::state,||chrono::Utc::now().timestamp_millis(),||{})?.into_runtime_observation();
+    if recovery_receipt_pins(home,proof)? != pins {return Err(ObservationError::Invalid);}
+    Ok(RecoveryReadProof {observation,pins})
+}
+fn read_checked_mode<S,N,F>(home:&Path,team:&str,seat:&str,generation:u64,
+    reservation:Option<&StartReservation>, recovery:Option<&crate::team_replacement::native::RecoveryObservationCandidate>,
+    state:S,now:N,before_recheck:F)->Result<VerifiedObservation,ObservationError>
+where S:Fn(&ProcessIdentity)->ProcessState,N:FnOnce()->i64,F:FnOnce() {
     if !crate::agent_loader::is_valid_seat_name(team)
         || team.len() > 16
-        || !crate::agent_loader::is_valid_seat_name(&reservation.seat)
-        || reservation.generation == 0
+        || !crate::agent_loader::is_valid_seat_name(seat)
+        || generation == 0
     {
         return Err(ObservationError::Invalid);
     }
     let _team = try_lock(&home.join(".aperture/run/team-locks"), team)
         .map_err(|_| ObservationError::Owner)?;
-    match classify_managed_seat(home, &reservation.seat).map_err(|_| ObservationError::Owner)? {
+    match classify_managed_seat(home, seat).map_err(|_| ObservationError::Owner)? {
         Some(ManagedSeatState::Active { team: actual, .. }) if actual == team => {}
         _ => return Err(ObservationError::Owner),
     }
     let store = OwnerStore::new(home.join(".aperture/run/owner"));
     let _seat = store
-        .lock(&reservation.seat)
+        .lock(seat)
         .map_err(|_| ObservationError::Owner)?;
-    let owner: OwnerRecord = read_private_json(&store.record_path(&reservation.seat))
+    let owner: OwnerRecord = read_private_json(&store.record_path(seat))
         .map_err(|_| ObservationError::Owner)?;
+    match (reservation,recovery) {
+        (Some(_),None)=>{},
+        (None,Some(proof))=>proof.verify_locked(home,&owner).map_err(|_|ObservationError::Owner)?,
+        _=>return Err(ObservationError::Owner),
+    }
     let candidate = owner.incarnation.as_ref().ok_or(ObservationError::Owner)?;
     if owner.schema_version != 1
-        || owner.seat != reservation.seat
-        || owner.generation != reservation.generation
-        || owner.state != OwnerState::Starting
+        || owner.seat != seat
+        || owner.generation != generation
+        || (owner.state != OwnerState::Starting && !(recovery.is_some() && owner.state == OwnerState::Active))
         || owner.requested.harness != Harness::Codex
         || owner.requested.reasoning.is_none()
         || (!candidate.observed && !candidate.thread_id.is_empty())
@@ -204,9 +247,9 @@ where
                 || candidate.harness != owner.requested.harness
                 || candidate.model != owner.requested.model
                 || candidate.reasoning != owner.requested.reasoning))
-        || owner.reservation_nonce_sha256.as_deref()
-            != Some(digest(reservation.nonce().as_bytes()).as_str())
-        || owner.provisional_token_id.as_deref() != Some(candidate.token_id.as_str())
+        || reservation.is_some_and(|r| owner.reservation_nonce_sha256.as_deref() != Some(digest(r.nonce().as_bytes()).as_str()))
+        || (owner.state==OwnerState::Starting && owner.provisional_token_id.as_deref() != Some(candidate.token_id.as_str()))
+        || (owner.state==OwnerState::Active && (owner.reservation_nonce_sha256.is_some() || owner.provisional_token_id.is_some()))
         || !hash(&candidate.token_id)
         || !candidate
             .processes
@@ -222,15 +265,15 @@ where
     }
     token_current(
         home,
-        &reservation.seat,
-        reservation.generation,
+        seat,
+        generation,
         &candidate.token_id,
     )?;
     let root = home.join(".aperture/run");
-    let base = format!("{}.g{}", reservation.seat, reservation.generation);
+    let base = format!("{}.g{}", seat, generation);
     let attempt: Attempt = json(&root.join(format!("{base}.managed-start-attempt.json")))?;
     let receipt: Receipt = json(&root.join(format!("{base}.managed-observation.json")))?;
-    let since = chrono::DateTime::parse_from_rfc3339(&owner.since)
+    let since = chrono::DateTime::parse_from_rfc3339(recovery.map(|p|p.starting_since()).unwrap_or(&owner.since))
         .map_err(|_| ObservationError::Owner)?
         .timestamp_millis();
     let now = now();
@@ -264,7 +307,7 @@ where
         return Err(ObservationError::Invalid);
     }
     before_recheck();
-    if read_private_json::<OwnerRecord>(&store.record_path(&reservation.seat))
+    if read_private_json::<OwnerRecord>(&store.record_path(seat))
         .map_err(|_| ObservationError::Owner)?
         != owner
     {
@@ -272,8 +315,8 @@ where
     }
     token_current(
         home,
-        &reservation.seat,
-        reservation.generation,
+        seat,
+        generation,
         &candidate.token_id,
     )?;
     if state(&identity) != ProcessState::Same {

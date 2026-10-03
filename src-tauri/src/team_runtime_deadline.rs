@@ -909,3 +909,144 @@ impl RuntimeAttempt {
 #[cfg(test)]
 #[path = "team_runtime_deadline_tests.rs"]
 mod tests;
+
+/// Explicit recovery uses the SAME private append-only substrate. An intent is
+/// never a success receipt. A second invocation may reconcile a completed native
+/// postcondition, but cannot repeat an uncertain signal/revoke/spawn.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryPhaseFact {
+    version: u8,
+    operation_id: String,
+    step: String,
+    completed: bool,
+    reconciled: bool,
+}
+pub(crate) struct RecoveryJournal {
+    dir: PathBuf,
+    operation_id: String,
+}
+impl RecoveryJournal {
+    pub(crate) fn open(dir: PathBuf, operation_id: &str) -> Result<Self, ReplacementError> {
+        if !crate::team_claude_launch::canonical_uuid(operation_id) { return Err(ReplacementError::AuthorizationRequired); }
+        ensure_private_dir(&dir).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        Ok(Self {dir, operation_id:operation_id.into()})
+    }
+    pub(crate) fn read(dir:PathBuf,operation_id:&str)->Result<Self,ReplacementError> {
+        use std::os::unix::fs::MetadataExt;
+        if !crate::team_claude_launch::canonical_uuid(operation_id) {return Err(ReplacementError::OutcomeUnknown);}
+        let parent=dir.parent().ok_or(ReplacementError::OutcomeUnknown)?;
+        let name=dir.file_name().and_then(|s|s.to_str()).ok_or(ReplacementError::OutcomeUnknown)?;
+        validate_component_path(parent,name,false).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        let m=std::fs::symlink_metadata(&dir).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if !m.is_dir() || m.uid()!=unsafe{libc::geteuid()} || m.mode()&0o777!=0o700 {return Err(ReplacementError::OutcomeUnknown);}
+        Ok(Self {dir,operation_id:operation_id.into()})
+    }
+    fn path(&self, step: &str, completed: bool) -> Result<PathBuf, ReplacementError> {
+        if step.is_empty() || step.len()>96 || !step.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        Ok(self.dir.join(format!("{step}.{}.json", if completed {"done"} else {"intent"})))
+    }
+    pub(crate) fn has(&self, step: &str, completed: bool) -> Result<bool, ReplacementError> {
+        let path = self.path(step, completed)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(ReplacementError::OutcomeUnknown),
+            Ok(_) => {
+                let f: RecoveryPhaseFact = read_private_json(&path).map_err(|_| ReplacementError::OutcomeUnknown)?;
+                if f.version!=1 || f.operation_id!=self.operation_id || f.step!=step || f.completed!=completed
+                    || (!completed && f.reconciled) { return Err(ReplacementError::OutcomeUnknown); }
+                Ok(true)
+            }
+        }
+    }
+    fn write(&self, step: &str, completed: bool, reconciled: bool) -> Result<(), ReplacementError> {
+        let path = self.path(step, completed)?;
+        let f = RecoveryPhaseFact {version:1, operation_id:self.operation_id.clone(), step:step.into(), completed, reconciled};
+        write_private_json_atomic(&path,&f,false).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if read_private_json::<RecoveryPhaseFact>(&path).map_err(|_|ReplacementError::OutcomeUnknown)? != f {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        Ok(())
+    }
+    /// `known` is the real native postcondition, never caller-supplied proof.
+    /// `effect` returns only after its own native ACK/postcondition is checked.
+    pub(crate) fn phase(&self, step: &str,
+        known: impl FnOnce()->Result<bool,ReplacementError>,
+        effect: impl FnOnce()->Result<(),ReplacementError>,
+    ) -> Result<(), ReplacementError> {
+        if self.has(step,true)? { return Ok(()); }
+        let intent = self.has(step,false)?;
+        if known()? {
+            if !intent { self.write(step,false,false)?; }
+            return self.write(step,true,true);
+        }
+        if intent { return Err(ReplacementError::OutcomeUnknown); }
+        self.write(step,false,false)?;
+        effect()?;
+        self.write(step,true,false)
+    }
+}
+
+impl RuntimeAttempt {
+    /// Called only with a native stopped/revoked/quarantined recovery proof.
+    /// This is a fresh admission, not a reconstruction of an old start nonce.
+    pub(crate) fn begin_readmission(home: &Path, actor: &AuthenticatedActor,
+        proof: &super::native::ReadmissionProof, budget: Deadline,
+    ) -> Result<Self, ReplacementError> {
+        proof.verify(home, actor)?;
+        let dir = proof.directory().join("start");
+        ensure_private_dir(&dir).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        budget.forward(Duration::from_secs(90))?;
+        // Re-entry is permitted only by the opaque proof that the original
+        // quarantined gN is still exact: reserve_start has not happened. A new
+        // UUID/second spawn is never inferred from a missing completion fact.
+        let mut attempt=if dir.join("admitted.json").exists() {
+            let admitted:Admission=read_private_json(&dir.join("admitted.json")).map_err(|_|ReplacementError::OutcomeUnknown)?;
+            if admitted.team!=proof.team() || admitted.seat!=proof.seat() || admitted.old_generation!=proof.generation()
+                || admitted.schema_version!=1 || admitted.native_budget_ms!=170_000 || admitted.cleanup_reserve_ms!=40_000
+                || !crate::team_claude_launch::canonical_uuid(&admitted.attempt_id)
+                || dir.join("terminal.json").exists() {return Err(ReplacementError::OutcomeUnknown);}
+            Self {home:home.into(),dir,admitted,budget,effects_admitted:false,terminal:false,prior_ready:None}
+        } else {Self::publish(home, dir, Admission {
+            schema_version:1, attempt_id:uuid::Uuid::new_v4().to_string(),
+            team:proof.team().into(), seat:proof.seat().into(), old_generation:proof.generation(),
+            admitted_at_ms:chrono::Utc::now().timestamp_millis(), native_budget_ms:170_000, cleanup_reserve_ms:40_000,
+        }, budget)?};
+        if attempt.dir.join("effects.json").exists() {
+            verify_readmission(proof.directory(),proof.team(),proof.seat(),proof.generation())?;
+        } else {attempt.fact("effects.json",FactKind::EffectsMayHaveOccurred)?;}
+        attempt.effects_admitted=true;
+        Ok(attempt)
+    }
+}
+
+/// Exact start admission/effects pair for recovery observation access; no nonce
+/// reconstruction, renewed budget or inferred zero-effect status.
+pub(crate) fn verify_readmission(dir:&Path,team:&str,seat:&str,generation:u64)->Result<(),ReplacementError> {
+    let a:Admission=read_private_json(&dir.join("start/admitted.json")).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    let e:Fact=read_private_json(&dir.join("start/effects.json")).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    if a.schema_version!=1 || a.team!=team || a.seat!=seat || a.old_generation!=generation
+        || a.native_budget_ms!=170_000 || a.cleanup_reserve_ms!=40_000
+        || !crate::team_claude_launch::canonical_uuid(&a.attempt_id)
+        || e.schema_version!=1 || e.attempt_id!=a.attempt_id || e.kind!=FactKind::EffectsMayHaveOccurred {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    Ok(())
+}
+
+impl RecoveryJournal {
+    /// This exception is typed: exact old quarantined owner proves native
+    /// reserve_start (the first start effect) has not committed. No generic
+    /// retry/boolean flag can re-enter a signal or a new-generation candidate.
+    pub(crate) fn start_unreserved(&self,proof:&super::native::ReadmissionProof,
+        home:&Path,actor:&AuthenticatedActor,effect:impl FnOnce()->Result<(),ReplacementError>)->Result<(),ReplacementError> {
+        proof.verify(home,actor)?;
+        if self.dir!=proof.directory() || self.has("start",true)? {return Err(ReplacementError::OutcomeUnknown);}
+        if !self.has("start",false)? {self.write("start",false,false)?;}
+        proof.verify(home,actor)?;
+        effect()?;
+        self.write("start",true,false)
+    }
+}

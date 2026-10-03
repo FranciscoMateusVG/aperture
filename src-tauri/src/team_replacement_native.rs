@@ -601,7 +601,7 @@ fn start_claude_diagnostic(home: &Path, actor: &AuthenticatedActor, team: &str,
     plan.revalidate(&budget)?;
     let mut attempt = deadline::RuntimeAttempt::begin_bootstrap(home, &AuthenticatedActor::launcher(), team, seat, budget)?;
     attempt.admit_effects()?;
-    let started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor)) {
+    let started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor), None) {
         Ok(v) => v,
         Err(e) => { let _ = attempt.finish_unknown(); return Err(e); }
     };
@@ -835,7 +835,7 @@ pub(crate) fn bootstrap_authorized(
         budget,
     )?;
     attempt.admit_effects()?;
-    let mut started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor)) {
+    let mut started = match start_native(home, team, seat, 0, selected, &plan, &attempt, Some(actor), None) {
         Ok(v) => v,
         Err(e) => {
             let _ = attempt.finish_unknown();
@@ -933,7 +933,7 @@ fn bootstrap_recovery_authorized(
     attempt.admit_effects()?;
     // From here the proof is pre-reserve: exactly this attempt's open admission.
     let plan = NativePlan::ClaudeRecovery(binding, admission.bind_attempt(attempt.id()));
-    let mut started = match start_native(home, team, seat, generation, selected, &plan, &attempt, Some(actor)) {
+    let mut started = match start_native(home, team, seat, generation, selected, &plan, &attempt, Some(actor), None) {
         Ok(v) => v,
         Err(e) => {
             let _ = attempt.finish_unknown();
@@ -1062,6 +1062,7 @@ fn start_native(
     plan: &NativePlan,
     attempt: &deadline::RuntimeAttempt,
     bootstrap_actor: Option<&AuthenticatedActor>,
+    readmission: Option<&ReadmissionProof>,
 ) -> Result<NativeStarted, ReplacementError> {
     attempt.budget().forward(Duration::from_secs(90))?;
     plan.revalidate(attempt.budget())?;
@@ -1072,6 +1073,12 @@ fn start_native(
             .map_err(|_| ReplacementError::NativeFailure)?;
         if let Some(actor) = bootstrap_actor {
             authorize_bootstrap(actor)?;
+        }
+        if let Some(proof)=readmission {
+            if proof.home!=home || proof.team()!=team || proof.seat()!=seat || proof.generation()!=generation {
+                return Err(ReplacementError::AuthorizationRequired);
+            }
+            proof.verify_locked(bootstrap_actor.ok_or(ReplacementError::AuthorizationRequired)?)?;
         }
         if let NativePlan::ClaudeSmoke(_, admission) = plan {
             admission.matches_target(home, team, seat, generation)?;
@@ -2535,6 +2542,7 @@ impl ReplacementRuntime for NativeRuntime<'_> {
             &plan,
             &self.attempt,
             None,
+            None,
         )?;
         let result = started.candidate.clone();
         self.started = Some(started);
@@ -2639,3 +2647,505 @@ pub(crate) fn revoked_metadata(
 #[cfg(test)]
 #[path = "team_replacement_native_tests.rs"]
 mod tests;
+
+
+// Explicit loss-accepting recovery is NOT a checkpoint or a claim that the old
+// thread did no work. All input fields are selectors/acknowledgements; native
+// process and revocation evidence alone authorizes the old incarnation's exit.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverCodexInput {
+    pub team: String,
+    pub seat: String,
+    pub expected_generation: u64,
+    pub expected_owner_sha256: String,
+    pub expected_thread_id: String,
+    pub operation_id: String,
+    pub accept_context_loss: bool,
+    pub accept_unverified_effects: bool,
+    pub mission_withdrawn: bool,
+}
+impl RecoverCodexInput {
+    pub(crate) fn validate(&self) -> Result<(), ReplacementError> {
+        if !crate::agent_loader::is_valid_seat_name(&self.team) || self.team.len() > 16
+            || !crate::agent_loader::is_valid_seat_name(&self.seat)
+            || self.expected_generation == 0 || self.expected_generation >= 9_007_199_254_740_991
+            || !crate::team_claude_launch::canonical_uuid(&self.operation_id)
+            || self.expected_owner_sha256.len() != 64
+            || !self.expected_owner_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.expected_thread_id.is_empty() || self.expected_thread_id.len() > 128
+            || !self.expected_thread_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || !self.accept_context_loss || !self.accept_unverified_effects || !self.mission_withdrawn {
+            return Err(ReplacementError::AuthorizationRequired);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CodexRecoveryAdmission {
+    version: u8,
+    request: RecoverCodexInput,
+    // Exact original bytes remain private and are never emitted as a receipt.
+    owner_bytes: Vec<u8>,
+    owner: OwnerRecord,
+    snapshot_sha256: String,
+}
+fn recovery_bytes(path: &Path) -> Result<Vec<u8>, ReplacementError> {
+    use std::io::Read;
+    let file = crate::journal::open_private_file_nofollow(path).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    let mut bytes = Vec::new();
+    file.take(262145).read_to_end(&mut bytes).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    if bytes.len() > 262144 { return Err(ReplacementError::OutcomeUnknown); }
+    Ok(bytes)
+}
+fn recovery_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn recovery_snapshot(home: &Path, request: &RecoverCodexInput) -> Result<(TeamSnapshot,String), ReplacementError> {
+    match crate::teams::classify_managed_seat(home, &request.seat).map_err(|_| ReplacementError::AuthorizationRequired)? {
+        Some(crate::teams::ManagedSeatState::Active {team, ..}) if team == request.team => {},
+        _ => return Err(ReplacementError::AuthorizationRequired),
+    }
+    let raw = recovery_bytes(&home.join(".aperture/teams").join(&request.team).join("team.json"))?;
+    let snapshot: TeamSnapshot = serde_json::from_slice(&raw).map_err(|_| ReplacementError::AuthorizationRequired)?;
+    if snapshot.team != request.team { return Err(ReplacementError::AuthorizationRequired); }
+    Ok((snapshot, recovery_digest(&raw)))
+}
+fn recovery_owner_matches(old: &OwnerRecord, now: &OwnerRecord) -> bool {
+    let mut expected = old.clone();
+    let Some(before) = expected.incarnation.as_mut() else { return false; };
+    let Some(current) = now.incarnation.as_ref() else { return false; };
+    // Only the existing persist_for_stop may append an exactly captured process
+    // identity; the original root, thread, tuple, time and state stay bound.
+    if current.processes.len() < before.processes.len()
+        || before.processes.iter().any(|p| !current.processes.contains(p)) { return false; }
+    before.processes = current.processes.clone();
+    expected.writer = "launcher".into();
+    let mut actual = now.clone();
+    if actual.writer == old.writer { actual.writer = "launcher".into(); }
+    expected == actual
+}
+fn recovery_admission(home: &Path, actor: &AuthenticatedActor, request: &RecoverCodexInput,
+    dir: &Path) -> Result<CodexRecoveryAdmission, ReplacementError> {
+    authorize_recovery(actor)?;
+    request.validate()?;
+    let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"), &request.team)
+        .map_err(|_| ReplacementError::NativeFailure)?;
+    let store = OwnerStore::new(home.join(".aperture/run/owner"));
+    let _seat = store.lock(&request.seat).map_err(|_| ReplacementError::NativeFailure)?;
+    authorize_recovery(actor)?;
+    let (snapshot, snapshot_sha256) = recovery_snapshot(home, request)?;
+    let path = dir.join("recovery-admitted.json");
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let admission: CodexRecoveryAdmission = read_private_json(&path).map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if admission.version != 1 || admission.request != *request || admission.snapshot_sha256 != snapshot_sha256
+            || recovery_digest(&admission.owner_bytes) != request.expected_owner_sha256
+            || serde_json::from_slice::<OwnerRecord>(&admission.owner_bytes).ok().as_ref() != Some(&admission.owner) {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        return Ok(admission);
+    }
+    absent(&path)?;
+    let owner_bytes = recovery_bytes(&store.record_path(&request.seat))?;
+    let owner: OwnerRecord = serde_json::from_slice(&owner_bytes).map_err(|_| ReplacementError::GenerationMismatch)?;
+    let incarnation = owner.incarnation.as_ref().ok_or(ReplacementError::GenerationMismatch)?;
+    if recovery_digest(&owner_bytes) != request.expected_owner_sha256 || owner.state != OwnerState::Active
+        || owner.seat != request.seat || owner.generation != request.expected_generation
+        || owner.requested.harness != Harness::Codex || owner.requested.reasoning.is_none()
+        || owner.reservation_nonce_sha256.is_some() || owner.provisional_token_id.is_some()
+        || !incarnation.observed || incarnation.thread_id != request.expected_thread_id
+        || incarnation.execution_tuple().as_ref() != Some(&owner.requested) {
+        return Err(ReplacementError::GenerationMismatch);
+    }
+    selected_in_snapshot(&snapshot, &request.seat, &owner.requested)?;
+    crate::journal::ensure_private_dir(dir).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    let admission = CodexRecoveryAdmission {version:1, request:request.clone(), owner_bytes, owner, snapshot_sha256};
+    crate::journal::write_private_json_atomic(&path, &admission, false).map_err(|_| ReplacementError::OutcomeUnknown)?;
+    if read_private_json::<CodexRecoveryAdmission>(&path).map_err(|_| ReplacementError::OutcomeUnknown)? != admission {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    Ok(admission)
+}
+fn recovery_revoked(home: &Path, owner: &OwnerRecord) -> Result<bool, ReplacementError> {
+    let inc = owner.incarnation.as_ref().ok_or(ReplacementError::RevocationUnverified)?;
+    let token = home.join(".aperture/run/hub-tokens").join(format!("{}.token", owner.seat));
+    match std::fs::symlink_metadata(&token) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::ws_hub::managed_control::verify_floor(home, &owner.seat, owner.generation, &inc.token_id)?;
+            Ok(true)
+        },
+        Ok(_) => {
+            model_observation::token_current(home, &owner.seat, owner.generation, &inc.token_id)
+                .map_err(|_| ReplacementError::RevocationUnverified)?;
+            Ok(false)
+        },
+        _ => Err(ReplacementError::RevocationUnverified),
+    }
+}
+fn recovery_all_gone(owner: &OwnerRecord) -> Result<(), ReplacementError> {
+    let inc = owner.incarnation.as_ref().ok_or(ReplacementError::StopUnverified)?;
+    if inc.processes.is_empty() || !inc.processes.iter().any(|p| p.pid==inc.pid && p.start_time==inc.start_time) {
+        return Err(ReplacementError::StopUnverified);
+    }
+    for p in &inc.processes {
+        if team_process::state(&team_process::identity_from_owner(p.pid,p.start_time)?) != ProcessState::Gone {
+            return Err(ReplacementError::StopUnverified);
+        }
+    }
+    Ok(())
+}
+/// Opaque stopped/revoked proof. Its process guard owns team then seat locks.
+/// No caller can serialize/construct it or supply its postconditions.
+pub(crate) struct StoppedCodexRecoveryProof {
+    home: std::path::PathBuf,
+    admission: CodexRecoveryAdmission,
+    expected: OwnerRecord,
+    guard: team_process::PersistedProcessSnapshot,
+}
+impl StoppedCodexRecoveryProof {
+    pub(crate) fn verified_owner(&self, root: &Path, actor: &AuthenticatedActor) -> Result<OwnerRecord, ReplacementError> {
+        authorize_recovery(actor)?;
+        if root != self.home.join(".aperture/run/owner") { return Err(ReplacementError::AuthorizationRequired); }
+        let now: OwnerRecord = read_private_json(&root.join(format!("{}.json",self.expected.seat)))
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if now != self.expected || !recovery_owner_matches(&self.admission.owner,&now)
+            || recovery_snapshot(&self.home,&self.admission.request)?.1 != self.admission.snapshot_sha256 {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        claude_stopped(self.guard.snapshot(),team_process::state)?;
+        recovery_all_gone(&now)?;
+        if !recovery_revoked(&self.home,&now)? { return Err(ReplacementError::RevocationUnverified); }
+        Ok(now)
+    }
+}
+/// Readmission is a NEW typed admission after recorded factual exit. It does
+/// not recover an old nonce, claim remote effects absent or erase gN history.
+pub(crate) struct ReadmissionProof {
+    home: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    admission: CodexRecoveryAdmission,
+    quarantined: OwnerRecord,
+}
+impl ReadmissionProof {
+    pub(crate) fn directory(&self) -> &Path { &self.dir }
+    pub(crate) fn team(&self) -> &str { &self.admission.request.team }
+    pub(crate) fn seat(&self) -> &str { &self.admission.request.seat }
+    pub(crate) fn generation(&self) -> u64 { self.admission.request.expected_generation }
+    fn verify_locked(&self, actor: &AuthenticatedActor) -> Result<(),ReplacementError> {
+        authorize_recovery(actor)?;
+        let owner: OwnerRecord = read_private_json(&self.home.join(".aperture/run/owner").join(format!("{}.json",self.seat())))
+            .map_err(|_| ReplacementError::OutcomeUnknown)?;
+        if owner != self.quarantined || owner.state != OwnerState::Quarantined
+            || owner.generation != self.generation() || owner.reservation_nonce_sha256.is_some()
+            || owner.provisional_token_id.is_some()
+            || recovery_snapshot(&self.home,&self.admission.request)?.1 != self.admission.snapshot_sha256 {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        absent(&self.home.join(".aperture/run").join(format!("{}.sock",self.seat())))?;
+        let journal=deadline::RecoveryJournal::read(self.dir.clone(),&self.admission.request.operation_id)?;
+        for phase in ["stop-complete","revocation","socket-release","quarantine"] {
+            if !journal.has(phase,true)? {return Err(ReplacementError::OutcomeUnknown);}
+        }
+        if read_private_json::<OwnerRecord>(&self.dir.join("quarantined-owner.json")).map_err(|_|ReplacementError::OutcomeUnknown)? != owner
+            || read_private_json::<CodexRecoveryAdmission>(&self.dir.join("recovery-admitted.json")).map_err(|_|ReplacementError::OutcomeUnknown)? != self.admission {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        let next=owner.generation.checked_add(1).ok_or(ReplacementError::GenerationMismatch)?;
+        for suffix in ["managed-start-attempt.json","managed-observation.json"] {
+            absent(&self.home.join(".aperture/run").join(format!("{}.g{next}.{suffix}",self.seat())))?;
+        }
+        absent(&self.home.join(".aperture/run/managed").join(self.seat()).join(format!("g{next}")))?;
+        recovery_all_gone(&owner)?;
+        if !recovery_revoked(&self.home,&owner)? { return Err(ReplacementError::RevocationUnverified); }
+        Ok(())
+    }
+    pub(crate) fn verify(&self, home:&Path, actor:&AuthenticatedActor) -> Result<(),ReplacementError> {
+        if home != self.home { return Err(ReplacementError::AuthorizationRequired); }
+        let _team = crate::owner::try_lock(&home.join(".aperture/run/team-locks"),self.team())
+            .map_err(|_| ReplacementError::NativeFailure)?;
+        let store = OwnerStore::new(home.join(".aperture/run/owner"));
+        let _seat = store.lock(self.seat()).map_err(|_| ReplacementError::NativeFailure)?;
+        self.verify_locked(actor)
+    }
+}
+
+#[derive(serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverySocketRecord {
+    operation_id:String,
+    owner_sha256:String,
+    socket:crate::team_terminal::ManagedRecoverySocket,
+}
+fn recovery_owner_read(home:&Path, seat:&str)->Result<OwnerRecord,ReplacementError> {
+    OwnerStore::new(home.join(".aperture/run/owner")).read_owner(seat).map_err(|_|ReplacementError::OutcomeUnknown)
+}
+fn recovery_quarantined(admission:&CodexRecoveryAdmission, current:&OwnerRecord)->bool {
+    if current.state != OwnerState::Quarantined || current.writer != "glados"
+        || current.reservation_nonce_sha256.is_some() || current.provisional_token_id.is_some() { return false; }
+    let mut active=current.clone();
+    active.state=OwnerState::Active;
+    active.since=admission.owner.since.clone();
+    active.writer=admission.owner.writer.clone();
+    recovery_owner_matches(&admission.owner,&active)
+}
+fn recovery_bound(home:&Path, actor:&AuthenticatedActor, admission:&CodexRecoveryAdmission)->Result<OwnerRecord,ReplacementError> {
+    authorize_recovery(actor)?;
+    if recovery_snapshot(home,&admission.request)?.1 != admission.snapshot_sha256 {
+        return Err(ReplacementError::AuthorizationRequired);
+    }
+    let current=recovery_owner_read(home,&admission.request.seat)?;
+    if !recovery_owner_matches(&admission.owner,&current) && !recovery_quarantined(admission,&current) {
+        return Err(ReplacementError::GenerationMismatch);
+    }
+    Ok(current)
+}
+/// Explicit GLaDOS recovery. A duplicate call joins by durable operation ID,
+/// never by heuristics/name. No absence of checkpoint/rollout grants authority.
+pub(crate) fn recover_codex_authorized(home:&Path, actor:&AuthenticatedActor,
+    request:&RecoverCodexInput)->Result<StartedReplacement,ReplacementError> {
+    authorize_recovery(actor)?;
+    request.validate()?;
+    let budget=deadline::Deadline::new();
+    let _operation=crate::owner::try_lock(&home.join(".aperture/run/recovery-locks"),&request.seat)
+        .map_err(|_|ReplacementError::OutcomeUnknown)?;
+    // Closed operation subtree leaves original gN admission/effects/Unknown
+    // untouched. Legacy readers fail closed rather than erase this history.
+    let dir=home.join(".aperture/teams").join(&request.team).join("runtime-attempts")
+        .join(&request.seat).join(format!("g{}",request.expected_generation)).join("codex-recovery");
+    let admission=recovery_admission(home,actor,request,&dir)?;
+    let journal=deadline::RecoveryJournal::open(dir.clone(),&request.operation_id)?;
+    let store=OwnerStore::new(home.join(".aperture/run/owner"));
+    let current=store.read_owner(&request.seat).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    // After a known new reservation, reconciliation reads only that exact
+    // operation's receipts. No second start, token or signal is dispatched.
+    if current.generation == request.expected_generation+1 {
+        return finish_codex_readmission(home,actor,&admission,&dir,&journal,&budget);
+    }
+    recovery_bound(home,actor,&admission)?;
+    let socket_path=dir.join("socket-before-stop.json");
+    let socket:RecoverySocketRecord=if std::fs::symlink_metadata(&socket_path).is_ok() {
+        read_private_json(&socket_path).map_err(|_|ReplacementError::OutcomeUnknown)?
+    } else {
+        absent(&socket_path)?;
+        if journal.has("stop-complete",false)? || journal.has("quarantine",false)? { return Err(ReplacementError::OutcomeUnknown); }
+        let owner=recovery_bound(home,actor,&admission)?;
+        let inc=owner.incarnation.as_ref().ok_or(ReplacementError::InvalidSnapshot)?;
+        let id=team_process::identity_from_owner(inc.pid,inc.start_time)?;
+        let record=RecoverySocketRecord {operation_id:request.operation_id.clone(),owner_sha256:request.expected_owner_sha256.clone(),
+            socket:crate::team_terminal::capture_recovery_socket(home,&request.seat,&id)
+                .map_err(|_|ReplacementError::StopUnverified)?};
+        crate::journal::write_private_json_atomic(&socket_path,&record,false).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        record
+    };
+    let original=admission.owner.incarnation.as_ref().ok_or(ReplacementError::GenerationMismatch)?;
+    if socket.operation_id != request.operation_id || socket.owner_sha256 != request.expected_owner_sha256
+        || !socket.socket.matches_owner(&request.seat,&team_process::identity_from_owner(original.pid,original.start_time)?) {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    if current.state==OwnerState::Active {
+        // Full native closure/disjoint proof remains mandatory, including
+        // already stopped roots and every persisted orphan identity.
+        let snapshot=team_process::native::collect_native_until(home,&request.team,&request.seat,
+            request.expected_generation,budget.forward_until(Duration::from_secs(10))?)?;
+        recovery_bound(home,actor,&admission)?;
+        let guard=team_process::persist_for_stop(home,&request.team,&AuthenticatedActor::launcher(),snapshot)?;
+        if !recovery_owner_matches(&admission.owner,&store.read_owner_locked(&request.seat).map_err(|_|ReplacementError::OutcomeUnknown)?) {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        let mut processes=guard.snapshot().processes.clone();
+        processes.sort_by_key(|p|std::cmp::Reverse(p.depth));
+        for (signal,label,wait) in [(Signal::Term,"term",Duration::from_secs(10)),(Signal::Kill,"kill",Duration::from_secs(1))] {
+            for p in &processes {
+                authorize_recovery(actor)?;
+                budget.forward(Duration::from_secs(90))?;
+                let name=format!("{label}-{}-{}",p.identity.pid,team_process::birth_micros(&p.identity)?);
+                journal.phase(&name,||match team_process::state(&p.identity) {
+                    ProcessState::Gone=>Ok(true),ProcessState::Same=>Ok(false),_=>Err(ReplacementError::StopUnverified),
+                },||{authorize_recovery(actor)?;team_process::signal_recorded(&guard,&p.identity,signal)})?;
+            }
+            let until=budget.forward_until(wait)?;
+            loop {
+                if processes.iter().all(|p|team_process::state(&p.identity)==ProcessState::Gone) {break;}
+                if Instant::now()>=until {break;}
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if processes.iter().all(|p|team_process::state(&p.identity)==ProcessState::Gone) {break;}
+        }
+        claude_stopped(guard.snapshot(),team_process::state)?;
+        drop(guard);
+        let snapshot=team_process::native::collect_native_until(home,&request.team,&request.seat,
+            request.expected_generation,budget.forward_until(Duration::from_secs(10))?)?;
+        claude_stopped(&snapshot,team_process::state)?;
+        recovery_bound(home,actor,&admission)?;
+        let guard=team_process::persist_for_stop(home,&request.team,&AuthenticatedActor::launcher(),snapshot)?;
+        let expected=store.read_owner_locked(&request.seat).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if !recovery_owner_matches(&admission.owner,&expected) {return Err(ReplacementError::GenerationMismatch);}
+        journal.phase("stop-complete",||{claude_stopped(guard.snapshot(),team_process::state)?;Ok(true)},||Err(ReplacementError::OutcomeUnknown))?;
+        authorize_recovery(actor)?;
+        journal.phase("revocation",||recovery_revoked(home,&expected),||{
+            authorize_recovery(actor)?;
+            crate::ws_hub::managed_control::revoke_stopped_before(home,&guard,budget.forward_until(Duration::from_secs(3))?)?;
+            if !recovery_revoked(home,&expected)? {return Err(ReplacementError::RevocationUnverified);}
+            Ok(())
+        })?;
+        // Known metadata revocation is explicitly reconciliation, not a forged
+        // socket close/reconnect ACK. Both states prevent new old-gen authority.
+        if !recovery_revoked(home,&expected)? {return Err(ReplacementError::RevocationUnverified);}
+        authorize_recovery(actor)?;
+        journal.phase("socket-release",||Ok(matches!(std::fs::symlink_metadata(home.join(".aperture/run").join(format!("{}.sock",request.seat))),Err(e) if e.kind()==std::io::ErrorKind::NotFound)),||{
+            authorize_recovery(actor)?;
+            crate::team_terminal::release_recovery_socket(home,&socket.socket,&guard).map_err(|_|ReplacementError::StopUnverified)
+        })?;
+        absent(&home.join(".aperture/run").join(format!("{}.sock",request.seat)))?;
+        let proof=StoppedCodexRecoveryProof {home:home.into(),admission:admission.clone(),expected,guard};
+        journal.phase("quarantine",||Ok(false),||{
+            store.quarantine_recovered_codex(actor,&proof).map_err(|_|ReplacementError::OutcomeUnknown)?;Ok(())
+        })?;
+        drop(proof);
+    }
+    let quarantined=recovery_bound(home,actor,&admission)?;
+    if !recovery_quarantined(&admission,&quarantined) || !journal.has("quarantine",false)? {
+        return Err(ReplacementError::OutcomeUnknown);
+    }
+    recovery_all_gone(&quarantined)?;
+    if !recovery_revoked(home,&quarantined)? {return Err(ReplacementError::RevocationUnverified);}
+    journal.phase("quarantine",||Ok(true),||Err(ReplacementError::OutcomeUnknown))?;
+    let retained=dir.join("quarantined-owner.json");
+    if retained.exists() {
+        if read_private_json::<OwnerRecord>(&retained).map_err(|_|ReplacementError::OutcomeUnknown)? != quarantined {return Err(ReplacementError::OutcomeUnknown);}
+    } else {crate::journal::write_private_json_atomic(&retained,&quarantined,false).map_err(|_|ReplacementError::OutcomeUnknown)?;}
+    let proof=ReadmissionProof {home:home.into(),dir:dir.clone(),admission:admission.clone(),quarantined};
+    proof.verify(home,actor)?;
+    let repo=repository::resolve_native(home,&request.team,budget.forward_until(Duration::from_secs(10))?)
+        .map_err(|_|ReplacementError::RepoBindingUnavailable)?;
+    let plan=NativePlan::preflight(home,&request.team,&request.seat,&admission.owner.requested,&repo,None,&budget)?;
+    let mut attempt=deadline::RuntimeAttempt::begin_readmission(home,actor,&proof,budget)?;
+    attempt.admit_effects()?;
+    // Intent is durable before reserve/token/spawn. On resumption only factual
+    // observations may complete this phase; this closure cannot execute twice.
+    journal.start_unreserved(&proof,home,actor,||{
+        proof.verify(home,actor)?;
+        let mut started=start_native(home,&request.team,&request.seat,request.expected_generation,
+            admission.owner.requested.clone(),&plan,&attempt,Some(actor),Some(&proof))?;
+        // Keep an immutable observed Starting record for post-commit crash
+        // reconciliation. Neither nonce bytes nor caller observations enter it.
+        let observed=store.read_owner(&request.seat).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        let activate=crate::journal::write_private_json_atomic(&dir.join("candidate-observed.json"),&observed,false)
+            .map_err(|_|ReplacementError::OutcomeUnknown)
+            .and_then(|_|activate_native(home,&request.team,&started,&attempt,Some(actor)));
+        if let Err(e)=activate {
+            let cleanup=cleanup_native(home,&request.team,&started.reservation,started.child.as_mut(),attempt.budget().cleanup_until());
+            return Err(if cleanup.is_ok(){e}else{ReplacementError::StartCleanupUnverified});
+        }
+        Ok(())
+    })?;
+    attempt.finish_active()?;
+    finish_codex_readmission(home,actor,&admission,&dir,&journal,attempt.budget())
+}
+
+/// Candidate observation access is gated by the SAME durable start intention,
+/// exact admitted owner/snapshot and current observed Starting identity. This
+/// proof grants read-only access, not commit or signal authority.
+pub(crate) struct RecoveryObservationCandidate {
+    home:std::path::PathBuf, dir:std::path::PathBuf,
+    admission:CodexRecoveryAdmission, starting:OwnerRecord,
+}
+impl RecoveryObservationCandidate {
+    pub(crate) fn team(&self)->&str { &self.admission.request.team }
+    pub(crate) fn seat(&self)->&str { &self.admission.request.seat }
+    pub(crate) fn generation(&self)->u64 { self.admission.request.expected_generation+1 }
+    pub(crate) fn starting_since(&self)->&str { &self.starting.since }
+    pub(crate) fn verify_locked(&self,home:&Path,current:&OwnerRecord)->Result<(),ReplacementError> {
+        if home != self.home || self.starting.state!=OwnerState::Starting || self.starting.generation!=self.generation()
+            || self.starting.seat!=self.seat() || self.starting.requested!=self.admission.owner.requested
+            || self.starting.reservation_nonce_sha256.is_none()
+            || recovery_snapshot(home,&self.admission.request)?.1!=self.admission.snapshot_sha256 {
+            return Err(ReplacementError::GenerationMismatch);
+        }
+        let inc=self.starting.incarnation.as_ref().ok_or(ReplacementError::ModelUnverified)?;
+        if !inc.observed || inc.execution_tuple().as_ref()!=Some(&self.starting.requested)
+            || inc.thread_id==self.admission.request.expected_thread_id
+            || self.starting.provisional_token_id.as_deref()!=Some(inc.token_id.as_str()) {
+            return Err(ReplacementError::ModelUnverified);
+        }
+        let journal=deadline::RecoveryJournal::read(self.dir.clone(),&self.admission.request.operation_id)?;
+        if !journal.has("start",false)? {return Err(ReplacementError::OutcomeUnknown);}
+        for step in ["stop-complete","revocation","socket-release","quarantine"] {
+            if !journal.has(step,true)? {return Err(ReplacementError::OutcomeUnknown);}
+        }
+        let stopped:OwnerRecord=read_private_json(&self.dir.join("quarantined-owner.json")).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if !recovery_quarantined(&self.admission,&stopped) {return Err(ReplacementError::GenerationMismatch);}
+        recovery_all_gone(&stopped)?;
+        deadline::verify_readmission(&self.dir,self.team(),self.seat(),self.admission.request.expected_generation)?;
+        let stored:CodexRecoveryAdmission=read_private_json(&self.dir.join("recovery-admitted.json"))
+            .map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if stored!=self.admission {return Err(ReplacementError::OutcomeUnknown);}
+        let mut expected=self.starting.clone();
+        if current.state==OwnerState::Active {
+            expected.state=OwnerState::Active; expected.reservation_nonce_sha256=None;expected.provisional_token_id=None;
+            expected.since=current.since.clone();
+        }
+        if current!=&expected {return Err(ReplacementError::GenerationMismatch);}
+        recovery_all_gone(&self.admission.owner)?;
+        // Old floor must still revoke gN; current gN+1 token is verified by the
+        // observation reader. No metadata-only claim of a new token's liveness.
+        let old=self.admission.owner.incarnation.as_ref().ok_or(ReplacementError::InvalidSnapshot)?;
+        crate::ws_hub::managed_control::verify_floor(home,self.seat(),self.admission.request.expected_generation,&old.token_id)?;
+        Ok(())
+    }
+}
+pub(crate) struct RecoveryCommitProof {
+    candidate:RecoveryObservationCandidate,
+    expected:OwnerRecord,
+    observation:model_observation::RecoveryReadProof,
+}
+impl RecoveryCommitProof {
+    pub(crate) fn verified_owner(&self,root:&Path,actor:&AuthenticatedActor)->Result<OwnerRecord,ReplacementError> {
+        authorize_recovery(actor)?;
+        if root!=self.candidate.home.join(".aperture/run/owner") {return Err(ReplacementError::AuthorizationRequired);}
+        let current:OwnerRecord=read_private_json(&root.join(format!("{}.json",self.candidate.seat())))
+            .map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if current!=self.expected {return Err(ReplacementError::GenerationMismatch);}
+        self.candidate.verify_locked(&self.candidate.home,&current)?;
+        // The real receipt has just been checked before acquiring these locks.
+        // Bind its bytes so any producer rewrite before CAS is a conflict.
+        self.observation.recheck_locked(&self.candidate.home,&self.candidate).map_err(|_|ReplacementError::ModelUnverified)?;
+        Ok(current)
+    }
+}
+fn finish_codex_readmission(home:&Path,actor:&AuthenticatedActor,admission:&CodexRecoveryAdmission,
+    dir:&Path,journal:&deadline::RecoveryJournal,budget:&deadline::Deadline)->Result<StartedReplacement,ReplacementError> {
+    authorize_recovery(actor)?;
+    budget.forward(Duration::ZERO)?;
+    let store=OwnerStore::new(home.join(".aperture/run/owner"));
+    let current=store.read_owner(&admission.request.seat).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    let path=dir.join("candidate-observed.json");
+    let starting:OwnerRecord=match std::fs::symlink_metadata(&path) {
+        Ok(_)=>read_private_json(&path).map_err(|_|ReplacementError::OutcomeUnknown)?,
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound && current.state==OwnerState::Starting => current.clone(),
+        _=>return Err(ReplacementError::OutcomeUnknown),
+    };
+    let candidate=RecoveryObservationCandidate {home:home.into(),dir:dir.into(),admission:admission.clone(),starting};
+    let verified=model_observation::read_recovery(home,&candidate).map_err(|_|ReplacementError::ModelUnverified)?;
+    let observation_thread=verified.observation().thread_id.clone();
+    let observation_token=verified.observation().token_id.clone();
+    let observation_tuple=verified.observation().actual.clone();
+    if !path.exists() {
+        crate::journal::write_private_json_atomic(&path,&candidate.starting,false).map_err(|_|ReplacementError::OutcomeUnknown)?;
+    }
+    // Record a byte pin after genuine native validation, before final locks.
+    // It is never constructed from caller observations or reconstructed nonce.
+    let _team=crate::owner::try_lock(&home.join(".aperture/run/team-locks"),candidate.team()).map_err(|_|ReplacementError::NativeFailure)?;
+    let _seat=store.lock(candidate.seat()).map_err(|_|ReplacementError::NativeFailure)?;
+    authorize_recovery(actor)?;
+    let proof=RecoveryCommitProof {candidate,expected:current,observation:verified};
+    let owner=store.commit_recovered_codex(actor,&proof).map_err(|_|ReplacementError::ModelUnverified)?;
+    let inc=owner.incarnation.as_ref().ok_or(ReplacementError::ModelUnverified)?;
+    if owner.state!=OwnerState::Active || inc.thread_id!=observation_thread || inc.token_id!=observation_token
+        || inc.execution_tuple().as_ref()!=Some(&observation_tuple) {return Err(ReplacementError::ModelUnverified);}
+    journal.phase("start",||Ok(true),||Err(ReplacementError::OutcomeUnknown))?;
+    Ok(StartedReplacement {generation:owner.generation,thread_id:inc.thread_id.clone(),requested_model:owner.requested.model.clone(),
+        actual_model:Some(inc.model.clone()),model_verified:true})
+}

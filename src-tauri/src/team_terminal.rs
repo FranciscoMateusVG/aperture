@@ -56,7 +56,8 @@ struct Binding {
 }
 // Path metadata is pinned as well as the kernel peer. This is a bounded
 // check/recheck, not atomic exclusion of a malicious concurrent same-UID swap.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PathPin {
     path: PathBuf,
     dev: u64,
@@ -89,7 +90,8 @@ impl PathPin {
         Ok(())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SocketBinding {
     path: PathBuf,
     pins: Vec<PathPin>,
@@ -1626,3 +1628,63 @@ fn open_claude_with(io: &mut impl ClaudeWindowIo, input: &OpenSeatInput) -> Resu
 #[cfg(test)]
 #[path = "team_terminal_tests.rs"]
 mod tests;
+
+
+/// Private recovery capture; never accepted through a command DTO. Disk bytes
+/// are bound by the exact recovery admission and rechecked against native pins.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedRecoverySocket {
+    seat: String,
+    identity: crate::team_replacement::ProcessIdentity,
+    parents: Vec<PathPin>,
+    binding: SocketBinding,
+}
+impl ManagedRecoverySocket {
+    pub(crate) fn matches_owner(&self,seat:&str,identity:&crate::team_replacement::ProcessIdentity)->bool {
+        self.seat==seat && self.identity==*identity
+    }
+}
+pub(crate) fn capture_recovery_socket(home: &Path, seat: &str,
+    identity: &crate::team_replacement::ProcessIdentity) -> Result<ManagedRecoverySocket> {
+    if !crate::agent_loader::is_valid_seat_name(seat)
+        || team_process::state(identity) != crate::team_replacement::ProcessState::Same { return Err(ERROR.into()); }
+    let parents = coordination_runtime_dirs(home)?;
+    let fixed = home.join(".aperture/run").join(format!("{seat}.sock"));
+    let binding = verified_socket(&fixed,identity.pid)?;
+    for p in &parents { p.recheck()?; }
+    if team_process::state(identity) != crate::team_replacement::ProcessState::Same { return Err(ERROR.into()); }
+    Ok(ManagedRecoverySocket {seat:seat.into(),identity:identity.clone(),parents,binding})
+}
+pub(crate) fn release_recovery_socket(home: &Path, captured: &ManagedRecoverySocket,
+    guard: &crate::team_process::PersistedProcessSnapshot) -> Result<()> {
+    use crate::team_replacement::ProcessState;
+    let snapshot = guard.snapshot();
+    if snapshot.seat != captured.seat || !snapshot.complete || !snapshot.unowned_matches.is_empty()
+        || !snapshot.processes.iter().any(|p| p.identity==captured.identity)
+        || snapshot.processes.iter().any(|p| team_process::state(&p.identity)!=ProcessState::Gone) {
+        return Err(ERROR.into());
+    }
+    release_recovery_socket_checked(home,captured,native_explicit_refusal)
+}
+fn release_recovery_socket_checked(home: &Path, captured: &ManagedRecoverySocket,
+    refuse: impl FnOnce(&Path)->Result<()>) -> Result<()> {
+    if !crate::agent_loader::is_valid_seat_name(&captured.seat)
+        || coordination_runtime_dirs(home)? != captured.parents { return Err(ERROR.into()); }
+    for p in &captured.parents { p.recheck()?; }
+    let fixed = home.join(".aperture/run").join(format!("{}.sock",captured.seat));
+    if captured.binding.pins.first().map(|p| &p.path) != Some(&fixed) { return Err(ERROR.into()); }
+    match fs::symlink_metadata(&fixed) {
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ERROR.into()),
+        Ok(_) => {},
+    }
+    captured.binding.recheck()?;
+    // Gone root alone is not authority over an endpoint now serving another
+    // peer. Require native explicit ECONNREFUSED, never treat a timeout as it.
+    refuse(&captured.binding.path)?;
+    captured.binding.recheck()?;
+    CodexCleanup::new(fixed, captured.binding.clone())?.unlink()?;
+    journal::sync_dir(&home.join(".aperture/run"))?;
+    Ok(())
+}

@@ -1284,3 +1284,43 @@ fn local_terminal_legacy_or_drifted_receipt_denies_without_any_dispatch() {
     assert_eq!(journal::read_private_json::<serde_json::Value>(&path).unwrap(),stale);
     drop(body);drop(work);runtime.close().unwrap();
 }
+
+#[test]
+fn recovery_socket_direct_link_and_no_follow_cleanup_match_original_capture() {
+    use std::os::unix::{fs::{PermissionsExt,symlink},net::UnixListener};
+    for linked in [false,true] {
+        let f=SocketFixture::new();let home=f.root.join("h");journal::ensure_private_dir(&home.join(".aperture/run")).unwrap();
+        let fixed=home.join(".aperture/run/test-dev.sock");
+        let direct=if linked {symlink(&f.target,&fixed).unwrap();None} else {
+            let listener=UnixListener::bind(&fixed).unwrap();fs::set_permissions(&fixed,fs::Permissions::from_mode(0o600)).unwrap();Some(listener)
+        };
+        let captured=ManagedRecoverySocket {seat:"test-dev".into(),identity:crate::team_replacement::ProcessIdentity {pid:900001,start_time:"42.000000".into()},
+            parents:coordination_runtime_dirs(&home).unwrap(),binding:pin_socket(&fixed,&f.daemon,unsafe{libc::geteuid()}).unwrap()};
+        drop(direct);
+        let calls=std::cell::Cell::new(0);
+        release_recovery_socket_checked(&home,&captured,|target|{calls.set(calls.get()+1);assert_eq!(target,if linked{&f.target}else{&fixed});Ok(())}).unwrap();
+        assert_eq!(calls.get(),1);assert!(fs::symlink_metadata(&fixed).is_err());assert!(f.target.exists());
+        release_recovery_socket_checked(&home,&captured,|_|panic!("already absent cannot be unlinked again")).unwrap();
+        assert!(f.target.exists());
+    }
+}
+#[test]
+fn recovery_socket_leaf_target_parent_drift_and_foreign_listener_never_unlink() {
+    use std::os::unix::{fs::{PermissionsExt,symlink},net::UnixListener};
+    for mode in 0..5 {
+        let f=SocketFixture::new();let home=f.root.join("h");journal::ensure_private_dir(&home.join(".aperture/run")).unwrap();
+        let fixed=home.join(".aperture/run/test-dev.sock");symlink(&f.target,&fixed).unwrap();
+        let capture=ManagedRecoverySocket {seat:"test-dev".into(),identity:crate::team_replacement::ProcessIdentity {pid:900001,start_time:"42.000000".into()},
+            parents:coordination_runtime_dirs(&home).unwrap(),binding:pin_socket(&fixed,&f.daemon,unsafe{libc::geteuid()}).unwrap()};
+        let mut listener=None;
+        match mode {
+            0=>{fs::rename(&fixed,f.root.join("old-link")).unwrap();symlink(&f.target,&fixed).unwrap();},
+            1=>{fs::rename(&f.target,f.root.join("old-target")).unwrap();listener=Some(UnixListener::bind(&f.target).unwrap());fs::set_permissions(&f.target,fs::Permissions::from_mode(0o600)).unwrap();},
+            2=>fs::set_permissions(home.join(".aperture/run"),fs::Permissions::from_mode(0o755)).unwrap(),
+            3=>fs::set_permissions(&f.target,fs::Permissions::from_mode(0o666)).unwrap(),
+            _=>{},
+        }
+        assert!(release_recovery_socket_checked(&home,&capture,|_|Err(ERROR.into())).is_err(),"mode {mode}");
+        assert!(fs::symlink_metadata(&fixed).is_ok());assert!(f.target.exists());drop(listener);
+    }
+}

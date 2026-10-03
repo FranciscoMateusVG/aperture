@@ -689,6 +689,7 @@ pub enum TeamControlRequest {
     ListPending,
     ListTeams,
     BootstrapSeat(BootstrapSeatInput),
+    RecoverCodex(crate::team_replacement::native::RecoverCodexInput),
     StopSeat(StopSeatInput),
     RetireSeat(RetireSeatInput),
     ReconcileStoppedRetirement(RetireSeatInput),
@@ -716,6 +717,7 @@ pub enum TeamControlResponse {
     ListPending(Vec<TeamView>),
     ListTeams(Vec<TeamView>),
     BootstrapSeat(BootstrapView),
+    RecoverCodex(RecoverCodexView),
     StopSeat(StopSeatView),
     RetireSeat(RetireSeatView),
     ReconcileStoppedRetirement(RetireSeatView),
@@ -731,6 +733,15 @@ pub enum TeamControlResponse {
     Replace(ReplacementView),
     Archive(ArchiveView),
     RollbackArchive(TeamView),
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverCodexView {
+    pub team:String, pub seat:String, pub operation_id:String,
+    pub previous_generation:u64, pub generation:u64,
+    pub phase:&'static str, pub mission:&'static str, pub readiness:&'static str,
+    pub previous_effects:&'static str, pub owner:crate::state::OwnerSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2473,6 +2484,18 @@ pub fn team_control_headless(input_json: &str) -> TeamResult<TeamControlResponse
             let actor = authenticate_glados_control().map_err(TeamError::from_message)?;
             bootstrap_seat(&engine, &actor, input).map(TeamControlResponse::BootstrapSeat)
         }
+        TeamControlRequest::RecoverCodex(input) => {
+            let actor=authenticate_glados_control().map_err(TeamError::from_message)?;
+            let started=crate::team_replacement::native::recover_codex_authorized(&engine.paths.home,&actor,&input)
+                .map_err(replacement_error)?;
+            let owner=owner_summary(&engine.paths.home,&input.seat)?;
+            if owner.generation!=started.generation || owner.state!=OwnerState::Active {
+                return Err(TeamError::new("E_CONTROL_UNKNOWN","recovery readback differs; inspect same operation"));
+            }
+            Ok(TeamControlResponse::RecoverCodex(RecoverCodexView {team:input.team,seat:input.seat,operation_id:input.operation_id,
+                previous_generation:input.expected_generation,generation:started.generation,phase:"started",mission:"wait_go",
+                readiness:"not_verified",previous_effects:"unknown_accepted",owner}))
+        }
         TeamControlRequest::ListTeams => {
             authenticate_glados_control().map_err(TeamError::from_message)?;
             engine.list_teams().map(TeamControlResponse::ListTeams)
@@ -3916,5 +3939,24 @@ mod tests {
             assert!(object.contains_key(key), "missing {key}");
         }
         assert!(value.to_string().find("thread_id").is_none());
+    }
+}
+
+#[cfg(test)]
+mod codex_recovery_wire_tests {
+    use super::*;
+    #[test]
+    fn explicit_recovery_wire_has_no_caller_path_actor_or_model() {
+        let value=serde_json::json!({"action":"recover_codex","input":{
+            "team":"t1","seat":"t1-worker","expected_generation":1,
+            "expected_owner_sha256":"a".repeat(64),"expected_thread_id":"old-thread",
+            "operation_id":"12345678-1234-4234-9234-123456789012","accept_context_loss":true,
+            "accept_unverified_effects":true,"mission_withdrawn":true}});
+        let request:TeamControlRequest=serde_json::from_value(value.clone()).unwrap();
+        match request {TeamControlRequest::RecoverCodex(input)=>input.validate().unwrap(),_=>panic!("wrong action")}
+        for key in ["actor","path","model","nonce","ready"] {
+            let mut changed=value.clone();changed["input"][key]="caller".into();
+            assert!(serde_json::from_value::<TeamControlRequest>(changed).is_err());
+        }
     }
 }

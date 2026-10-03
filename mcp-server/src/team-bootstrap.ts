@@ -62,3 +62,24 @@ export function parseBootstrapStarted(value: unknown, input: BootstrapSeatSelect
   }
   return parsed.data;
 }
+
+/** Explicit loss acceptance, never evidence that a missing thread did no work. */
+export const recoverCodexSchema = z.object({ team:name.max(16),seat:name,
+  expected_generation:z.number().int().positive().max(Number.MAX_SAFE_INTEGER-1),
+  expected_owner_sha256:z.string().regex(/^[a-f0-9]{64}$/), expected_thread_id:z.string().regex(/^[a-zA-Z0-9-]{1,128}$/),
+  operation_id:z.string().uuid(), accept_context_loss:z.literal(true), accept_unverified_effects:z.literal(true),
+  mission_withdrawn:z.literal(true) }).strict();
+export type RecoverCodexSelectors=z.infer<typeof recoverCodexSchema>;
+export function parseCodexRecovered(value:unknown,input:RecoverCodexSelectors) {
+ const parsed=z.object({action:z.literal('recover_codex'),result:z.object({team:name,seat:name,
+  operation_id:z.string().uuid(),previous_generation:z.number().int().positive(),generation:z.number().int().positive(),
+  phase:z.literal('started'),mission:z.literal('wait_go'),readiness:z.literal('not_verified'),
+  previous_effects:z.literal('unknown_accepted'),owner:owner.strict()}).strict()}).strict().safeParse(value);
+ if(!parsed.success) throw new Error('E_CONTROL_UNKNOWN: recovery receipt invalid; inspect same operation without retry');
+ const r=parsed.data.result,o=r.owner;
+ if(r.team!==input.team || r.seat!==input.seat || r.operation_id!==input.operation_id || r.previous_generation!==input.expected_generation
+  || r.generation!==input.expected_generation+1 || o.generation!==r.generation || o.state!=='active' || !o.thread_bound
+  || o.process_count<1 || !o.actual || o.actual.harness!=='codex' || o.actual.reasoning===null || !same(o.configured,o.actual))
+  throw new Error('E_CONTROL_UNKNOWN: recovery does not prove the exact admitted successor');
+ return parsed.data;
+}

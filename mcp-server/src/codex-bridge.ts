@@ -598,13 +598,11 @@ export class CodexBridgeClient {
           if (active === null || active.requested.harness !== "codex") {
             throw new Error("E_MODEL_UNVERIFIED: active managed Codex identity is invalid");
           }
-          await this.request("thread/resume", { threadId: active.threadId });
-          this.hooks.beforeManagedOwnerReadback?.(this.agent, "active-resume");
-          const confirmed = readManagedActiveRuntime(this.agent);
-          if (confirmed === null || !sameActiveRuntime(active, confirmed)) {
-            throw new Error("E_GENERATION_MISMATCH: managed owner changed during thread resume");
-          }
-          if (!(await this.verifyManagedMcp(ws, active))) return;
+          // One budget covers classification AND MCP admission. An Active owner
+          // may have an in-memory thread but no rollout before its first turn.
+          const until = Date.now() + 20_000;
+          if (!(await this.admitActiveThread(ws, active, until))) return;
+          if (!(await this.verifyManagedMcp(ws, active, until))) return;
           this.bindToThread(active.threadId, "thread_list");
           if (!this.hooks.skipReplay) this.deliver();
           return;
@@ -800,29 +798,103 @@ export class CodexBridgeClient {
     throw new Error("E_FRESH_THREAD_UNVERIFIED: managed bridge disconnected before activation");
   }
 
+  /** Exact 0.158 thread metadata, never content, never a new turn to create a
+   * rollout. Loaded and persisted are separate: read success with path=null
+   * is NOT persisted proof. Absence is a blocked lifecycle, not zero effects. */
+  private async admitActiveThread(ws: WebSocket, owner: ManagedActiveRuntime, until: number): Promise<boolean> {
+    let code = "E_THREAD_STATUS_UNAVAILABLE";
+    const current = () => {
+      const now = readManagedActiveRuntime(this.agent);
+      return this.ws === ws && ws.readyState === WebSocket.OPEN && !this.stopped &&
+        loadSeatRegistry().seats.get(this.agent)?.group === "team" &&
+        now !== null && sameActiveRuntime(owner, now);
+    };
+    const rpc = async (method: string, params: Record<string, unknown>) => {
+      if (!current()) throw new Error("owner changed");
+      const remaining = until - Date.now();
+      if (remaining <= 0) throw new Error("deadline");
+      const result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
+      if (!current() || Date.now() >= until) throw new Error("owner/deadline changed");
+      if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("shape");
+      return result as Record<string, unknown>;
+    };
+    try {
+      const seen = new Set<string>();
+      const cursors = new Set<string>();
+      let cursor: string | null = null;
+      for (let page = 0; page < 4; page++) {
+        const result = await rpc("thread/loaded/list", { limit: 20, ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(result.data) || result.data.length > 20) throw new Error("shape");
+        for (const id of result.data) {
+          if (typeof id !== "string" || !id || seen.has(id)) throw new Error("shape");
+          seen.add(id);
+        }
+        if (result.nextCursor === null) { cursor = null; break; }
+        if (typeof result.nextCursor !== "string" || !result.nextCursor ||
+            result.nextCursor.length > 4096 || cursors.has(result.nextCursor)) throw new Error("cursor");
+        cursor = result.nextCursor; cursors.add(cursor);
+      }
+      if (cursor !== null) throw new Error("incomplete");
+      let read: Record<string, unknown>;
+      try { read = await rpc("thread/read", { threadId: owner.threadId, includeTurns: false }); }
+      catch (e) {
+        // -32600 alone is not absence: malformed/unsupported requests share it.
+        if (e instanceof Error && (e as Error & { threadNotFound?: boolean }).threadNotFound) {
+          code = seen.has(owner.threadId) ? "E_THREAD_STATUS_CONFLICT" : "E_THREAD_ABSENT";
+        }
+        throw e;
+      }
+      const thread = read.thread as Record<string, unknown> | undefined;
+      code = "E_THREAD_BINDING_UNVERIFIED";
+      if (!thread || thread.id !== owner.threadId || thread.model !== owner.requested.model ||
+          thread.reasoningEffort !== owner.requested.reasoning) throw new Error("binding");
+      const loaded = seen.has(owner.threadId);
+      if (!loaded) {
+        code = "E_THREAD_PERSISTENCE_UNVERIFIED";
+        if (typeof thread.path !== "string" || !thread.path.startsWith("/") || thread.ephemeral !== false) throw new Error("persisted proof");
+        await rpc("thread/resume", { threadId: owner.threadId });
+        // Re-read the effective metadata, not just the old persisted metadata.
+        const resumed = (await rpc("thread/read", { threadId: owner.threadId, includeTurns: false })).thread as Record<string, unknown> | undefined;
+        if (!resumed || resumed.id !== owner.threadId || resumed.model !== owner.requested.model ||
+            resumed.reasoningEffort !== owner.requested.reasoning) throw new Error("resumed binding");
+      }
+      this.hooks.beforeManagedOwnerReadback?.(this.agent, "active-resume");
+      code = "E_MCP_OWNER_CHANGED";
+      if (!current()) throw new Error("owner changed");
+      this.hooks.log("codex_managed_thread_classified", { agent: this.agent, generation: owner.generation, kind: loaded ? "loaded" : "persisted" });
+      return true;
+    } catch {
+      if (this.ws !== ws || this.stopped) return false;
+      this.managedMcpProven = false;
+      this.managedMcpState = "blocked";
+      this.managedMcpRecoverable = false;
+      this.hooks.log("codex_managed_thread_blocked", { agent: this.agent, generation: owner.generation, code });
+      return false;
+    }
+  }
+
   /** Codex 0.155.1 native protocol, exact thread only. No reload, turn,
    * config mutation or pre-Active tool call. Error bodies/catalogs are private;
    * only finite categories/counts leave this seam. Terminal failure stays held;
    * transient startup is bounded to 20s plus at most one ready-triggered 20s
    * re-entry on this connection, never a reconnect/restart to manufacture success. */
-  private verifyManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime): Promise<boolean> {
+  private verifyManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime, until = Date.now() + 20_000): Promise<boolean> {
     const flight = this.managedMcpFlight;
     if (flight) return flight.ws === ws && sameActiveRuntime(owner, flight.owner)
       ? flight.promise : Promise.resolve(false);
-    const promise = this.checkManagedMcp(ws, owner).finally(() => {
+    const promise = this.checkManagedMcp(ws, owner, until).finally(() => {
       if (this.managedMcpFlight?.promise === promise) this.managedMcpFlight = null;
     });
     this.managedMcpFlight = { ws, owner, promise };
     return promise;
   }
 
-  private async checkManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime): Promise<boolean> {
+  private async checkManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime, deadline: number): Promise<boolean> {
     this.managedMcpRecoverable = false;
     const proofOwner = this.managedMcpOwner;
     this.managedMcpState = "checking";
     this.managedMcpOwner = owner;
     let epoch = this.managedMcpEpoch;
-    const deadline = Date.now() + 20_000;
     let code = "E_MCP_STATUS_UNAVAILABLE";
     let server: "aperture-bus" | "sentry" | "unknown" = "unknown";
     const current = () => {
@@ -1166,7 +1238,10 @@ export class CodexBridgeClient {
       clearTimeout(p.timer);
       if (msg.error) {
         const err = msg.error as JsonRpcError;
-        p.reject(new Error(`${p.method}: ${err.message ?? JSON.stringify(msg.error)}`));
+        const error = new Error(`${p.method}: ${err.message ?? "RPC error"}`) as Error & { threadNotFound?: boolean };
+        error.threadNotFound = p.method === "thread/read" && err.code === -32600 &&
+          typeof err.message === "string" && /^thread not found(?:\b|:)/i.test(err.message);
+        p.reject(error);
       } else {
         p.resolve(msg.result ?? null);
       }
@@ -1256,7 +1331,8 @@ export class CodexBridgeClient {
     if (fresh.length === 0) return;
 
     // Revalidate readiness AFTER the awaited BEADS read, before dispatch.
-    // Existing standing-seat behavior is unchanged.
+    // Registry may change while BEADS is awaited, including standing seats.
+    if (!this.threadId || this.stopped || !loadSeatRegistry().seats.has(this.agent)) return;
     if (this.managedMcpOwner) {
       const ws = this.ws;
       if (!ws || !(await this.verifyManagedMcp(ws, this.managedMcpOwner))) return;

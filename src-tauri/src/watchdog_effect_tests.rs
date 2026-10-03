@@ -374,3 +374,21 @@ fn d_kickoff_actual_tick_is_bounded_and_preserves_unverified_seats() {
     assert!(status.success(),"owned kickoff matrix failed: {status}");
     assert_eq!(crate::team_process::state(&identity),crate::team_replacement::ProcessState::Gone);
 }
+
+
+#[test]
+fn managed_monitor_expiry_only_signals_after_trustworthy_silence() {
+    let mut watch = HashMap::new();
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-a", true, true, at));
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-a", true, false, at));
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-a", true, false, at+Duration::from_secs(59)));
+    assert!(managed_silence_due(&mut watch, "team-qa", "owner-a", true, false, at+Duration::from_secs(60)));
+    // Watchdog subscriber loss is not agent death; no expiry/recovery claim.
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-a", false, false, at+Duration::from_secs(61)));
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-a", true, false, at+Duration::from_secs(120)));
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-b", true, false, at+Duration::from_secs(181)));
+    assert!(managed_silence_due(&mut watch, "team-qa", "owner-b", true, false, at+Duration::from_secs(241)));
+    assert!(!managed_silence_due(&mut watch, "team-qa", "owner-b", true, true, at+Duration::from_secs(242)));
+    assert!(watch.is_empty()); // join clears only silence timer, not readiness
+}

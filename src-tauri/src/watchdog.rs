@@ -134,6 +134,7 @@ struct Shared {
     subscriber_connected: bool,
     /// When the subscriber last (re)connected — start of the RECONNECT_GRACE.
     connected_since: Option<SystemTime>,
+    managed_silence: HashMap<String, (String, SystemTime)>,
 }
 
 impl Shared {
@@ -143,6 +144,7 @@ impl Shared {
             watch: HashMap::new(),
             subscriber_connected: false,
             connected_since: None,
+            managed_silence: HashMap::new(),
         }
     }
 }
@@ -666,6 +668,20 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &
         (s.subscriber_connected, past_grace)
     };
 
+    // Filesystem owner evidence is not AppState/model-name authority. No
+    // token/arguments/TUI body is read. Missing/corrupt evidence never nudges.
+    let managed_owners: HashMap<_, _> = managed.keys().filter_map(|name| {
+        let owner = crate::owner::OwnerStore::new(home.as_ref()?.join(".aperture/run/owner"))
+            .read_owner(name).ok()?;
+        if owner.state != crate::state::OwnerState::Active || owner.requested.harness != crate::state::Harness::Claude { return None; }
+        let inc = owner.incarnation.as_ref()?;
+        if !inc.observed || inc.thread_id.is_empty() || inc.harness != owner.requested.harness ||
+            inc.model != owner.requested.model || inc.reasoning != owner.requested.reasoning { return None; }
+        use sha2::Digest;
+        let bytes = serde_json::to_vec(&owner).ok()?;
+        Some((name.clone(), (owner.generation, format!("{:x}", sha2::Sha256::digest(bytes)))))
+    }).collect();
+    let mut managed_alerts = Vec::new();
     let mut rekicks: Vec<RekickOrder> = Vec::new();
     let mut dot_writes: Vec<DotWrite> = Vec::new();
 
@@ -676,7 +692,15 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &
             if let Some(active) = managed.get(name) {
                 dot_writes.push(managed_presence_write(name, *active,
                     subscriber_ok && past_grace, s.presence.get(name), at));
-                // Observation only: managed lifecycle is never a legacy watchdog action.
+                if let Some((generation, fingerprint)) = managed_owners.get(name) {
+                    let trustworthy = *active && subscriber_ok && past_grace;
+                    let online = s.presence.get(name).is_some_and(|p| p.online);
+                    if managed_silence_due(&mut s.managed_silence, name, fingerprint, trustworthy, online, at) {
+                        managed_alerts.push((name.clone(), *generation, fingerprint.clone()));
+                    }
+                }
+                // No native Claude input-buffer proof exists. Detection only;
+                // managed lifecycle NEVER falls through to the standing nudge.
                 continue;
             }
             let kickoff_millis = match kickoffs.get(name) {
@@ -811,6 +835,19 @@ fn tick(shared: &Arc<Mutex<Shared>>, app_state: &Arc<Mutex<AppState>>, worker: &
         }
     }
 
+    for (name, generation, fingerprint) in managed_alerts {
+        if worker.stopped() { return; }
+        let Some(home) = &home else { continue; };
+        let Ok(work) = worker.admit(Some(&name)) else { continue; };
+        let Ok(_body) = work.body() else { continue; };
+        if signal_managed_deaf(home, &name, generation, &fingerprint).is_ok() {
+            if let Ok(mut a) = app_state.lock() {
+                if let Some(agent) = a.agents.get_mut(&name) {
+                    crate::agents::light_attention(agent, crate::agents::AttentionReason::Crash);
+                }
+            }
+        }
+    }
     // Execute actuator orders (blocking tmux / boot work) with no locks held.
     for order in rekicks {
         if worker.stopped() { return; }
@@ -859,6 +896,48 @@ fn managed_presence_write(name: &str, active: bool, trustworthy: bool,
         kickoff_fired_at: None,
         turn_state: current.and_then(|p| p.turn).map(|turn| turn.as_str().into()),
     }
+}
+
+// No positive TUI input-buffer evidence: therefore no managed keys. This is
+// deliberately NOT called recovery. Subscriber loss resets the silence clock.
+fn managed_silence_due(watch: &mut HashMap<String, (String, SystemTime)>, name: &str,
+    fingerprint: &str, trustworthy: bool, online: bool, at: SystemTime) -> bool {
+    if !trustworthy || online { watch.remove(name); return false; }
+    let entry = watch.entry(name.into()).or_insert((fingerprint.into(), at));
+    if entry.0 != fingerprint { *entry = (fingerprint.into(), at); }
+    at.duration_since(entry.1).unwrap_or_default() >= SILENCE_DEADLINE
+}
+fn signal_managed_deaf(home: &std::path::Path, seat: &str, generation: u64, fingerprint: &str) -> Result<(), String> {
+    use sha2::Digest;
+    let _serial = EFFECT_SERIAL.lock().map_err(|_| "E_WATCHDOG_JOURNAL_UNAVAILABLE")?;
+    let store = crate::owner::OwnerStore::new(home.join(".aperture/run/owner"));
+    let _seat = store.lock(seat)?;
+    let owner: crate::owner::OwnerRecord = crate::journal::read_private_json(&store.record_path(seat))?;
+    if owner.generation != generation || owner.state != crate::state::OwnerState::Active ||
+        owner.requested.harness != crate::state::Harness::Claude ||
+        format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&owner).map_err(|_| "E_WATCHDOG_FACT")?)) != fingerprint {
+        return Err("E_WATCHDOG_OWNER_CHANGED".into());
+    }
+    let root = home.join(".aperture/run/watchdog");
+    let path = root.join(seat).join(format!("managed-g{generation}.signal.json"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return match read_effect(&path)? {
+            EffectFact::ManagedSignal { version: 1, seat: s, generation: g, owner_sha256, code, .. }
+                if s == seat && g == generation && owner_sha256 == fingerprint && code == "E_MANAGED_COMMS_OFFLINE" => Ok(()),
+            _ => Err("E_WATCHDOG_FACT".into()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return Err("E_WATCHDOG_FACT".into()),
+    }
+    let at = effect_now()?;
+    let h = effect_history(&root, seat, at)?;
+    if h.entries + 2 > 512 || (!h.existing && h.seats >= 128) { return Err("E_WATCHDOG_CAPACITY".into()); }
+    crate::journal::ensure_private_dir(&root)?;
+    crate::journal::ensure_private_dir(&root.join(seat))?;
+    write_effect(&path, &EffectFact::ManagedSignal { version:1, seat:seat.into(), generation,
+        owner_sha256:fingerprint.into(), code:"E_MANAGED_COMMS_OFFLINE".into(), at_ms:at })?;
+    eprintln!("[watchdog] {seat}: E_MANAGED_COMMS_OFFLINE; no input-buffer proof, no keys; recovery NOT verified");
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1303,6 +1382,7 @@ struct DispatchObservation { spawned: bool, accepted: bool }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum EffectFact {
+    ManagedSignal { version: u8, seat: String, generation: u64, owner_sha256: String, code: String, at_ms: u64 },
     Intent { version: u8, id: String, seat: String, producer: NudgeProducer, payload: String,
         target: EffectTarget, plan: String, at_ms: u64 },
     Outcome { version: u8, id: String, seat: String, outcome: DispatchOutcome,
@@ -1352,6 +1432,7 @@ fn effect_history(root: &std::path::Path, seat: &str, at: u64) -> Result<EffectH
         let name = entry.file_name().into_string().map_err(|_| "E_WATCHDOG_PATH")?;
         if !crate::daemon_registry::valid_name(&name) { return Err("E_WATCHDOG_PATH".into()); }
         crate::controller::private_dir_readonly(&entry.path())?;
+        let mut signals = 0;
         let mut intents = HashMap::new();
         let mut outcomes = HashMap::new();
         for file in std::fs::read_dir(entry.path()).map_err(|_| "E_WATCHDOG_PATH")? {
@@ -1360,6 +1441,14 @@ fn effect_history(root: &std::path::Path, seat: &str, at: u64) -> Result<EffectH
             let file = file.map_err(|_| "E_WATCHDOG_PATH")?;
             let fname = file.file_name().into_string().map_err(|_| "E_WATCHDOG_FACT")?;
             match read_effect(&file.path())? {
+                EffectFact::ManagedSignal { version, seat, generation, owner_sha256, code, at_ms } => {
+                    if version != 1 || seat != name || generation == 0 || at_ms == 0 ||
+                        fname != format!("managed-g{generation}.signal.json") || owner_sha256.len() != 64 ||
+                        !owner_sha256.bytes().all(|b| b.is_ascii_hexdigit()) || code != "E_MANAGED_COMMS_OFFLINE" {
+                        return Err("E_WATCHDOG_FACT".into());
+                    }
+                    signals += 1;
+                }
                 EffectFact::Intent { version, id, seat, producer, payload, target, plan, at_ms } => {
                     if version != 1 || !effect_id(&id) || seat != name || fname != format!("{id}.intent.json")
                         || !target_valid(&target) || payload != match producer { NudgeProducer::RekickNudge => "boot_nudge", NudgeProducer::UnreadNudge => "inbox_nudge" }
@@ -1376,7 +1465,7 @@ fn effect_history(root: &std::path::Path, seat: &str, at: u64) -> Result<EffectH
                 }
             }
         }
-        if intents.is_empty() || outcomes.iter().any(|(id, (_, time))| intents.get(id).is_none_or(|start| time < start)) { return Err("E_WATCHDOG_FACT".into()); }
+        if (intents.is_empty() && signals == 0) || outcomes.iter().any(|(id, (_, time))| intents.get(id).is_none_or(|start| time < start)) { return Err("E_WATCHDOG_FACT".into()); }
         if name == seat {
             h.existing = true;
             for id in intents.keys() {

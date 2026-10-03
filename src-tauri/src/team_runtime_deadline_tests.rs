@@ -761,3 +761,62 @@ fn retirement_history_never_substitutes_for_gone_floor_token_or_authority() {
         assert!(result.is_err(),"mode {mode}");assert!(!retired_path(&f).exists());assert_eq!(std::fs::read(owner).unwrap(),before);
     }
 }
+
+#[test]
+fn recovery_phase_reconciles_known_effect_without_second_dispatch() {
+    let f=Fixture::new(); let id=uuid::Uuid::new_v4().to_string();
+    let journal=RecoveryJournal::open(f.0.join("recovery"),&id).unwrap();
+    for step in ["stop", "revoke", "release", "quarantine", "start"] {
+        let calls=std::cell::Cell::new(0);
+        assert!(journal.phase(step,||Ok(false),||{calls.set(calls.get()+1);Err(ReplacementError::OutcomeUnknown)}).is_err());
+        assert!(journal.phase(step,||Ok(false),||{calls.set(calls.get()+1);Ok(())}).is_err());
+        assert_eq!(calls.get(),1);
+        journal.phase(step,||Ok(true),||panic!("known effect must not replay")).unwrap();
+        journal.phase(step,||panic!("durable completed phase"),||panic!("completed effect")).unwrap();
+        assert_eq!(calls.get(),1);
+    }
+}
+#[test]
+fn recovery_phase_no_effect_on_conflict_corruption_or_duplicate_intent() {
+    let f=Fixture::new(); let dir=f.0.join("recovery"); let id=uuid::Uuid::new_v4().to_string();
+    let journal=RecoveryJournal::open(dir.clone(),&id).unwrap();
+    journal.phase("stop",||Ok(false),||Ok(())).unwrap();
+    let other=RecoveryJournal::open(dir.clone(),&uuid::Uuid::new_v4().to_string()).unwrap();
+    assert!(other.phase("stop",||Ok(false),||panic!("conflicting admission")).is_err());
+    std::fs::write(dir.join("revoke.intent.json"),"{}").unwrap();
+    assert!(journal.phase("revoke",||Ok(false),||panic!("corrupt intent")).is_err());
+    assert!(journal.has("../escape",false).is_err());
+}
+#[test]
+fn recovery_phase_serial_owner_lock_denies_second_invocation() {
+    let f=Fixture::new(); let root=f.0.join("locks");
+    let first=try_lock(&root,"team-qa").unwrap();
+    assert!(try_lock(&root,"team-qa").is_err());
+    drop(first); assert!(try_lock(&root,"team-qa").is_ok());
+}
+
+#[test]
+fn recovery_concurrent_invocations_have_one_effect_owner() {
+    use std::sync::{Arc,Barrier,atomic::{AtomicUsize,Ordering}};
+    let f=Fixture::new();let root=f.0.join("recovery-locks");let dir=f.0.join("facts");
+    ensure_private_dir(&root).unwrap();let id=uuid::Uuid::new_v4().to_string();
+    let start=Arc::new(Barrier::new(2));let held=Arc::new(Barrier::new(2));let effects=Arc::new(AtomicUsize::new(0));
+    let jobs:Vec<_>=(0..2).map(|_| {
+        let (root,dir,id,start,held,effects)=(root.clone(),dir.clone(),id.clone(),start.clone(),held.clone(),effects.clone());
+        std::thread::spawn(move||{
+            start.wait();let lock=try_lock(&root,"t1-worker");held.wait();
+            match lock {Ok(_lock)=>{
+                let journal=RecoveryJournal::open(dir,&id).unwrap();
+                journal.phase("stop",||Ok(false),||{effects.fetch_add(1,Ordering::SeqCst);Ok(())}).unwrap();true
+            },Err(_)=>false}
+        })
+    }).collect();
+    assert_eq!(jobs.into_iter().map(|j|usize::from(j.join().unwrap())).sum::<usize>(),1);
+    assert_eq!(effects.load(Ordering::SeqCst),1);
+}
+#[test]
+fn recovery_read_path_never_creates_missing_history() {
+    let f=Fixture::new();let missing=f.0.join("never-created");
+    assert!(RecoveryJournal::read(missing.clone(),&uuid::Uuid::new_v4().to_string()).is_err());
+    assert!(!missing.exists());
+}

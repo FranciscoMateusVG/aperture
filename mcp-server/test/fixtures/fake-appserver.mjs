@@ -41,6 +41,8 @@ export class FakeAppServer {
       ], nextCursor: null,
     };
     this.mcpProbe = opts.mcpProbe ?? { content: [{ type: "text", text: "No unread messages." }], isError: false };
+    this.loadedThreads = opts.loadedThreads ?? [];
+    this.threadRead = opts.threadRead;
     this.threadStartModel = opts.threadStartModel;
     this.threadStartReasoning = opts.threadStartReasoning;
     /** @type {{method: string, params: unknown, id: number|string|null, ts: number}[]} */
@@ -108,6 +110,13 @@ export class FakeAppServer {
         result = this.mcpStatus; break;
       case "mcpServer/tool/call":
         result = this.mcpProbe; break;
+      case "thread/loaded/list":
+        result = { data: this.loadedThreads, nextCursor: null }; break;
+      case "thread/read":
+        if (this.threadRead === null) {
+          this.send(ws, { jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: "thread not found: fixture" } }); return;
+        }
+        result = this.threadRead ?? { thread: { id: msg.params.threadId, model: "gpt-6-astra", reasoningEffort: "high", path: "/fixture/rollout.jsonl", ephemeral: false } }; break;
       case "thread/list":
         result = { data: this.threads };
         break;

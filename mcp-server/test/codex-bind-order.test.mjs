@@ -131,7 +131,7 @@ async function scenario(t, {
   failures = {},
   threadStartModel,
   threadStartReasoning,
-  mcpStatus, mcpProbe,
+  mcpStatus, mcpProbe, loadedThreads, threadRead,
   beforeManagedOwnerReadback,
 } = {}) {
   const agent = `cbx${++sockCounter}`;
@@ -143,7 +143,7 @@ async function scenario(t, {
   writeFileSync(join(AGENTS, agent, "prompt.md"), "fixture");
   const sock = join(TMP, `${agent}.sock`);
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
-  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning, mcpStatus, mcpProbe });
+  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning, mcpStatus, mcpProbe, loadedThreads, threadRead });
   await server.start();
   const { hooks, logs, presence } = makeHooks(beforeManagedOwnerReadback);
   const bridge = new CodexBridgeClient(agent, sock, hooks);
@@ -494,7 +494,7 @@ test("managed Active owner change during resume rejects bind and delivery", asyn
     owner.incarnation.processes[0].pid = 322;
   });
   await waitFor(
-    () => logs.some((entry) => entry.event === "codex_handshake_error"),
+    () => logs.some((entry) => entry.event === "codex_managed_thread_blocked"),
     "changed Active owner rejected",
   );
   bridge.stop();
@@ -914,4 +914,51 @@ test("late ready cannot recover a changed owner even with a connected catalog", 
   assert.equal(s.server.callsOf("mcpServerStatus/list").length, count);
   assert.equal(s.server.callsOf("turn/start").length, 0);
   assert.ok(s.logs.some(x => x.code === "E_MCP_OWNER_CHANGED"));
+});
+
+// Native 0.158 classification: no provider/rollout manufacture.
+test("managed loaded thread survives connection loss without resume and replays only unread", async t => {
+  const s = await scenario(t, { loadedThreads: ["owner-thread"], threadRead: { thread: {
+    id: "owner-thread", model: "gpt-6-astra", reasoningEffort: "high", path: null, ephemeral: false,
+  } } });
+  makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "owner-thread" });
+  const before = readFileSync(join(TMP, "owner", `${s.agent}.json`));
+  setUnread([msgRow("loaded-1", "glados", s.agent, "RO challenge")]);
+  s.bridge.start();
+  await waitFor(() => s.server.turnCallsContaining("loaded-1").length === 1, "first challenge");
+  setUnread([]); // durable ACK is BEADS truth, not the bridge's in-memory set
+  dropClients(s.server);
+  await waitFor(() => s.server.callsOf("thread/read").length === 2 && s.bridge.isBound, "same loaded thread re-adopted");
+  s.bridge.deliver(); await delay(100);
+  assert.equal(s.server.turnCallsContaining("loaded-1").length, 1);
+  setUnread([msgRow("loaded-2", "glados", s.agent, "after reconnect")]);
+  s.bridge.deliver(); s.bridge.deliver();
+  await waitFor(() => s.server.turnCallsContaining("loaded-2").length === 1, "continuation");
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.ok(s.server.callsOf("thread/read").every(x => x.params.includeTurns === false && x.params.threadId === "owner-thread"));
+  assert.equal(s.bridge.boundThreadId, "owner-thread");
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), before);
+});
+for (const [kind, loadedThreads, threadRead, code] of [
+  ["absent", [], null, "E_THREAD_ABSENT"],
+  ["contradiction", ["owner-thread"], null, "E_THREAD_STATUS_CONFLICT"],
+  ["no-persistence", [], {thread:{id:"owner-thread",model:"gpt-6-astra",reasoningEffort:"high",path:null,ephemeral:false}}, "E_THREAD_PERSISTENCE_UNVERIFIED"],
+  ["wrong-model", ["owner-thread"], {thread:{id:"owner-thread",model:"wrong",reasoningEffort:"high",path:null}}, "E_THREAD_BINDING_UNVERIFIED"],
+  ["wrong-thread", ["owner-thread"], {thread:{id:"other",model:"gpt-6-astra",reasoningEffort:"high",path:null}}, "E_THREAD_BINDING_UNVERIFIED"],
+]) test(`managed ${kind} is blocked, never fallback/new thread/turn/reconnect`, async t => {
+  const s = await scenario(t, {loadedThreads, threadRead});
+  makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", {thread_id:"owner-thread"});
+  const before = readFileSync(join(TMP, "owner", `${s.agent}.json`));
+  s.bridge.start();
+  await waitFor(() => s.logs.some(x => x.code === code), code);
+  for (let i=0;i<3;i++) s.server.notify("mcpServer/startupStatus/updated", {threadId:"owner-thread",name:"aperture-bus",status:"ready"});
+  s.bridge.deliver(); await delay(180);
+  assert.equal(s.bridge.isBound, false);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
+  assert.equal(s.server.calls.filter(x => x.method.startsWith("turn/")).length, 0);
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), before);
 });

@@ -1,3 +1,4 @@
+import { recoverCodexSchema, parseCodexRecovered } from "./team-bootstrap.js";
 import { validateCheckpointSchema, parseCheckpointValidation } from "./team-checkpoint-validation.js";
 import { claudeInboxProbeSchema, parseClaudeInboxProbe } from "./team-claude-inbox.js";
 import { stopSeatSchema, parseStopSeatReady } from "./team-stop.js";
@@ -507,6 +508,19 @@ server.tool(
     } catch (e: any) {
       return { content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true };
     }
+  },
+);
+
+server.tool(
+  "team_recover_codex",
+  "GLaDOS-only explicit recovery of one exact Active Codex incarnation, after operator accepts context loss and unknown prior effects and withdraws its business dispatches. Never infer no work from no checkpoint/rollout. Native complete/disjoint process closure, Gone and revocation precede a single fresh admission; same-operation reconciliation never repeats uncertain effects. Bind operation UUID, original owner SHA and exact thread/generation. Never generate another operation on UNKNOWN. Started is NOT recovered: successor waits GO; validate only a BEADS read/ack/reply challenge before any new mission. No caller paths/model/actor/nonce, no automatic retry.",
+  {input:recoverCodexSchema},
+  async ({input}) => {
+    const denied=gladosControlDenied();if(denied)return denied;
+    try {const request=recoverCodexSchema.parse(input);
+      const result=parseCodexRecovered(await invokeTeamControl({action:"recover_codex",input:request}),request);
+      return {content:[{type:"text",text:JSON.stringify(result)}]};
+    } catch(e:any) {return {content:[{type:"text",text:`ERROR: ${e.message}`}],isError:true};}
   },
 );
 
