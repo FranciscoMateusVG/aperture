@@ -1,19 +1,20 @@
 # Managed Claude seats — exact model literals
 
-Status: source + tests only (aperture-wzayo, 2026-09-24). Catalog admission is
+Policy: aperture-wzayo (2026-09-24), extended by operator approval for Opus 5.5
+(aperture-xpmca, 2026-10-03). Catalog admission is
 **not** proof of live harness support: each model still needs its own explicit,
 operator-acknowledged smoke on a real seat before anyone claims it "works".
 
 ## Authorized literals
 
-| Model | Exact Claude API id | Provenance (2026-09-24) |
+| Model | Exact Claude API id | Provenance |
 |---|---|---|
 | Claude Sonnet 5 | `claude-sonnet-5` | unchanged; 4 real receipts in `~/.aperture/run/*.claude-observation.json` show `actual_model == "claude-sonnet-5"` |
 | Claude Fable 5.1 | `claude-fable-5-1` | platform.claude.com/docs/en/models/overview ("Claude API ID" and alias rows); Claude Code 2.1.281 bundle model table `{id:"claude-fable-5-1",family:"fable"}` |
 | Claude Opus 5 | `claude-opus-5` | platform.claude.com/docs/en/models/opus-5/overview ("Model ID: `claude-opus-5`", status *Active (legacy)*, released 2026-07-24); Claude Code 2.1.281 bundle model table `{id:"claude-opus-5",family:"opus"}` |
+| Claude Opus 5.5 | `claude-opus-5-5` | [Official model ID](https://platform.claude.com/docs/en/models/opus-5-5/overview), verified 2026-10-03; installed Claude Code 2.1.281 contains the exact literal. Account/runtime support still requires the actual startup receipt. |
 
-Not authorized (deliberately): `claude-opus-5-5` (the current Opus per the docs —
-a separate operator decision, never a silent substitution), `claude-fable-5`
+Not authorized (deliberately): `claude-opus-5.5`, `claude-opus-5-5-latest`, `claude-fable-5`
 (legacy), the CLI aliases `opus` / `sonnet` / `fable`, and any `[1m]` context
 suffix (a Claude Code shorthand, not part of the API id). Reasoning is always
 `None` for Claude tuples.

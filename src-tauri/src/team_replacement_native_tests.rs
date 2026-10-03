@@ -620,7 +620,7 @@ fn recovery_proof_accepts_only_the_factual_quarantined_claude_bootstrap_at_g1_or
         r.f.write(".aperture/teams/t1/team.json", &snapshot);
         assert_eq!(r.proof().unwrap_err(), ReplacementError::LaunchUnavailable);
         snapshot["seats"][0]["harness"] = "claude".into();
-        snapshot["seats"][0]["model"] = "claude-opus-5-5".into();
+        snapshot["seats"][0]["model"] = "claude-opus-5-5-latest".into();
         snapshot["seats"][0]["reasoning"] = serde_json::Value::Null;
         r.f.write(".aperture/teams/t1/team.json", &snapshot);
         assert!(r.proof().is_err(), "non-admitted literal never proves");

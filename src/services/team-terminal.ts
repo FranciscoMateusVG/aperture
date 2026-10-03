@@ -12,7 +12,7 @@ export function canOpenSeat(team: TeamView, seat: string): boolean {
 }
 /** Exact Claude literals the backend admits (mirrors Rust `CLAUDE_MODELS`, parity-tested there).
  *  No alias, `[1m]` suffix or fallback; the catalog alone never grants Open. */
-export const CLAUDE_EXACT_MODELS: readonly string[] = ["claude-sonnet-5", "claude-fable-5-1", "claude-opus-5"];
+export const CLAUDE_EXACT_MODELS: readonly string[] = ["claude-sonnet-5", "claude-fable-5-1", "claude-opus-5", "claude-opus-5-5"];
 export function createTerminalCommands(call: typeof invoke) {
   return { async open(team: TeamView, seat: string): Promise<void> {
     if (!canOpenSeat(team, seat)) throw {code:"E_TERMINAL_UNAVAILABLE"};

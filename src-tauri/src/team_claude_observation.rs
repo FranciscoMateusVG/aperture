@@ -250,7 +250,7 @@ mod tests {
     }
     #[test]
     fn rejects_unknown_model_alias_session_drift_and_stale_window() {
-        for id in ["sonnet", "fable", "claude-fable-5", "claude-opus-5-5", "claude-fable-5-1[1m]", "claude-sonnet-5 "] {
+        for id in ["sonnet", "fable", "claude-fable-5", "claude-opus-5.5", "claude-opus-5-5[1m]", "claude-opus-5-5-latest", "claude-opus-5-5 ", "CLAUDE-OPUS-5-5", "claude-fable-5-1[1m]", "claude-sonnet-5 "] {
             let mut v = input();
             v["model"]["id"] = id.into();
             assert!(matches!(parse(&v), Err(ClaudeError::Model)), "{id}");
@@ -278,7 +278,7 @@ mod tests {
                 assert!(matches!(project(&cross, parse(&v).unwrap(), 1001), Err(ClaudeError::Model)), "{other} requested, {model} observed");
             }
             let mut bad = attempt(&v);
-            bad.requested_model = "claude-opus-5-5".into();
+            bad.requested_model = "claude-opus-5-5-latest".into();
             assert!(matches!(project(&bad, parse(&v).unwrap(), 1001), Err(ClaudeError::Invalid)));
         }
     }
