@@ -5,8 +5,15 @@
  *
  *   Monitor({
  *     command: "node <repo>/mcp-server/dist/hub-client.js <agent-name>",
- *     persistent: true,
+ *     timeout_ms: 1800000,
  *   })
+ *
+ * Claude Code 2.1.281 exposes a finite Monitor, with no persistent field.
+ * Monitor expiry kills this process after at most 30 minutes; reconnection
+ * below works only while this process is alive. After confirmed tool expiry
+ * (not replacement/rejection), the seat must re-arm exactly one Monitor.
+ * Never duplicate a live/uncertain monitor or self-rearm after 4000/4001/4003.
+ * An API outage can prevent rearming; this is not automatic recovery.
  *
  * Why this exists (aperture-1qwty): the Monitor tool's native ws source is
  * RECEIVE-ONLY — it cannot send the hello frame the hub requires to identify
@@ -38,7 +45,8 @@
  *   - client-side liveness: the hub pings every 30s; if NO frame of any kind
  *     arrives for 90s the hub is wedged (alive, not talking) and the client
  *     prints HUB_SOCKET_STALE, terminates the socket and reconnects.
- *   - the process EXITS only when reconnecting would be wrong:
+ *   - voluntary exits below mean reconnecting would be wrong (the Monitor
+ *     may also terminate the process at its deadline):
  *       HUB_SOCKET_CLOSED code=4000 … → exit 0. A NEWER monitor for this
  *         agent connected and replaced this one. Do NOT restart it —
  *         reconnecting here would fight the newer monitor (flap loop).

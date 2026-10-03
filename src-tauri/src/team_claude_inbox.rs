@@ -41,12 +41,14 @@ pub(crate) fn managed_inbox_recipe(seat: &str) -> Result<String, InboxRecipeErro
     Ok(format!(
         "\n# Managed inbox (Claude seat {seat})\n\n\
 Your only inbox is BEADS through aperture-bus, pushed live by the hub. Use exactly the tooling below; all of it already exists.\n\n\
-1. Monitor first. Before any inbox call, start the inbox monitor with the native Claude Code Monitor tool as a persistent bash command, exactly:\n\
-   Monitor(command: {command}, persistent: true)\n\
+1. Monitor first. Before any inbox call, start the inbox monitor with the native Claude Code Monitor tool as a finite bash command, exactly:\n\
+   Monitor(command: {command}, timeout_ms: 1800000)\n\
+   The current tool has no persistent parameter and expires after at most 30 minutes. Do not add unsupported fields or assume a session-length watch.\n\
    The client path comes from that environment variable and the client reads its own credential from the launcher environment. Never look up, type, print, store or pass a credential. Do not use the Monitor ws source: it cannot send the hello and the hub would treat you as offline.\n\
 2. If the monitor reports HUB_OWNER_PENDING, wait for HUB_OWNER_ACTIVE before any inbox call; do not restart it or do project work. This is native activation in progress. HUB_OWNER_ACTIVE confirms only local activation, not hub delivery or working tools. Then drain the inbox: call get_messages, process each message, and call mark_as_read for a message only after you have actually handled it.\n\
 3. Every Monitor event whose type is \"message\" means a BEADS message is waiting: get_messages, process, mark_as_read. Do not poll on a timer instead.\n\
 4. A HUB_RECONNECTING line means wait; the client reconnects by itself. HUB_RECONNECTED means unread messages are replaying now.\n\
+   Tool expiry is different: the Monitor kills its command. Only after an explicit Monitor expiry and confirmed end of that monitor, with no rejection/replacement from rule 5, re-arm exactly one Monitor using the same command and timeout. Never create a second monitor while the first is alive or its outcome is unknown. After reconnection, drain and acknowledge the inbox normally; do not replay project effects. If an API outage prevents rearming, communication is degraded, not recovered; report that limit once tools work again.\n\
 5. Do NOT restart the monitor after HUB_IDENTITY_INVALID or HUB_OWNER_TIMEOUT, or after HUB_SOCKET_CLOSED with code 4000 (a newer monitor replaced this one), 4001 (hello rejected) or 4003 (managed identity rejected). Keep the exact line; if the aperture-bus update_task tool is callable, record it on your assigned bead, then wait for dispatch.\n\
 6. If the Monitor tool is unavailable, or the command exits at once (for example a HUB_CLIENT_ERROR line), that is an honest blocker: record it on your assigned bead with update_task only if that tool is callable, then stop. If aperture-bus itself is absent there is no way to send anything: stay idle and say so in your terminal; never invent another channel: no background Bash loops, no file watching, no tmux, no hooks, no other harness.\n\
 7. Do no project work before a scoped dispatch arrives through this inbox. Boot order is fixed: monitor, then get_messages, then only the work that was dispatched.\n"
@@ -67,7 +69,7 @@ mod tests {
     fn pins_exact_monitor_command_with_seat_and_env_pointer() {
         let r = recipe();
         assert!(r.contains(
-            "Monitor(command: node \"$APERTURE_MANAGED_HUB_CLIENT\" t1-worker, persistent: true)"
+            "Monitor(command: node \"$APERTURE_MANAGED_HUB_CLIENT\" t1-worker, timeout_ms: 1800000)"
         ));
         assert_eq!(
             monitor_command(SEAT),
@@ -77,6 +79,40 @@ mod tests {
         assert_eq!(r.matches("Monitor(command:").count(), 1);
         assert!(r.contains("# Managed inbox (Claude seat t1-worker)"));
         assert_eq!(recipe(), r, "deterministic");
+    }
+
+    #[test]
+    fn finite_monitor_expiry_is_not_socket_reconnection_or_recovery() {
+        let r = recipe();
+        assert!(!r.contains("persistent: true"));
+        assert!(r.contains("current tool has no persistent parameter"));
+        assert!(r.contains("expires after at most 30 minutes"));
+        assert!(r.contains("Only after an explicit Monitor expiry and confirmed end"));
+        assert!(r.contains("with no rejection/replacement from rule 5"));
+        assert!(r.contains("Never create a second monitor while the first is alive or its outcome is unknown"));
+        assert!(r.contains("do not replay project effects"));
+        assert!(r.contains("communication is degraded, not recovered"));
+    }
+
+    #[test]
+    fn shipped_inbox_instructions_match_the_finite_monitor_schema() {
+        let sources = [
+            ("glados", include_str!("../../prompts/glados.md")),
+            ("wheatley", include_str!("../../prompts/wheatley.md")),
+            ("peppy", include_str!("../../prompts/peppy.md")),
+            ("izzy", include_str!("../../prompts/izzy.md")),
+            ("vance", include_str!("../../prompts/vance.md")),
+            ("scout", include_str!("../../prompts/scout.md")),
+            ("cipher", include_str!("../../prompts/cipher.md")),
+            ("communicate", include_str!("../../.claude/skills/communicate/SKILL.md")),
+            ("hub-client", include_str!("../../mcp-server/src/hub-client.ts")),
+        ];
+        for (name, text) in sources {
+            assert!(text.contains("timeout_ms: 1800000"), "{name}");
+            assert!(!text.contains("persistent: true"), "{name}");
+            assert!(text.contains("Monitor expiry"), "{name}");
+            assert!(text.contains("4003"), "{name}");
+        }
     }
 
     #[test]
