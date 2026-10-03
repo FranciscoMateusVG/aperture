@@ -94,6 +94,19 @@ fn shell_atom(value: &str) -> Result<String, ClaudeError> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
+// Test-only last-step attribution. No callback, payload, path, new production
+// error category or runtime diagnostic authority is added by this marker.
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_TEST_STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("not_started") };
+}
+macro_rules! publication_test_stage {
+    ($step:literal) => {
+        #[cfg(test)]
+        PUBLICATION_TEST_STAGE.with(|stage| stage.set($step));
+    };
+}
+
 /// Old records and diagnostic launches retain the finite-tool recipe. New
 /// normal publications always select PluginV1; failure never falls back.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -688,9 +701,11 @@ impl ClaudeBinding {
         Ok(())
     }
     pub(crate) fn revalidate(&self, budget: &Deadline) -> Result<(), ClaudeError> {
+        publication_test_stage!("revalidate.active_team");
         if active_team(&self.home, &self.team, &self.seat)? != self.snapshot {
             return Err(ClaudeError::Owner);
         }
+        publication_test_stage!("revalidate.repository");
         let repo = repository::resolve_native(
             &self.home,
             &self.team,
@@ -699,6 +714,7 @@ impl ClaudeBinding {
                 .map_err(|_| ClaudeError::Closed)?,
         )
         .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("revalidate.cwd");
         let cwd = match &self.worktree {
             Some(w) => repository::replacement_cwd(
                 &repo,
@@ -710,11 +726,20 @@ impl ClaudeBinding {
             None => repo.bootstrap_cwd(),
         }
         .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("revalidate.cwd_metadata");
         let m = std::fs::symlink_metadata(&cwd).map_err(|_| ClaudeError::Unsafe)?;
         if cwd != self.cwd || (m.dev(), m.ino()) != self.cwd_identity {
             return Err(ClaudeError::Unsafe);
         }
         for (p, before) in &self.pins {
+            #[cfg(test)]
+            PUBLICATION_TEST_STAGE.with(|stage| stage.set(if p.starts_with(&self.runtime) {
+                "revalidate.runtime_pin"
+            } else if p == &self.node { "revalidate.node_pin" }
+            else if p == &self.executable { "revalidate.executable_pin" }
+            else if p == &self.helper { "revalidate.helper_pin" }
+            else if p == &self.tmux { "revalidate.tmux_pin" }
+            else { "revalidate.packaged_js_pin" }));
             let now = if p.starts_with(&self.runtime) {
                 digest(&private_bytes(p, PRIVATE_CAP)?.0)
             } else {
@@ -730,6 +755,7 @@ impl ClaudeBinding {
                 return Err(ClaudeError::Unsafe);
             }
         }
+        publication_test_stage!("revalidate.skills_inventory");
         if common::inventory(&self.runtime.join("skills"), budget)
             .map_err(|_| ClaudeError::Unsafe)?
             != self.skills
@@ -754,11 +780,15 @@ impl ClaudeBinding {
         budget: &Deadline,
         password: &str,
     ) -> Result<PublishedClaude, ClaudeError> {
+        publication_test_stage!("publish.revalidate");
         self.revalidate(budget)?;
+        publication_test_stage!("publish.team_lock");
         let _team = try_lock(&self.home.join(".aperture/run/team-locks"), &self.team)
             .map_err(|_| ClaudeError::Owner)?;
         let store = OwnerStore::new(self.home.join(".aperture/run/owner"));
+        publication_test_stage!("publish.seat_lock");
         let _seat = store.lock(&self.seat).map_err(|_| ClaudeError::Owner)?;
+        publication_test_stage!("publish.owner");
         let owner: OwnerRecord =
             read_private_json(&store.record_path(&self.seat)).map_err(|_| ClaudeError::Owner)?;
         if res.seat != self.seat
@@ -773,19 +803,27 @@ impl ClaudeBinding {
         {
             return Err(ClaudeError::Owner);
         }
+        publication_test_stage!("publish.managed_path");
         let base = validate_component_path(&self.home.join(".aperture/run"), "managed", true)
             .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.managed_dir");
         ensure_private_dir(&base).map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.seat_path");
         let dir =
             validate_component_path(&base, &self.seat, true).map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.seat_dir");
         ensure_private_dir(&dir).map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.generation_path");
         let dest = validate_component_path(&dir, &format!("g{}", res.generation), true)
             .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.generation_absence");
         match std::fs::symlink_metadata(&dest) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             _ => return Err(ClaudeError::Closed),
         }
+        publication_test_stage!("publish.generation_dir");
         ensure_private_dir(&dest).map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.plan");
         let mut plan = ClaudeLaunchPlan::for_mode(
             &self.home,
             &self.team,
@@ -795,7 +833,9 @@ impl ClaudeBinding {
             &self.helper,
             self.mode,
         )?;
+        publication_test_stage!("publish.prompt_read");
         let mut prompt = private_bytes(&self.runtime.join("prompt.md"), PRIVATE_CAP)?;
+        publication_test_stage!("publish.resident_read");
         let resident = private_bytes(&self.runtime.join("resident.txt"), 8192)?;
         for name in std::str::from_utf8(&resident.0)
             .map_err(|_| ClaudeError::Invalid)?
@@ -809,6 +849,7 @@ impl ClaudeBinding {
             {
                 return Err(ClaudeError::Unsafe);
             }
+            publication_test_stage!("publish.skill_read");
             let content = private_bytes(
                 &self.runtime.join("skills").join(name).join("SKILL.md"),
                 PRIVATE_CAP,
@@ -837,6 +878,7 @@ impl ClaudeBinding {
         }
         // This appendix supplies the actual harness inbox recipe; role prompts
         // alone only say to await dispatch. It submits no input before D1.
+        publication_test_stage!("publish.inbox_recipe");
         let inbox_mode=if self.mode==ClaudeLaunchMode::NormalPositional {InboxMode::PluginV1} else {InboxMode::Legacy};
         let inbox = if inbox_mode==InboxMode::PluginV1 {
             crate::team_claude_inbox::managed_plugin_inbox_recipe(&self.seat)
@@ -845,14 +887,17 @@ impl ClaudeBinding {
         prompt.0.extend_from_slice(inbox.as_bytes());
         if prompt.0.len() > PRIVATE_CAP { return Err(ClaudeError::Invalid); }
         let prompt_path = dest.join("prompt.md");
+        publication_test_stage!("publish.prompt_write");
         write_private_bytes_atomic(&prompt_path, &prompt.0, false)
             .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.skills_copy");
         crate::teams::copy_private_tree_bounded(
             &self.runtime.join("skills"),
             &dest.join("skills"),
             PRIVATE_CAP,
         )
         .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.skills_inventory");
         if common::inventory(&dest.join("skills"), budget).map_err(|_| ClaudeError::Unsafe)?
             != self.skills
         {
@@ -860,22 +905,28 @@ impl ClaudeBinding {
         }
         let mut env = serde_json::json!({"HOME":self.home,"AGENT_NAME":self.seat,"AGENT_ROLE":self.role,"AGENT_MODEL":self.tuple.model,"APERTURE_TEAM_GENERATION":res.generation.to_string(),"APERTURE_HUB_TOKEN_FILE":token.path(),"BEADS_DIR":self.home.join(".aperture/.beads"),"BD_ACTOR":self.seat,"BEADS_DOLT_PASSWORD":password,"APERTURE_MAILBOX":self.home.join(".aperture/mailbox")});
         let mut mcp = serde_json::json!({"mcpServers":{"aperture-bus":{"command":self.node,"args":[self.infra.join(crate::local_package::BUS)],"env":env},"sentry":{"command":self.node,"args":[self.infra.join(crate::local_package::SENTRY)],"env":env}}});
+        publication_test_stage!("publish.mcp_serialize");
         let config = PrivateBytes(serde_json::to_vec(&mcp).map_err(|_| ClaudeError::Invalid)?);
         if config.0.len() > PRIVATE_CAP {
             return Err(ClaudeError::Invalid);
         }
+        publication_test_stage!("publish.mcp_write");
         write_private_bytes_atomic(&plan.mcp_path, &config.0, false)
             .map_err(|_| ClaudeError::Unsafe)?;
         // No credential values are returned, logged or placed in tmux argv.
         env.take();
         mcp.take();
+        publication_test_stage!("publish.settings_write");
         write_private_json_atomic(&plan.settings_path, &plan.settings, false)
             .map_err(|_| ClaudeError::Unsafe)?;
         plan.append_system_prompt(&prompt_path);
         let plugin_path=inbox_plugin_dir(&dest).join(".claude-plugin/plugin.json");
         if inbox_mode==InboxMode::PluginV1 {
+            publication_test_stage!("publish.plugin_dir");
             ensure_private_dir(plugin_path.parent().ok_or(ClaudeError::Unsafe)?).map_err(|_|ClaudeError::Unsafe)?;
+            publication_test_stage!("publish.plugin_manifest");
             let manifest=inbox_plugin_manifest(&self.node,&self.infra.join(crate::local_package::HUB_CLIENT),&self.seat)?;
+            publication_test_stage!("publish.plugin_write");
             write_private_json_atomic(&plugin_path,&manifest,false).map_err(|_|ClaudeError::Unsafe)?;
             plan.append_inbox_plugin(&dest);
         }
@@ -905,15 +956,22 @@ impl ClaudeBinding {
             inbox_mode,
         };
         for p in [&plan.settings_path, &plan.mcp_path, &prompt_path] {
+            #[cfg(test)]
+            PUBLICATION_TEST_STAGE.with(|stage| stage.set(if p == &plan.settings_path {
+                "publish.settings_pin"
+            } else if p == &plan.mcp_path { "publish.mcp_pin" } else { "publish.prompt_pin" }));
             record
                 .private_pins
                 .insert(p.clone(), digest(&private_bytes(p, PRIVATE_CAP)?.0));
         }
         if inbox_mode==InboxMode::PluginV1 {
+            publication_test_stage!("publish.plugin_pin");
             record.private_pins.insert(plugin_path.clone(),digest(&private_bytes(&plugin_path,PRIVATE_CAP)?.0));
         }
+        publication_test_stage!("publish.record_write");
         write_private_json_atomic(&dest.join("claude-launch.json"), &record, false)
             .map_err(|_| ClaudeError::Unsafe)?;
+        publication_test_stage!("publish.complete");
         Ok(PublishedClaude {
             home: self.home.clone(),
             record,
@@ -2354,9 +2412,24 @@ mod publication_tests {
     }
     #[test]
     fn native_plugin_publication_is_closed_pinned_and_has_no_legacy_fallback() {
-        for drift in ["none","manifest","extra","symlink","mode","missing","node","argv"] {
-            let f=Fixture::new();let mut binding=f.binding().unwrap();binding.mode=ClaudeLaunchMode::NormalPositional;
-            let (r,t)=f.reservation();let mut p=binding.publish_with_password(&r,&t,&Deadline::new(),"").unwrap();
+        let mut fixture_roots = std::collections::HashSet::new();
+        for (case, drift) in ["none","manifest","extra","symlink","mode","missing","node","argv"].into_iter().enumerate() {
+            publication_test_stage!("fixture.create");
+            let f=Fixture::new();
+            assert!(fixture_roots.insert(f.home.clone()), "fixture path reused at case {case}");
+            let home_meta=std::fs::symlink_metadata(&f.home).expect("fixture.home_metadata");
+            let parent_meta=std::fs::symlink_metadata(f.home.parent().unwrap()).expect("fixture.parent_metadata");
+            eprintln!("PLUGIN_PUBLICATION case={case} drift={drift} home_private={} home_uid_match={} parent_directory={} parent_write_bits={:o}",
+                home_meta.mode() & 0o077 == 0, home_meta.uid() == unsafe { libc::geteuid() }, parent_meta.is_dir(), parent_meta.mode() & 0o022);
+            publication_test_stage!("fixture.binding");
+            let mut binding=f.binding().unwrap_or_else(|error| panic!("case={case} drift={drift} stage=fixture.binding code={error:?}"));
+            binding.mode=ClaudeLaunchMode::NormalPositional;
+            publication_test_stage!("fixture.reservation");
+            let (r,t)=f.reservation();
+            let mut p=binding.publish_with_password(&r,&t,&Deadline::new(),"").unwrap_or_else(|error| {
+                let stage=PUBLICATION_TEST_STAGE.with(|stage| stage.get());
+                panic!("case={case} drift={drift} stage={stage} code={error:?}");
+            });
             let base=generation_dir(&f.home,"t1-worker",1);let dir=inbox_plugin_dir(&base);
             let file=dir.join(".claude-plugin/plugin.json");
             let manifest:serde_json::Value=read_private_json(&file).unwrap();
