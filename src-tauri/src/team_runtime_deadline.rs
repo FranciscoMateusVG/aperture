@@ -1037,6 +1037,18 @@ pub(crate) fn verify_readmission(dir:&Path,team:&str,seat:&str,generation:u64)->
 }
 
 impl RecoveryJournal {
+    /// Typed re-entry of the CAS only. No generic phase retry, signal, token,
+    /// or spawn callback: an exact Active postimage proves CAS not committed.
+    /// Quarantined postimages use ordinary postcondition reconciliation.
+    pub(crate) fn quarantine_stopped(&self,proof:&super::native::StoppedCodexRecoveryProof,
+        actor:&AuthenticatedActor)->Result<(),ReplacementError> {
+        proof.verify_quarantine_journal(&self.dir,&self.operation_id,actor)?;
+        if self.has("quarantine",true)? {return Err(ReplacementError::OutcomeUnknown);}
+        if !self.has("quarantine",false)? {self.write("quarantine",false,false)?;}
+        proof.verify_quarantine_journal(&self.dir,&self.operation_id,actor)?;
+        proof.commit_quarantine(actor)?;
+        self.write("quarantine",true,false)
+    }
     /// This exception is typed: exact old quarantined owner proves native
     /// reserve_start (the first start effect) has not committed. No generic
     /// retry/boolean flag can re-enter a signal or a new-generation candidate.

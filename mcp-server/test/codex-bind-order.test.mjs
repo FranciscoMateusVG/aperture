@@ -790,12 +790,19 @@ test("failure during initial read proof cannot publish readiness", async t => {
   assert.equal(s.server.callsOf("turn/start").length, 0);
 });
 
-test("managed MCP startup deadline is finite and never releases a pending catalog", async t => {
+test("managed MCP startup deadline inside status RPC keeps timeout category and zero delivery", async t => {
   const s = await scenario(t);
   makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "t-mcp-existing" });
   s.server.mcpStatus.data[0].runtimeStatus = "starting";
   s.bridge.start();
+  await waitFor(() => s.server.callsOf("mcpServerStatus/list").length === 1, "first pending status");
+  // Keep successful starting polls past the 10s per-RPC cap. Then hold the
+  // next reply longer than the REMAINING shared budget, so its deadline (not
+  // a poll sleep or the independent 10s RPC cap) is the causal failure.
+  await delay(10_500);
+  s.server.delays["mcpServerStatus/list"] = 10_000;
   await waitFor(() => s.bridge.mcpReadiness === "blocked", "20-second startup deadline", 22_000);
+  assert.ok(s.server.callsOf("mcpServerStatus/list").length >= 2);
   assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
   assert.equal(s.server.callsOf("turn/start").length, 0);
   assert.equal(s.server.callsOf("initialize").length, 1);

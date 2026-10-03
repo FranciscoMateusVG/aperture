@@ -55,11 +55,39 @@ Your only inbox is BEADS through aperture-bus, pushed live by the hub. Use exact
     ))
 }
 
+/// For new normal launches only. The native host, not a model turn, arms the
+/// generation-pinned plugin. This appendix supersedes standing Monitor-first
+/// instructions without modifying standing sessions or diagnostic records.
+pub(crate) fn managed_plugin_inbox_recipe(seat:&str)->Result<String,InboxRecipeError> {
+    if !crate::agent_loader::is_valid_seat_name(seat) {return Err(InboxRecipeError::InvalidSeat);}
+    Ok(format!("\n# Native managed inbox (Claude seat {seat})\n\n\
+This managed launch uses the aperture-managed-inbox plugin, monitor beads-inbox. The native host starts exactly one generation-pinned inbox client for the session. This rule overrides any standing instruction to start or re-arm a Monitor tool. DO NOT start a Monitor, background command, second client, or alternate channel.\n\n\
+If HUB_OWNER_PENDING appears, wait for HUB_OWNER_ACTIVE; no project work before native activation. Activation and an online socket are not messaging readiness. On an inbox notification, call aperture-bus get_messages, process each message, then mark_as_read only after handling it. Inbox reminders contain pending message IDs, not a new business dispatch: check authoritative unread state and do not replay completed project effects.\n\n\
+HUB_RECONNECTING means the same live client is reconnecting. HUB_RECONNECTED means unread replay is available; drain and acknowledge normally. Do not replace the client. The plugin monitor is session-owned, not the finite 30-minute Monitor tool.\n\n\
+A terminal process exit is different from a WebSocket outage. Never re-arm after HUB_IDENTITY_INVALID, HUB_OWNER_TIMEOUT, HUB_CLIENT_ERROR, or HUB_SOCKET_CLOSED 4000/4001/4003. Report the finite code through the existing task tool when callable and await coordination. Disabling or reloading a plugin is not proof its process stopped.\n\n\
+If the provider is unavailable, notifications or pending unread messages do not mean recovery. After it returns, recover by reading and handling the authoritative inbox; only a real read/ack/reply demonstrates restored communication. Never claim success from presence alone. If the plugin is missing, disabled, failed, or not supported by this harness, report a blocker; do not silently fall back to a manual Monitor. Do no project work until a fresh scoped BEADS dispatch.\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SEAT: &str = "t1-worker";
+
+    #[test]
+    fn plugin_recipe_never_arms_a_competing_monitor_or_claims_presence_as_recovery() {
+        let r=managed_plugin_inbox_recipe(SEAT).unwrap();
+        assert!(r.len()<4096 && r.is_ascii());
+        for required in ["DO NOT start a Monitor", "4000/4001/4003", "get_messages", "mark_as_read",
+            "real read/ack/reply", "do not silently fall back", "not proof its process stopped"] {
+            assert!(r.contains(required),"{required}");
+        }
+        for absent in ["Monitor(","timeout_ms:","persistent:","hub-client.js", "APERTURE_HUB_TOKEN", "--dangerously"] {
+            assert!(!r.contains(absent),"{absent}");
+        }
+        assert!(managed_plugin_inbox_recipe("../escape").is_err());
+        assert!(managed_inbox_recipe(SEAT).unwrap().contains("Monitor(command:"),"legacy facts remain compatible");
+    }
 
     fn recipe() -> String {
         managed_inbox_recipe(SEAT).unwrap()

@@ -1,7 +1,10 @@
 /**
  * hub-client — the canonical inbox-monitor client for Claude agents.
  *
- * Agents run this via a bash-based Monitor:
+ * New normal managed Claude launches run this exact client through their
+ * generation-pinned native plugin monitor (whole-session, one subscriber).
+ * Do not also launch a Monitor tool there. Standing/legacy diagnostic agents
+ * still use the finite bash-based Monitor below:
  *
  *   Monitor({
  *     command: "node <repo>/mcp-server/dist/hub-client.js <agent-name>",
@@ -14,6 +17,8 @@
  * (not replacement/rejection), the seat must re-arm exactly one Monitor.
  * Never duplicate a live/uncertain monitor or self-rearm after 4000/4001/4003.
  * An API outage can prevent rearming; this is not automatic recovery.
+ * Plugin process exit is also terminal (no promised host restart); persistent
+ * WS delivery does not prove the provider processed/read/replied to an event.
  *
  * Why this exists (aperture-1qwty): the Monitor tool's native ws source is
  * RECEIVE-ONLY — it cannot send the hello frame the hub requires to identify

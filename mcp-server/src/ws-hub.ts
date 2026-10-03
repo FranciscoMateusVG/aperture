@@ -54,12 +54,13 @@ import { WebSocketServer, WebSocket } from "ws";
 import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { getUnreadMessages, persistDeniedNotification } from "./beads.js";
+import { getUnreadMessages, persistDeniedNotification, UNREAD_LIMIT } from "./beads.js";
 import { startCodexBridges, type PresenceEvent } from "./codex-bridge.js";
 import { writePresenceSnapshot, PRESENCE_FILE, type PresenceEntry, type PresenceState } from "./presence-snapshot.js";
 import { authorizeMessage, isValidSeatName, loadSeatRegistry } from "./seat-registry.js";
 import { identityIsRevoked, revokeGeneration } from "./revocation-store.js";
-import { managedOwnerMatches, readManagedOwner } from "./managed-owner.js";
+import { managedOwnerMatches, readManagedOwner, readManagedActiveRuntime } from "./managed-owner.js";
+import { ManagedInboxReminder } from "./managed-inbox-reminder.js";
 import { fixedRuntimeChild } from "./private-runtime-path.js";
 
 const HOST = "127.0.0.1";
@@ -89,6 +90,81 @@ interface Conn {
 const conns = new Map<WebSocket, Conn>();
 /** Presence map: agent name → its (single) live socket. */
 const agents = new Map<string, WebSocket>();
+/** Managed Claude only. Scheduler has no authority; every IO is fenced here. */
+type ReminderRow = { id: string; from: string };
+const reminders = new Map<WebSocket, { reminder: ManagedInboxReminder<ReminderRow>; current: () => boolean }>();
+function cancelReminder(ws: WebSocket): void {
+  const binding = reminders.get(ws);
+  binding?.reminder.cancel();
+  reminders.delete(ws);
+  if (binding) log("managed_inbox_reminder_cancelled", { agent: conns.get(ws)?.agent });
+}
+
+function armManagedReminder(ws: WebSocket, conn: Conn): void {
+  const seat = conn.agent;
+  if (!seat || conn.role !== "agent") return;
+  try {
+    const principal = loadSeatRegistry().seats.get(seat);
+    if (principal?.group !== "team") return;
+    const owner = readManagedActiveRuntime(seat);
+    if (!owner || owner.requested.harness !== "claude") return;
+    const binding = JSON.stringify(owner);
+    const registryBinding = JSON.stringify(principal);
+    const current = (): boolean => {
+      try {
+        if (conns.get(ws) !== conn || conn.revoked || conn.role !== "agent" ||
+            agents.get(seat) !== ws || ws.readyState !== WebSocket.OPEN ||
+            conn.generation !== owner.generation || conn.tokenId !== owner.tokenId ||
+            JSON.stringify(loadSeatRegistry().seats.get(seat)) !== registryBinding ||
+            JSON.stringify(readManagedActiveRuntime(seat)) !== binding ||
+            identityIsRevoked(seat, owner.generation, owner.tokenId)) return false;
+        validateExactToken(seat, owner.tokenId);
+        return true;
+      } catch { return false; }
+    };
+    if (!current()) return;
+    const reminder = new ManagedInboxReminder<ReminderRow>({
+      valid: current,
+      unread: async () => {
+        if (!current()) throw new Error("E_REMINDER_BINDING_CHANGED");
+        const raw = await getUnreadMessages(seat);
+        if (!current()) throw new Error("E_REMINDER_BINDING_CHANGED");
+        const values: unknown = JSON.parse(raw);
+        if (!Array.isArray(values) || values.length > UNREAD_LIMIT) throw new Error("E_REMINDER_QUERY_INVALID");
+        const registry = loadSeatRegistry();
+        const seen = new Set<string>();
+        return values.map(value => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("E_REMINDER_QUERY_INVALID");
+          const row = value as Record<string, unknown>;
+          const match = typeof row.title === "string" ? row.title.match(/^\[([a-z0-9][a-z0-9_-]{0,30})->([a-z0-9][a-z0-9_-]{0,30})\](?: |$)/) : null;
+          if (typeof row.id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(row.id) || seen.has(row.id) ||
+              row.status !== "open" || (row.issue_type ?? row.type) !== "message" || !match || match[2] !== seat ||
+              !authorizeMessage(registry, match[1]!, seat).allowed) throw new Error("E_REMINDER_QUERY_INVALID");
+          seen.add(row.id);
+          return { id: row.id, from: match[1]! }; // no body retained by timer
+        });
+      },
+      send: rows => {
+        if (!current()) { cancelReminder(ws); return; }
+        const registry = loadSeatRegistry();
+        if (rows.some(row => !authorizeMessage(registry, row.from, seat).allowed)) {
+          cancelReminder(ws); return;
+        }
+        send(ws, { type: "message", id: rows[0]!.id, from: rows[0]!.from,
+          preview: "Unread BEADS inbox reminder: get_messages; process then mark_as_read. Not a new mission.",
+          reminder: true, pending_ids: rows.slice(0, 20).map(row => row.id), truncated: rows.length > 20 });
+        log("managed_inbox_reminder_sent", { agent: seat, generation: owner.generation, count: rows.length });
+      },
+      error: () => log("managed_inbox_reminder_error", { agent: seat, code: "E_REMINDER_QUERY_UNAVAILABLE" }),
+    });
+    reminders.set(ws, { reminder, current });
+    reminder.pending(); // queued, but hello replay owns the only query until start()
+    log("managed_inbox_reminder_armed", { agent: seat, generation: owner.generation });
+  } catch {
+    // Malformed/unobserved owners never acquire reminder authority.
+    log("managed_inbox_reminder_denied", { agent: seat, code: "E_REMINDER_OWNER_UNVERIFIED" });
+  }
+}
 /**
  * Latest presence event per agent (aperture-3x136). The hub previously only
  * BROADCAST presence and never stored it, so a subscriber connecting (or
@@ -238,6 +314,7 @@ function tokenBelongsToAnotherAgent(agent: string, presented: unknown): boolean 
  * Failure is non-fatal: the agent can always pull via get_messages.
  */
 async function replayUnread(agent: string, ws: WebSocket): Promise<void> {
+  const managed = reminders.get(ws); // retain binding across await/cancellation
   if (SKIP_REPLAY) {
     log("replay_skipped", { agent });
     return;
@@ -249,6 +326,9 @@ async function replayUnread(agent: string, ws: WebSocket): Promise<void> {
       log("replay", { agent, count: 0 });
       return;
     }
+    // The captured managed binding is checked after the existing unread await.
+    // No timer query overlaps replay; cancelled/replaced connections cannot send.
+    if ((agents.get(agent) !== ws) || (managed && !managed.current())) return;
     let count = 0;
     for (const r of rows as Record<string, unknown>[]) {
       if (typeof r.id !== "string") continue;
@@ -367,11 +447,14 @@ function handleHello(ws: WebSocket, conn: Conn, msg: Record<string, unknown>): H
     const old = agents.get(agent);
     if (old && old !== ws) {
       log("agent_replaced", { agent });
+      cancelReminder(old);
       old.close(4000, "replaced by newer connection");
     }
     agents.set(agent, ws);
     broadcastPresence(agent, "join");
-    void replayUnread(agent, ws);
+    armManagedReminder(ws, conn);
+    const reminder = reminders.get(ws)?.reminder;
+    void replayUnread(agent, ws).finally(() => reminder?.start());
   }
   return { ok: true };
 }
@@ -437,6 +520,7 @@ function deleteExactToken(seat: string, expectedTokenId: string): TokenDeletionP
 }
 
 function closeManagedSocket(candidate: WebSocket): Promise<boolean> {
+  cancelReminder(candidate);
   if (candidate.readyState === WebSocket.CLOSED) return Promise.resolve(true);
   return new Promise((resolve) => {
     let settled = false;
@@ -490,6 +574,7 @@ async function handleRevokeGeneration(ws: WebSocket, conn: Conn, msg: Record<str
         // Fence authority synchronously at the durable revocation point,
         // before token cleanup or the asynchronous close handshake.
         identity.revoked = true;
+        cancelReminder(candidate);
         matchingSockets.push({ socket: candidate, identity });
       }
     }
@@ -578,6 +663,9 @@ async function handleNotify(ws: WebSocket, conn: Conn, msg: Record<string, unkno
     outcome = "codex";
     log("notify_codex", { to, id, from });
   } else if (target) {
+    const reminder = reminders.get(target);
+    if (reminder && !reminder.current()) cancelReminder(target);
+    else reminder?.reminder.pending();
     send(target, { type: "message", id, from, preview });
     outcome = "forwarded";
     log("notify_forwarded", { to, id, from });
@@ -743,6 +831,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    cancelReminder(ws);
     clearTimeout(helloDeadline);
     conns.delete(ws);
     if (conn.role === "agent" && conn.agent && agents.get(conn.agent) === ws) {
@@ -776,6 +865,7 @@ function shutdown(signal: string): void {
   clearInterval(heartbeat);
   codexBridges.stop();
   for (const ws of conns.keys()) {
+    cancelReminder(ws);
     ws.close(1001, "hub shutting down");
   }
   wss.close(() => {

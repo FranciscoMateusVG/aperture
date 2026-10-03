@@ -50,6 +50,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { ManagedInboxReminder } from "../dist/managed-inbox-reminder.js";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -205,7 +207,7 @@ async function spawnHub({ bdFail = false } = {}) {
   }
 
   await waitForEvent((e) => e.event === "listening", "listening", 5000);
-  return { port, proc, dataDir, agentsDir: emptyAgentsDir, stderrEvents, waitForEvent, until, stop };
+  return { port, proc, dataDir, homeDir, runDir, tokenDir, teamsDir, agentsDir: emptyAgentsDir, stderrEvents, waitForEvent, until, stop };
 }
 
 /** Seed $BD_STUB_DIR/unread-<agent>.json with unread message rows. */
@@ -685,4 +687,104 @@ test("replay-vs-live: notify racing an in-flight replay → both frames arrive, 
   } finally {
     hub.stop();
   }
+});
+
+// The coalescer has no IO/authority. Clock and callbacks are the complete seam.
+function fakeReminderClock(random = 0.5) {
+  let seq = 0;
+  const tasks = new Map(), delays = [];
+  return {
+    tasks, delays,
+    set(fn, ms) { const id = ++seq; tasks.set(id, fn); delays.push(ms); return id; },
+    clear(id) { tasks.delete(id); }, random: () => random,
+    fire() { assert.equal(tasks.size, 1); const [id, fn] = tasks.entries().next().value; tasks.delete(id); fn(); return fn; },
+  };
+}
+const flushReminder = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
+const deferred = () => { let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject}; };
+function reminderHarness(clock = fakeReminderClock()) {
+  let valid = true, rows = [{ id: "ap-pending", from: "glados" }], queries = 0, sends = [], errors = 0;
+  const r = new ManagedInboxReminder({ valid: () => valid,
+    unread: async () => {queries++;return await rows;}, send: x => sends.push(x), error: () => errors++ }, clock);
+  return {r,clock,sends, setRows:x=>{rows=x;}, invalidate:()=>{valid=false;}, counts:()=>({queries,errors})};
+}
+test("managed reminder stays singleflight, uses bounded backoff, never acknowledges on send", async () => {
+  const h = reminderHarness(); h.r.pending(); h.r.pending(); assert.equal(h.clock.tasks.size,0);
+  h.r.start(); h.r.start(); assert.equal(h.clock.tasks.size,1);
+  for (let i=0;i<6;i++) {h.clock.fire();await flushReminder();}
+  assert.deepEqual(h.clock.delays,[30_000,60_000,120_000,300_000,300_000,300_000,300_000]);
+  assert.equal(h.sends.length,6); assert.equal(h.counts().queries,6);
+  h.setRows([]); h.clock.fire(); await flushReminder();
+  assert.equal(h.clock.tasks.size,0); // only authoritative read/empty stops reminders
+  h.r.pending(); assert.equal(h.clock.delays.at(-1),30_000); h.r.cancel();
+  for (const rand of [0,1]) {const j=reminderHarness(fakeReminderClock(rand));j.r.pending();j.r.start();for(let i=0;i<8;i++){j.clock.fire();await flushReminder();}assert.ok(j.clock.delays.every(n=>n>=27000&&n<=300000));j.r.cancel();}
+});
+test("managed reminder coalesces notify during pending query; old empty cannot cancel new notify", async () => {
+  const h=reminderHarness(), d=deferred();h.setRows(d.promise);h.r.pending();h.r.start();h.clock.fire();
+  for(let i=0;i<20;i++) h.r.pending();
+  assert.equal(h.counts().queries,1); assert.equal(h.clock.tasks.size,0);
+  d.resolve([]);await flushReminder();assert.equal(h.clock.tasks.size,1);
+  h.setRows([{id:"ap-new",from:"glados"}]);h.clock.fire();await flushReminder();
+  assert.equal(h.sends[0][0].id,"ap-new");h.r.cancel();
+});
+test("managed reminder cancellation fences queued callback and in-flight query; auth drift denies send", async () => {
+  for(const mode of ["queued","query","auth-drift"]) {
+    const h=reminderHarness(),d=deferred();h.setRows(d.promise);h.r.pending();h.r.start();
+    const fn=h.clock.tasks.values().next().value;
+    if(mode==="queued"){h.r.cancel();fn();assert.equal(h.counts().queries,0);}
+    else {h.clock.fire();if(mode==="query")h.r.cancel();else h.invalidate();d.resolve([{id:"ap-pending",from:"glados"}]);await flushReminder();}
+    assert.equal(h.sends.length,0);assert.equal(h.clock.tasks.size,0);
+    h.r.pending();h.r.start();assert.equal(h.clock.tasks.size,0);
+  }
+});
+test("managed reminder query failure is not empty or ACK; same pending ID survives provider outage", async () => {
+  const h=reminderHarness(),d=deferred();h.setRows(d.promise);h.r.pending();h.r.start();h.clock.fire();d.reject(new Error("fixture"));await flushReminder();
+  assert.equal(h.counts().errors,1);assert.equal(h.clock.tasks.size,1);assert.equal(h.sends.length,0);
+  h.setRows([{id:"ap-pending",from:"glados"}]);h.clock.fire();await flushReminder();
+  assert.equal(h.sends[0][0].id,"ap-pending");h.r.cancel();
+});
+function managedFixture(hub, seat, harness="claude", observed=true) {
+  const team="reminder",token="aa".repeat(32),tokenId=createHash("sha256").update(token).digest("hex");
+  const dir=join(hub.agentsDir,seat);mkdirSync(dir,{recursive:true});
+  for(const file of ["TEAM",".complete","prompt.md"])writeFileSync(join(dir,file),file==="TEAM"?team:"fixture");
+  writeFileSync(join(dir,"manifest.json"),JSON.stringify({name:seat,model:`${harness}/test`,window:seat,role:"qa",enabled:true}));
+  mkdirSync(join(hub.teamsDir,team),{recursive:true});
+  const seats=["reminder-claude","reminder-codex","reminder-unobserved"].map(name=>({name,role:"qa"}));
+  writeFileSync(join(hub.teamsDir,team,"state.json"),JSON.stringify({state:"active",generation:1}));
+  writeFileSync(join(hub.teamsDir,team,"team.json"),JSON.stringify({team,project:"project:aperture",lead:"reminder-claude",seats}));
+  const ownerDir=join(hub.runDir,"owner");mkdirSync(ownerDir,{recursive:true,mode:0o700});
+  const tuple={harness,model:harness==="claude"?"claude-sonnet-5":"gpt-6-astra",reasoning:harness==="claude"?null:"high"};
+  const owner={schema_version:1,seat,generation:1,state:"active",provisional_token_id:null,requested:tuple,
+    incarnation:{...tuple,pid:123,start_time:456,thread_id:"fixture-thread",token_id:tokenId,observed}};
+  const ownerPath=join(ownerDir,`${seat}.json`);writeFileSync(ownerPath,JSON.stringify(owner),{mode:0o600});
+  writeFileSync(join(hub.tokenDir,`${seat}.token`),token,{mode:0o600});
+  return {owner,ownerPath,hello:(ws,role="agent")=>ws.send(JSON.stringify({type:"hello",role,agent:seat,token,generation:1,token_id:tokenId}))};
+}
+test("real hub wiring arms only owner-proven managed Claude; reminder has IDs but no mission body", async () => {
+  const hub=await spawnHub(), sockets=[];
+  try {
+    const c=managedFixture(hub,"reminder-claude"), x=managedFixture(hub,"reminder-codex","codex"), u=managedFixture(hub,"reminder-unobserved","claude",false);
+    const rows=[{id:"ap-reminder",title:"[glados->reminder-claude] fixture",issue_type:"message",status:"open",description:"PRIVATE_MISSION_SENTINEL"}];
+    seedUnread(hub.dataDir,"reminder-claude",rows);
+    for(const [fixture,role] of [[c,"producer"],[c,"subscriber"],[x,"agent"],[u,"agent"]]) {
+      const ws=await connect(hub.port);sockets.push(ws);fixture.hello(ws,role);
+    }
+    const legacy=await connect(hub.port);sockets.push(legacy);hello(legacy,"agent","rp-empty");
+    const agent=await connect(hub.port);sockets.push(agent);const frames=[];agent.on("message",m=>frames.push(JSON.parse(m)));c.hello(agent);
+    await hub.waitForEvent(e=>e.event==="managed_inbox_reminder_armed","managed Claude armed");
+    await hub.waitForEvent(e=>e.event==="replay"&&e.agent==="reminder-claude","managed replay");
+    await hub.until(()=>frames.some(f=>f.reminder),"native timer reminder (no fake hub clock)",35000);
+    const reminder=frames.find(f=>f.reminder);assert.deepEqual(reminder.pending_ids,["ap-reminder"]);
+    assert.equal(JSON.stringify(reminder).includes("PRIVATE_MISSION_SENTINEL"),false);
+    assert.deepEqual(hub.stderrEvents.filter(e=>e.event==="managed_inbox_reminder_armed").map(e=>e.agent),["reminder-claude"]);
+    assert.equal(bdCalls(hub.dataDir).filter(a=>a[0]==="close").length,0,"reminder is never ACK");
+    // Owner thread drift invalidates current binding, even with same token/seat.
+    c.owner.incarnation.thread_id="other-thread";writeFileSync(c.ownerPath,JSON.stringify(c.owner),{mode:0o600});
+    const producer=await connect(hub.port);sockets.push(producer);hello(producer,"producer","glados");
+    producer.send(JSON.stringify({type:"notify",to:"reminder-claude",id:"ap-new",preview:"fixture"}));
+    await hub.waitForEvent(e=>e.event==="notify_forwarded"&&e.id==="ap-new","new notify after drift");
+    await hub.waitForEvent(e=>e.event==="managed_inbox_reminder_cancelled"&&e.agent==="reminder-claude","native binding drift cancels");
+    // Fake-clock oracles above additionally cover cancellation during await;
+    // this real hub oracle proves native owner classification and recheck.
+  } finally {closeAll(...sockets);hub.stop();}
 });

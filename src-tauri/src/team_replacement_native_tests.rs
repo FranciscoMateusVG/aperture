@@ -1781,3 +1781,61 @@ fn codex_recovery_owner_checks_allow_only_captured_process_union_not_incarnation
         assert!(!recovery_owner_matches(&old,&now),"mode {mode}");
     }
 }
+
+fn codex_quarantine_proof(f:&Fixture,a:&CodexRecoveryAdmission,j:&deadline::RecoveryJournal)->StoppedCodexRecoveryProof {
+    for step in ["stop-complete","revocation","socket-release"] {
+        j.phase(step,||Ok(true),||panic!("already proven fixture")).unwrap();
+    }
+    let mut s=snapshot();
+    s.processes[0].identity=team_process::identity_from_owner(900001,42).unwrap();
+    let guard=team_process::persist_for_stop(&f.0,"t1",&AuthenticatedActor::launcher(),s).unwrap();
+    let expected=OwnerStore::new(f.0.join(".aperture/run/owner")).read_owner_locked("t1-worker").unwrap();
+    StoppedCodexRecoveryProof {home:f.0.clone(),admission:a.clone(),expected,guard}
+}
+#[test]
+fn codex_recovery_quarantine_pre_cas_reentry_commits_once_and_post_cas_reconciles() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for after_cas in [false,true] {
+        let f=Fixture::new();let _env=SmokeEnv::set(&f);
+        let (actor,a,dir,j)=codex_recovery_fixture(&f);
+        let proof=codex_quarantine_proof(&f,&a,&j);
+        // Persist intent and simulate control exit before its done receipt.
+        assert!(j.phase("quarantine",||Ok(false),||{
+            if after_cas {proof.commit_quarantine(&actor)?;}
+            Err(ReplacementError::OutcomeUnknown)
+        }).is_err());
+        let store=OwnerStore::new(f.0.join(".aperture/run/owner"));
+        if !after_cas {j.quarantine_stopped(&proof,&actor).unwrap();}
+        let bytes=std::fs::read(store.record_path("t1-worker")).unwrap();
+        let current=store.read_owner_locked("t1-worker").unwrap();
+        assert!(recovery_quarantined(&a,&current));
+        assert!(j.quarantine_stopped(&proof,&actor).is_err(),"no second CAS");
+        j.phase("quarantine",||Ok(recovery_quarantined(&a,&current)),||panic!("CAS already done")).unwrap();
+        assert_eq!(std::fs::read(store.record_path("t1-worker")).unwrap(),bytes);
+        let done:serde_json::Value=read_private_json(&dir.join("quarantine.done.json")).unwrap();
+        assert_eq!(done["reconciled"],after_cas);
+        assert!(!dir.join("start").exists());
+        assert!(read_private_json::<CodexRecoveryAdmission>(&dir.join("recovery-admitted.json")).unwrap()==a);
+    }
+}
+#[test]
+fn codex_recovery_quarantine_reentry_rechecks_current_proof_before_cas() {
+    let _lock=crate::team_auth::tests::ENV_LOCK.lock().unwrap();
+    for drift in ["owner","snapshot","socket","floor","actor","phase"] {
+        let f=Fixture::new();let _env=SmokeEnv::set(&f);
+        let (actor,a,dir,j)=codex_recovery_fixture(&f);let proof=codex_quarantine_proof(&f,&a,&j);
+        assert!(j.phase("quarantine",||Ok(false),||Err(ReplacementError::OutcomeUnknown)).is_err());
+        match drift {
+            "owner"=>{let mut o=proof.expected.clone();o.since.push('x');f.write(".aperture/run/owner/t1-worker.json",&serde_json::to_value(o).unwrap());},
+            "snapshot"=>f.write(".aperture/teams/t1/team.json",&serde_json::json!({})),
+            "socket"=>write_private_bytes_atomic(&f.0.join(".aperture/run/t1-worker.sock"),b"foreign",false).unwrap(),
+            "floor"=>std::fs::remove_file(f.0.join(".aperture/run/revocations/t1-worker.json")).unwrap(),
+            "actor"=>write_private_bytes_atomic(&f.0.join(".aperture/run/hub-tokens/glados.token"),b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",true).unwrap(),
+            "phase"=>std::fs::remove_file(dir.join("socket-release.done.json")).unwrap(),
+            _=>unreachable!(),
+        }
+        let path=f.0.join(".aperture/run/owner/t1-worker.json");let before=std::fs::read(&path).unwrap();
+        assert!(j.quarantine_stopped(&proof,&actor).is_err(),"{drift}");
+        assert_eq!(std::fs::read(path).unwrap(),before);assert!(!dir.join("quarantine.done.json").exists());
+    }
+}

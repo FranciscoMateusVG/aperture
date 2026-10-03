@@ -896,6 +896,7 @@ export class CodexBridgeClient {
     this.managedMcpOwner = owner;
     let epoch = this.managedMcpEpoch;
     let code = "E_MCP_STATUS_UNAVAILABLE";
+    let startupPending = false;
     let server: "aperture-bus" | "sentry" | "unknown" = "unknown";
     const current = () => {
       if (this.ws !== ws || ws.readyState !== WebSocket.OPEN || this.stopped) return false;
@@ -907,8 +908,21 @@ export class CodexBridgeClient {
       if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
       if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
       const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(code);
-      const result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
+      if (remaining <= 0) {
+        if (startupPending) code = "E_MCP_STARTUP_TIMEOUT";
+        throw new Error(code);
+      }
+      let result: unknown;
+      try {
+        result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
+      } catch (error) {
+        // The shared deadline can expire inside the status RPC, not only in
+        // the poll delay. Preserve the observed pending-startup category.
+        if (!current()) code = "E_MCP_OWNER_CHANGED";
+        else if (this.managedMcpTerminal) code = "E_MCP_STARTUP_CHANGED";
+        else if (startupPending && Date.now() >= deadline) code = "E_MCP_STARTUP_TIMEOUT";
+        throw error;
+      }
       if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
       if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
       if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error(code);
@@ -917,7 +931,10 @@ export class CodexBridgeClient {
     try {
       // Only pending startup is polled; terminal failure never reloads/restarts.
       admission: while (true) {
-        if (Date.now() >= deadline) throw new Error(code);
+        if (Date.now() >= deadline) {
+          if (startupPending) code = "E_MCP_STARTUP_TIMEOUT";
+          throw new Error(code);
+        }
         epoch = this.managedMcpEpoch;
         code = "E_MCP_STATUS_UNAVAILABLE";
         const rows = new Map<string, Record<string, unknown>>();
@@ -944,6 +961,7 @@ export class CodexBridgeClient {
           const row = rows.get(name);
           if (!row) { code = "E_MCP_SERVER_MISSING"; throw new Error(code); }
           if (row.runtimeStatus === "starting" || row.runtimeStatus === "notStarted") {
+            startupPending = true;
             code = "E_MCP_STARTUP_TIMEOUT";
             if (Date.now() + 200 >= deadline) throw new Error(code);
             await delay(200);
@@ -962,6 +980,7 @@ export class CodexBridgeClient {
             code = "E_MCP_REQUIRED_TOOL_MISSING"; throw new Error(code);
           }
         }
+        startupPending = false;
         // Notifications may invalidate a coherent-looking catalog or arrive
         // during the RO probe. Re-read both within the SAME deadline, never
         // bless the stale epoch. A failed/cancelled/unknown event stays terminal.

@@ -94,6 +94,30 @@ fn shell_atom(value: &str) -> Result<String, ClaudeError> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
+/// Old records and diagnostic launches retain the finite-tool recipe. New
+/// normal publications always select PluginV1; failure never falls back.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all="snake_case")]
+enum InboxMode { #[default] Legacy, PluginV1 }
+impl InboxMode { fn is_legacy(&self)->bool { *self==Self::Legacy } }
+fn inbox_plugin_dir(base:&Path)->PathBuf {base.join("inbox-plugin")}
+fn inbox_plugin_manifest(node:&Path,client:&Path,seat:&str)->Result<serde_json::Value,ClaudeError> {
+    if !node.is_absolute() || !client.is_absolute() || !crate::agent_loader::is_valid_seat_name(seat) {
+        return Err(ClaudeError::Unsafe);
+    }
+    let n=node.to_str().ok_or(ClaudeError::Unsafe)?;
+    let c=client.to_str().ok_or(ClaudeError::Unsafe)?;
+    // The host interpolates variables before invoking its shell. No literal
+    // installed path may turn into a host-selected environment substitution.
+    if n.contains('$') || c.contains('$') {return Err(ClaudeError::Unsafe);}
+    Ok(serde_json::json!({"name":"aperture-managed-inbox","version":"1.0.0",
+        "description":"Native managed BEADS inbox; no mission input",
+        "author":{"name":"Aperture"},"experimental":{"monitors":[{
+            "name":"beads-inbox","when":"always","description":"BEADS inbox notifications",
+            "command":format!("exec {} {} {}",shell_atom(n)?,shell_atom(c)?,shell_atom(seat)?)
+        }]}}))
+}
+
 /// This plan is never Deserialize: no worker path/session/model authority.
 /// The fixed helper is supplied by the native installation binding, not a DTO.
 pub(crate) struct ClaudeLaunchPlan {
@@ -122,6 +146,10 @@ impl ClaudeLaunchPlan {
         // argv item, after all native-generated flags.
         let at = self.argv.len() - usize::from(self.mode == ClaudeLaunchMode::NormalPositional);
         self.argv.splice(at..at, ["--append-system-prompt-file".into(), path.to_string_lossy().into_owned()]);
+    }
+    fn append_inbox_plugin(&mut self,base:&Path) {
+        let at=self.argv.len()-usize::from(self.mode==ClaudeLaunchMode::NormalPositional);
+        self.argv.splice(at..at,["--plugin-dir".into(),inbox_plugin_dir(base).to_string_lossy().into_owned()]);
     }
 
     pub(crate) fn new(
@@ -809,7 +837,10 @@ impl ClaudeBinding {
         }
         // This appendix supplies the actual harness inbox recipe; role prompts
         // alone only say to await dispatch. It submits no input before D1.
-        let inbox = crate::team_claude_inbox::managed_inbox_recipe(&self.seat)
+        let inbox_mode=if self.mode==ClaudeLaunchMode::NormalPositional {InboxMode::PluginV1} else {InboxMode::Legacy};
+        let inbox = if inbox_mode==InboxMode::PluginV1 {
+            crate::team_claude_inbox::managed_plugin_inbox_recipe(&self.seat)
+        } else {crate::team_claude_inbox::managed_inbox_recipe(&self.seat)}
             .map_err(|_| ClaudeError::Invalid)?;
         prompt.0.extend_from_slice(inbox.as_bytes());
         if prompt.0.len() > PRIVATE_CAP { return Err(ClaudeError::Invalid); }
@@ -841,6 +872,13 @@ impl ClaudeBinding {
         write_private_json_atomic(&plan.settings_path, &plan.settings, false)
             .map_err(|_| ClaudeError::Unsafe)?;
         plan.append_system_prompt(&prompt_path);
+        let plugin_path=inbox_plugin_dir(&dest).join(".claude-plugin/plugin.json");
+        if inbox_mode==InboxMode::PluginV1 {
+            ensure_private_dir(plugin_path.parent().ok_or(ClaudeError::Unsafe)?).map_err(|_|ClaudeError::Unsafe)?;
+            let manifest=inbox_plugin_manifest(&self.node,&self.infra.join(crate::local_package::HUB_CLIENT),&self.seat)?;
+            write_private_json_atomic(&plugin_path,&manifest,false).map_err(|_|ClaudeError::Unsafe)?;
+            plan.append_inbox_plugin(&dest);
+        }
         let args = plan.argv.clone();
         let mut record = LaunchRecord {
             schema_version: 1,
@@ -864,11 +902,15 @@ impl ClaudeBinding {
             pins: self.pins.clone(),
             private_pins: BTreeMap::new(),
             mode: self.mode,
+            inbox_mode,
         };
         for p in [&plan.settings_path, &plan.mcp_path, &prompt_path] {
             record
                 .private_pins
                 .insert(p.clone(), digest(&private_bytes(p, PRIVATE_CAP)?.0));
+        }
+        if inbox_mode==InboxMode::PluginV1 {
+            record.private_pins.insert(plugin_path.clone(),digest(&private_bytes(&plugin_path,PRIVATE_CAP)?.0));
         }
         write_private_json_atomic(&dest.join("claude-launch.json"), &record, false)
             .map_err(|_| ClaudeError::Unsafe)?;
@@ -901,6 +943,8 @@ struct LaunchRecord {
     private_pins: BTreeMap<PathBuf, String>,
     #[serde(default, skip_serializing_if = "ClaudeLaunchMode::is_diagnostic")]
     mode: ClaudeLaunchMode,
+    #[serde(default,skip_serializing_if="InboxMode::is_legacy")]
+    inbox_mode: InboxMode,
 }
 pub(crate) struct PublishedClaude {
     home: PathBuf,
@@ -1370,7 +1414,8 @@ fn validate_record_staged(
             .any(|p| !p.is_absolute())
         || !canonical_uuid(&r.session_id)
         || r.pins.len() > 32
-        || r.private_pins.len() != 3
+        || r.private_pins.len() != if r.inbox_mode==InboxMode::PluginV1 {4} else {3}
+        || (r.inbox_mode==InboxMode::PluginV1 && r.mode!=ClaudeLaunchMode::NormalPositional)
         || r.helper != infra.join(crate::local_package::BOOT)
     {
         return Err(ClaudeError::Invalid);
@@ -1399,15 +1444,31 @@ fn validate_record_staged(
     // is rederived; a private malformed record cannot add flags/initial input.
     plan.argv[3] = r.session_id.clone();
     plan.append_system_prompt(&base.join("prompt.md"));
+    if r.inbox_mode==InboxMode::PluginV1 {plan.append_inbox_plugin(&base);}
     if plan.argv != r.args {
         return Err(ClaudeError::Invalid);
     }
     stage(LaunchStage::PinsSettings)?;
-    let expected_private = [
+    let mut expected_private = vec![
         base.join("claude-settings.json"),
         base.join("claude-mcp.json"),
         base.join("prompt.md"),
     ];
+    if r.inbox_mode==InboxMode::PluginV1 {
+        let plugin=inbox_plugin_dir(&base);
+        let manifest_path=plugin.join(".claude-plugin/plugin.json");
+        let expected=inbox_plugin_manifest(&r.node,&infra.join(crate::local_package::HUB_CLIENT),&r.seat)?;
+        let actual:serde_json::Value=read_private_json(&manifest_path).map_err(|_|ClaudeError::Unsafe)?;
+        if actual!=expected {return Err(ClaudeError::Unsafe);}
+        let expected_inventory=BTreeMap::from([(".claude-plugin/plugin.json".to_string(),
+            digest(&private_bytes(&manifest_path,PRIVATE_CAP)?.0))]);
+        // Plugins discover hooks/settings/components automatically. Pin the
+        // entire closed tree, not just a manifest hiding extra executable files.
+        if common::inventory(&plugin,budget).map_err(|_|ClaudeError::Unsafe)?!=expected_inventory {
+            return Err(ClaudeError::Unsafe);
+        }
+        expected_private.push(manifest_path);
+    }
     if r.private_pins.keys().any(|p| !expected_private.contains(p)) {
         return Err(ClaudeError::Unsafe);
     }
@@ -1919,6 +1980,7 @@ mod gate_tests {
             pins: BTreeMap::new(),
             private_pins: BTreeMap::new(),
             mode: ClaudeLaunchMode::DiagnosticPreinput,
+            inbox_mode: InboxMode::Legacy,
         };
         let a = ClaudeAttempt {
             schema_version: 1,
@@ -2280,6 +2342,8 @@ mod publication_tests {
         let mut published = binding.publish_with_password(&r, &t, &Deadline::new(), "").unwrap();
         assert_eq!(published.record.mode, ClaudeLaunchMode::NormalPositional);
         assert_eq!(published.record.args.last().unwrap(), crate::launcher::KICKOFF_TEXT);
+        assert_eq!(published.record.args.iter().filter(|a|a.as_str()=="--plugin-dir").count(),1);
+        assert!(published.record.inbox_mode==InboxMode::PluginV1);
         validate_record_at(&f.home, &published.record, &Deadline::new(), &f.infra).unwrap();
         published.record.mode = ClaudeLaunchMode::DiagnosticPreinput;
         assert!(matches!(validate_record_at(&f.home, &published.record, &Deadline::new(), &f.infra), Err(ClaudeError::Invalid)));
@@ -2287,6 +2351,40 @@ mod publication_tests {
         *published.record.args.last_mut().unwrap() = "caller supplied mission".into();
         assert!(matches!(validate_record_at(&f.home, &published.record, &Deadline::new(), &f.infra), Err(ClaudeError::Invalid)));
         assert!(!generation_dir(&f.home, "t1-worker", 1).join("claude-spawn.json").exists());
+    }
+    #[test]
+    fn native_plugin_publication_is_closed_pinned_and_has_no_legacy_fallback() {
+        for drift in ["none","manifest","extra","symlink","mode","missing","node","argv"] {
+            let f=Fixture::new();let mut binding=f.binding().unwrap();binding.mode=ClaudeLaunchMode::NormalPositional;
+            let (r,t)=f.reservation();let mut p=binding.publish_with_password(&r,&t,&Deadline::new(),"").unwrap();
+            let base=generation_dir(&f.home,"t1-worker",1);let dir=inbox_plugin_dir(&base);
+            let file=dir.join(".claude-plugin/plugin.json");
+            let manifest:serde_json::Value=read_private_json(&file).unwrap();
+            assert_eq!(manifest,inbox_plugin_manifest(&p.record.node,&f.infra.join(crate::local_package::HUB_CLIENT),"t1-worker").unwrap());
+            assert_eq!(p.record.private_pins.len(),4);
+            assert!(std::fs::read_to_string(base.join("prompt.md")).unwrap().contains("DO NOT start a Monitor"));
+            match drift {
+                "manifest"=>write_private_json_atomic(&file,&serde_json::json!({"name":"forged"}),true).unwrap(),
+                "extra"=>write_private_bytes_atomic(&dir.join("settings.json"),b"{}",false).unwrap(),
+                "symlink"=>{std::fs::remove_file(&file).unwrap();std::os::unix::fs::symlink(base.join("claude-settings.json"),&file).unwrap();},
+                "mode"=>std::fs::set_permissions(&dir,std::fs::Permissions::from_mode(0o755)).unwrap(),
+                "missing"=>std::fs::remove_file(&file).unwrap(),
+                "node"=>p.record.node=PathBuf::from("/usr/bin/false"),
+                "argv"=>p.record.args.push("--plugin-dir=/foreign".into()),
+                "none"=>{},_=>unreachable!(),
+            }
+            let result=validate_record_at(&f.home,&p.record,&Deadline::new(),&f.infra);
+            assert_eq!(result.is_ok(),drift=="none","{drift}");
+            assert!(!base.join("claude-spawn.json").exists());
+        }
+    }
+    #[test]
+    fn native_plugin_manifest_quotes_literal_commands_and_rejects_host_substitution() {
+        let m=inbox_plugin_manifest(Path::new("/fixture/a b/node"),Path::new("/fixture/it's/client.js"),"t1-worker").unwrap();
+        assert_eq!(m["experimental"]["monitors"].as_array().unwrap().len(),1);
+        assert_eq!(m["experimental"]["monitors"][0]["command"],"exec '/fixture/a b/node' '/fixture/it'\\''s/client.js' 't1-worker'");
+        assert!(inbox_plugin_manifest(Path::new("/fixture/${NODE}"),Path::new("/fixed/client.js"),"t1-worker").is_err());
+        assert!(inbox_plugin_manifest(Path::new("node"),Path::new("/fixed/client.js"),"t1-worker").is_err());
     }
     #[test]
     fn native_publication_is_private_no_replace_and_uses_absolute_node_for_both_mcps() {

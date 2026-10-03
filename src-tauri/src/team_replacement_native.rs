@@ -2817,7 +2817,33 @@ impl StoppedCodexRecoveryProof {
         claude_stopped(self.guard.snapshot(),team_process::state)?;
         recovery_all_gone(&now)?;
         if !recovery_revoked(&self.home,&now)? { return Err(ReplacementError::RevocationUnverified); }
+        absent(&self.home.join(".aperture/run").join(format!("{}.sock",now.seat)))?;
         Ok(now)
+    }
+    /// Only the exact stopped Active postimage, with the process guard's
+    /// team/seat locks still held, may retry an uncommitted quarantine CAS.
+    pub(crate) fn verify_quarantine_journal(&self, dir:&Path, operation:&str,
+        actor:&AuthenticatedActor)->Result<(),ReplacementError> {
+        let expected=self.home.join(".aperture/teams").join(&self.admission.request.team)
+            .join("runtime-attempts").join(&self.expected.seat)
+            .join(format!("g{}",self.expected.generation)).join("codex-recovery");
+        if dir!=expected || operation!=self.admission.request.operation_id {
+            return Err(ReplacementError::OutcomeUnknown);
+        }
+        let recorded:CodexRecoveryAdmission=read_private_json(&dir.join("recovery-admitted.json"))
+            .map_err(|_|ReplacementError::OutcomeUnknown)?;
+        if recorded!=self.admission {return Err(ReplacementError::OutcomeUnknown);}
+        let j=deadline::RecoveryJournal::read(dir.into(),operation)?;
+        for step in ["stop-complete","revocation","socket-release"] {
+            if !j.has(step,true)? {return Err(ReplacementError::OutcomeUnknown);}
+        }
+        self.verified_owner(&self.home.join(".aperture/run/owner"),actor)?;
+        Ok(())
+    }
+    pub(crate) fn commit_quarantine(&self,actor:&AuthenticatedActor)->Result<(),ReplacementError> {
+        OwnerStore::new(self.home.join(".aperture/run/owner"))
+            .quarantine_recovered_codex(actor,self).map_err(|_|ReplacementError::OutcomeUnknown)?;
+        Ok(())
     }
 }
 /// Readmission is a NEW typed admission after recorded factual exit. It does
@@ -3000,9 +3026,7 @@ pub(crate) fn recover_codex_authorized(home:&Path, actor:&AuthenticatedActor,
         })?;
         absent(&home.join(".aperture/run").join(format!("{}.sock",request.seat)))?;
         let proof=StoppedCodexRecoveryProof {home:home.into(),admission:admission.clone(),expected,guard};
-        journal.phase("quarantine",||Ok(false),||{
-            store.quarantine_recovered_codex(actor,&proof).map_err(|_|ReplacementError::OutcomeUnknown)?;Ok(())
-        })?;
+        journal.quarantine_stopped(&proof,actor)?;
         drop(proof);
     }
     let quarantined=recovery_bound(home,actor,&admission)?;

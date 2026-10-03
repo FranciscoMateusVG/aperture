@@ -250,6 +250,19 @@ test("hub close 4001 (hello rejected): HUB_SOCKET_CLOSED code=4001, exit 1, no r
   }
 });
 
+test("hub close 4003 fences native plugin client without respawn or repeated hello", async () => {
+  const hub = startFakeHub(0, ws => ws.close(4003, "managed identity rejected"));
+  await hub.listening;
+  const client = spawnClient(hub.wss.address().port);
+  try {
+    await client.waitForLine(startsWith("HUB_SOCKET_CLOSED code=4003"), "managed rejection");
+    assert.equal(await client.waitForExit(), 1);
+    await sleep(150);
+    assert.equal(hub.hellos.length, 1);
+    assert.equal(client.lines.filter(startsWith("HUB_RECONNECTING")).length, 0);
+  } finally { client.kill(); hub.stop(); }
+});
+
 // ── 4. nothing listening at startup → keeps retrying ────────────────────────
 
 test("hub unreachable at startup: keeps retrying (≥2 attempts), connects once hub appears, never exits", async () => {
@@ -336,7 +349,10 @@ test('managed monitor sends no socket or hello before Active; same generation co
     renameSync(`${path}.tmp`, path);
   }
   publish('starting');
-  const hub = startFakeHub(0);
+  const hub = startFakeHub(0, (ws, index) => {
+    ws.send(JSON.stringify({type:"message",id:"fixture-pending",from:"glados",reminder:index>0,preview:"inbox"}));
+    if(index===0) setTimeout(()=>ws.close(1001,"fixture reconnect"),25);
+  });
   await hub.listening;
   const client = spawnClient(hub.wss.address().port, {
     HOME: home, APERTURE_RUN_DIR: run, APERTURE_OWNER_DIR: owner,
@@ -354,8 +370,14 @@ test('managed monitor sends no socket or hello before Active; same generation co
       type: 'hello', role: 'agent', agent: AGENT, token: TOKEN,
       generation: 1, token_id: digest,
     });
-    assert.equal(client.proc.exitCode, null);
+    const pid=client.proc.pid;
+    await hub.waitForHellos(2);
+    await client.waitForLine(line => line.includes('"reminder":true'), 'same pending notification after reconnect');
+    assert.deepEqual(hub.hellos[1],hub.hellos[0]);
+    assert.equal(client.proc.pid,pid);assert.equal(client.proc.exitCode,null);
+    assert.equal(client.lines.filter(line=>line.includes('"id":"fixture-pending"')).length,2);
     assert.equal(client.lines.some(line => line.includes(TOKEN)), false);
+    // Transport re-delivery is not model read/reply or business-effect replay.
   } finally {
     client.kill(); hub.stop(); rmSync(home, { recursive: true, force: true });
   }
