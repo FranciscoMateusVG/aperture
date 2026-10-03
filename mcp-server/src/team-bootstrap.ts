@@ -19,7 +19,7 @@ export type BootstrapSeatSelectors = z.infer<typeof bootstrapSeatSchema>;
 const same = (a: z.infer<typeof tuple>, b: z.infer<typeof tuple>) => a.harness === b.harness && a.model === b.model && a.reasoning === b.reasoning;
 /** Exact Claude literals admitted for managed seats; mirrors Rust `CLAUDE_MODELS` and
  *  `src/services/team-terminal.ts` (parity-tested). No alias, `[1m]` suffix or fallback. */
-export const CLAUDE_EXACT_MODELS = ["claude-sonnet-5", "claude-fable-5-1", "claude-opus-5"] as const;
+export const CLAUDE_EXACT_MODELS = ["claude-sonnet-5", "claude-fable-5-1", "claude-opus-5", "claude-opus-5-5"] as const;
 const supported = (t: z.infer<typeof tuple>) => t.harness === "codex" ||
   (t.harness === "claude" && (CLAUDE_EXACT_MODELS as readonly string[]).includes(t.model) && t.reasoning === null);
 export function parseTeamList(value: unknown) {

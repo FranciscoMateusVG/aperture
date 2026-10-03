@@ -478,7 +478,7 @@ server.tool(
 
 server.tool(
   "team_get_creation_catalog",
-  "GLaDOS-only read-only native catalog of roles, repository availability and execution tuples. Use this before proposing a team; catalog configuration is not proof of live harness support. Claude managed launches remain unavailable.",
+  "GLaDOS-only read-only native catalog of roles, repository availability and execution tuples. Use this before proposing a team; catalog configuration is not proof of live harness support. Exact managed Claude models require native startup and observed model equality.",
   {},
   async () => {
     const denied = gladosControlDenied();
@@ -512,7 +512,7 @@ server.tool(
 
 server.tool(
   "team_bootstrap_seat",
-  "GLaDOS-only: start one eligible Codex or exact Claude (claude-sonnet-5, claude-fable-5-1 or claude-opus-5) / reasoning None seat of an already approved team through native ownership, fresh session and real exact model observation. expected_generation 0 = first start; 1 | 2 = explicit GLaDOS-only recovery of a normal Claude bootstrap that ended quarantined unobserved at exactly that generation (1 = the first bootstrap, 2 = its one recovery that failed the same way; nothing later, never automatic). Native proof: every recorded process Gone, token revoked at exactly that floor, the previous bootstrap admission expired Unknown, normal launch/attempt/release records; mints generation 2 or 3 and preserves every earlier fact. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. Started is not messaging readiness: require a real BEADS reply/read acknowledgment before business dispatch. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
+  "GLaDOS-only: start one eligible Codex or exact Claude (claude-sonnet-5, claude-fable-5-1, claude-opus-5 or claude-opus-5-5) / reasoning None seat of an already approved team through native ownership, fresh session and real exact model observation. expected_generation 0 = first start; 1 | 2 = explicit GLaDOS-only recovery of a normal Claude bootstrap that ended quarantined unobserved at exactly that generation (1 = the first bootstrap, 2 = its one recovery that failed the same way; nothing later, never automatic). Native proof: every recorded process Gone, token revoked at exactly that floor, the previous bootstrap admission expired Unknown, normal launch/attempt/release records; mints generation 2 or 3 and preserves every earlier fact. GLaDOS orchestrates all seats sequentially; the operator does not click per worker. Each call has its own bounded deadline. Started is not messaging readiness: require a real BEADS reply/read acknowledgment before business dispatch. No retries after unknown outcomes; inspect team_list and stop the batch on a blocker. No actor, model override or caller authority.",
   { input: bootstrapSeatSchema },
   async ({ input }) => {
     const denied = gladosControlDenied();

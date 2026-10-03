@@ -1384,6 +1384,7 @@ fn execution_catalog() -> Vec<ExecutionTuple> {
         ExecutionTuple { harness: Harness::Claude, model: "claude-sonnet-5".into(), reasoning: None },
         ExecutionTuple { harness: Harness::Claude, model: "claude-fable-5-1".into(), reasoning: None },
         ExecutionTuple { harness: Harness::Claude, model: "claude-opus-5".into(), reasoning: None },
+        ExecutionTuple { harness: Harness::Claude, model: "claude-opus-5-5".into(), reasoning: None },
     ];
     let efforts = [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Xhigh, ReasoningEffort::Max, ReasoningEffort::Ultra];
     for model in ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"] {
@@ -3251,7 +3252,7 @@ mod tests {
         assert!(validate_execution_tuple(&ExecutionTuple { reasoning: Some(ReasoningEffort::High), ..tuple.clone() }).is_err());
         assert!(validate_execution_tuple(&ExecutionTuple { harness: Harness::Codex, ..tuple.clone() }).is_err());
         assert!(validate_execution_tuple(&ExecutionTuple { model: "claude-sonnet-guessed".into(), ..tuple.clone() }).is_err());
-        for model in ["claude-fable-5-1", "claude-opus-5"] {
+        for model in ["claude-fable-5-1", "claude-opus-5", "claude-opus-5-5"] {
             let exact = ExecutionTuple { model: model.into(), ..tuple.clone() };
             assert!(validate_execution_tuple(&exact).is_ok(), "{model} is an authorized exact literal");
             assert!(validate_execution_tuple(&ExecutionTuple { reasoning: Some(ReasoningEffort::High), ..exact.clone() }).is_err());
@@ -3262,12 +3263,12 @@ mod tests {
             seat.observed_owner = Some(capability_owner(&seat.configured, 0, OwnerState::Stale));
             assert!(team_capabilities(&TeamLifecycle::Active, &[seat]).start, "{model} fresh exact seat is startable");
         }
-        for model in ["fable", "claude-fable-5", "claude-opus-5-5", "claude-fable-5-1[1m]", "claude-opus-5 ", "CLAUDE-OPUS-5"] {
+        for model in ["fable", "claude-fable-5", "claude-opus-5.5", "claude-opus-5-5[1m]", "claude-opus-5-5-latest", "claude-opus-5-5 ", "CLAUDE-OPUS-5-5", "claude-fable-5-1[1m]", "claude-opus-5 ", "CLAUDE-OPUS-5"] {
             let bad = ExecutionTuple { model: model.into(), ..tuple.clone() };
             assert!(validate_execution_tuple(&bad).is_err(), "{model} must not be admitted");
             assert!(!managed_execution_enabled(&bad), "{model} must not launch");
         }
-        assert_eq!(execution_catalog().iter().filter(|t| t.harness == Harness::Claude && crate::team_claude_launch::is_exact_claude_model(&t.model)).count(), 3);
+        assert_eq!(execution_catalog().iter().filter(|t| t.harness == Harness::Claude && crate::team_claude_launch::is_exact_claude_model(&t.model)).count(), 4);
         let mut seat = capability_seat("t1-qa", Harness::Claude, None);
         seat.configured.model = tuple.model;
         seat.configured.reasoning = None;

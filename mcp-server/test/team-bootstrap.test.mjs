@@ -43,7 +43,7 @@ test('bootstrap receipt matches the actual Rust-serialized shared wire fixture',
  assert.equal(parseBootstrapStarted(wire,input,tuple).result.owner.actual.model,'gpt-5.6-sol');
 });
 
-test('normal Claude admission is exact Sonnet/None, still requires native capability and actual observation',()=>{
+test('normal Claude admission is exact allowlisted model/None, still requires native capability and actual observation',()=>{
  const claude={harness:'claude',model:'claude-sonnet-5',reasoning:null};
  function claudeList(t=claude){
   const v=list(), row=v.result[0], s={...seat,...t};
@@ -52,9 +52,9 @@ test('normal Claude admission is exact Sonnet/None, still requires native capabi
   return v;
  }
  assert.deepEqual(bootstrapSelection(claudeList(),input),claude);
- assert.deepEqual([...CLAUDE_EXACT_MODELS],['claude-sonnet-5','claude-fable-5-1','claude-opus-5']);
+ assert.deepEqual([...CLAUDE_EXACT_MODELS],['claude-sonnet-5','claude-fable-5-1','claude-opus-5','claude-opus-5-5']);
  for(const model of CLAUDE_EXACT_MODELS){const t={...claude,model};assert.deepEqual(bootstrapSelection(claudeList(t),input),t);assert.throws(()=>bootstrapSelection(claudeList({...t,reasoning:'low'}),input));}
- for(const t of [{...claude,model:'sonnet'},{...claude,model:'fable'},{...claude,model:'claude-other'},{...claude,model:'claude-fable-5'},{...claude,model:'claude-opus-5-5'},{...claude,model:'claude-fable-5-1[1m]'},{...claude,reasoning:'high'}])
+ for(const t of [{...claude,model:'sonnet'},{...claude,model:'fable'},{...claude,model:'claude-other'},{...claude,model:'claude-fable-5'},{...claude,model:'claude-opus-5.5'},{...claude,model:'claude-opus-5-5[1m]'},{...claude,model:'claude-opus-5-5-latest'},{...claude,model:'claude-opus-5-5 '},{...claude,model:'CLAUDE-OPUS-5-5'},{...claude,model:'claude-fable-5-1[1m]'},{...claude,reasoning:'high'}])
   assert.throws(()=>bootstrapSelection(claudeList(t),input));
  const disabled=claudeList();disabled.result[0].capabilities.start=false;
  assert.throws(()=>bootstrapSelection(disabled,input));
@@ -62,6 +62,16 @@ test('normal Claude admission is exact Sonnet/None, still requires native capabi
  assert.deepEqual(parseBootstrapStarted(wire,input,claude).result.owner.actual,claude);
  wire.result.owner.actual=null;
  assert.throws(()=>parseBootstrapStarted(wire,input,claude),/E_CONTROL_UNKNOWN/);
+});
+
+test('Opus 5.5 receipt requires the exact requested model, never Opus 5 or an alias',()=>{
+ const requested={harness:'claude',model:'claude-opus-5-5',reasoning:null};
+ const wire=started();wire.result.owner.configured=requested;wire.result.owner.actual=requested;
+ assert.deepEqual(parseBootstrapStarted(wire,input,requested).result.owner.actual,requested);
+ for(const model of ['claude-opus-5','opus','claude-opus-5.5','claude-opus-5-5[1m]']){
+  wire.result.owner.actual={...requested,model};
+  assert.throws(()=>parseBootstrapStarted(wire,input,requested),/E_CONTROL_UNKNOWN/);
+ }
 });
 
 test('recovery selector 1 admits only the quarantined unobserved first Claude bootstrap and proves generation 2',()=>{

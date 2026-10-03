@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 /// normal admission uses `CLAUDE_MODELS` through `is_exact_claude_model`.
 pub(crate) const MODEL: &str = "claude-sonnet-5";
 /// Exact Claude model literals admitted for managed seats (operator-authorized
-/// 2026-09-24, aperture-wzayo). Reasoning is always None. No alias (`opus`,
+/// 2026-09-24, aperture-wzayo; Opus 5.5 added 2026-10-03, aperture-xpmca). Reasoning is always None. No alias (`opus`,
 /// `sonnet`, `fable`), no context suffix (`[1m]`), no prefix/substring match,
 /// no fallback resolution: the observed status-line id must equal one of these
 /// AND equal the requested literal of the same attempt.
-pub(crate) const CLAUDE_MODELS: [&str; 3] = [MODEL, "claude-fable-5-1", "claude-opus-5"];
+pub(crate) const CLAUDE_MODELS: [&str; 4] = [MODEL, "claude-fable-5-1", "claude-opus-5", "claude-opus-5-5"];
 pub(crate) fn is_exact_claude_model(model: &str) -> bool {
     CLAUDE_MODELS.contains(&model)
 }
@@ -298,7 +298,7 @@ mod tests {
             assert_eq!(found, rust, "{marker} drifted from team_claude_launch::CLAUDE_MODELS");
         }
         for m in CLAUDE_MODELS {
-            assert!(m.starts_with("claude-") && !m.contains('[') && m != "claude-opus-5-5", "{m}");
+            assert!(m.starts_with("claude-") && !m.contains('['), "{m}");
         }
     }
     #[test]
@@ -320,7 +320,7 @@ mod tests {
     }
     #[test]
     fn alias_codex_reasoning_and_bad_selectors_are_not_authority() {
-        for model in ["sonnet", "opus", "fable", "claude-fable-5", "claude-opus-5-5", "claude-fable-5-1[1m]", "unknown"] {
+        for model in ["sonnet", "opus", "fable", "claude-fable-5", "claude-opus-5.5", "claude-opus-5-5[1m]", "claude-opus-5-5-latest", "claude-opus-5-5 ", "CLAUDE-OPUS-5-5", "claude-fable-5-1[1m]", "unknown"] {
             let mut t = tuple();
             t.model = model.into();
             assert!(exact_tuple(&t).is_err(), "{model} is not an exact literal");
