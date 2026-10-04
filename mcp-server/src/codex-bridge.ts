@@ -403,6 +403,7 @@ export class CodexBridgeClient {
 
   private threadId: string | null = null;
   private turnActive = false;
+  private turnStateEpoch = 0;
   private joined = false;
   private stopped = false;
   private offlineLogged = false;
@@ -856,6 +857,7 @@ export class CodexBridgeClient {
       if (cursor !== null) throw new Error("incomplete");
       trace.rpc_reason = "none";
       trace.loaded_global = seen.has(owner.threadId);
+      const stateEpochBeforeRead = this.turnStateEpoch;
       let read: Record<string, unknown>;
       try { read = await rpc("thread/read", { threadId: owner.threadId, includeTurns: false }); }
       catch (e) {
@@ -881,11 +883,13 @@ export class CodexBridgeClient {
       // the effectful persisted readmission is forbidden by a busy snapshot.
       if (loaded && status.type === "active") this.setTurnActive(true);
       if (!loaded) {
-        code = "E_THREAD_RESUME_BUSY";
-        if (this.turnActive) throw new Error("busy");
         code = "E_THREAD_PERSISTENCE_UNVERIFIED";
         if (typeof thread.path !== "string" || !thread.path.startsWith("/") || thread.ephemeral !== false) throw new Error("persisted proof");
         guard();
+        // notLoaded supersedes an old optimistic busy flag, never a newer
+        // notification (including true→true) arriving during metadata read.
+        if (this.turnStateEpoch !== stateEpochBeforeRead) { code = "E_THREAD_RESUME_BUSY"; throw new Error("state changed during read"); }
+        this.setTurnActive(false);
         if (this.turnActive) { code = "E_THREAD_RESUME_BUSY"; throw new Error("busy"); }
         // Proof from a prior loaded lifetime cannot authorize this one.
         this.managedMcpProven = false;
@@ -1391,6 +1395,9 @@ export class CodexBridgeClient {
         if (/^(idle|ready|completed)$/i.test(status)) this.setTurnActive(false);
         else if (/^(active|busy|running|generating|in_?progress|turn.*)$/i.test(status)) {
           this.setTurnActive(true);
+        } else {
+          // An unrecognized/new native state is not permission to resume.
+          this.turnStateEpoch++;
         }
         return;
       }
@@ -1400,6 +1407,7 @@ export class CodexBridgeClient {
   }
 
   private setTurnActive(active: boolean): void {
+    this.turnStateEpoch++; // evidence freshness, even if the boolean is equal
     if (this.turnActive === active) return;
     this.turnActive = active;
     if (this.joined) this.hooks.broadcastPresence(this.agent, active ? "busy" : "idle");

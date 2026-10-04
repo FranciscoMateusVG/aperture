@@ -231,3 +231,15 @@ unread row remains in BEADS; no automatic ACK or new mission is created.
   hub/server/worker restart, package build, manual resume or provider action is
   part of this source delivery. Native Open's separate tmux-target defect and
   Claude recovery witnesses are not changed by this four-file patch.
+
+### F-DR1 follow-up (successor of reviewed f4db6ed4)
+
+Wheatley independently ran f4db6ed4: 65/65 PASS and causal RED against 568.
+His residual finding is addressed narrowly: exact native notLoaded, persisted
+metadata and current owner/socket/tuple/deadline fences may clear an older
+optimistic busy flag. An epoch captured before thread/read must still match;
+every new turn-state indication advances it even for equal booleans. A newer
+state denies resume with E_THREAD_RESUME_BUSY instead of being overwritten.
+Loaded active STOP/steer and active status after resume remain unchanged. The
+old busy-notLoaded denial fixture is replaced by stale-state recovery and two
+notification-during-read variants. Review/application remain separate gates.

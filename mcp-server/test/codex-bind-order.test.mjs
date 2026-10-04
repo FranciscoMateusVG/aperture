@@ -1015,7 +1015,7 @@ function nativeThread(overrides = {}) {
 
 for (const [kind, code] of [
   ["absent", "E_THREAD_ABSENT"], ["owner-drift", "E_MCP_OWNER_CHANGED"],
-  ["terminal", "E_MCP_STARTUP_CHANGED"], ["busy-notLoaded", "E_THREAD_RESUME_BUSY"],
+  ["terminal", "E_MCP_STARTUP_CHANGED"],
   ["active-notLoaded", "E_THREAD_STATUS_CONFLICT"], ["busy-wrong-thread", "E_THREAD_BINDING_UNVERIFIED"],
   ["read-params", "E_THREAD_STATUS_UNAVAILABLE"],
 ]) test(`delivery readmission: ${kind} denies resume and injection`, async t => {
@@ -1027,7 +1027,7 @@ for (const [kind, code] of [
     s.server.notify("mcpServer/startupStatus/updated", { threadId: "owner-thread", name: "aperture-bus", status: "failed" });
     await waitFor(() => s.bridge.mcpReadiness === "blocked", "terminal fence");
   }
-  if (kind === "busy-notLoaded" || kind === "busy-wrong-thread") {
+  if (kind === "busy-wrong-thread") {
     s.server.notify("turn/started", { threadId: "owner-thread" });
     await waitFor(() => s.bridge.isTurnActive, "busy fence");
   }
@@ -1162,4 +1162,51 @@ for (const unloads of [1, 2]) test(`delivery readmission: ${unloads} unload(s) b
     assert.equal(s.logs.findLast(l => l.event === "codex_managed_mcp_blocked").code, "E_MCP_THREAD_NOT_LOADED");
     assert.equal(s.bridge.delivered.has("m-window"), false, "not acked or marked injected");
   } else assert.equal(s.bridge.mcpReadiness, "ready");
+});
+
+// F-DR1: native notLoaded can replace an OLD optimistic flag, never a newer
+// turn/thread notification arriving while its metadata response is in flight.
+test("F-DR1 stale optimistic busy is superseded by exact native notLoaded", async t => {
+  const s = await deliveryReadmissionScenario(t);
+  setUnread([msgRow("m-before-unload", "glados", s.agent, "first fixture turn")]);
+  s.bridge.deliver(); await s.bridge.deliverChain;
+  await waitFor(() => s.server.turnCallsContaining("m-before-unload").length === 1, "initial optimistic turn");
+  assert.equal(s.bridge.isTurnActive, true);
+  // Completion notification was lost; no disconnect or manual flag update.
+  s.server.loadedThreads = [];
+  setUnread([msgRow("m-after-stale", "glados", s.agent, "technical continuation")]);
+  s.bridge.deliver(); await s.bridge.deliverChain;
+  await waitFor(() => s.server.turnCallsContaining("m-after-stale").length === 1, "stale flag recovered");
+  assert.equal(s.server.callsOf("thread/resume").length, 1);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 2);
+  assert.equal(s.server.turnCallsContaining("m-after-stale")[0].method, "turn/start");
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), s.ownerBytes);
+});
+
+test("F-DR1 notification during read preserves busy and denies resume", async t => {
+  for (const method of ["turn/started", "thread/status/changed"]) await t.test(method, async t => {
+    const s = await deliveryReadmissionScenario(t);
+    setUnread([msgRow("m-active-first", "glados", s.agent, "optimistic busy before await")]);
+    s.bridge.deliver(); await s.bridge.deliverChain;
+    await waitFor(() => s.server.turnCallsContaining("m-active-first").length === 1, "optimistic busy");
+    assert.equal(s.bridge.isTurnActive, true);
+    s.server.loadedThreads = [];
+    s.server.delays["thread/read"] = 120;
+    const reads = s.server.callsOf("thread/read").length;
+    const epoch = s.bridge.turnStateEpoch;
+    setUnread([msgRow("m-race-busy", "glados", s.agent, "must remain unread")]);
+    s.bridge.deliver();
+    await waitFor(() => s.server.callsOf("thread/read").length > reads, "read request in flight");
+    s.server.notify(method, {threadId:"owner-thread", status:{type:"active",activeFlags:[]}});
+    await waitFor(() => s.bridge.turnStateEpoch > epoch, "same-boolean notification received");
+    await s.bridge.deliverChain;
+    assert.equal(s.bridge.isTurnActive, true, "new busy evidence not cleared");
+    assert.equal(s.server.callsOf("thread/resume").length, 0);
+    assert.equal(s.server.turnCallsContaining("m-race-busy").length, 0);
+    assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1);
+    assert.ok(s.logs.some(l => l.code === "E_THREAD_RESUME_BUSY"));
+    assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), s.ownerBytes);
+  });
 });
