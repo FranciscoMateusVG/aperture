@@ -951,6 +951,7 @@ test("managed loaded thread survives connection loss without resume and replays 
 for (const [kind, loadedThreads, threadRead, code] of [
   ["absent", [], null, "E_THREAD_ABSENT"],
   ["contradiction", ["owner-thread"], null, "E_THREAD_STATUS_CONFLICT"],
+  ["system-error", ["owner-thread"], {thread: nativeThread({status:{type:"systemError"}})}, "E_THREAD_SYSTEM_ERROR"],
   ["no-persistence", [], {thread:{id:"owner-thread",model:"gpt-6-astra",reasoningEffort:"high",path:null,ephemeral:false,status:{type:"notLoaded"}}}, "E_THREAD_PERSISTENCE_UNVERIFIED"],
   ["wrong-model", ["owner-thread"], {thread:{id:"owner-thread",model:"wrong",reasoningEffort:"high",path:null}}, "E_THREAD_BINDING_UNVERIFIED"],
   ["wrong-thread", ["owner-thread"], {thread:{id:"other",model:"gpt-6-astra",reasoningEffort:"high",path:null}}, "E_THREAD_BINDING_UNVERIFIED"],
@@ -1012,6 +1013,43 @@ function nativeThread(overrides = {}) {
   return { id: "owner-thread", model: "gpt-6-astra", reasoningEffort: "high",
     path: "/fixture/rollout.jsonl", ephemeral: false, status: { type: "notLoaded" }, ...overrides };
 }
+
+// A native systemError is a known denied state, not a status contradiction.
+// No error payload is needed to classify it, and ready notifications cannot
+// turn it into readmission/retry. Invalid or contradictory metadata still deny.
+for (const [kind, loaded, status, code] of [
+  ["systemError", true, {type:"systemError"}, "E_THREAD_SYSTEM_ERROR"],
+  ["invalid-enum", true, {type:"PRIVATE_STATUS_SENTINEL"}, "E_THREAD_STATUS_CONFLICT"],
+  ["missing-status", true, null, "E_THREAD_STATUS_CONFLICT"],
+  ["loaded-notLoaded", true, {type:"notLoaded"}, "E_THREAD_STATUS_CONFLICT"],
+  ["unloaded-systemError", false, {type:"systemError"}, "E_THREAD_STATUS_CONFLICT"],
+]) test(`native status category: ${kind} denies delivery without effects or ready retry`, async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.loadedThreads = loaded ? ["owner-thread"] : [];
+  s.server.threadRead = {thread: nativeThread({status,
+    error: {message:"PRIVATE_ERROR_SENTINEL", codexErrorInfo:"PRIVATE_CODE_SENTINEL"}})};
+  const begin = s.server.calls.length;
+  setUnread([msgRow("m-native-denied", "glados", s.agent, "PRIVATE_BODY_SENTINEL")]);
+  s.bridge.deliver(); await s.bridge.deliverChain;
+  const event = s.logs.findLast(l => l.event === "codex_managed_thread_blocked");
+  assert.equal(event?.code, code);
+  assert.equal(event.method, "thread/read");
+  assert.equal(event.loaded_global, loaded);
+  assert.equal(event.resumed_on_this_socket, false);
+  assert.equal(event.rpc_reason, "none");
+  assert.equal(s.bridge.mcpReadiness, "blocked");
+  const afterDenial = s.server.calls.length;
+  s.server.notify("mcpServer/startupStatus/updated", {threadId:"owner-thread",name:"aperture-bus",status:"ready"});
+  await delay(180); // longer than the fixture's retry timer; no automatic retry
+  assert.equal(s.server.calls.length, afterDenial);
+  assert.deepEqual(s.server.calls.slice(begin).map(c => c.method), ["thread/loaded/list", "thread/read"]);
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.calls.filter(c => c.method.startsWith("turn/")).length, 0);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1, "only initial fixture admission proof");
+  assert.equal(JSON.stringify(s.logs).includes("PRIVATE_"), false, "trace contains categories only");
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), s.ownerBytes);
+});
 
 for (const [kind, code] of [
   ["absent", "E_THREAD_ABSENT"], ["owner-drift", "E_MCP_OWNER_CHANGED"],

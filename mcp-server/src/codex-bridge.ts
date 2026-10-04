@@ -872,10 +872,13 @@ export class CodexBridgeClient {
       if (!thread || thread.id !== owner.threadId || thread.model !== owner.requested.model ||
           thread.reasoningEffort !== owner.requested.reasoning) throw new Error("binding");
       const loaded = seen.has(owner.threadId);
+      const status = thread.status as { type?: unknown; activeFlags?: unknown } | undefined;
+      // A known native failed state is not a shape/loaded contradiction. Keep
+      // it denied without reading error content or making it recoverable.
+      if (loaded && status?.type === "systemError") { code = "E_THREAD_SYSTEM_ERROR"; throw new Error(code); }
       // A precise status not-found permits ONE causal reclassification, not
       // speculative resume of a still-loaded thread or connection attachment.
       if (requireUnloaded && loaded) { code = "E_MCP_THREAD_NOT_LOADED"; throw new Error(code); }
-      const status = thread.status as { type?: unknown; activeFlags?: unknown } | undefined;
       code = "E_THREAD_STATUS_CONFLICT";
       if (!status || (loaded ? status.type !== "idle" && status.type !== "active" : status.type !== "notLoaded") ||
           (status.type === "active" && !Array.isArray(status.activeFlags))) throw new Error("status");
