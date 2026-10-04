@@ -165,3 +165,69 @@ facts, never a new operation UUID to evade Unknown. Plugin migration of a
 currently healthy Claude session is not included. Rollback retains old package
 inputs, but cannot undo accepted context loss or erase a completed lifecycle
 transition; older readers may fail closed on new facts.
+
+## Delivery-time readmission (04 October 2026, child of 568ae426)
+
+The authorized 16:33:13Z RO probe used the bridge's exact initialize and status
+request shapes on the existing QA app-server: loaded list empty, exact persisted
+thread metadata `notLoaded`, and thread-scoped MCP status rejected with the
+native exact-thread not-found predicate. This demonstrates a later unload (A),
+not its cause. Per-connection catalog/attachment behavior (B) remains unproven.
+The sanitized receipt is `bridge-status-recon/bridge-exact-initialize-ro.json`
+under `~/aperture-evidence/aperture-g4nyg/2026-10-04/`, SHA256
+`be87ee5b43867a055f8af511d0c13451a60f0abab1253991da4ee2175bc9c718`.
+No further live probe or resume was performed for this source change.
+
+Previously delivery checked MCP without reclassifying the thread; only initial
+binding could resume a persisted, unloaded thread. The existing socket/owner
+singleflight now includes classification, at most one exact persisted/notLoaded
+resume, metadata readback, and native MCP proof within one 20-second deadline.
+The resume happens on the durable bridge socket, never a transient rescue
+client. It invalidates the earlier callable proof. Loaded threads get no
+speculative resume; active loaded threads retain normal steer/STOP delivery and
+message-ID dedupe. Busy + unloaded, owner/socket drift, terminal readiness,
+missing persistence, absent/mismatched metadata and malformed requests deny.
+Owner, generation and thread authority are not rewritten.
+
+The response must match a pending numeric request ID, an allowed method
+(`thread/read` or `mcpServerStatus/list`), code -32600, and the native exact
+`thread not found: <expected thread>` message to count as not-found. Other
+-32600 errors are invalid-request, not recovery authority. Finite diagnostics
+include method, loaded_global, resumed_on_this_socket, and rpc_reason; no raw
+RPC error, catalog, inbox body or thread identifier is added to those events.
+`resumed_on_this_socket` records a successful resume response on this socket,
+not an assertion about the provider or a durable runtime fact.
+
+To close the read-to-status unload window, an exact not-found from status after
+a loaded classification permits one causal reclassification in the SAME flight
+and deadline. It must now prove persisted/notLoaded before the flight's sole
+resume. Still-loaded contradiction or a second not-found ends the flight with a
+finite denial; it never loops, renews the budget or starts a new thread. The
+unread row remains in BEADS; no automatic ACK or new mission is created.
+
+### Evidence and limits of this child
+
+- The same open-socket unload oracle against compiled 568 source is RED:
+  0 resumes instead of 1. With this delta it is GREEN: exactly one resume,
+  metadata readback + callable proof, one inject, same socket/owner bytes.
+- The affected bind-order execution was **64 PASS / 1 FAIL (65 tests)**. The new
+  budget oracle advanced its clock before the intended RPC and failed its
+  expected-stage assertion; it did not record the alternate code. A scheduling
+  phase race is the explanation inferred from that oracle, not a runtime cause
+  established by this log. The only subsequent test edit synchronizes clock
+  advancement to actual MCP request arrival, keeping the budget/assertion. Its
+  focused final rerun is **1/1 PASS**. Do not report a final 65/65 execution.
+- The affected run includes 1/2 unloads between read and status, ceiling one
+  resume, busy loaded STOP/steer, busy/contradictory/absent/drift/terminal denies,
+  precise error categorization, singleflight, and the previous reconnect/replay,
+  startup-epoch/deadline and standing delivery regressions. No Rust/general
+  matrix rerun was needed. TypeScript build PASS.
+- A preliminary build invoked from the repo root failed to locate the existing
+  MCP TypeScript entrypoint; the corrected MCP-directory build passed. Both
+  logs are retained, not classified as a product failure.
+- Application, real QA read/ACK/reply, PR1017 review and any healthy-seat witness
+  are **NOT_RUN** here. Root may apply the reviewed MCP through the existing
+  paired package/launcher lifecycle, retaining canonical worker inputs. No
+  hub/server/worker restart, package build, manual resume or provider action is
+  part of this source delivery. Native Open's separate tmux-target defect and
+  Claude recovery witnesses are not changed by this four-file patch.

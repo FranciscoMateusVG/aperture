@@ -43,6 +43,11 @@ export class FakeAppServer {
     this.mcpProbe = opts.mcpProbe ?? { content: [{ type: "text", text: "No unread messages." }], isError: false };
     this.loadedThreads = opts.loadedThreads ?? [];
     this.threadRead = opts.threadRead;
+    this.requireLoadedMcp = opts.requireLoadedMcp ?? false;
+    this.rpcErrors = {};
+    this.unloadAfterRead = 0;
+    this.connectionCounter = 0;
+    this.connectionIds = new WeakMap();
     this.threadStartModel = opts.threadStartModel;
     this.threadStartReasoning = opts.threadStartReasoning;
     /** @type {{method: string, params: unknown, id: number|string|null, ts: number}[]} */
@@ -63,6 +68,7 @@ export class FakeAppServer {
     this.wss = new WebSocketServer({ server: this.http });
     this.wss.on("connection", (ws) => {
       this.sockets.add(ws);
+      this.connectionIds.set(ws, ++this.connectionCounter);
       ws.on("close", () => this.sockets.delete(ws));
       ws.on("message", (data) => {
         void this.onMessage(ws, data.toString());
@@ -85,6 +91,7 @@ export class FakeAppServer {
     // Log at ARRIVAL time so `calls` order == wire order regardless of delays.
     this.calls.push({
       method: msg.method,
+      connection: this.connectionIds.get(ws),
       params: msg.params ?? null,
       id: msg.id ?? null,
       ts: Date.now(),
@@ -104,9 +111,16 @@ export class FakeAppServer {
       return;
     }
 
+    if (this.rpcErrors[msg.method]) {
+      this.send(ws, { jsonrpc: "2.0", id: msg.id, error: this.rpcErrors[msg.method] });
+      return;
+    }
     let result = {};
     switch (msg.method) {
       case "mcpServerStatus/list":
+        if (this.requireLoadedMcp && !this.loadedThreads.includes(msg.params.threadId)) {
+          this.send(ws, { jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: `thread not found: ${msg.params.threadId}` } }); return;
+        }
         result = this.mcpStatus; break;
       case "mcpServer/tool/call":
         result = this.mcpProbe; break;
@@ -114,15 +128,20 @@ export class FakeAppServer {
         result = { data: this.loadedThreads, nextCursor: null }; break;
       case "thread/read":
         if (this.threadRead === null) {
-          this.send(ws, { jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: "thread not found: fixture" } }); return;
+          this.send(ws, { jsonrpc: "2.0", id: msg.id, error: { code: -32600, message: `thread not found: ${msg.params.threadId}` } }); return;
         }
-        result = this.threadRead ?? { thread: { id: msg.params.threadId, model: "gpt-6-astra", reasoningEffort: "high", path: "/fixture/rollout.jsonl", ephemeral: false } }; break;
+        result = this.threadRead ?? { thread: { id: msg.params.threadId, model: "gpt-6-astra", reasoningEffort: "high", path: "/fixture/rollout.jsonl", ephemeral: false,
+          status: { type: this.loadedThreads.includes(msg.params.threadId) ? "idle" : "notLoaded" } } }; break;
+      case "thread/resume":
+        if (!this.loadedThreads.includes(msg.params.threadId)) this.loadedThreads.push(msg.params.threadId);
+        break;
       case "thread/list":
         result = { data: this.threads };
         break;
       case "thread/start": {
         const id = `t-fake-${++this.threadCounter}`;
         this.threads.unshift({ id });
+        this.loadedThreads.push(id);
         result = {
           thread: { id },
           model: this.threadStartModel ?? msg.params?.model ?? "gpt-test",
@@ -133,6 +152,12 @@ export class FakeAppServer {
       // initialize, thread/resume, turn/start, turn/steer → empty result
       default:
         result = {};
+    }
+    // Faithful race: metadata was loaded, but the following thread-scoped
+    // status request sees an unload on the SAME still-open connection.
+    if (msg.method === "thread/read" && this.loadedThreads.includes(msg.params.threadId) && this.unloadAfterRead > 0) {
+      this.unloadAfterRead--;
+      this.loadedThreads = this.loadedThreads.filter(id => id !== msg.params.threadId);
     }
     this.send(ws, { jsonrpc: "2.0", id: msg.id, result });
   }

@@ -131,7 +131,7 @@ async function scenario(t, {
   failures = {},
   threadStartModel,
   threadStartReasoning,
-  mcpStatus, mcpProbe, loadedThreads, threadRead,
+  mcpStatus, mcpProbe, loadedThreads, threadRead, requireLoadedMcp,
   beforeManagedOwnerReadback,
 } = {}) {
   const agent = `cbx${++sockCounter}`;
@@ -143,7 +143,7 @@ async function scenario(t, {
   writeFileSync(join(AGENTS, agent, "prompt.md"), "fixture");
   const sock = join(TMP, `${agent}.sock`);
   assert.ok(sock.length < 100, `socket path too long for sun_path: ${sock}`);
-  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning, mcpStatus, mcpProbe, loadedThreads, threadRead });
+  const server = new FakeAppServer(sock, { threads, delays, failures, threadStartModel, threadStartReasoning, mcpStatus, mcpProbe, loadedThreads, threadRead, requireLoadedMcp });
   await server.start();
   const { hooks, logs, presence } = makeHooks(beforeManagedOwnerReadback);
   const bridge = new CodexBridgeClient(agent, sock, hooks);
@@ -926,7 +926,7 @@ test("late ready cannot recover a changed owner even with a connected catalog", 
 // Native 0.158 classification: no provider/rollout manufacture.
 test("managed loaded thread survives connection loss without resume and replays only unread", async t => {
   const s = await scenario(t, { loadedThreads: ["owner-thread"], threadRead: { thread: {
-    id: "owner-thread", model: "gpt-6-astra", reasoningEffort: "high", path: null, ephemeral: false,
+    id: "owner-thread", model: "gpt-6-astra", reasoningEffort: "high", path: null, ephemeral: false, status: { type: "idle" },
   } } });
   makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "owner-thread" });
   const before = readFileSync(join(TMP, "owner", `${s.agent}.json`));
@@ -934,8 +934,9 @@ test("managed loaded thread survives connection loss without resume and replays 
   s.bridge.start();
   await waitFor(() => s.server.turnCallsContaining("loaded-1").length === 1, "first challenge");
   setUnread([]); // durable ACK is BEADS truth, not the bridge's in-memory set
+  const readsBeforeReconnect = s.server.callsOf("thread/read").length;
   dropClients(s.server);
-  await waitFor(() => s.server.callsOf("thread/read").length === 2 && s.bridge.isBound, "same loaded thread re-adopted");
+  await waitFor(() => s.server.callsOf("thread/read").length > readsBeforeReconnect && s.bridge.isBound, "same loaded thread re-adopted");
   s.bridge.deliver(); await delay(100);
   assert.equal(s.server.turnCallsContaining("loaded-1").length, 1);
   setUnread([msgRow("loaded-2", "glados", s.agent, "after reconnect")]);
@@ -950,7 +951,7 @@ test("managed loaded thread survives connection loss without resume and replays 
 for (const [kind, loadedThreads, threadRead, code] of [
   ["absent", [], null, "E_THREAD_ABSENT"],
   ["contradiction", ["owner-thread"], null, "E_THREAD_STATUS_CONFLICT"],
-  ["no-persistence", [], {thread:{id:"owner-thread",model:"gpt-6-astra",reasoningEffort:"high",path:null,ephemeral:false}}, "E_THREAD_PERSISTENCE_UNVERIFIED"],
+  ["no-persistence", [], {thread:{id:"owner-thread",model:"gpt-6-astra",reasoningEffort:"high",path:null,ephemeral:false,status:{type:"notLoaded"}}}, "E_THREAD_PERSISTENCE_UNVERIFIED"],
   ["wrong-model", ["owner-thread"], {thread:{id:"owner-thread",model:"wrong",reasoningEffort:"high",path:null}}, "E_THREAD_BINDING_UNVERIFIED"],
   ["wrong-thread", ["owner-thread"], {thread:{id:"other",model:"gpt-6-astra",reasoningEffort:"high",path:null}}, "E_THREAD_BINDING_UNVERIFIED"],
 ]) test(`managed ${kind} is blocked, never fallback/new thread/turn/reconnect`, async t => {
@@ -968,4 +969,197 @@ for (const [kind, loadedThreads, threadRead, code] of [
   assert.equal(s.server.callsOf("mcpServer/tool/call").length, 0);
   assert.equal(s.server.calls.filter(x => x.method.startsWith("turn/")).length, 0);
   assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), before);
+});
+
+// Delivery-time regression: an open bridge is not proof its thread stayed loaded.
+async function deliveryReadmissionScenario(t) {
+  const s = await scenario(t, { loadedThreads: ["owner-thread"], requireLoadedMcp: true });
+  makeManagedSeat(s.agent); writeManagedOwner(s.agent, "active", { thread_id: "owner-thread" });
+  setUnread([]);
+  s.bridge.start();
+  await waitFor(() => s.bridge.isBound, "initial loaded bind");
+  await s.bridge.deliverChain;
+  s.ownerBytes = readFileSync(join(TMP, "owner", `${s.agent}.json`));
+  return s;
+}
+
+test("delivery readmission: unload on OPEN socket resumes once then proves MCP before one inject", async t => {
+  const s = await deliveryReadmissionScenario(t);
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  const begin = s.server.calls.length;
+  s.server.loadedThreads = [];
+  setUnread([msgRow("m-readmit", "glados", s.agent, "technical readmission challenge")]);
+  s.bridge.deliver(); s.bridge.deliver();
+  await s.bridge.deliverChain;
+  await delay(30); // outbound fire-and-forget arrival, not a retry
+  assert.equal(s.server.callsOf("thread/resume").length, 1);
+  assert.equal(s.server.turnCallsContaining("m-readmit").length, 1);
+  const calls = s.server.calls.slice(begin);
+  const index = method => calls.findIndex(c => c.method === method);
+  assert.ok(index("thread/loaded/list") < index("thread/resume"));
+  assert.ok(calls.findIndex((c, i) => i > index("thread/resume") && c.method === "thread/read") < index("mcpServerStatus/list"));
+  assert.ok(index("mcpServerStatus/list") < index("mcpServer/tool/call"));
+  assert.ok(index("mcpServer/tool/call") < index("turn/start"));
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 2, "resume invalidates old callable proof");
+  assert.equal(new Set(s.server.calls.map(c => c.connection)).size, 1, "all readmission/proof/injection on original bridge socket");
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.bridge.boundThreadId, "owner-thread");
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), s.ownerBytes);
+});
+
+function nativeThread(overrides = {}) {
+  return { id: "owner-thread", model: "gpt-6-astra", reasoningEffort: "high",
+    path: "/fixture/rollout.jsonl", ephemeral: false, status: { type: "notLoaded" }, ...overrides };
+}
+
+for (const [kind, code] of [
+  ["absent", "E_THREAD_ABSENT"], ["owner-drift", "E_MCP_OWNER_CHANGED"],
+  ["terminal", "E_MCP_STARTUP_CHANGED"], ["busy-notLoaded", "E_THREAD_RESUME_BUSY"],
+  ["active-notLoaded", "E_THREAD_STATUS_CONFLICT"], ["busy-wrong-thread", "E_THREAD_BINDING_UNVERIFIED"],
+  ["read-params", "E_THREAD_STATUS_UNAVAILABLE"],
+]) test(`delivery readmission: ${kind} denies resume and injection`, async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.loadedThreads = [];
+  if (kind === "absent") s.server.threadRead = null;
+  if (kind === "owner-drift") mutateManagedOwner(s.agent, o => { o.generation++; });
+  if (kind === "terminal") {
+    s.server.notify("mcpServer/startupStatus/updated", { threadId: "owner-thread", name: "aperture-bus", status: "failed" });
+    await waitFor(() => s.bridge.mcpReadiness === "blocked", "terminal fence");
+  }
+  if (kind === "busy-notLoaded" || kind === "busy-wrong-thread") {
+    s.server.notify("turn/started", { threadId: "owner-thread" });
+    await waitFor(() => s.bridge.isTurnActive, "busy fence");
+  }
+  if (kind === "active-notLoaded") s.server.threadRead = { thread: nativeThread({status: {type:"active", activeFlags:[]}}) };
+  if (kind === "busy-wrong-thread") {
+    s.server.loadedThreads = ["owner-thread"];
+    s.server.threadRead = { thread: nativeThread({id:"wrong",status:{type:"active",activeFlags:[]}}) };
+  }
+  if (kind === "read-params") s.server.rpcErrors["thread/read"] = { code:-32600, message:"invalid params PRIVATE_SENTINEL" };
+  const ownerBefore = readFileSync(join(TMP, "owner", `${s.agent}.json`));
+  setUnread([msgRow("m-denied", "glados", s.agent, "not delivered")]);
+  s.bridge.deliver(); await s.bridge.deliverChain;
+  assert.ok(s.logs.some(l => l.code === code), code);
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.turnCallsContaining("m-denied").length, 0);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1, "no new callable proof on denial");
+  assert.equal(JSON.stringify(s.logs).includes("PRIVATE_SENTINEL"), false);
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), ownerBefore);
+});
+
+test("delivery readmission: loaded active thread receives deduped STOP via steer without resume", async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.threadRead = { thread: nativeThread({status:{type:"active",activeFlags:[]}}) };
+  setUnread([msgRow("m-stop", "glados", s.agent, "STOP this fixture work")]);
+  s.bridge.deliver(); s.bridge.deliver(); await s.bridge.deliverChain;
+  await waitFor(() => s.server.turnCallsContaining("m-stop").length === 1, "STOP steer");
+  assert.equal(s.server.turnCallsContaining("m-stop")[0].method, "turn/steer");
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.equal(s.bridge.mcpReadiness, "ready");
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), s.ownerBytes);
+});
+
+for (const [variant, error, code, reason] of [
+  ["exact-missing", {code:-32600,message:"thread not found: owner-thread"}, "E_MCP_THREAD_NOT_LOADED", "remote_error"],
+  ["different-thread", {code:-32600,message:"thread not found: another-thread"}, "E_MCP_STATUS_UNAVAILABLE", "invalid_request"],
+  ["params", {code:-32600,message:"invalid params PRIVATE_SENTINEL"}, "E_MCP_STATUS_UNAVAILABLE", "invalid_request"],
+  ["other-code", {code:-32000,message:"thread not found: owner-thread"}, "E_MCP_STATUS_UNAVAILABLE", "remote_error"],
+  ["bare-prefix", {code:-32600,message:"thread not found"}, "E_MCP_STATUS_UNAVAILABLE", "invalid_request"],
+]) test(`delivery readmission: MCP ${variant} finite diagnosis, no speculative loaded resume`, async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.rpcErrors["mcpServerStatus/list"] = error;
+  setUnread([msgRow("m-mcp-denied", "glados", s.agent, "not delivered")]);
+  s.bridge.deliver(); await s.bridge.deliverChain;
+  const event = s.logs.findLast(l => l.event === "codex_managed_mcp_blocked");
+  assert.equal(event.code, code);
+  assert.equal(event.method, "mcpServerStatus/list");
+  assert.equal(event.rpc_reason, reason);
+  assert.equal(event.loaded_global, true);
+  assert.equal(event.resumed_on_this_socket, false);
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.turnCallsContaining("m-mcp-denied").length, 0);
+  assert.equal(JSON.stringify(event).includes(error.message), false, "never log the error body");
+});
+
+test("delivery readmission: singleflight includes classification and delayed resume on bridge socket", async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.loadedThreads = [];
+  s.server.delays["thread/resume"] = 120;
+  setUnread([msgRow("m-flight", "glados", s.agent, "coalesced notification")]);
+  s.bridge.deliver();
+  await waitFor(() => s.server.callsOf("thread/resume").length === 1, "resume flight");
+  const first = s.bridge.verifyManagedMcp(s.bridge.ws, s.bridge.managedMcpOwner);
+  const second = s.bridge.verifyManagedMcp(s.bridge.ws, s.bridge.managedMcpOwner);
+  assert.equal(first, second);
+  s.bridge.deliver();
+  s.server.notify("mcpServer/startupStatus/updated", {threadId:"owner-thread",name:"aperture-bus",status:"ready"});
+  assert.equal(await first, true);
+  await s.bridge.deliverChain;
+  await waitFor(() => s.server.turnCallsContaining("m-flight").length === 1, "coalesced delivery");
+  assert.equal(s.server.callsOf("thread/resume").length, 1);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 2);
+});
+
+for (const drift of ["owner", "terminal"]) test(`delivery readmission: ${drift} during classification denies effect`, async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.loadedThreads = [];
+  s.server.delays["thread/read"] = 100;
+  const reads = s.server.callsOf("thread/read").length;
+  setUnread([msgRow("m-drift", "glados", s.agent, "fenced")]);
+  s.bridge.deliver();
+  await waitFor(() => s.server.callsOf("thread/read").length > reads, "metadata in flight");
+  if (drift === "owner") mutateManagedOwner(s.agent, o => {o.generation++;});
+  else s.server.notify("mcpServer/startupStatus/updated", {threadId:"owner-thread",name:"aperture-bus",status:"failed"});
+  await s.bridge.deliverChain;
+  assert.equal(s.server.callsOf("thread/resume").length, 0);
+  assert.equal(s.server.turnCallsContaining("m-drift").length, 0);
+  assert.ok(s.logs.some(l => l.code === (drift === "owner" ? "E_MCP_OWNER_CHANGED" : "E_MCP_STARTUP_CHANGED")));
+});
+
+test("delivery readmission: one 20s budget covers resume and MCP, never renews after classification", async t => {
+  const s = await deliveryReadmissionScenario(t);
+  const now = Date.now.bind(Date); let offset = 0;
+  t.mock.method(Date, "now", () => now() + offset);
+  s.server.loadedThreads = [];
+  s.server.delays["thread/resume"] = 100;
+  s.server.delays["mcpServerStatus/list"] = 500;
+  setUnread([msgRow("m-deadline", "glados", s.agent, "held on deadline")]);
+  s.bridge.deliver();
+  await waitFor(() => s.server.callsOf("thread/resume").length === 1, "resume started");
+  // Spend half the SAME budget during classification. Advance the rest only
+  // once the MCP request has actually arrived: scheduler load must not move
+  // this oracle's expiration to an earlier RPC/phase.
+  offset += 10_000;
+  await waitFor(() => s.server.callsOf("mcpServerStatus/list").length === 2, "MCP after resume");
+  offset += 10_001;
+  await s.bridge.deliverChain;
+  assert.ok(s.logs.some(l => l.code === "E_MCP_ADMISSION_TIMEOUT"), JSON.stringify(s.logs.filter(l => l.code).map(({code, method, rpc_reason}) => ({code, method, rpc_reason}))));
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, 1, "only initial proof");
+  assert.equal(s.server.turnCallsContaining("m-deadline").length, 0);
+  assert.equal(s.server.callsOf("thread/resume").length, 1);
+});
+
+for (const unloads of [1, 2]) test(`delivery readmission: ${unloads} unload(s) between read and MCP bounded to one causal resume`, async t => {
+  const s = await deliveryReadmissionScenario(t);
+  s.server.unloadAfterRead = unloads;
+  const beforeReads = s.server.callsOf("thread/read").length;
+  setUnread([msgRow("m-window", "glados", s.agent, "read to status race")]);
+  s.bridge.deliver(); await s.bridge.deliverChain;
+  await delay(30);
+  assert.equal(s.server.callsOf("thread/resume").length, 1);
+  assert.equal(s.server.callsOf("thread/read").length - beforeReads, 3, "loaded, causal notLoaded, resumed readback");
+  assert.equal(s.server.callsOf("initialize").length, 1);
+  assert.equal(s.server.callsOf("thread/start").length, 0);
+  assert.deepEqual(readFileSync(join(TMP, "owner", `${s.agent}.json`)), s.ownerBytes);
+  assert.equal(s.server.turnCallsContaining("m-window").length, unloads === 1 ? 1 : 0);
+  assert.equal(s.server.callsOf("mcpServer/tool/call").length, unloads === 1 ? 2 : 1);
+  if (unloads === 2) {
+    assert.equal(s.bridge.mcpReadiness, "blocked");
+    assert.equal(s.logs.findLast(l => l.event === "codex_managed_mcp_blocked").code, "E_MCP_THREAD_NOT_LOADED");
+    assert.equal(s.bridge.delivered.has("m-window"), false, "not acked or marked injected");
+  } else assert.equal(s.bridge.mcpReadiness, "ready");
 });

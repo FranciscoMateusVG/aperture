@@ -355,9 +355,18 @@ function readModelOverrides(path: string): Record<string, string> {
 
 interface Pending {
   method: string;
+  expectedThreadId?: string;
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
+}
+
+type RpcFailure = Error & { threadNotFound?: boolean; rpcReason?: "remote_error" | "invalid_request" | "timeout" | "not_connected" | "socket_closed" };
+interface ManagedAdmissionTrace {
+  method: string;
+  loaded_global: boolean | null;
+  resumed_on_this_socket: boolean;
+  rpc_reason: "none" | "remote_error" | "invalid_request" | "timeout" | "not_connected" | "socket_closed" | "shape";
 }
 
 interface JsonRpcError {
@@ -408,6 +417,7 @@ export class CodexBridgeClient {
   private managedMcpTerminal = false;
   private managedMcpRecoverable = false;
   private managedMcpRecoveryUsed = false;
+  private managedResumedOnSocket = false;
   private managedMcpFlight: { ws: WebSocket; owner: ManagedActiveRuntime; promise: Promise<boolean> } | null = null;
   private managedMcpState: "not_checked" | "checking" | "ready" | "blocked" = "not_checked";
 
@@ -601,7 +611,6 @@ export class CodexBridgeClient {
           // One budget covers classification AND MCP admission. An Active owner
           // may have an in-memory thread but no rollout before its first turn.
           const until = Date.now() + 20_000;
-          if (!(await this.admitActiveThread(ws, active, until))) return;
           if (!(await this.verifyManagedMcp(ws, active, until))) return;
           this.bindToThread(active.threadId, "thread_list");
           if (!this.hooks.skipReplay) this.deliver();
@@ -798,24 +807,33 @@ export class CodexBridgeClient {
     throw new Error("E_FRESH_THREAD_UNVERIFIED: managed bridge disconnected before activation");
   }
 
-  /** Exact 0.158 thread metadata, never content, never a new turn to create a
-   * rollout. Loaded and persisted are separate: read success with path=null
-   * is NOT persisted proof. Absence is a blocked lifecycle, not zero effects. */
-  private async admitActiveThread(ws: WebSocket, owner: ManagedActiveRuntime, until: number): Promise<boolean> {
-    let code = "E_THREAD_STATUS_UNAVAILABLE";
-    const current = () => {
+  private managedCurrent(ws: WebSocket, owner: ManagedActiveRuntime): boolean {
+    try {
       const now = readManagedActiveRuntime(this.agent);
       return this.ws === ws && ws.readyState === WebSocket.OPEN && !this.stopped &&
         loadSeatRegistry().seats.get(this.agent)?.group === "team" &&
         now !== null && sameActiveRuntime(owner, now);
+    } catch { return false; }
+  }
+
+  /** Exact 0.158 metadata only. Loaded is not persisted; absence is not zero
+   * effects. Reclassify on delivery, never manufacture a rollout with a turn. */
+  private async admitActiveThread(ws: WebSocket, owner: ManagedActiveRuntime, until: number, trace: ManagedAdmissionTrace, requireUnloaded = false): Promise<boolean> {
+    let code = "E_THREAD_STATUS_UNAVAILABLE";
+    const current = () => this.managedCurrent(ws, owner);
+    const guard = () => {
+      if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
+      if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
+      if (Date.now() >= until) { code = "E_THREAD_ADMISSION_TIMEOUT"; throw new Error(code); }
     };
     const rpc = async (method: string, params: Record<string, unknown>) => {
-      if (!current()) throw new Error("owner changed");
-      const remaining = until - Date.now();
-      if (remaining <= 0) throw new Error("deadline");
-      const result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
-      if (!current() || Date.now() >= until) throw new Error("owner/deadline changed");
-      if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("shape");
+      trace.method = method;
+      guard();
+      let result: unknown;
+      try { result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, until - Date.now())); }
+      catch (error) { trace.rpc_reason = (error as RpcFailure).rpcReason ?? "remote_error"; guard(); throw error; }
+      guard();
+      if (!result || typeof result !== "object" || Array.isArray(result)) { trace.rpc_reason = "shape"; throw new Error("shape"); }
       return result as Record<string, unknown>;
     };
     try {
@@ -824,6 +842,7 @@ export class CodexBridgeClient {
       let cursor: string | null = null;
       for (let page = 0; page < 4; page++) {
         const result = await rpc("thread/loaded/list", { limit: 20, ...(cursor ? { cursor } : {}) });
+        trace.rpc_reason = "shape";
         if (!Array.isArray(result.data) || result.data.length > 20) throw new Error("shape");
         for (const id of result.data) {
           if (typeof id !== "string" || !id || seen.has(id)) throw new Error("shape");
@@ -835,6 +854,8 @@ export class CodexBridgeClient {
         cursor = result.nextCursor; cursors.add(cursor);
       }
       if (cursor !== null) throw new Error("incomplete");
+      trace.rpc_reason = "none";
+      trace.loaded_global = seen.has(owner.threadId);
       let read: Record<string, unknown>;
       try { read = await rpc("thread/read", { threadId: owner.threadId, includeTurns: false }); }
       catch (e) {
@@ -849,26 +870,51 @@ export class CodexBridgeClient {
       if (!thread || thread.id !== owner.threadId || thread.model !== owner.requested.model ||
           thread.reasoningEffort !== owner.requested.reasoning) throw new Error("binding");
       const loaded = seen.has(owner.threadId);
+      // A precise status not-found permits ONE causal reclassification, not
+      // speculative resume of a still-loaded thread or connection attachment.
+      if (requireUnloaded && loaded) { code = "E_MCP_THREAD_NOT_LOADED"; throw new Error(code); }
+      const status = thread.status as { type?: unknown; activeFlags?: unknown } | undefined;
+      code = "E_THREAD_STATUS_CONFLICT";
+      if (!status || (loaded ? status.type !== "idle" && status.type !== "active" : status.type !== "notLoaded") ||
+          (status.type === "active" && !Array.isArray(status.activeFlags))) throw new Error("status");
+      // Busy loaded threads still accept ordinary steer/STOP delivery. Only
+      // the effectful persisted readmission is forbidden by a busy snapshot.
+      if (loaded && status.type === "active") this.setTurnActive(true);
       if (!loaded) {
+        code = "E_THREAD_RESUME_BUSY";
+        if (this.turnActive) throw new Error("busy");
         code = "E_THREAD_PERSISTENCE_UNVERIFIED";
         if (typeof thread.path !== "string" || !thread.path.startsWith("/") || thread.ephemeral !== false) throw new Error("persisted proof");
+        guard();
+        if (this.turnActive) { code = "E_THREAD_RESUME_BUSY"; throw new Error("busy"); }
+        // Proof from a prior loaded lifetime cannot authorize this one.
+        this.managedMcpProven = false;
+        code = "E_THREAD_RESUME_UNVERIFIED";
         await rpc("thread/resume", { threadId: owner.threadId });
+        this.managedResumedOnSocket = true;
+        trace.resumed_on_this_socket = true;
         // Re-read the effective metadata, not just the old persisted metadata.
         const resumed = (await rpc("thread/read", { threadId: owner.threadId, includeTurns: false })).thread as Record<string, unknown> | undefined;
         if (!resumed || resumed.id !== owner.threadId || resumed.model !== owner.requested.model ||
             resumed.reasoningEffort !== owner.requested.reasoning) throw new Error("resumed binding");
+        const afterStatus = resumed.status as { type?: unknown; activeFlags?: unknown } | undefined;
+        if (!afterStatus || (afterStatus.type !== "idle" && afterStatus.type !== "active") ||
+            (afterStatus.type === "active" && !Array.isArray(afterStatus.activeFlags))) throw new Error("resumed status");
+        if (afterStatus.type === "active") this.setTurnActive(true);
       }
       this.hooks.beforeManagedOwnerReadback?.(this.agent, "active-resume");
       code = "E_MCP_OWNER_CHANGED";
-      if (!current()) throw new Error("owner changed");
-      this.hooks.log("codex_managed_thread_classified", { agent: this.agent, generation: owner.generation, kind: loaded ? "loaded" : "persisted" });
+      guard();
+      this.hooks.log("codex_managed_thread_classified", { agent: this.agent, generation: owner.generation, kind: loaded ? "loaded" : "persisted", ...trace });
       return true;
     } catch {
       if (this.ws !== ws || this.stopped) return false;
       this.managedMcpProven = false;
       this.managedMcpState = "blocked";
       this.managedMcpRecoverable = false;
-      this.hooks.log("codex_managed_thread_blocked", { agent: this.agent, generation: owner.generation, code });
+      if (!current()) code = "E_MCP_OWNER_CHANGED";
+      else if (this.managedMcpTerminal) code = "E_MCP_STARTUP_CHANGED";
+      this.hooks.log("codex_managed_thread_blocked", { agent: this.agent, generation: owner.generation, code, ...trace });
       return false;
     }
   }
@@ -882,14 +928,34 @@ export class CodexBridgeClient {
     const flight = this.managedMcpFlight;
     if (flight) return flight.ws === ws && sameActiveRuntime(owner, flight.owner)
       ? flight.promise : Promise.resolve(false);
-    const promise = this.checkManagedMcp(ws, owner, until).finally(() => {
+    // One connection/owner flight and ONE deadline cover every delivery's
+    // classification, optional persisted readmission, and native MCP proof.
+    if (!this.managedMcpOwner || !sameActiveRuntime(owner, this.managedMcpOwner)) this.managedMcpProven = false;
+    this.managedMcpOwner = owner;
+    this.managedMcpState = "checking";
+    const trace: ManagedAdmissionTrace = { method: "thread/loaded/list", loaded_global: null,
+      resumed_on_this_socket: this.managedResumedOnSocket, rpc_reason: "none" };
+    const promise = (async () => {
+      if (!(await this.admitActiveThread(ws, owner, until, trace))) return false;
+      const initiallyLoaded = trace.loaded_global === true;
+      const result = await this.checkManagedMcp(ws, owner, until, trace);
+      if (result === "ready") return true;
+      if (result !== "thread_not_loaded" || !initiallyLoaded) return false;
+      // Close the observed unload window between metadata and MCP. This is
+      // not a renewed budget or general RPC retry; the first pass did NOT
+      // resume, and the second must prove persisted/notLoaded before its sole
+      // resume. A second not-found ends the flight; unread remains durable.
+      trace.rpc_reason = "none";
+      if (!(await this.admitActiveThread(ws, owner, until, trace, true))) return false;
+      return (await this.checkManagedMcp(ws, owner, until, trace)) === "ready";
+    })().finally(() => {
       if (this.managedMcpFlight?.promise === promise) this.managedMcpFlight = null;
     });
     this.managedMcpFlight = { ws, owner, promise };
     return promise;
   }
 
-  private async checkManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime, deadline: number): Promise<boolean> {
+  private async checkManagedMcp(ws: WebSocket, owner: ManagedActiveRuntime, deadline: number, trace: ManagedAdmissionTrace): Promise<"ready" | "thread_not_loaded" | "blocked"> {
     this.managedMcpRecoverable = false;
     const proofOwner = this.managedMcpOwner;
     this.managedMcpState = "checking";
@@ -898,41 +964,42 @@ export class CodexBridgeClient {
     let code = "E_MCP_STATUS_UNAVAILABLE";
     let startupPending = false;
     let server: "aperture-bus" | "sentry" | "unknown" = "unknown";
-    const current = () => {
-      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN || this.stopped) return false;
-      const registry = loadSeatRegistry().seats.get(this.agent);
-      const now = readManagedActiveRuntime(this.agent);
-      return registry?.group === "team" && now !== null && sameActiveRuntime(owner, now);
-    };
+    const current = () => this.managedCurrent(ws, owner);
     const rpc = async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      trace.method = method;
       if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
       if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        if (startupPending) code = "E_MCP_STARTUP_TIMEOUT";
+        code = startupPending ? "E_MCP_STARTUP_TIMEOUT" : "E_MCP_ADMISSION_TIMEOUT";
         throw new Error(code);
       }
       let result: unknown;
       try {
         result = await this.request(method, params, Math.min(RPC_TIMEOUT_MS, remaining));
       } catch (error) {
+        trace.rpc_reason = (error as RpcFailure).rpcReason ?? "remote_error";
         // The shared deadline can expire inside the status RPC, not only in
         // the poll delay. Preserve the observed pending-startup category.
         if (!current()) code = "E_MCP_OWNER_CHANGED";
         else if (this.managedMcpTerminal) code = "E_MCP_STARTUP_CHANGED";
-        else if (startupPending && Date.now() >= deadline) code = "E_MCP_STARTUP_TIMEOUT";
+        else if (Date.now() >= deadline) code = startupPending ? "E_MCP_STARTUP_TIMEOUT" : "E_MCP_ADMISSION_TIMEOUT";
+        else if (method === "mcpServerStatus/list" && (error as RpcFailure).threadNotFound) code = "E_MCP_THREAD_NOT_LOADED";
+        // No speculative resume here: classification just proved loaded. A
+        // contradictory status is denied, not a generic RPC retry/fallback.
         throw error;
       }
       if (!current()) { code = "E_MCP_OWNER_CHANGED"; throw new Error(code); }
       if (this.managedMcpTerminal) { code = "E_MCP_STARTUP_CHANGED"; throw new Error(code); }
-      if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error(code);
+      if (Date.now() >= deadline) { code = startupPending ? "E_MCP_STARTUP_TIMEOUT" : "E_MCP_ADMISSION_TIMEOUT"; throw new Error(code); }
+      if (!result || typeof result !== "object" || Array.isArray(result)) { trace.rpc_reason = "shape"; throw new Error(code); }
       return result as Record<string, unknown>;
     };
     try {
       // Only pending startup is polled; terminal failure never reloads/restarts.
       admission: while (true) {
         if (Date.now() >= deadline) {
-          if (startupPending) code = "E_MCP_STARTUP_TIMEOUT";
+          code = startupPending ? "E_MCP_STARTUP_TIMEOUT" : "E_MCP_ADMISSION_TIMEOUT";
           throw new Error(code);
         }
         epoch = this.managedMcpEpoch;
@@ -944,6 +1011,7 @@ export class CodexBridgeClient {
           const result = await rpc("mcpServerStatus/list", {
             threadId: owner.threadId, detail: "toolsAndAuthOnly", limit: 20, ...(cursor ? { cursor } : {}),
           });
+          trace.rpc_reason = "shape";
           if (!Array.isArray(result.data) || result.data.length > 20) throw new Error(code);
           for (const raw of result.data) {
             if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(code);
@@ -956,6 +1024,7 @@ export class CodexBridgeClient {
           cursor = result.nextCursor; cursors.add(cursor);
         }
         if (cursor !== null) throw new Error(code);
+        trace.rpc_reason = "none";
         for (const name of ["aperture-bus", "sentry"] as const) {
           server = name;
           const row = rows.get(name);
@@ -1000,21 +1069,22 @@ export class CodexBridgeClient {
       this.managedMcpOwner = owner;
       this.managedMcpProven = true;
       this.managedMcpState = "ready";
-      this.hooks.log("codex_managed_mcp_ready", { agent: this.agent, generation: owner.generation, requiredServers: 2, readProbe: true });
-      return true;
+      this.hooks.log("codex_managed_mcp_ready", { agent: this.agent, generation: owner.generation, requiredServers: 2, readProbe: true, ...trace });
+      return "ready";
     } catch {
-      if (this.ws !== ws || this.stopped) return false;
+      if (this.ws !== ws || this.stopped) return "blocked";
       this.managedMcpProven = false;
       this.managedMcpState = "blocked";
       this.managedMcpRecoverable = !this.managedMcpTerminal && !this.threadId &&
         (code === "E_MCP_STARTUP_TIMEOUT" || code === "E_MCP_READINESS_CHANGED");
-      this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: owner.generation, code, server });
-      return false;
+      this.hooks.log("codex_managed_mcp_blocked", { agent: this.agent, generation: owner.generation, code, server, ...trace });
+      return code === "E_MCP_THREAD_NOT_LOADED" ? "thread_not_loaded" : "blocked";
     }
   }
 
   /** One ready-triggered re-entry after a transient initial admission timeout.
-   * No new thread/resume/kickoff, no renewed budget per notification, no retry
+   * Reclassifies the same thread; only exact persisted/notLoaded may resume.
+   * No new thread/kickoff, no renewed budget per notification, no retry
    * of terminal errors. Delivery still revalidates before sending unread work. */
   private async recoverManagedMcp(): Promise<void> {
     const ws = this.ws;
@@ -1164,6 +1234,7 @@ export class CodexBridgeClient {
     this.managedMcpTerminal = false;
     this.managedMcpRecoverable = false;
     this.managedMcpRecoveryUsed = false;
+    this.managedResumedOnSocket = false;
     this.managedMcpFlight = null;
     this.threadId = null;
     this.clearThreadReady();
@@ -1210,17 +1281,17 @@ export class CodexBridgeClient {
   request(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<unknown> {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error(`not connected (${method})`));
+      return Promise.reject(Object.assign(new Error(`not connected (${method})`), { rpcReason: "not_connected" }));
     }
     const id = this.nextId++;
     const ms = timeoutMs ?? (method.startsWith("turn/") ? TURN_RPC_TIMEOUT_MS : RPC_TIMEOUT_MS);
     return new Promise((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        rejectPromise(new Error(`${method} timed out after ${ms}ms`));
+        rejectPromise(Object.assign(new Error(`${method} timed out after ${ms}ms`), { rpcReason: "timeout" }));
       }, ms);
       timer.unref?.();
-      this.pending.set(id, { method, resolve: resolvePromise, reject: rejectPromise, timer });
+      this.pending.set(id, { method, expectedThreadId: typeof params.threadId === "string" ? params.threadId : undefined, resolve: resolvePromise, reject: rejectPromise, timer });
       ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
     });
   }
@@ -1235,7 +1306,7 @@ export class CodexBridgeClient {
   private failAllPending(err: Error): void {
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
-      p.reject(err);
+      p.reject(Object.assign(err, { rpcReason: "socket_closed" }));
     }
     this.pending.clear();
   }
@@ -1257,9 +1328,14 @@ export class CodexBridgeClient {
       clearTimeout(p.timer);
       if (msg.error) {
         const err = msg.error as JsonRpcError;
-        const error = new Error(`${p.method}: ${err.message ?? "RPC error"}`) as Error & { threadNotFound?: boolean };
-        error.threadNotFound = p.method === "thread/read" && err.code === -32600 &&
-          typeof err.message === "string" && /^thread not found(?:\b|:)/i.test(err.message);
+        const error = new Error(`${p.method}: ${err.message ?? "RPC error"}`) as RpcFailure;
+        error.rpcReason = "remote_error";
+        // Numeric response id selects THIS pending method/thread. Invalid
+        // params and not-found errors for a different thread never qualify.
+        error.threadNotFound = (p.method === "thread/read" || p.method === "mcpServerStatus/list") &&
+          err.code === -32600 && p.expectedThreadId !== undefined && typeof err.message === "string" &&
+          /^thread not found:\s*(.+)$/i.exec(err.message)?.[1] === p.expectedThreadId;
+        if (err.code === -32600 && !error.threadNotFound) error.rpcReason = "invalid_request";
         p.reject(error);
       } else {
         p.resolve(msg.result ?? null);
@@ -1354,7 +1430,11 @@ export class CodexBridgeClient {
     if (!this.threadId || this.stopped || !loadSeatRegistry().seats.has(this.agent)) return;
     if (this.managedMcpOwner) {
       const ws = this.ws;
-      if (!ws || !(await this.verifyManagedMcp(ws, this.managedMcpOwner))) return;
+      const owner = this.managedMcpOwner;
+      if (!ws || !(await this.verifyManagedMcp(ws, owner))) return;
+      // Awaited proof is not authority: fence the actual delivery too.
+      if (!this.managedCurrent(ws, owner) || this.managedMcpTerminal ||
+          !this.managedMcpProven || this.threadId !== owner.threadId) return;
     } else if (loadSeatRegistry().seats.get(this.agent)?.group === "team") {
       return;
     }
