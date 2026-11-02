@@ -1,0 +1,6 @@
+/_build/
+/deps/
+/data/
+erl_crash.dump
+*.ez
+/claude-outputs/

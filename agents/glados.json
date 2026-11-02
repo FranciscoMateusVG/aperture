@@ -1,0 +1,19 @@
+{
+  "name": "glados",
+  "display": "GLaDOS",
+  "role": "Orchestrator: turns your requests into tasks, delegates to Peppy and Wheatley, creates teams",
+  "prompt": "prompts/glados.md",
+  "harness": "claude",
+  "model": "opus",
+  "mcp": {
+    "mempalace": {
+      "command": "~/.mempalace/venv/bin/python",
+      "args": [
+        "-m",
+        "mempalace.mcp_server",
+        "--palace",
+        "~/.aperture/mempalace"
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "peppy",
+  "display": "Peppy",
+  "role": "Infrastructure: servers, Docker, Dokploy, deploys, CI",
+  "prompt": "prompts/peppy.md",
+  "harness": "codex",
+  "model": "gpt-6-astra",
+  "mcp": {
+    "mempalace": {
+      "command": "~/.mempalace/venv/bin/python",
+      "args": [
+        "-m",
+        "mempalace.mcp_server",
+        "--palace",
+        "~/.aperture/mempalace"
+      ]
+    }
+  }
+}

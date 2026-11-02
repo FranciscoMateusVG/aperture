@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stand-in for the codex CLI in launcher tests: records its arguments per
+# subcommand (NUL-separated, so multi-line values survive) and stays alive.
+# The test plays the app-server itself.
+set -eu
+mkdir -p "$FAKE_LOG_DIR"
+# app-server's bypass is a root option; preserve it in the recorded argv.
+subcommand=$1
+if [[ "$subcommand" == --dangerously-bypass-approvals-and-sandbox ]]; then
+  subcommand=$2
+fi
+pwd > "$FAKE_LOG_DIR/codex-$subcommand-$APERTURE_AGENT.cwd"
+printf '%s\0' "$@" > "$FAKE_LOG_DIR/codex-$subcommand-$APERTURE_AGENT.args"
+exec sleep 3600

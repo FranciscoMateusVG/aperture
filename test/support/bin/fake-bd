@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stand-in for the bd CLI in tests. Appends one JSON line per call to
+# $BEADS_DIR/calls.jsonl (argv + BD_ACTOR) and prints canned --json output.
+# Like bd 1.0.2, it prints a warning on stderr on every call.
+set -eu
+mkdir -p "$BEADS_DIR"
+echo "warning: beads.role not configured; defaulting to contributor" >&2
+node -e '
+  const [actor, ...argv] = process.argv.slice(1);
+  require("fs").appendFileSync(process.env.BEADS_DIR + "/calls.jsonl",
+    JSON.stringify({ actor, argv }) + "\n");
+' "${BD_ACTOR:-}" "$@"
+# like bd 1.0.2: the title comes as --title=VALUE
+title=""
+for a in "$@"; do case "$a" in --title=*) title="${a#--title=}";; esac; done
+case "$1" in
+  create)
+    if [ "$title" = "FAIL" ]; then echo "Error: database is locked" >&2; exit 1; fi
+    printf '{"id":"ap-%s","title":%s,"status":"open","priority":2,"labels":[],"created_by":"%s"}\n' "$RANDOM" "$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$title")" "$BD_ACTOR" ;;
+  list|ready)
+    printf '[{"id":"ap-1","title":"First","status":"open","priority":1,"assignee":"","labels":["project:aperture"],"description":"long text","notes":"history"},{"id":"ap-2","title":"Second","status":"in_progress","priority":2,"assignee":"peppy","labels":[]}]\n' ;;
+  show)
+    node -e 'process.stdout.write(JSON.stringify([{id: process.argv[1], title: "Shown", status: "open", description: "x".repeat(5000), acceptance: "it works"}]) + "\n")' "$2" ;;
+  update|close)
+    printf '[{"id":"%s","title":"T","status":"%s","assignee":"%s","priority":2,"labels":[]}]\n' "$2" "$([ "$1" = close ] && echo closed || echo in_progress)" "$BD_ACTOR" ;;
+  *) echo "unknown" >&2; exit 2 ;;
+esac

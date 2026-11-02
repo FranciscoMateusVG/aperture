@@ -1,0 +1,19 @@
+{
+  "name": "wheatley",
+  "display": "Wheatley",
+  "role": "Planning, research and scoped implementation",
+  "prompt": "prompts/wheatley.md",
+  "harness": "codex",
+  "model": "gpt-6-astra",
+  "mcp": {
+    "mempalace": {
+      "command": "~/.mempalace/venv/bin/python",
+      "args": [
+        "-m",
+        "mempalace.mcp_server",
+        "--palace",
+        "~/.aperture/mempalace"
+      ]
+    }
+  }
+}

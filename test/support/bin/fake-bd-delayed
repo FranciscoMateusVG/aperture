@@ -1,0 +1,3 @@
+#!/bin/sh
+# Bypass the Volta launcher shim: the Port's OS pid must be the actual test CLI.
+exec "$(node -p 'process.execPath')" "$(dirname "$0")/fake-bd-delayed.cjs" "$@"

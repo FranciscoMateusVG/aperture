@@ -1,0 +1,124 @@
+#!/bin/zsh
+# Launch Services supplies a minimal PATH. Re-enter the user's login environment.
+if [[ ${1:-} != --login ]]; then
+  exec /bin/zsh -lic 'exec "$1" --login' aperture "$0"
+fi
+set -eu
+umask 077
+resources="${0:A:h:h}/Resources"
+repo="$(cat "$resources/repo-path")"
+session=aperture-v4
+url=http://127.0.0.1:4518
+mkdir -p "$HOME/Library/Logs"
+exec >> "$HOME/Library/Logs/Aperture-launcher.log" 2>&1
+print -r -- "$(date -u +%FT%TZ) launch pid=$$ repo=$repo"
+
+fail() {
+  local detail="$1" pane
+  pane="$(tmux capture-pane -p -J -S -25 -t "$session:hub" 2>/dev/null || true)"
+  print -r -- "$detail" "$pane"
+  /usr/bin/osascript - "$detail" "$pane" <<'APPLESCRIPT' || true
+on run argv
+  display alert "Aperture could not start" message ((item 1 of argv) & return & return & (item 2 of argv)) as critical buttons {"OK"} default button "OK"
+end run
+APPLESCRIPT
+  exit 1
+}
+attachment_failed() {
+  local detail="Aperture is running, but $terminal did not attach. Open $terminal and run: tmux attach -t $session"
+  print -r -- "$detail"
+  /usr/bin/osascript - "$detail" <<'APPLESCRIPT' || true
+on run argv
+  display alert "Aperture is running" message (item 1 of argv) as warning buttons {"OK"} default button "OK"
+end run
+APPLESCRIPT
+  exit 1
+}
+[[ -d "$repo" && -x "$repo/scripts/up.sh" ]] || fail "Repository missing: $repo. Run scripts/install-app.sh again."
+cd "$repo"
+mkdir -p data/run
+# Serialize simultaneous clicks through startup AND terminal attachment.
+lock="$repo/data/run/dock-launch.lock"
+for attempt in {1..70}; do
+  if mkdir "$lock" 2>/dev/null; then
+    print -r -- $$ > "$lock/pid"
+    trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+    break
+  fi
+  owner="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+    rm -f "$lock/pid"
+    rmdir "$lock" 2>/dev/null || true
+  fi
+  (( attempt < 70 )) || fail "Another Aperture launch is still in progress."
+  sleep 1
+done
+
+healthy() { /usr/bin/curl -sf --max-time 1 "$url/health" >/dev/null; }
+if ! healthy; then
+  for tool in mix elixir node tmux bd claude codex; do
+    location="$(command -v "$tool" || true)"
+    [[ -n "$location" ]] || fail "$tool is missing from the login shell PATH."
+    print -r -- "$tool=$location"
+  done
+  # Pass PATH into this session, including when some unrelated tmux server exists.
+  ./scripts/up.sh || fail "scripts/up.sh failed."
+  deadline=$(( SECONDS + 60 ))
+  until healthy; do
+    (( SECONDS < deadline )) || fail "The hub did not become healthy within 60 seconds. Last hub output:"
+    sleep 1
+  done
+  print -r -- "hub ready"
+else
+  print -r -- "hub already healthy; skipped startup"
+fi
+
+/usr/bin/open "$url"
+clients="$(tmux list-clients -t "$session" -F '#{client_pid}' 2>/dev/null || true)"
+if [[ -d /Applications/Warp.app ]]; then
+  terminal=Warp
+else
+  terminal=Terminal
+fi
+if [[ -z "$clients" ]]; then
+  tmux_bin="$(command -v tmux)"
+  attach="exec ${(q)tmux_bin} attach -t $session"
+  command="/bin/zsh -lic ${(q)attach}"
+  if [[ "$terminal" == Warp ]]; then
+    # Warp's documented launch configuration URI opens a window and runs attach.
+    mkdir -p "$HOME/.warp/launch_configurations"
+    yaml_repo="${repo//\'/\'\'}"
+    yaml_command="${command//\'/\'\'}"
+    cat > "$HOME/.warp/launch_configurations/aperture-v4.yaml" <<YAML
+# Keep the configuration name equal to the URI identifier: Warp looks up names.
+name: aperture-v4
+windows:
+  - tabs:
+      - title: Aperture v4
+        layout:
+          cwd: '$yaml_repo'
+          commands:
+            - exec: '$yaml_command'
+YAML
+    /usr/bin/open 'warp://launch/aperture-v4' || attachment_failed
+  else
+    /usr/bin/osascript - "$command" <<'APPLESCRIPT' || attachment_failed
+on run argv
+  tell application "Terminal"
+    do script (item 1 of argv)
+    activate
+  end tell
+end run
+APPLESCRIPT
+  fi
+  # Avoid another click opening a second terminal before the first attaches.
+  for attempt in {1..15}; do
+    [[ -n "$(tmux list-clients -t "$session" -F '#{client_pid}' 2>/dev/null || true)" ]] && break
+    sleep 1
+  done
+  [[ -n "$(tmux list-clients -t "$session" -F '#{client_pid}' 2>/dev/null || true)" ]] || attachment_failed
+  print -r -- "attached terminal=$terminal"
+else
+  /usr/bin/open -a "$terminal"
+  print -r -- "existing tmux client; focused $terminal"
+fi

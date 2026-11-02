@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.aperture.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string><string>-i</string>
+    <string>/bin/bash</string><string>--noprofile</string><string>--norc</string>
+    <string>__APERTURE_HOME__/Library/Application Support/Aperture/launchd/server.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>__APERTURE_REPO__</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>__APERTURE_HOME__/Library/Logs/Aperture/server.stdout.log</string>
+  <key>StandardErrorPath</key><string>__APERTURE_HOME__/Library/Logs/Aperture/server.stderr.log</string>
+</dict>
+</plist>

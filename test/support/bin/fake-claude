@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stand-in for the claude CLI in launcher tests: records its arguments (NUL-separated
+# so multi-line values survive), then does what the real agent's kickoff asks for: runs aperture-inbox.
+set -eu
+mkdir -p "$FAKE_LOG_DIR"
+pwd > "$FAKE_LOG_DIR/claude-$APERTURE_AGENT.cwd"
+printf '%s\0' "$@" > "$FAKE_LOG_DIR/claude-$APERTURE_AGENT.args"
+mode_file="$FAKE_LOG_DIR/claude-$APERTURE_AGENT.mode"
+mode="$(cat "$mode_file" 2>/dev/null || true)"
+case "$mode" in
+  exit) exit 23 ;;
+  delayed) sleep 0.5 ;;
+  no-inbox) exec sleep 3600 ;;
+esac
+here="$(cd "$(dirname "$0")/../../.." && pwd)"
+exec node "$here/bin/aperture-inbox.mjs" --agent "$APERTURE_AGENT" --url "$APERTURE_HUB_WS"
